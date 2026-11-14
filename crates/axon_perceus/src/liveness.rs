@@ -27,6 +27,7 @@ impl<'a> LivenessPass<'a> {
     fn process_block(&self, block: &mut BasicBlock, var_types: &[Type]) {
         let mut last_use_map: HashMap<IrVar, usize> = HashMap::new();
         let mut returned_vars: HashSet<IrVar> = HashSet::new();
+        let mut moved_vars: HashSet<IrVar> = HashSet::new();
 
         if let Terminator::Return {
             value: Some(Operand::Var(ret_v)),
@@ -34,6 +35,17 @@ impl<'a> LivenessPass<'a> {
         } = &block.terminator
         {
             returned_vars.insert(*ret_v);
+        }
+
+        // Track variables whose ownership was moved into another variable via Copy
+        for inst in &block.instructions {
+            if let Instruction::Assign {
+                op: IrOp::Copy(Operand::Var(src)),
+                ..
+            } = inst
+            {
+                moved_vars.insert(*src);
+            }
         }
 
         // 1. Scan instructions to find the latest index where each variable is read
@@ -53,8 +65,9 @@ impl<'a> LivenessPass<'a> {
                 let v_ty = var_types.get(v.0 as usize).unwrap_or(&Type::Unknown);
                 let byte_size = compute_type_size(v_ty, self.ctx);
 
-                // Only insert Drop for allocated types with non-zero size
-                if byte_size > 0 && !returned_vars.contains(&v) {
+                // Only insert Drop for allocated types with non-zero size,
+                // and not returned, and not moved!
+                if byte_size > 0 && !returned_vars.contains(&v) && !moved_vars.contains(&v) {
                     if let Some(&last_idx) = last_use_map.get(&v) {
                         drop_insertions.push((last_idx + 1, v, byte_size, *span));
                     } else {

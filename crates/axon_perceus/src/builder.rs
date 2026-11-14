@@ -197,15 +197,24 @@ impl<'a> IrBuilder<'a> {
                 init,
                 span,
             } => {
+                let operand = self.lower_expr(init, ast);
                 let var_ty = match ty {
                     Some(t_id) => self
                         .ctx
                         .resolve_ast_type(t_id, ast, self.interner)
                         .unwrap_or(Type::Unknown),
-                    None => Type::Unknown,
+                    None => {
+                        if let Operand::Var(init_var) = operand {
+                            self.var_types
+                                .get(init_var.0 as usize)
+                                .cloned()
+                                .unwrap_or(Type::Unknown)
+                        } else {
+                            Type::Unknown
+                        }
+                    }
                 };
                 let var = self.new_var(var_ty, Some(name));
-                let operand = self.lower_expr(init, ast);
                 self.emit(Instruction::Assign {
                     dest: var,
                     op: IrOp::Copy(operand),

@@ -325,3 +325,144 @@ fn test_checked_wrapping_saturating_arithmetic_ir() {
         "Must preserve checked Add (+) in Perceus IR"
     );
 }
+
+#[test]
+fn test_fbip_size_mismatch_no_reuse() {
+    let src = r#"
+    struct Small {
+        a: i32,
+        b: i32,
+    }
+
+    struct Big {
+        x: i64,
+        y: i64,
+        z: i64,
+        w: i64,
+    }
+
+    fn cannot_reuse() -> Big {
+        let s = Small(1, 2);
+        let val = s.a;
+        // s is 8B, Big is 32B. Cannot reuse s for b!
+        let b = Big(10, 20, 30, 40);
+        return b;
+    }
+    "#;
+
+    let bump = Bump::new();
+    let mut arena = AstArena::new(&bump);
+    let mut interner = Rodeo::default();
+    let tokens = Lexer::new(src, FileId(0), &mut interner)
+        .tokenize_all()
+        .unwrap();
+    let prog = {
+        let mut parser = Parser::new(&tokens, &mut arena, &mut interner);
+        parser.parse_program().unwrap()
+    };
+
+    let ctx = {
+        let mut checker = TypeChecker::new(&arena, &interner);
+        checker.check_program(&prog).unwrap();
+        checker.ctx.clone()
+    };
+
+    let frozen = arena.freeze();
+    let (_ir_prog, stats) = compile_to_perceus(&prog, frozen, &ctx, &interner);
+
+    assert_eq!(
+        stats.reused_allocations, 0,
+        "Cannot reuse smaller dropped memory for larger allocation"
+    );
+}
+
+#[test]
+fn test_fbip_multiple_slots() {
+    let src = r#"
+    struct Vec2 {
+        x: f32,
+        y: f32,
+    }
+
+    fn multi_reuse() -> Vec2 {
+        let a = Vec2(1.0, 2.0);
+        let b = Vec2(3.0, 4.0);
+        let sum_x = a.x + b.x;
+        let sum_y = a.y + b.y;
+        // a (8B) and b (8B) are now dead
+        let c = Vec2(sum_x, 0.0);
+        let d = Vec2(0.0, sum_y);
+        return d;
+    }
+    "#;
+
+    let bump = Bump::new();
+    let mut arena = AstArena::new(&bump);
+    let mut interner = Rodeo::default();
+    let tokens = Lexer::new(src, FileId(0), &mut interner)
+        .tokenize_all()
+        .unwrap();
+    let prog = {
+        let mut parser = Parser::new(&tokens, &mut arena, &mut interner);
+        parser.parse_program().unwrap()
+    };
+
+    let ctx = {
+        let mut checker = TypeChecker::new(&arena, &interner);
+        checker.check_program(&prog).unwrap();
+        checker.ctx.clone()
+    };
+
+    let frozen = arena.freeze();
+    let (_ir_prog, stats) = compile_to_perceus(&prog, frozen, &ctx, &interner);
+
+    assert_eq!(
+        stats.reused_allocations, 2,
+        "Expected both dead Vec2 slots to be reused in-place"
+    );
+}
+
+#[test]
+fn test_fbip_token_consumed_once() {
+    let src = r#"
+    struct Vec2 {
+        x: f32,
+        y: f32,
+    }
+
+    fn single_reuse() -> f32 {
+        let a = Vec2(1.0, 2.0);
+        let v = a.x;
+        // a (8B) is dead -> 1 slot available
+        let b = Vec2(v, 0.0); // reuses a
+        let c = Vec2(0.0, v); // fresh alloc: b is still alive!
+        let total = b.x + c.x; // keeps b and c alive simultaneously
+        return total;
+    }
+    "#;
+
+    let bump = Bump::new();
+    let mut arena = AstArena::new(&bump);
+    let mut interner = Rodeo::default();
+    let tokens = Lexer::new(src, FileId(0), &mut interner)
+        .tokenize_all()
+        .unwrap();
+    let prog = {
+        let mut parser = Parser::new(&tokens, &mut arena, &mut interner);
+        parser.parse_program().unwrap()
+    };
+
+    let ctx = {
+        let mut checker = TypeChecker::new(&arena, &interner);
+        checker.check_program(&prog).unwrap();
+        checker.ctx.clone()
+    };
+
+    let frozen = arena.freeze();
+    let (_ir_prog, stats) = compile_to_perceus(&prog, frozen, &ctx, &interner);
+
+    assert_eq!(
+        stats.reused_allocations, 1,
+        "Only one allocation can reuse the single dead slot while other is alive"
+    );
+}
