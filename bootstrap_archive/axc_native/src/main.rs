@@ -40,7 +40,7 @@ fn main() {
     let cmd = args[1].as_str();
     match cmd {
         "-v" | "--version" | "version" => {
-            println!("axc 5.0.0 (Axon Zero-Ceremony Native x86_64/PE32+ Direct Compiler - Built-in @shield Anti-Crack & AVX2 SIMD)");
+            println!("axc 6.0.0-seed (Axon Zero-Ceremony Native x86_64/PE32+ Stage-0 Seed Compiler)");
         }
         "-h" | "--help" | "help" => {
             print_usage();
@@ -99,7 +99,7 @@ fn main() {
 }
 
 fn print_usage() {
-    println!("Axon v5.0 Super-Language Compiler (Zero-Ceremony, Direct x86_64/PE32+, Built-in Anti-Crack)");
+    println!("Axon v6.0 Stage-0 Seed Compiler (Zero-Ceremony, Direct x86_64/PE32+, Built-in Anti-Crack)");
     println!("Usage:");
     println!("  axc <app.ax>                     Compile & run `.ax` directly in ~2ms");
     println!("  axc build <app.ax> [-o app.exe]  Emit standalone 3KB-6KB native PE32+ executable");
@@ -480,7 +480,7 @@ fn cmd_disasm(file: &str) -> Result<(), i32> {
 
 fn cmd_test(extra_args: &[String]) -> i32 {
     let t0 = Instant::now();
-    println!("=== AXON v5.0 REAL NATIVE EXECUTION & SECURITY TEST SUITE ===");
+    println!("=== AXON v6.0 REAL NATIVE EXECUTION & SECURITY TEST SUITE ===");
 
     if extra_args.iter().any(|a| a == "--docs") {
         let code = cmd_run("tools/doc_test_runner.ax", false);
@@ -575,7 +575,7 @@ fn shannon_entropy(data: &[u8]) -> f64 {
 
 fn cmd_audit(caps_mode: bool) -> i32 {
     println!("======================================================================");
-    println!("       AXON v5.0 REAL BINARY SECURITY, W^X & ZERO-MOCK AUDIT          ");
+    println!("       AXON v6.0 REAL BINARY SECURITY, W^X & ZERO-MOCK AUDIT          ");
     println!("======================================================================");
 
     // 1. Scan repository outside `bootstrap_archive`

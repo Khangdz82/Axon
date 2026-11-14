@@ -155,49 +155,22 @@ fn analyze_fn_perceus(f: &FnDecl, checked: &CheckedProgram) -> PerceusFnPlan {
         }
     }
 
-    // 4. Schedule deterministic Perceus `Drop` (`VirtualFree`) for remaining non-escaped allocations
-    let mut drops_after_stmt: HashMap<usize, Vec<(String, AllocKind)>> = HashMap::new();
+    // 4. Schedule deterministic Perceus `Drop` (`VirtualFree`) at scope epilogue for remaining non-escaped allocations
+    // (FBIP donors were already paired in `fbip_reuse_from`; keeping non-donor drops at epilogue preserves zero-copy `buf_slice_str` borrows!)
+    let drops_after_stmt: HashMap<usize, Vec<(String, AllocKind)>> = HashMap::new();
     let mut epilogue_drops: Vec<(String, AllocKind)> = Vec::new();
 
     for (var_name, kind) in &owned_map {
         if escaped.contains(var_name) || consumed_by_reuse.contains(var_name) {
             continue;
         }
-        if let Some(&lu_idx) = last_use.get(var_name) {
-            // If last use is not a return/control-flow tail, drop right after last use; else at epilogue
-            if lu_idx + 1 < f.body.len() && !stmt_contains_return(&f.body[lu_idx]) {
-                drops_after_stmt
-                    .entry(lu_idx)
-                    .or_default()
-                    .push((var_name.clone(), kind.clone()));
-            } else {
-                epilogue_drops.push((var_name.clone(), kind.clone()));
-            }
-        } else {
-            epilogue_drops.push((var_name.clone(), kind.clone()));
-        }
+        epilogue_drops.push((var_name.clone(), kind.clone()));
     }
 
     PerceusFnPlan {
         drops_after_stmt,
         epilogue_drops,
         fbip_reuse_from,
-    }
-}
-
-fn stmt_contains_return(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::Return { .. } => true,
-        Stmt::If {
-            then_body,
-            else_body,
-            ..
-        } => then_body.iter().any(stmt_contains_return) || else_body.iter().any(stmt_contains_return),
-        Stmt::While { body, .. }
-        | Stmt::ForRange { body, .. }
-        | Stmt::ForEach { body, .. }
-        | Stmt::With { body, .. } => body.iter().any(stmt_contains_return),
-        _ => false,
     }
 }
 

@@ -1,31 +1,34 @@
-# Axon v5.0 Standalone Toolchain Installer (Windows x64)
+# Axon v6.0 Ultra-Lightweight Self-Hosted Toolchain Installer (Windows x64)
 $ErrorActionPreference = "Stop"
 
-$AxonVersion = "5.0.0"
-$InstallDir = Join-Path $env:USERPROFILE ".axon\bin"
-$AxcExe = Join-Path $InstallDir "axc.exe"
+$AxonVersion = "6.0.0"
+$AxonRoot = Join-Path $env:USERPROFILE ".axon"
+$InstallBin = Join-Path $AxonRoot "bin"
+$InstallStd = Join-Path $AxonRoot "std"
+$AxcExe = Join-Path $InstallBin "axc.exe"
 
-Write-Host "[*] Installing Axon v$AxonVersion Self-Hosted Native Compiler..." -ForegroundColor Cyan
+Write-Host "[*] Installing Axon v$AxonVersion Self-Hosted Native Toolchain..." -ForegroundColor Cyan
 
-if (-not (Test-Path -Path $InstallDir)) {
-    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-}
+New-Item -ItemType Directory -Path $InstallBin -Force | Out-Null
+New-Item -ItemType Directory -Path $InstallStd -Force | Out-Null
 
 $CurrentAxc = Join-Path $PSScriptRoot "bin\axc.exe"
 if (-not (Test-Path -Path $CurrentAxc)) {
-    throw "bin\axc.exe not found. Build Stage-0 first via cargo build --release --manifest-path bootstrap_archive/axc_native/Cargo.toml"
+    throw "bin\axc.exe not found. Bootstrap Stage-0 first via bootstrap_archive/axc_native."
 }
 
 Copy-Item -Path $CurrentAxc -Destination $AxcExe -Force
+Copy-Item -Path (Join-Path $PSScriptRoot "std\*.ax") -Destination $InstallStd -Force
 
 $UserPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::User)
-if ($UserPath -notlike "*$InstallDir*") {
-    $NewPath = "$InstallDir;$UserPath"
+if ($UserPath -notlike "*$InstallBin*") {
+    $NewPath = "$InstallBin;$UserPath"
     [Environment]::SetEnvironmentVariable("Path", $NewPath, [EnvironmentVariableTarget]::User)
-    $env:Path = "$InstallDir;$env:Path"
-    Write-Host "[+] Added $InstallDir to User PATH." -ForegroundColor Green
+    $env:Path = "$InstallBin;$env:Path"
+    Write-Host "[+] Added $InstallBin to User PATH." -ForegroundColor Green
 }
 
-$AxcSizeKB = [math]::Round((Get-Item $AxcExe).Length / 1KB, 2)
-Write-Host "[+] Installed axc.exe ($AxcSizeKB KB) to $AxcExe" -ForegroundColor Green
+$TotalBytes = (Get-ChildItem -Path $AxonRoot -Recurse -File | Measure-Object -Property Length -Sum).Sum
+$TotalKB = [math]::Round($TotalBytes / 1KB, 2)
+Write-Host "[+] Installed Axon v$AxonVersion ($TotalKB KB total: compiler + linker + stdlib) to $AxonRoot" -ForegroundColor Green
 & $AxcExe version

@@ -730,6 +730,7 @@ impl<'a> ModuleCodegen<'a> {
             ret_buf_ptr_slot: None,
             secret_wipe_ranges: Vec::new(),
             loop_stack: Vec::new(),
+            loop_fbip_drop_slots: Vec::new(),
             elide_bounds_vars: std::collections::HashSet::new(),
         };
         fcg.emit(f);
@@ -759,6 +760,7 @@ struct FnCodegen<'a, 'b> {
     ret_buf_ptr_slot: Option<usize>,
     secret_wipe_ranges: Vec<(usize, usize)>,
     loop_stack: Vec<LoopPatch>,
+    loop_fbip_drop_slots: Vec<usize>,
     elide_bounds_vars: std::collections::HashSet<String>,
 }
 
@@ -889,6 +891,18 @@ impl<'a, 'b> FnCodegen<'a, 'b> {
             }
         }
 
+        let param_end_slot = self.next_slot;
+        self.mc.code.push(0x57); // PUSH RDI
+        self.mc.code.extend_from_slice(&[0x48, 0x8D, 0xBD]); // LEA RDI, [RBP + disp32]
+        let zero_lea_pos = self.mc.code.len();
+        self.mc.code.extend_from_slice(&0i32.to_le_bytes());
+        self.mc.code.push(0xB9); // MOV ECX, count
+        let zero_cnt_pos = self.mc.code.len();
+        self.mc.code.extend_from_slice(&0u32.to_le_bytes());
+        self.mc
+            .code
+            .extend_from_slice(&[0x31, 0xC0, 0xF3, 0x48, 0xAB, 0x5F]); // XOR EAX,EAX; REP STOSQ; POP RDI
+
         // Compile body statements with Perceus deterministic Drop scheduling
         for (stmt_idx, stmt) in f.body.iter().enumerate() {
             self.emit_stmt(stmt, f);
@@ -904,6 +918,10 @@ impl<'a, 'b> FnCodegen<'a, 'b> {
             }
         }
 
+        if self.next_slot == param_end_slot {
+            let _ = self.alloc_slots(1);
+        }
+
         // Implicit fallthrough epilogue (returns 0)
         self.emit_perceus_epilogue_drops();
         self.emit_writeback_mut_params(f);
@@ -913,34 +931,34 @@ impl<'a, 'b> FnCodegen<'a, 'b> {
             .code
             .extend_from_slice(&[0x48, 0x89, 0xEC, 0x5D, 0xC3]);
 
-        // Patch 16-byte aligned stack frame size (+ 64 bytes Win64 shadow/call scratch!)
+        // Patch prolog zeroing range & 16-byte aligned stack frame size
+        let zero_slots = self.next_slot.saturating_sub(param_end_slot).max(1);
+        let zero_lowest_disp = -(((param_end_slot + zero_slots) as i32) * 8);
+        self.mc.code[zero_lea_pos..zero_lea_pos + 4]
+            .copy_from_slice(&zero_lowest_disp.to_le_bytes());
+        self.mc.code[zero_cnt_pos..zero_cnt_pos + 4]
+            .copy_from_slice(&(zero_slots as u32).to_le_bytes());
+
         let raw_bytes = (self.next_slot * 8) + 96;
         let aligned_frame = ((raw_bytes + 15) & !15) as u32;
         self.mc.code[frame_imm_pos..frame_imm_pos + 4]
             .copy_from_slice(&aligned_frame.to_le_bytes());
     }
 
-    fn emit_perceus_drop_var(&mut self, var_name: &str) {
-        let Some(lv) = self.vars.get(var_name).cloned() else {
-            return;
-        };
+    fn emit_perceus_drop_slot(&mut self, slot: usize) {
         self.mc.perceus_drops += 1;
-        // Load pointer from slot 0 (`Table`, `ByteBuf`, and `IntBuf` all keep heap base ptr in slot 0)
-        self.emit_load_slot_rax(lv.slot, 0);
-        // TEST RAX, RAX; JZ .skip_free
+        self.emit_load_slot_rax(slot, 0);
         self.mc.code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x0F, 0x84]);
         let jz_skip = self.mc.code.len();
         self.mc.code.extend_from_slice(&0i32.to_le_bytes());
 
-        // Zero slot 0 first so early-return / epilogue paths can never double-free
-        self.mc.code.extend_from_slice(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX (lpAddress)
+        self.mc.code.extend_from_slice(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
         self.emit_mov_rax_imm64(0);
-        self.emit_store_rax_slot(lv.slot, 0);
-        // VirtualFree(RCX, RDX=0, R8D=0x8000 MEM_RELEASE)
-        self.mc.code.extend_from_slice(&[0x31, 0xD2]); // XOR EDX, EDX
+        self.emit_store_rax_slot(slot, 0);
+        self.mc.code.extend_from_slice(&[0x31, 0xD2]);
         self.mc
             .code
-            .extend_from_slice(&[0x41, 0xB8, 0x00, 0x80, 0x00, 0x00]); // MOV R8D, 0x8000
+            .extend_from_slice(&[0x41, 0xB8, 0x00, 0x80, 0x00, 0x00]);
         self.mc.emit_call_iat(IAT_VIRTUAL_FREE);
 
         let after_pos = self.mc.code.len();
@@ -948,11 +966,21 @@ impl<'a, 'b> FnCodegen<'a, 'b> {
         self.mc.code[jz_skip..jz_skip + 4].copy_from_slice(&rel.to_le_bytes());
     }
 
+    fn emit_perceus_drop_var(&mut self, var_name: &str) {
+        let Some(lv) = self.vars.get(var_name).cloned() else {
+            return;
+        };
+        self.emit_perceus_drop_slot(lv.slot);
+    }
+
     fn emit_perceus_epilogue_drops(&mut self) {
         if let Some(drops) = self.perceus_plan.as_ref().map(|p| p.epilogue_drops.clone()) {
             for (vname, _) in drops {
                 self.emit_perceus_drop_var(&vname);
             }
+        }
+        for s in self.loop_fbip_drop_slots.clone() {
+            self.emit_perceus_drop_slot(s);
         }
     }
 
@@ -1166,6 +1194,74 @@ impl<'a, 'b> FnCodegen<'a, 'b> {
                                 LocalVar {
                                     slot: dst_slot,
                                     ty: Ty::Table(elem_ty.clone()),
+                                },
+                            );
+                            return;
+                        }
+                    }
+                }
+
+                // Loop Self-FBIP In-Place Reuse for `buf_new` / `ibuf_new` inside loops
+                if !self.loop_stack.is_empty() && !var_escapes_in_stmts(&f.body, name) {
+                    if let Expr::Call { callee, args, .. } = init {
+                        if (callee == "buf_new" || callee == "ibuf_new") && args.len() == 1 {
+                            let dst_slot = self.alloc_slots(1);
+                            self.loop_fbip_drop_slots.push(dst_slot);
+                            let (cap_slot, _) = self.emit_expr(&args[0].expr, f);
+
+                            self.emit_load_slot_rax(dst_slot, 0);
+                            self.mc.code.extend_from_slice(&[0x48, 0x85, 0xC0, 0x0F, 0x84]); // TEST RAX,RAX; JZ .slow
+                            let jz_slow = self.mc.code.len();
+                            self.mc.code.extend_from_slice(&0i32.to_le_bytes());
+
+                            self.mc.code.extend_from_slice(&[0x49, 0x89, 0xC0]); // MOV R8, RAX
+                            self.emit_load_slot_rax(cap_slot, 0);
+                            self.mc.code.extend_from_slice(&[0x49, 0x3B, 0x40, 0x08]); // CMP RAX, [R8 + 8]
+                            self.mc.code.extend_from_slice(&[0x0F, 0x8F]); // JG .free_old
+                            let jg_free = self.mc.code.len();
+                            self.mc.code.extend_from_slice(&0i32.to_le_bytes());
+
+                            // Reuse existing buffer in-place: reset len = 0 (`MOV QWORD [R8], 0`)
+                            self.mc
+                                .code
+                                .extend_from_slice(&[0x49, 0xC7, 0x00, 0x00, 0x00, 0x00, 0x00]);
+                            self.mc.code.extend_from_slice(&[0x4C, 0x89, 0xC0, 0xE9]); // MOV RAX, R8; JMP .done
+                            let jmp_done = self.mc.code.len();
+                            self.mc.code.extend_from_slice(&0i32.to_le_bytes());
+
+                            let free_pos = self.mc.code.len();
+                            let rel_free = (free_pos as isize - (jg_free as isize + 4)) as i32;
+                            self.mc.code[jg_free..jg_free + 4]
+                                .copy_from_slice(&rel_free.to_le_bytes());
+                            self.mc.code.extend_from_slice(&[0x4C, 0x89, 0xC1, 0x31, 0xD2]);
+                            self.mc
+                                .code
+                                .extend_from_slice(&[0x41, 0xB8, 0x00, 0x80, 0x00, 0x00]);
+                            self.mc.emit_call_iat(IAT_VIRTUAL_FREE);
+
+                            let slow_pos = self.mc.code.len();
+                            let rel_slow = (slow_pos as isize - (jz_slow as isize + 4)) as i32;
+                            self.mc.code[jz_slow..jz_slow + 4]
+                                .copy_from_slice(&rel_slow.to_le_bytes());
+                            let (fresh_slot, _) = self.emit_expr(init, f);
+                            self.emit_load_slot_rax(fresh_slot, 0);
+
+                            let done_pos = self.mc.code.len();
+                            let rel_done = (done_pos as isize - (jmp_done as isize + 4)) as i32;
+                            self.mc.code[jmp_done..jmp_done + 4]
+                                .copy_from_slice(&rel_done.to_le_bytes());
+
+                            self.emit_store_rax_slot(dst_slot, 0);
+                            let bty = if callee == "buf_new" {
+                                Ty::Struct("ByteBuf".into())
+                            } else {
+                                Ty::Struct("IntBuf".into())
+                            };
+                            self.vars.insert(
+                                name.clone(),
+                                LocalVar {
+                                    slot: dst_slot,
+                                    ty: bty,
                                 },
                             );
                             return;
@@ -3293,7 +3389,130 @@ impl<'a, 'b> FnCodegen<'a, 'b> {
                 self.emit_store_rax_slot(dst, 1);
                 Some((dst, Ty::Result(Box::new(Ty::Int), Box::new(Ty::Int))))
             }
+            "ushr64" if args.len() == 2 => {
+                let (vslot, _) = self.emit_expr(&args[0].expr, f);
+                let (sslot, _) = self.emit_expr(&args[1].expr, f);
+                self.emit_load_slot_rax(sslot, 0);
+                self.mc.code.extend_from_slice(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
+                self.emit_load_slot_rax(vslot, 0);
+                self.mc.code.extend_from_slice(&[0x48, 0xD3, 0xE8]); // SHR RAX, CL
+                let dst = self.alloc_slots(1);
+                self.emit_store_rax_slot(dst, 0);
+                Some((dst, Ty::Int))
+            }
+            "exit_process" if args.len() == 1 => {
+                let (cslot, _) = self.emit_expr(&args[0].expr, f);
+                self.emit_load_slot_rax(cslot, 0);
+                self.mc.code.extend_from_slice(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
+                self.mc.emit_call_iat(IAT_EXIT_PROCESS);
+                self.mc.code.push(0xCC);
+                let z = self.alloc_slots(1);
+                Some((z, Ty::Unit))
+            }
             _ => None,
         }
+    }
+}
+
+fn var_escapes_in_stmts(stmts: &[Stmt], target: &str) -> bool {
+    for s in stmts {
+        match s {
+            Stmt::Return { val: Some(e), .. } => {
+                if expr_mentions_ident(e, target) {
+                    return true;
+                }
+            }
+            Stmt::VarDecl { init, .. } | Stmt::TupleDestruct { init, .. } => {
+                if var_escapes_in_expr(init, target) {
+                    return true;
+                }
+            }
+            Stmt::Assign { val, .. } => {
+                if var_escapes_in_expr(val, target) {
+                    return true;
+                }
+            }
+            Stmt::ExprStmt { expr, .. } => {
+                if var_escapes_in_expr(expr, target) {
+                    return true;
+                }
+            }
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+                ..
+            } => {
+                if var_escapes_in_expr(cond, target)
+                    || var_escapes_in_stmts(then_body, target)
+                    || var_escapes_in_stmts(else_body, target)
+                {
+                    return true;
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                if var_escapes_in_expr(cond, target) || var_escapes_in_stmts(body, target) {
+                    return true;
+                }
+            }
+            Stmt::ForRange {
+                start, end, body, ..
+            } => {
+                if var_escapes_in_expr(start, target)
+                    || var_escapes_in_expr(end, target)
+                    || var_escapes_in_stmts(body, target)
+                {
+                    return true;
+                }
+            }
+            Stmt::ForEach {
+                collection, body, ..
+            } => {
+                if var_escapes_in_expr(collection, target) || var_escapes_in_stmts(body, target) {
+                    return true;
+                }
+            }
+            Stmt::With { init, body, .. } => {
+                if var_escapes_in_expr(init, target) || var_escapes_in_stmts(body, target) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn expr_mentions_ident(e: &Expr, target: &str) -> bool {
+    match e {
+        Expr::Ident(n, _) | Expr::MoveIdent(n, _) => n == target,
+        Expr::Tuple(v, _) => v.iter().any(|x| expr_mentions_ident(x, target)),
+        Expr::Unary { expr: inner, .. } | Expr::Cast { expr: inner, .. } => {
+            expr_mentions_ident(inner, target)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_mentions_ident(left, target) || expr_mentions_ident(right, target)
+        }
+        Expr::Field { base, .. } | Expr::TupleIdx { base, .. } => expr_mentions_ident(base, target),
+        Expr::Index { base, idx, .. } => {
+            expr_mentions_ident(base, target) || expr_mentions_ident(idx, target)
+        }
+        Expr::Call { args, .. } => args.iter().any(|a| expr_mentions_ident(&a.expr, target)),
+        _ => false,
+    }
+}
+
+fn var_escapes_in_expr(e: &Expr, target: &str) -> bool {
+    match e {
+        Expr::MoveIdent(n, _) => n == target,
+        Expr::Call { args, .. } => args.iter().any(|a| {
+            (a.mode == ArgPassMode::Move && expr_mentions_ident(&a.expr, target))
+                || var_escapes_in_expr(&a.expr, target)
+        }),
+        Expr::Binary { left, right, .. } => {
+            var_escapes_in_expr(left, target) || var_escapes_in_expr(right, target)
+        }
+        Expr::Spawn { body, .. } => var_escapes_in_stmts(body, target),
+        _ => false,
     }
 }

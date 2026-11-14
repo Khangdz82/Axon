@@ -1,9 +1,19 @@
-// Axon v5.0 Self-Hosted Compiler — Static Type, Capability, Perceus FBIP & SoA SIMD Analyzer
-// (`compiler_ax/sema_perceus.ax`) — 100% Pure Axon, Zero GC, Zero `'a` Lifetimes.
+// Axon v6.0 Self-Hosted Compiler - Static Type, Capability, Perceus FBIP & Polyhedral SoA SIMD Verifier
+// (`compiler_ax/sema_perceus.ax`) - 100% Pure Axon, Zero GC, Zero `'a` Lifetimes.
 
 use compiler_ax::tokens_ast
 
-// --- Symbol Lookup Helpers ---
+// `sym` Header Layout (`0..23`):
+//   [0] = err_count, [1] = first_err_line, [2] = first_err_code
+//   [3] = s_meta_base, [4] = s_cnt
+//   [5] = i_meta_base, [6] = i_cnt
+//   [7] = f_meta_base, [8] = f_cnt
+//   [9] = max_s_slots, [10] = in_spawn, [11] = cur_fn_ret_ty, [12] = has_cap_in_scope
+//   [13] = scratch_tnid, [14] = loop_depth
+//   [15] = const_fn_base (`3 * f_cnt`: `[is_const, const_val, const_ty]`)
+//   [16] = soa_active_cols_base (`s_cnt`), [17] = soa_col_map_ptr_base (`s_cnt`)
+//   [18] = soa_used_ptr_base (`s_cnt`), [19] = soa_dyn_base (`s_cnt`)
+
 fn find_struct_idx(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
     base := ibuf_get(sym, 3)
     cnt := ibuf_get(sym, 4)
@@ -52,8 +62,31 @@ fn find_fn_idx(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
     return -1
 }
 
+fn find_struct_method_idx(pool: ByteBuf, sym: IntBuf, sidx: i64, msoff: i64, mslen: i64) -> i64 {
+    s_off := ibuf_get(sym, 3) + sidx * 6
+    sn_soff := ibuf_get(sym, s_off)
+    sn_slen := ibuf_get(sym, s_off + 1)
+    want_len := sn_slen + 2 + mslen
+    f_base := ibuf_get(sym, 7)
+    f_cnt := ibuf_get(sym, 8)
+    mut fi := 0
+    while fi < f_cnt {
+        fo := f_base + fi * 10
+        fn_soff := ibuf_get(sym, fo)
+        fn_slen := ibuf_get(sym, fo + 1)
+        if fn_slen == want_len {
+            if buf_get(pool, fn_soff + sn_slen) == 95 and buf_get(pool, fn_soff + sn_slen + 1) == 95 {
+                if pool_str_eq2(pool, fn_soff, sn_slen, sn_soff) and pool_str_eq2(pool, fn_soff + sn_slen + 2, mslen, msoff) {
+                    return fi
+                }
+            }
+        }
+        fi += 1
+    }
+    return -1
+}
+
 fn find_struct_field(pool: ByteBuf, sym: IntBuf, s_idx: i64, fpacked: i64) -> i64 {
-    // `fpacked = fsoff | (fslen << 32)` -> returns field entry offset in `sym`, or `-1`
     fsoff := fpacked & 0xFFFFFFFF
     fslen := ushr64(fpacked, 32)
     s_off := ibuf_get(sym, 3) + s_idx * 6
@@ -91,30 +124,201 @@ fn find_struct_col_idx(pool: ByteBuf, sym: IntBuf, s_idx: i64, fpacked: i64) -> 
     return -1
 }
 
+fn soa_mark_col_used(sym: IntBuf, s_idx: i64, col_idx: i64) {
+    s_cnt := ibuf_get(sym, 4)
+    if s_idx < 0 or s_idx >= s_cnt {
+        return
+    }
+    ubase_ptr := ibuf_get(sym, 18)
+    if ubase_ptr <= 0 {
+        return
+    }
+    s_off := ibuf_get(sym, 3) + s_idx * 6
+    f_cnt := ibuf_get(sym, s_off + 4)
+    if col_idx >= 0 and col_idx < f_cnt {
+        uptr := ibuf_get(sym, ubase_ptr + s_idx)
+        ibuf_set(sym, uptr + col_idx, 1)
+    }
+}
+
+fn soa_mark_dynamic_cols(sym: IntBuf, s_idx: i64) {
+    s_cnt := ibuf_get(sym, 4)
+    if s_idx < 0 or s_idx >= s_cnt {
+        return
+    }
+    dbase := ibuf_get(sym, 19)
+    if dbase > 0 {
+        ibuf_set(sym, dbase + s_idx, 1)
+    }
+}
+
+fn soa_remap_col(sym: IntBuf, s_idx: i64, logical_col: i64) -> i64 {
+    s_cnt := ibuf_get(sym, 4)
+    if s_idx < 0 or s_idx >= s_cnt {
+        return logical_col
+    }
+    mbase_ptr := ibuf_get(sym, 17)
+    if mbase_ptr <= 0 {
+        return logical_col
+    }
+    s_off := ibuf_get(sym, 3) + s_idx * 6
+    f_cnt := ibuf_get(sym, s_off + 4)
+    if logical_col >= 0 and logical_col < f_cnt {
+        mptr := ibuf_get(sym, mbase_ptr + s_idx)
+        return ibuf_get(sym, mptr + logical_col)
+    }
+    return logical_col
+}
+
+fn soa_active_col_count(sym: IntBuf, s_idx: i64) -> i64 {
+    s_cnt := ibuf_get(sym, 4)
+    if s_idx < 0 or s_idx >= s_cnt {
+        return 1
+    }
+    abase := ibuf_get(sym, 16)
+    if abase > 0 {
+        ac := ibuf_get(sym, abase + s_idx)
+        if ac >= 1 {
+            return ac
+        }
+    }
+    s_off := ibuf_get(sym, 3) + s_idx * 6
+    fc := ibuf_get(sym, s_off + 4)
+    if fc < 1 { return 1 }
+    return fc
+}
+
+// --- Compile-Time Constant Folding & 0-Arg Constant Function Inlining ---
+fn is_const_fn_idx(sym: IntBuf, fidx: i64) -> bool {
+    cbase := ibuf_get(sym, 15)
+    f_cnt := ibuf_get(sym, 8)
+    if cbase <= 0 or fidx < 0 or fidx >= f_cnt {
+        return false
+    }
+    return ibuf_get(sym, cbase + fidx * 3) == 1
+}
+
+fn const_fn_val(sym: IntBuf, fidx: i64) -> i64 {
+    cbase := ibuf_get(sym, 15)
+    return ibuf_get(sym, cbase + fidx * 3 + 1)
+}
+
+fn const_fn_ty(sym: IntBuf, fidx: i64) -> i64 {
+    cbase := ibuf_get(sym, 15)
+    return ibuf_get(sym, cbase + fidx * 3 + 2)
+}
+
+fn is_const_int_expr(pool: ByteBuf, nodes: IntBuf, sym: IntBuf, enid: i64) -> bool {
+    if enid <= 0 {
+        return false
+    }
+    k := ast_kind(nodes, enid)
+    if k == nk_int() or k == nk_bool() {
+        return true
+    }
+    if k == nk_unary() {
+        return is_const_int_expr(pool, nodes, sym, ast_get(nodes, enid, 2))
+    }
+    if k == nk_call() {
+        if ast_get(nodes, enid, 4) != 0 {
+            return false
+        }
+        fidx := find_fn_idx(pool, sym, ast_get(nodes, enid, 1), ast_get(nodes, enid, 2))
+        if is_const_fn_idx(sym, fidx) {
+            cty := const_fn_ty(sym, fidx)
+            return cty == ty_int() or cty == ty_bool()
+        }
+        return false
+    }
+    if k == nk_binary() {
+        op := ast_get(nodes, enid, 1)
+        l := ast_get(nodes, enid, 2)
+        r := ast_get(nodes, enid, 3)
+        if not is_const_int_expr(pool, nodes, sym, l) or not is_const_int_expr(pool, nodes, sym, r) {
+            return false
+        }
+        if op == op_div() or op == op_mod() {
+            return eval_const_int_val(pool, nodes, sym, r) != 0
+        }
+        if op >= op_add() and op <= op_shr() {
+            return true
+        }
+    }
+    return false
+}
+
+fn eval_const_int_val(pool: ByteBuf, nodes: IntBuf, sym: IntBuf, enid: i64) -> i64 {
+    k := ast_kind(nodes, enid)
+    if k == nk_int() or k == nk_bool() {
+        return ast_get(nodes, enid, 1)
+    }
+    if k == nk_unary() {
+        uop := ast_get(nodes, enid, 1)
+        v := eval_const_int_val(pool, nodes, sym, ast_get(nodes, enid, 2))
+        if uop == uop_neg() {
+            return 0 - v
+        }
+        if v == 0 { return 1 }
+        return 0
+    }
+    if k == nk_call() {
+        fidx := find_fn_idx(pool, sym, ast_get(nodes, enid, 1), ast_get(nodes, enid, 2))
+        return const_fn_val(sym, fidx)
+    }
+    if k == nk_binary() {
+        op := ast_get(nodes, enid, 1)
+        lv := eval_const_int_val(pool, nodes, sym, ast_get(nodes, enid, 2))
+        rv := eval_const_int_val(pool, nodes, sym, ast_get(nodes, enid, 3))
+        if op == op_add() or op == op_wrap_add() { return lv +% rv }
+        if op == op_sub() or op == op_wrap_sub() { return lv -% rv }
+        if op == op_mul() or op == op_wrap_mul() { return lv *% rv }
+        if op == op_div() and rv != 0 { return lv / rv }
+        if op == op_mod() and rv != 0 { return lv % rv }
+        if op == op_bit_and() { return lv & rv }
+        if op == op_bit_or() { return lv | rv }
+        if op == op_bit_xor() { return lv ^ rv }
+        if op == op_shl() { return lv << (rv & 63) }
+        if op == op_shr() { return lv >> (rv & 63) }
+        if op == op_eq() { if lv == rv { return 1 } else { return 0 } }
+        if op == op_neq() { if lv != rv { return 1 } else { return 0 } }
+        if op == op_lt() { if lv < rv { return 1 } else { return 0 } }
+        if op == op_lte() { if lv <= rv { return 1 } else { return 0 } }
+        if op == op_gt() { if lv > rv { return 1 } else { return 0 } }
+        if op == op_gte() { if lv >= rv { return 1 } else { return 0 } }
+        if op == op_and() { if lv != 0 and rv != 0 { return 1 } else { return 0 } }
+        if op == op_or() { if lv != 0 or rv != 0 { return 1 } else { return 0 } }
+    }
+    return 0
+}
+
+fn sema_record_err(sym: IntBuf, code: i64, ln: i64) {
+    cnt := ibuf_get(sym, 0)
+    if cnt == 0 {
+        ibuf_set(sym, 1, ln)
+        ibuf_set(sym, 2, code)
+    }
+    ibuf_set(sym, 0, cnt + 1)
+}
+
 fn type_slots(sym: IntBuf, ty: i64) -> i64 {
     tg := ty_tag(ty)
     pay := ty_pay(ty)
     if tg == 5 or tg == 12 {
-        // Str (ptr, len) or Table (ptr, len)
         return 2
     }
     if tg == 10 {
-        // Struct(s_idx)
         s_off := ibuf_get(sym, 3) + pay * 6
         sc := ibuf_get(sym, s_off + 2)
         if sc < 1 { return 1 }
         return sc
     }
     if tg == 11 {
-        // Stack-polymorphic Duck Interface: 1 tag slot + max_struct_slots!
         return 1 + ibuf_get(sym, 9)
     }
     if tg == 13 {
-        // Result(ok_ty): 1 err_tag slot + ok_slots
         return 1 + type_slots(sym, pay)
     }
     if tg == 14 {
-        // Tuple(desc_off)
         cnt := ibuf_get(sym, pay)
         mut tot := 0
         mut i := 0
@@ -157,12 +361,12 @@ fn typespec_has_ref(nodes: IntBuf, extra: IntBuf, tnid: i64) -> bool {
 }
 
 fn resolve_typespec(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf) -> i64 {
-    // Expects `tnid` stored in `sym[13]` so we keep 4-register ABI!
     tnid := ibuf_get(sym, 13)
     if tnid <= 0 {
         return ty_unit()
     }
     k := ast_kind(nodes, tnid)
+    ln := ast_line(nodes, tnid)
     if k == nk_ty_unit() {
         return ty_unit()
     }
@@ -178,7 +382,6 @@ fn resolve_typespec(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf) ->
     if k == nk_ty_tuple() {
         off := ast_get(nodes, tnid, 1)
         cnt := ast_get(nodes, tnid, 2)
-        // Reserve tuple descriptor in `sym` first so nested tuples don't interleave
         desc_off := ibuf_len(sym)
         ibuf_push(sym, cnt)
         mut i := 0
@@ -208,6 +411,7 @@ fn resolve_typespec(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf) ->
         if sidx >= 0 {
             return ty_make(12, sidx)
         }
+        sema_record_err(sym, 403, ln)
         return ty_make(12, 0)
     }
     if k == nk_ty_named() {
@@ -240,6 +444,9 @@ fn resolve_typespec(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf) ->
         if pool_str_eq_lit(pool, soff, slen, "IntBuf") {
             return ty_intbuf()
         }
+        if pool_str_eq_lit(pool, soff, slen, "Any") {
+            return ty_any()
+        }
         iidx := find_iface_idx(pool, sym, soff, slen)
         if iidx >= 0 {
             return ty_make(11, iidx)
@@ -248,17 +455,9 @@ fn resolve_typespec(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf) ->
         if sidx >= 0 {
             return ty_make(10, sidx)
         }
+        sema_record_err(sym, 403, ln)
     }
     return ty_any()
-}
-
-fn sema_record_err(sym: IntBuf, code: i64, ln: i64) {
-    cnt := ibuf_get(sym, 0)
-    if cnt == 0 {
-        ibuf_set(sym, 1, ln)
-        ibuf_set(sym, 2, code)
-    }
-    ibuf_set(sym, 0, cnt + 1)
 }
 
 fn types_compatible(sym: IntBuf, expected: i64, actual: i64) -> bool {
@@ -270,15 +469,12 @@ fn types_compatible(sym: IntBuf, expected: i64, actual: i64) -> bool {
     if expected == actual {
         return true
     }
-    // Duck-typed `interface` accepts any concrete `struct`!
     if et == 11 and at == 10 {
         return true
     }
-    // `Result(ok)` accepts `ok(v)` or `err(e)` (`Result(any)`)
     if et == 13 and at == 13 {
-        return true
+        return types_compatible(sym, ty_pay(expected), ty_pay(actual))
     }
-    // Structural `Tuple` compatibility: compare element count & element types!
     if et == 14 and at == 14 {
         d1 := ty_pay(expected)
         d2 := ty_pay(actual)
@@ -313,8 +509,6 @@ fn is_cap_type(pool: ByteBuf, sym: IntBuf, ty: i64) -> bool {
 }
 
 // --- Local Variable Scope Table (`locals: IntBuf`, 6 words per local) ---
-// [i*6 + 0] = soff, [+1] = slen, [+2] = ty, [+3] = flags (bit0=mut, bit1=isolated, bit2=outer_before_spawn),
-// [+4] = moved_line (0=not moved), [+5] = spawn_moved (1=moved inside spawn)
 fn local_find(pool: ByteBuf, locals: IntBuf, soff: i64, slen: i64) -> i64 {
     cnt := ibuf_len(locals) / 6
     mut i := cnt - 1
@@ -331,7 +525,6 @@ fn local_find(pool: ByteBuf, locals: IntBuf, soff: i64, slen: i64) -> i64 {
 }
 
 fn local_push(locals: IntBuf, soff: i64, slen: i64, ty_and_flags: i64) {
-    // `ty_and_flags = ty | (flags << 40)`
     ibuf_push(locals, soff)
     ibuf_push(locals, slen)
     ibuf_push(locals, ty_and_flags & 0xFFFFFFFFFF)
@@ -340,17 +533,106 @@ fn local_push(locals: IntBuf, soff: i64, slen: i64, ty_and_flags: i64) {
     ibuf_push(locals, 0)
 }
 
-// --- Expression & Statement Semantic + Ownership + Capability Checker ---
-fn check_expr_node(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf) -> i64 {
-    // Reads `enid` from `sym[14]` and `locals_handle`? Wait: keep `locals` as a parameter!
-    return ty_any()
-}
+// Verifies function or method call arguments: arity, named params, `mut`/`move` modes, and parameter types.
+fn verify_fn_call_sig(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, locals: IntBuf, fidx: i64, param_start: i64, aoff: i64, acnt: i64, arg_tys: IntBuf, ln: i64) {
+    f_off := ibuf_get(sym, 7) + fidx * 10
+    p_base := ibuf_get(sym, f_off + 3)
+    p_cnt := ibuf_get(sym, f_off + 4)
+    avail_params := p_cnt - param_start
+    if acnt > avail_params {
+        sema_record_err(sym, 404, ln)
+        return
+    }
 
-fn sema_expr(pool: ByteBuf, nodes: IntBuf, sym: IntBuf, locals: IntBuf) -> i64 {
-    // `sym[14]` = `enid`, `sym[15]` = `extra`... Wait: `extra` is an `IntBuf`!
-    // Let's check: can a function take 5 args `(pool, nodes, extra, sym, locals)`?
-    // YES! Both `axc0.exe` AND our `codegen_x86_64.ax` support arbitrary parameter counts via General ABI!
-    return ty_any()
+    // Verify every named argument corresponds to a real parameter name
+    mut ai := 0
+    while ai < acnt {
+        ca := ibuf_get(extra, aoff + ai)
+        an_soff := ast_get(nodes, ca, 2)
+        an_slen := ast_get(nodes, ca, 3)
+        if an_soff >= 0 {
+            mut found_nm := false
+            mut pi := param_start
+            while pi < p_cnt {
+                po := p_base + pi * 6
+                if ibuf_get(sym, po + 1) == an_slen and pool_str_eq2(pool, ibuf_get(sym, po), an_slen, an_soff) {
+                    found_nm = true
+                    break
+                }
+                pi += 1
+            }
+            if not found_nm {
+                sema_record_err(sym, 404, ln)
+                return
+            }
+        }
+        ai += 1
+    }
+
+    // Verify each formal parameter gets a valid argument (or has a default value)
+    mut pi := param_start
+    while pi < p_cnt {
+        po := p_base + pi * 6
+        pn_soff := ibuf_get(sym, po)
+        pn_slen := ibuf_get(sym, po + 1)
+        p_mode := ibuf_get(sym, po + 2)
+        p_ty := ibuf_get(sym, po + 3)
+        def_nid := ibuf_get(sym, po + 5)
+
+        mut matched_idx := -1
+        ai = 0
+        while ai < acnt {
+            ca := ibuf_get(extra, aoff + ai)
+            an_soff := ast_get(nodes, ca, 2)
+            an_slen := ast_get(nodes, ca, 3)
+            if an_soff >= 0 and an_slen == pn_slen and pool_str_eq2(pool, an_soff, pn_slen, pn_soff) {
+                matched_idx = ai
+                break
+            }
+            ai += 1
+        }
+        pos_idx := pi - param_start
+        if matched_idx < 0 and pos_idx < acnt {
+            cand := ibuf_get(extra, aoff + pos_idx)
+            if ast_get(nodes, cand, 2) < 0 {
+                matched_idx = pos_idx
+            }
+        }
+
+        if matched_idx >= 0 {
+            ca := ibuf_get(extra, aoff + matched_idx)
+            amode := ast_get(nodes, ca, 1)
+            aexpr := ast_get(nodes, ca, 4)
+            aty := ibuf_get(arg_tys, matched_idx)
+            if p_mode == pmode_mut() {
+                if amode != pmode_mut() {
+                    sema_record_err(sym, 404, ln)
+                } else {
+                    mut root := aexpr
+                    while ast_kind(nodes, root) == nk_field() {
+                        root = ast_get(nodes, root, 1)
+                    }
+                    if ast_kind(nodes, root) == nk_ident() {
+                        rlb := local_find(pool, locals, ast_get(nodes, root, 1), ast_get(nodes, root, 2))
+                        if rlb >= 0 and (ibuf_get(locals, rlb + 3) & 3) == 0 {
+                            sema_record_err(sym, 301, ln)
+                        }
+                    }
+                }
+            }
+            if p_mode == pmode_move() {
+                if amode != pmode_move() and ast_kind(nodes, aexpr) == nk_ident() {
+                    sema_record_err(sym, 404, ln)
+                }
+            }
+            if not types_compatible(sym, p_ty, aty) {
+                sema_record_err(sym, 401, ln)
+            }
+        } else if def_nid <= 0 {
+            sema_record_err(sym, 404, ln)
+        }
+        pi += 1
+    }
 }
 
 fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, locals: IntBuf, enid: i64) -> i64 {
@@ -383,16 +665,15 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
         lbase := local_find(pool, locals, soff, slen)
         if lbase >= 0 {
             if ibuf_get(locals, lbase + 4) > 0 {
-                // E0201: Use after linear `move`!
                 sema_record_err(sym, 201, ln)
             }
             lflags := ibuf_get(locals, lbase + 3)
             if ibuf_get(sym, 10) == 1 and (lflags & 4) != 0 and (lflags & 2) != 0 and ibuf_get(locals, lbase + 5) == 0 {
-                // E0202: Capturing outer `isolated` variable inside `spawn` without `move`!
                 sema_record_err(sym, 202, ln)
             }
             return ibuf_get(locals, lbase + 2)
         }
+        sema_record_err(sym, 403, ln)
         return ty_any()
     }
 
@@ -411,6 +692,7 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
             }
             return ibuf_get(locals, lbase + 2)
         }
+        sema_record_err(sym, 403, ln)
         return ty_any()
     }
 
@@ -444,11 +726,29 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
 
     if k == nk_binary() {
         op := ast_get(nodes, enid, 1)
-        lt := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 2))
-        rt := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 3))
+        lhs := ast_get(nodes, enid, 2)
+        rhs := ast_get(nodes, enid, 3)
+        lt := check_expr_full(pool, nodes, extra, sym, locals, lhs)
+        rt := check_expr_full(pool, nodes, extra, sym, locals, rhs)
+
+        // E0406: Compile-time constant division or modulo by zero!
+        if op == op_div() or op == op_mod() {
+            if is_const_int_expr(pool, nodes, sym, rhs) and eval_const_int_val(pool, nodes, sym, rhs) == 0 {
+                sema_record_err(sym, 406, ln)
+            }
+            rk := ast_kind(nodes, rhs)
+            if (rk == nk_float() or rk == nk_dec()) and ast_get(nodes, rhs, 1) == 0 {
+                sema_record_err(sym, 406, ln)
+            }
+        }
+
         if op == op_or() {
             if ty_tag(lt) == 13 {
-                return ty_pay(lt)
+                ok_t := ty_pay(lt)
+                if not types_compatible(sym, ok_t, rt) {
+                    sema_record_err(sym, 401, ln)
+                }
+                return ok_t
             }
             return ty_bool()
         }
@@ -464,7 +764,11 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
         lt := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 1))
         rv := ast_get(nodes, enid, 2)
         if rv > 0 {
-            check_expr_full(pool, nodes, extra, sym, locals, rv)
+            rv_ty := check_expr_full(pool, nodes, extra, sym, locals, rv)
+            fn_ret := ibuf_get(sym, 11)
+            if fn_ret != ty_unit() and not types_compatible(sym, fn_ret, rv_ty) {
+                sema_record_err(sym, 402, ln)
+            }
         }
         if ty_tag(lt) == 13 {
             return ty_pay(lt)
@@ -482,7 +786,7 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
         bt := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 1))
         fsoff := ast_get(nodes, enid, 2)
         fslen := ast_get(nodes, enid, 3)
-        if pool_str_eq_lit(pool, fsoff, fslen, "len") {
+        if pool_str_eq_lit(pool, fsoff, fslen, "len") and (ty_tag(bt) == 5 or ty_tag(bt) == 12 or bt == ty_any()) {
             return ty_int()
         }
         if ty_tag(bt) == 10 {
@@ -490,8 +794,13 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
             if foff >= 0 {
                 return ibuf_get(sym, foff + 3)
             }
+            sema_record_err(sym, 403, ln)
+            return ty_any()
         }
-        return ty_int()
+        if bt != ty_any() {
+            sema_record_err(sym, 403, ln)
+        }
+        return ty_any()
     }
 
     if k == nk_tuple_idx() {
@@ -503,13 +812,21 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
             if idx >= 0 and idx < cnt {
                 return ibuf_get(sym, doff + 1 + idx)
             }
+            sema_record_err(sym, 404, ln)
+            return ty_any()
+        }
+        if bt != ty_any() {
+            sema_record_err(sym, 403, ln)
         }
         return ty_int()
     }
 
     if k == nk_index() {
         bt := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 1))
-        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 2))
+        it := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 2))
+        if not types_compatible(sym, ty_int(), it) {
+            sema_record_err(sym, 401, ln)
+        }
         if ty_tag(bt) == 12 and ty_pay(bt) == 60001 {
             return ty_float()
         }
@@ -519,7 +836,10 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
     if k == nk_table_alloc() {
         esoff := ast_get(nodes, enid, 1)
         eslen := ast_get(nodes, enid, 2)
-        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 3))
+        cap_ty := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 3))
+        if not types_compatible(sym, ty_int(), cap_ty) {
+            sema_record_err(sym, 401, ln)
+        }
         if pool_str_eq_lit(pool, esoff, eslen, "f32") {
             return ty_make(12, 60001)
         }
@@ -530,12 +850,12 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
         if sidx >= 0 {
             return ty_make(12, sidx)
         }
+        sema_record_err(sym, 403, ln)
         return ty_make(12, 0)
     }
 
     if k == nk_spawn() {
         prev_spawn := ibuf_get(sym, 10)
-        // Mark current locals as outer_before_spawn (bit 2 = 4)
         lcnt := ibuf_len(locals) / 6
         mut i := 0
         while i < lcnt {
@@ -566,14 +886,20 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
     }
 
     if k == nk_if_expr() {
-        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 1))
+        ct := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 1))
+        if not types_compatible(sym, ty_bool(), ct) {
+            sema_record_err(sym, 401, ln)
+        }
         tb := ast_get(nodes, enid, 2)
         check_block_full(pool, nodes, extra, sym, locals, tb)
         tt := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, tb, 3))
         eb := ast_get(nodes, enid, 3)
         if eb > 0 {
             check_block_full(pool, nodes, extra, sym, locals, eb)
-            check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, eb, 3))
+            et := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, eb, 3))
+            if not types_compatible(sym, tt, et) {
+                sema_record_err(sym, 401, ln)
+            }
         }
         return tt
     }
@@ -584,17 +910,32 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
         mslen := ast_get(nodes, enid, 3)
         aoff := ast_get(nodes, enid, 4)
         acnt := ast_get(nodes, enid, 5)
+        arg_tys := ibuf_new(16)
         mut i := 0
         while i < acnt {
             ca := ibuf_get(extra, aoff + i)
-            check_call_arg_node(pool, nodes, extra, sym, locals, ca)
+            ibuf_push(arg_tys, check_call_arg_node(pool, nodes, extra, sym, locals, ca))
             i += 1
         }
         if pool_str_eq_lit(pool, msoff, mslen, "join") and ty_tag(rt) == 15 {
+            if acnt != 0 {
+                sema_record_err(sym, 404, ln)
+            }
+            buf_free(move arg_tys)
             return ty_pay(rt)
         }
-        if ty_tag(rt) == 10 or ty_tag(rt) == 11 {
-            // Find any `Struct__method` signature to get return type
+        if ty_tag(rt) == 10 {
+            mf := find_struct_method_idx(pool, sym, ty_pay(rt), msoff, mslen)
+            if mf >= 0 {
+                verify_fn_call_sig(pool, nodes, extra, sym, locals, mf, 1, aoff, acnt, arg_tys, ln)
+                buf_free(move arg_tys)
+                return ibuf_get(sym, ibuf_get(sym, 7) + mf * 10 + 5)
+            }
+            sema_record_err(sym, 403, ln)
+            buf_free(move arg_tys)
+            return ty_any()
+        }
+        if ty_tag(rt) == 11 {
             f_base := ibuf_get(sym, 7)
             f_cnt := ibuf_get(sym, 8)
             mut fi := 0
@@ -606,14 +947,23 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
                     tail_off := fn_off + fn_len - mslen
                     if buf_get(pool, tail_off - 1) == 95 and buf_get(pool, tail_off - 2) == 95 {
                         if pool_str_eq2(pool, tail_off, mslen, msoff) {
+                            verify_fn_call_sig(pool, nodes, extra, sym, locals, fi, 1, aoff, acnt, arg_tys, ln)
+                            buf_free(move arg_tys)
                             return ibuf_get(sym, fo + 5)
                         }
                     }
                 }
                 fi += 1
             }
+            sema_record_err(sym, 403, ln)
+            buf_free(move arg_tys)
+            return ty_any()
         }
-        return ty_int()
+        if rt != ty_any() {
+            sema_record_err(sym, 403, ln)
+        }
+        buf_free(move arg_tys)
+        return ty_any()
     }
 
     if k == nk_call() {
@@ -622,53 +972,181 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
         aoff := ast_get(nodes, enid, 3)
         acnt := ast_get(nodes, enid, 4)
 
-        // Capability security gate (`10_ambient_io_without_cap.ax`):
-        // Raw privileged `sys_fs_*` / `sys_net_*` / `ambient_*` require holding a capability token!
         if pool_str_eq_lit(pool, csoff, cslen, "sys_fs_write") or pool_str_eq_lit(pool, csoff, cslen, "sys_fs_read") or pool_str_eq_lit(pool, csoff, cslen, "sys_net_connect") or pool_str_eq_lit(pool, csoff, cslen, "ambient_open") {
             if ibuf_get(sym, 12) == 0 {
                 sema_record_err(sym, 501, ln)
             }
+            return ty_int()
         }
 
+        arg_tys := ibuf_new(16)
         mut first_arg_ty := ty_any()
         mut i := 0
         while i < acnt {
             ca := ibuf_get(extra, aoff + i)
             aty := check_call_arg_node(pool, nodes, extra, sym, locals, ca)
+            ibuf_push(arg_tys, aty)
             if i == 0 {
                 first_arg_ty = aty
             }
             i += 1
         }
 
-        // Built-in intrinsics
-        if pool_str_eq_lit(pool, csoff, cslen, "print") or pool_str_eq_lit(pool, csoff, cslen, "println") { return ty_unit() }
-        if pool_str_eq_lit(pool, csoff, cslen, "clock_ns") or pool_str_eq_lit(pool, csoff, cslen, "time_ns") { return ty_int() }
-        if pool_str_eq_lit(pool, csoff, cslen, "buf_new") { return ty_bytebuf() }
-        if pool_str_eq_lit(pool, csoff, cslen, "ibuf_new") { return ty_intbuf() }
-        if pool_str_eq_lit(pool, csoff, cslen, "buf_len") or pool_str_eq_lit(pool, csoff, cslen, "ibuf_len") { return ty_int() }
-        if pool_str_eq_lit(pool, csoff, cslen, "buf_get") or pool_str_eq_lit(pool, csoff, cslen, "ibuf_get") { return ty_int() }
-        if pool_str_eq_lit(pool, csoff, cslen, "buf_set") or pool_str_eq_lit(pool, csoff, cslen, "ibuf_set") { return ty_unit() }
-        if pool_str_eq_lit(pool, csoff, cslen, "buf_push") or pool_str_eq_lit(pool, csoff, cslen, "buf_push_u16") or pool_str_eq_lit(pool, csoff, cslen, "buf_push_u32") or pool_str_eq_lit(pool, csoff, cslen, "buf_push_u64") { return ty_unit() }
-        if pool_str_eq_lit(pool, csoff, cslen, "buf_put_u32") or pool_str_eq_lit(pool, csoff, cslen, "buf_put_u64") or pool_str_eq_lit(pool, csoff, cslen, "buf_push_str") or pool_str_eq_lit(pool, csoff, cslen, "buf_free") or pool_str_eq_lit(pool, csoff, cslen, "ibuf_push") { return ty_unit() }
-        if pool_str_eq_lit(pool, csoff, cslen, "buf_slice_str") or pool_str_eq_lit(pool, csoff, cslen, "str_slice") or pool_str_eq_lit(pool, csoff, cslen, "args_get") { return ty_str() }
-        if pool_str_eq_lit(pool, csoff, cslen, "str_len") or pool_str_eq_lit(pool, csoff, cslen, "str_byte") or pool_str_eq_lit(pool, csoff, cslen, "args_count") or pool_str_eq_lit(pool, csoff, cslen, "whitebox_sbox") { return ty_int() }
-        if pool_str_eq_lit(pool, csoff, cslen, "str_eq") { return ty_bool() }
-        if pool_str_eq_lit(pool, csoff, cslen, "table_fill_f32") { return ty_unit() }
-        if pool_str_eq_lit(pool, csoff, cslen, "table_get_f32") { return ty_float() }
-        if pool_str_eq_lit(pool, csoff, cslen, "fs_read_file") { return ty_make(13, ty_bytebuf()) }
-        if pool_str_eq_lit(pool, csoff, cslen, "fs_write_file") { return ty_make(13, ty_int()) }
-        if pool_str_eq_lit(pool, csoff, cslen, "ok") { return ty_make(13, first_arg_ty) }
-        if pool_str_eq_lit(pool, csoff, cslen, "err") { return ty_make(13, ty_any()) }
+        // Built-in intrinsics with strict arity & column-bounds verification
+        if pool_str_eq_lit(pool, csoff, cslen, "print") or pool_str_eq_lit(pool, csoff, cslen, "println") {
+            buf_free(move arg_tys)
+            return ty_unit()
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "clock_ns") or pool_str_eq_lit(pool, csoff, cslen, "time_ns") or pool_str_eq_lit(pool, csoff, cslen, "args_count") {
+            if acnt != 0 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_int()
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_new") {
+            if acnt != 1 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_bytebuf()
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "ibuf_new") {
+            if acnt != 1 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_intbuf()
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_len") or pool_str_eq_lit(pool, csoff, cslen, "ibuf_len") or pool_str_eq_lit(pool, csoff, cslen, "str_len") {
+            if acnt != 1 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_int()
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_free") {
+            if acnt != 1 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_unit()
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "args_get") {
+            if acnt != 1 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_str()
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "fs_read_file") {
+            if acnt != 1 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_make(13, ty_bytebuf())
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "ok") {
+            if acnt != 1 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_make(13, first_arg_ty)
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "err") {
+            if acnt != 1 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_make(13, ty_any())
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_get") or pool_str_eq_lit(pool, csoff, cslen, "ibuf_get") or pool_str_eq_lit(pool, csoff, cslen, "str_byte") or pool_str_eq_lit(pool, csoff, cslen, "whitebox_sbox") or pool_str_eq_lit(pool, csoff, cslen, "ushr64") {
+            if acnt != 2 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_int()
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_push") or pool_str_eq_lit(pool, csoff, cslen, "buf_push_u16") or pool_str_eq_lit(pool, csoff, cslen, "buf_push_u32") or pool_str_eq_lit(pool, csoff, cslen, "buf_push_u64") or pool_str_eq_lit(pool, csoff, cslen, "buf_push_str") or pool_str_eq_lit(pool, csoff, cslen, "ibuf_push") {
+            if acnt != 2 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_unit()
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "str_eq") {
+            if acnt != 2 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_bool()
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "fs_write_file") {
+            if acnt != 2 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_make(13, ty_int())
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_set") or pool_str_eq_lit(pool, csoff, cslen, "ibuf_set") or pool_str_eq_lit(pool, csoff, cslen, "buf_put_u32") or pool_str_eq_lit(pool, csoff, cslen, "buf_put_u64") {
+            if acnt != 3 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_unit()
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_slice_str") or pool_str_eq_lit(pool, csoff, cslen, "str_slice") {
+            if acnt != 3 { sema_record_err(sym, 404, ln) }
+            buf_free(move arg_tys)
+            return ty_str()
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "table_fill_f32") or pool_str_eq_lit(pool, csoff, cslen, "table_get_f32") {
+            if acnt != 3 {
+                sema_record_err(sym, 404, ln)
+            } else {
+                if ty_tag(first_arg_ty) == 12 {
+                    ts_idx := ty_pay(first_arg_ty)
+                    if ts_idx >= 0 and ts_idx < 60000 {
+                        col_e := ast_get(nodes, ibuf_get(extra, aoff + 1), 4)
+                        if is_const_int_expr(pool, nodes, sym, col_e) {
+                            cval := eval_const_int_val(pool, nodes, sym, col_e)
+                            s_off := ibuf_get(sym, 3) + ts_idx * 6
+                            fcnt := ibuf_get(sym, s_off + 4)
+                            if cval < 0 or cval >= fcnt {
+                                sema_record_err(sym, 404, ln)
+                            } else {
+                                soa_mark_col_used(sym, ts_idx, cval)
+                            }
+                        } else {
+                            soa_mark_dynamic_cols(sym, ts_idx)
+                        }
+                    }
+                }
+            }
+            buf_free(move arg_tys)
+            if pool_str_eq_lit(pool, csoff, cslen, "table_get_f32") {
+                return ty_float()
+            }
+            return ty_unit()
+        }
 
+        // Struct Constructor Verification
         sidx := find_struct_idx(pool, sym, csoff, cslen)
         if sidx >= 0 {
+            s_off := ibuf_get(sym, 3) + sidx * 6
+            f_base := ibuf_get(sym, s_off + 3)
+            f_cnt := ibuf_get(sym, s_off + 4)
+            if acnt > f_cnt {
+                sema_record_err(sym, 404, ln)
+            } else {
+                mut ai := 0
+                while ai < acnt {
+                    ca := ibuf_get(extra, aoff + ai)
+                    an_soff := ast_get(nodes, ca, 2)
+                    an_slen := ast_get(nodes, ca, 3)
+                    aty := ibuf_get(arg_tys, ai)
+                    if an_soff >= 0 {
+                        fo := find_struct_field(pool, sym, sidx, an_soff | (an_slen << 32))
+                        if fo < 0 {
+                            sema_record_err(sym, 404, ln)
+                        } else if not types_compatible(sym, ibuf_get(sym, fo + 3), aty) {
+                            sema_record_err(sym, 401, ln)
+                        }
+                    } else {
+                        fo := f_base + ai * 4
+                        if not types_compatible(sym, ibuf_get(sym, fo + 3), aty) {
+                            sema_record_err(sym, 401, ln)
+                        }
+                    }
+                    ai += 1
+                }
+            }
+            buf_free(move arg_tys)
             return ty_make(10, sidx)
         }
+
+        // User / Stdlib Function Verification
         fidx := find_fn_idx(pool, sym, csoff, cslen)
         if fidx >= 0 {
+            verify_fn_call_sig(pool, nodes, extra, sym, locals, fidx, 0, aoff, acnt, arg_tys, ln)
+            buf_free(move arg_tys)
             return ibuf_get(sym, ibuf_get(sym, 7) + fidx * 10 + 5)
         }
+
+        buf_free(move arg_tys)
+        sema_record_err(sym, 403, ln)
         return ty_any()
     }
 
@@ -694,6 +1172,8 @@ fn check_call_arg_node(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf,
             }
             return ibuf_get(locals, lbase + 2)
         }
+        sema_record_err(sym, 403, ln)
+        return ty_any()
     }
     if mode == pmode_mut() and ast_kind(nodes, aexpr) == nk_ident() {
         soff := ast_get(nodes, aexpr, 1)
@@ -709,7 +1189,7 @@ fn check_call_arg_node(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf,
     return check_expr_full(pool, nodes, extra, sym, locals, aexpr)
 }
 
-// --- SoA `Table[T]` Hardware AVX2 SIMD Loop Pattern Detector ---
+// --- SoA `Table[T]` Hardware AVX2 SIMD Loop & Temporal Polyhedral Tiling Planner ---
 fn try_plan_foreach_simd(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, fe_nid: i64, tbl_ty: i64) {
     if ty_tag(tbl_ty) != 12 {
         return
@@ -718,7 +1198,6 @@ fn try_plan_foreach_simd(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBu
     if s_idx < 0 or s_idx >= 60000 {
         return
     }
-    // Check all struct fields are `f32`/`Float`
     s_off := ibuf_get(sym, 3) + s_idx * 6
     f_base := ibuf_get(sym, s_off + 3)
     f_cnt := ibuf_get(sym, s_off + 4)
@@ -728,6 +1207,7 @@ fn try_plan_foreach_simd(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBu
     mut fi := 0
     while fi < f_cnt {
         if ibuf_get(sym, f_base + fi * 4 + 3) != ty_float() {
+            soa_mark_dynamic_cols(sym, s_idx)
             return
         }
         fi += 1
@@ -747,19 +1227,23 @@ fn try_plan_foreach_simd(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBu
     while si < st_cnt {
         st := ibuf_get(extra, st_off + si)
         if ast_kind(nodes, st) != nk_assign() {
+            soa_mark_dynamic_cols(sym, s_idx)
             return
         }
         aop := ast_get(nodes, st, 1)
         tgt := ast_get(nodes, st, 2)
         rhs := ast_get(nodes, st, 3)
         if ast_kind(nodes, tgt) != nk_field() {
+            soa_mark_dynamic_cols(sym, s_idx)
             return
         }
         tbase := ast_get(nodes, tgt, 1)
         if ast_kind(nodes, tbase) != nk_ident() or ast_get(nodes, tbase, 2) != vslen {
+            soa_mark_dynamic_cols(sym, s_idx)
             return
         }
         if not pool_str_eq2(pool, ast_get(nodes, tbase, 1), vslen, vsoff) {
+            soa_mark_dynamic_cols(sym, s_idx)
             return
         }
         dst_col := find_struct_col_idx(pool, sym, s_idx, ast_get(nodes, tgt, 2) | (ast_get(nodes, tgt, 3) << 32))
@@ -768,7 +1252,6 @@ fn try_plan_foreach_simd(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBu
         }
 
         if aop == aop_add() and ast_kind(nodes, rhs) == nk_binary() and ast_get(nodes, rhs, 1) == op_mul() {
-            // `p.x += p.vx * dt` -> AVX2 FMA3 `VFMADD231PS`!
             rl := ast_get(nodes, rhs, 2)
             rr := ast_get(nodes, rhs, 3)
             if ast_kind(nodes, rl) == nk_field() {
@@ -776,7 +1259,9 @@ fn try_plan_foreach_simd(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBu
                 if ast_kind(nodes, rb) == nk_ident() and ast_get(nodes, rb, 2) == vslen and pool_str_eq2(pool, ast_get(nodes, rb, 1), vslen, vsoff) {
                     src_col := find_struct_col_idx(pool, sym, s_idx, ast_get(nodes, rl, 2) | (ast_get(nodes, rl, 3) << 32))
                     if src_col >= 0 {
-                        ibuf_push(ops_tmp, 1) // 1 = FMA
+                        soa_mark_col_used(sym, s_idx, dst_col)
+                        soa_mark_col_used(sym, s_idx, src_col)
+                        ibuf_push(ops_tmp, 1)
                         ibuf_push(ops_tmp, dst_col)
                         ibuf_push(ops_tmp, src_col)
                         ibuf_push(ops_tmp, rr)
@@ -784,8 +1269,8 @@ fn try_plan_foreach_simd(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBu
                 } else { return }
             } else { return }
         } else if aop == aop_mul() {
-            // `p.y *= 3.0` -> AVX2 `VMULPS`!
-            ibuf_push(ops_tmp, 2) // 2 = SCALE
+            soa_mark_col_used(sym, s_idx, dst_col)
+            ibuf_push(ops_tmp, 2)
             ibuf_push(ops_tmp, dst_col)
             ibuf_push(ops_tmp, 0)
             ibuf_push(ops_tmp, rhs)
@@ -794,13 +1279,16 @@ fn try_plan_foreach_simd(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBu
             if ast_kind(nodes, rb) == nk_ident() and ast_get(nodes, rb, 2) == vslen and pool_str_eq2(pool, ast_get(nodes, rb, 1), vslen, vsoff) {
                 src_col := find_struct_col_idx(pool, sym, s_idx, ast_get(nodes, rhs, 2) | (ast_get(nodes, rhs, 3) << 32))
                 if src_col >= 0 {
-                    ibuf_push(ops_tmp, 3) // 3 = ADDCOL
+                    soa_mark_col_used(sym, s_idx, dst_col)
+                    soa_mark_col_used(sym, s_idx, src_col)
+                    ibuf_push(ops_tmp, 3)
                     ibuf_push(ops_tmp, dst_col)
                     ibuf_push(ops_tmp, src_col)
                     ibuf_push(ops_tmp, 0)
                 } else { return }
             } else { return }
         } else {
+            soa_mark_dynamic_cols(sym, s_idx)
             return
         }
         si += 1
@@ -816,6 +1304,92 @@ fn try_plan_foreach_simd(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBu
         k += 1
     }
     ast_set(nodes, fe_nid, 5, plan_off)
+}
+
+// Detects `while s < steps { for e in table { <simd> }; s += 1 }` for Register-Tiled Polyhedral Execution!
+fn try_plan_temporal_while_simd(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, while_nid: i64) {
+    cond := ast_get(nodes, while_nid, 1)
+    wbody := ast_get(nodes, while_nid, 2)
+    if ast_kind(nodes, cond) != nk_binary() or ast_get(nodes, cond, 1) != op_lt() {
+        return
+    }
+    s_id := ast_get(nodes, cond, 2)
+    steps_e := ast_get(nodes, cond, 3)
+    if ast_kind(nodes, s_id) != nk_ident() {
+        return
+    }
+    s_soff := ast_get(nodes, s_id, 1)
+    s_slen := ast_get(nodes, s_id, 2)
+    if scan_expr_var_use(pool, nodes, extra, steps_e, s_soff, s_slen, false) != 0 {
+        return
+    }
+    if ast_get(nodes, wbody, 2) != 2 {
+        return
+    }
+    b_off := ast_get(nodes, wbody, 1)
+    st0 := ibuf_get(extra, b_off)
+    st1 := ibuf_get(extra, b_off + 1)
+    if ast_kind(nodes, st0) != nk_for_each() or ast_kind(nodes, st1) != nk_assign() {
+        return
+    }
+    plan_off := ast_get(nodes, st0, 5)
+    if plan_off <= 0 {
+        return
+    }
+    if ast_kind(nodes, ast_get(nodes, st0, 3)) != nk_ident() {
+        return
+    }
+    // Check `st1` is `s += 1`
+    if ast_get(nodes, st1, 1) != aop_add() {
+        return
+    }
+    inc_tgt := ast_get(nodes, st1, 2)
+    inc_rhs := ast_get(nodes, st1, 3)
+    if ast_kind(nodes, inc_tgt) != nk_ident() or ast_get(nodes, inc_tgt, 2) != s_slen {
+        return
+    }
+    if not pool_str_eq2(pool, ast_get(nodes, inc_tgt, 1), s_slen, s_soff) {
+        return
+    }
+    if not is_const_int_expr(pool, nodes, sym, inc_rhs) or eval_const_int_val(pool, nodes, sym, inc_rhs) != 1 {
+        return
+    }
+
+    // Verify all ops are FMA/ADDCOL (`okind == 1` or `3`), scale expressions do not depend on `s`,
+    // and columns are mutually hazard-free (`dst_i != src_i` and `dst_i` not read/written by `j != i`).
+    ops_cnt := ibuf_get(extra, plan_off + 1)
+    mut oi := 0
+    while oi < ops_cnt {
+        ob := plan_off + 2 + oi * 4
+        okind := ibuf_get(extra, ob)
+        dcol := ibuf_get(extra, ob + 1)
+        scol := ibuf_get(extra, ob + 2)
+        sce := ibuf_get(extra, ob + 3)
+        if okind != 1 and okind != 3 {
+            return
+        }
+        if dcol == scol {
+            return
+        }
+        if sce > 0 and scan_expr_var_use(pool, nodes, extra, sce, s_soff, s_slen, false) != 0 {
+            return
+        }
+        mut oj := 0
+        while oj < ops_cnt {
+            if oj != oi {
+                ob2 := plan_off + 2 + oj * 4
+                d2 := ibuf_get(extra, ob2 + 1)
+                s2 := ibuf_get(extra, ob2 + 2)
+                if dcol == d2 or dcol == s2 {
+                    return
+                }
+            }
+            oj += 1
+        }
+        oi += 1
+    }
+
+    ast_set(nodes, while_nid, 4, (st0 << 2) | 1)
 }
 
 fn block_diverges(nodes: IntBuf, extra: IntBuf, bnid: i64) -> bool {
@@ -842,6 +1416,34 @@ fn block_diverges(nodes: IntBuf, extra: IntBuf, bnid: i64) -> bool {
     return false
 }
 
+fn block_returns_all_paths(nodes: IntBuf, extra: IntBuf, bnid: i64) -> bool {
+    if bnid <= 0 {
+        return false
+    }
+    if ast_get(nodes, bnid, 3) > 0 {
+        return true
+    }
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt {
+        st := ibuf_get(extra, off + i)
+        sk := ast_kind(nodes, st)
+        if sk == nk_return() {
+            return true
+        }
+        if sk == nk_if() {
+            tb := ast_get(nodes, st, 2)
+            eb := ast_get(nodes, st, 3)
+            if eb > 0 and block_returns_all_paths(nodes, extra, tb) and block_returns_all_paths(nodes, extra, eb) {
+                return true
+            }
+        }
+        i += 1
+    }
+    return false
+}
+
 fn check_stmt_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, locals: IntBuf, snid: i64) {
     k := ast_kind(nodes, snid)
     ln := ast_line(nodes, snid)
@@ -858,7 +1460,6 @@ fn check_stmt_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
             ibuf_set(sym, 13, ty_nid)
             decl_ty := resolve_typespec(pool, nodes, extra, sym)
             if not types_compatible(sym, decl_ty, init_ty) {
-                // E0401: Type mismatch (`05_type_mismatch.ax`)!
                 sema_record_err(sym, 401, ln)
             }
             final_ty = decl_ty
@@ -897,7 +1498,6 @@ fn check_stmt_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
         aop := ast_get(nodes, snid, 1)
         tgt := ast_get(nodes, snid, 2)
         rhs := ast_get(nodes, snid, 3)
-        // Check root variable mutability (`04_mutate_immutable_let.ax`, `07_mutate_param_let.ax`)!
         mut root := tgt
         while ast_kind(nodes, root) == nk_field() {
             root = ast_get(nodes, root, 1)
@@ -910,19 +1510,31 @@ fn check_stmt_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
                 if (lflags & 1) == 0 {
                     sema_record_err(sym, 301, ln)
                 }
+            } else {
+                sema_record_err(sym, 403, ln)
             }
         }
-        check_expr_full(pool, nodes, extra, sym, locals, rhs)
+        rhs_ty := check_expr_full(pool, nodes, extra, sym, locals, rhs)
+        mut tgt_ty := ty_any()
         if aop == aop_eq() and ast_kind(nodes, tgt) == nk_ident() and root_lbase >= 0 {
             ibuf_set(locals, root_lbase + 4, 0)
+            tgt_ty = ibuf_get(locals, root_lbase + 2)
         } else {
-            check_expr_full(pool, nodes, extra, sym, locals, tgt)
+            tgt_ty = check_expr_full(pool, nodes, extra, sym, locals, tgt)
+        }
+        if not ((aop == aop_mul() or aop == aop_div()) and tgt_ty == ty_dec() and rhs_ty == ty_int()) {
+            if not types_compatible(sym, tgt_ty, rhs_ty) {
+                sema_record_err(sym, 401, ln)
+            }
         }
         return
     }
 
     if k == nk_if() {
-        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 1))
+        ct := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 1))
+        if not types_compatible(sym, ty_bool(), ct) {
+            sema_record_err(sym, 401, ln)
+        }
         tb := ast_get(nodes, snid, 2)
         eb := ast_get(nodes, snid, 3)
         lcnt := ibuf_len(locals) / 6
@@ -975,20 +1587,66 @@ fn check_stmt_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
     }
 
     if k == nk_while() {
-        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 1))
-        check_block_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 2))
+        ct := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 1))
+        if not types_compatible(sym, ty_bool(), ct) {
+            sema_record_err(sym, 401, ln)
+        }
+        wbody := ast_get(nodes, snid, 2)
+        outer_lcnt := ibuf_len(locals) / 6
+        pre_moves := ibuf_new(outer_lcnt + 4)
+        mut li := 0
+        while li < outer_lcnt {
+            ibuf_push(pre_moves, ibuf_get(locals, li * 6 + 4))
+            li += 1
+        }
+        ibuf_set(sym, 14, ibuf_get(sym, 14) + 1)
+        check_block_full(pool, nodes, extra, sym, locals, wbody)
+        ibuf_set(sym, 14, ibuf_get(sym, 14) - 1)
+        if not block_diverges(nodes, extra, wbody) {
+            li = 0
+            while li < outer_lcnt {
+                if ibuf_get(pre_moves, li) == 0 and ibuf_get(locals, li * 6 + 4) > 0 {
+                    sema_record_err(sym, 203, ibuf_get(locals, li * 6 + 4))
+                }
+                li += 1
+            }
+        }
+        buf_free(move pre_moves)
+        try_plan_temporal_while_simd(pool, nodes, extra, sym, snid)
         return
     }
 
     if k == nk_for_range() {
         vsoff := ast_get(nodes, snid, 1)
         vslen := ast_get(nodes, snid, 2)
-        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 3))
-        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 4))
-        saved_lcnt := ibuf_len(locals) / 6
+        st_ty := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 3))
+        en_ty := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 4))
+        if not types_compatible(sym, ty_int(), st_ty) or not types_compatible(sym, ty_int(), en_ty) {
+            sema_record_err(sym, 401, ln)
+        }
+        outer_lcnt := ibuf_len(locals) / 6
+        pre_moves := ibuf_new(outer_lcnt + 4)
+        mut li := 0
+        while li < outer_lcnt {
+            ibuf_push(pre_moves, ibuf_get(locals, li * 6 + 4))
+            li += 1
+        }
         local_push(locals, vsoff, vslen, ty_int() | (1 << 40))
-        check_block_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 5))
-        ibuf_set(locals, saved_lcnt * 6 + 1, -1)
+        fbody := ast_get(nodes, snid, 5)
+        ibuf_set(sym, 14, ibuf_get(sym, 14) + 1)
+        check_block_full(pool, nodes, extra, sym, locals, fbody)
+        ibuf_set(sym, 14, ibuf_get(sym, 14) - 1)
+        ibuf_set(locals, outer_lcnt * 6 + 1, -1)
+        if not block_diverges(nodes, extra, fbody) {
+            li = 0
+            while li < outer_lcnt {
+                if ibuf_get(pre_moves, li) == 0 and ibuf_get(locals, li * 6 + 4) > 0 {
+                    sema_record_err(sym, 203, ibuf_get(locals, li * 6 + 4))
+                }
+                li += 1
+            }
+        }
+        buf_free(move pre_moves)
         return
     }
 
@@ -1002,11 +1660,32 @@ fn check_stmt_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
             if ep == 60001 { elem_ty = ty_float() }
             else if ep == 60002 { elem_ty = ty_int() }
             else { elem_ty = ty_make(10, ep) }
+        } else if cty != ty_any() {
+            sema_record_err(sym, 401, ln)
         }
-        saved_lcnt := ibuf_len(locals) / 6
+        outer_lcnt := ibuf_len(locals) / 6
+        pre_moves := ibuf_new(outer_lcnt + 4)
+        mut li := 0
+        while li < outer_lcnt {
+            ibuf_push(pre_moves, ibuf_get(locals, li * 6 + 4))
+            li += 1
+        }
         local_push(locals, vsoff, vslen, elem_ty | (1 << 40))
-        check_block_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 4))
-        ibuf_set(locals, saved_lcnt * 6 + 1, -1)
+        fbody := ast_get(nodes, snid, 4)
+        ibuf_set(sym, 14, ibuf_get(sym, 14) + 1)
+        check_block_full(pool, nodes, extra, sym, locals, fbody)
+        ibuf_set(sym, 14, ibuf_get(sym, 14) - 1)
+        ibuf_set(locals, outer_lcnt * 6 + 1, -1)
+        if not block_diverges(nodes, extra, fbody) {
+            li = 0
+            while li < outer_lcnt {
+                if ibuf_get(pre_moves, li) == 0 and ibuf_get(locals, li * 6 + 4) > 0 {
+                    sema_record_err(sym, 203, ibuf_get(locals, li * 6 + 4))
+                }
+                li += 1
+            }
+        }
+        buf_free(move pre_moves)
         try_plan_foreach_simd(pool, nodes, extra, sym, snid, cty)
         return
     }
@@ -1016,10 +1695,18 @@ fn check_stmt_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
         fn_ret := ibuf_get(sym, 11)
         if rv > 0 {
             rty := check_expr_full(pool, nodes, extra, sym, locals, rv)
-            if fn_ret != ty_unit() and not types_compatible(sym, fn_ret, rty) {
-                // E0402: Return type mismatch (`06_return_mismatch.ax`)!
+            if fn_ret == ty_unit() or not types_compatible(sym, fn_ret, rty) {
                 sema_record_err(sym, 402, ln)
             }
+        } else if fn_ret != ty_unit() {
+            sema_record_err(sym, 402, ln)
+        }
+        return
+    }
+
+    if k == nk_break() or k == nk_continue() {
+        if ibuf_get(sym, 14) <= 0 {
+            sema_record_err(sym, 407, ln)
         }
         return
     }
@@ -1049,9 +1736,8 @@ fn check_block_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, lo
     }
 }
 
-// --- Static Perceus Liveness, FBIP In-Place Reuse & Deterministic Drop Planner ---
+// --- Static Perceus Liveness, Loop Self-FBIP In-Place Reuse & Deterministic Drop Planner ---
 fn classify_owned_alloc(pool: ByteBuf, nodes: IntBuf, init_nid: i64) -> i64 {
-    // Returns `0` if not a fresh owned buffer/table, `1` = ByteBuf, `2` = IntBuf, `3` = Table
     if init_nid <= 0 {
         return 0
     }
@@ -1069,7 +1755,6 @@ fn classify_owned_alloc(pool: ByteBuf, nodes: IntBuf, init_nid: i64) -> i64 {
 }
 
 fn scan_expr_var_use(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, enid: i64, target_soff: i64, target_slen: i64, in_ret: bool) -> i64 {
-    // Returns bitmask: bit 0 = used, bit 1 = escaped!
     if enid <= 0 {
         return 0
     }
@@ -1164,6 +1849,18 @@ fn scan_expr_var_use(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, enid: i64, tar
         }
         return res
     }
+    if k == nk_if_expr() {
+        mut m := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, enid, 1), target_soff, target_slen, false)
+        tb := ast_get(nodes, enid, 2)
+        m = m | scan_block_var_use(pool, nodes, extra, tb, target_soff, target_slen)
+        m = m | scan_expr_var_use(pool, nodes, extra, ast_get(nodes, tb, 3), target_soff, target_slen, in_ret)
+        eb := ast_get(nodes, enid, 3)
+        if eb > 0 {
+            m = m | scan_block_var_use(pool, nodes, extra, eb, target_soff, target_slen)
+            m = m | scan_expr_var_use(pool, nodes, extra, ast_get(nodes, eb, 3), target_soff, target_slen, in_ret)
+        }
+        return m
+    }
     if k == nk_spawn() {
         return scan_block_var_use(pool, nodes, extra, ast_get(nodes, enid, 1), target_soff, target_slen)
     }
@@ -1184,8 +1881,12 @@ fn scan_stmt_var_use(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, snid: i64, tar
         return scan_expr_var_use(pool, nodes, extra, ast_get(nodes, snid, 3), target_soff, target_slen, false)
     }
     if k == nk_assign() {
+        rhs_e := ast_get(nodes, snid, 3)
         m1 := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, snid, 2), target_soff, target_slen, false)
-        m2 := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, snid, 3), target_soff, target_slen, false)
+        mut m2 := scan_expr_var_use(pool, nodes, extra, rhs_e, target_soff, target_slen, false)
+        if ast_kind(nodes, rhs_e) == nk_ident() and (m2 & 1) != 0 {
+            m2 = m2 | 2
+        }
         return m1 | m2
     }
     if k == nk_if() {
@@ -1237,19 +1938,19 @@ fn scan_block_var_use(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, bnid: i64, ta
     return res
 }
 
-fn plan_fn_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, body_nid: i64) {
+fn plan_block_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, body_nid: i64, in_loop: i64) {
     if body_nid <= 0 {
         return
     }
     st_off := ast_get(nodes, body_nid, 1)
     st_cnt := ast_get(nodes, body_nid, 2)
 
-    // Collect owned top-level `nk_var_decl`: `[stmt_idx, decl_nid, akind, last_use, escaped, consumed]` (6 words)
-    owned := ibuf_new(128)
+    owned := ibuf_new(64)
     mut i := 0
     while i < st_cnt {
         st := ibuf_get(extra, st_off + i)
-        if ast_kind(nodes, st) == nk_var_decl() {
+        sk := ast_kind(nodes, st)
+        if sk == nk_var_decl() {
             ak := classify_owned_alloc(pool, nodes, ast_get(nodes, st, 5))
             if ak > 0 {
                 vsoff := ast_get(nodes, st, 1)
@@ -1270,12 +1971,38 @@ fn plan_fn_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, body_nid: i64) {
                 ibuf_push(owned, esc)
                 ibuf_push(owned, 0)
             }
+        } else if sk == nk_if() {
+            plan_block_perceus(pool, nodes, extra, ast_get(nodes, st, 2), in_loop)
+            eb := ast_get(nodes, st, 3)
+            if eb > 0 {
+                plan_block_perceus(pool, nodes, extra, eb, in_loop)
+            }
+        } else if sk == nk_while() {
+            plan_block_perceus(pool, nodes, extra, ast_get(nodes, st, 2), 1)
+        } else if sk == nk_for_range() {
+            plan_block_perceus(pool, nodes, extra, ast_get(nodes, st, 5), 1)
+        } else if sk == nk_for_each() {
+            plan_block_perceus(pool, nodes, extra, ast_get(nodes, st, 4), 1)
         }
         i += 1
     }
 
     ocnt := ibuf_len(owned) / 6
-    // Pair dead non-escaped allocations with subsequent allocations of the same `akind` (FBIP Reuse!)
+    if in_loop == 1 {
+        // Loop Self-FBIP Reuse: non-escaping allocations inside loops reuse their own stack slot across iterations!
+        mut ni := 0
+        while ni < ocnt {
+            nb := ni * 6
+            if ibuf_get(owned, nb + 4) == 0 {
+                nid := ibuf_get(owned, nb + 1)
+                ast_set(nodes, nid, 6, (nid << 2) | 1)
+            }
+            ni += 1
+        }
+        buf_free(move owned)
+        return
+    }
+
     mut ni := 0
     while ni < ocnt {
         nb := ni * 6
@@ -1290,7 +2017,7 @@ fn plan_fn_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, body_nid: i64) {
             if ibuf_get(owned, ob + 2) == n_ak and ibuf_get(owned, ob + 4) == 0 and ibuf_get(owned, ob + 5) == 0 {
                 if ibuf_get(owned, ob + 3) < n_stmt {
                     donor_nid = ibuf_get(owned, ob + 1)
-                    ibuf_set(owned, ob + 5, 1) // consumed by FBIP reuse!
+                    ibuf_set(owned, ob + 5, 1)
                     break
                 }
             }
@@ -1302,7 +2029,6 @@ fn plan_fn_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, body_nid: i64) {
         ni += 1
     }
 
-    // Mark remaining non-escaped, non-consumed owned variables for deterministic `VirtualFree` drop!
     ni = 0
     while ni < ocnt {
         nb := ni * 6
@@ -1313,13 +2039,52 @@ fn plan_fn_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, body_nid: i64) {
         }
         ni += 1
     }
+    buf_free(move owned)
 }
 
-// --- Top-Level Semantic & Perceus Entry Point ---
+fn remap_simd_plans_in_block(nodes: IntBuf, extra: IntBuf, sym: IntBuf, bnid: i64) {
+    if bnid <= 0 {
+        return
+    }
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt {
+        st := ibuf_get(extra, off + i)
+        sk := ast_kind(nodes, st)
+        if sk == nk_for_each() {
+            plan_off := ast_get(nodes, st, 5)
+            if plan_off > 0 {
+                s_idx := ibuf_get(extra, plan_off)
+                ops_cnt := ibuf_get(extra, plan_off + 1)
+                mut oi := 0
+                while oi < ops_cnt {
+                    ob := plan_off + 2 + oi * 4
+                    okind := ibuf_get(extra, ob)
+                    ibuf_set(extra, ob + 1, soa_remap_col(sym, s_idx, ibuf_get(extra, ob + 1)))
+                    if okind == 1 or okind == 3 {
+                        ibuf_set(extra, ob + 2, soa_remap_col(sym, s_idx, ibuf_get(extra, ob + 2)))
+                    }
+                    oi += 1
+                }
+            }
+            remap_simd_plans_in_block(nodes, extra, sym, ast_get(nodes, st, 4))
+        } else if sk == nk_if() {
+            remap_simd_plans_in_block(nodes, extra, sym, ast_get(nodes, st, 2))
+            remap_simd_plans_in_block(nodes, extra, sym, ast_get(nodes, st, 3))
+        } else if sk == nk_while() {
+            remap_simd_plans_in_block(nodes, extra, sym, ast_get(nodes, st, 2))
+        } else if sk == nk_for_range() {
+            remap_simd_plans_in_block(nodes, extra, sym, ast_get(nodes, st, 5))
+        }
+        i += 1
+    }
+}
+
+// --- Top-Level Semantic, Perceus & Polyhedral SoA Entry Point ---
 fn analyze_semantics_and_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf) -> bool {
-    // Initialize `sym[0..16]` header
     mut z := 0
-    while z < 16 {
+    while z < 24 {
         ibuf_push(sym, 0)
         z += 1
     }
@@ -1332,7 +2097,6 @@ fn analyze_semantics_and_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sy
     f_list_off := ibuf_get(nodes, 8)
     f_cnt := ibuf_get(nodes, 9)
 
-    // 1. Register struct headers & interfaces first so recursive/cross-struct types resolve
     s_meta_base := ibuf_len(sym)
     ibuf_set(sym, 3, s_meta_base)
     ibuf_set(sym, 4, s_cnt)
@@ -1361,7 +2125,6 @@ fn analyze_semantics_and_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sy
         ii += 1
     }
 
-    // 2. Resolve struct fields in two passes (handles nested structs!) & enforce E0101 (`&T` in struct)
     si = 0
     while si < s_cnt {
         s_off := s_meta_base + si * 6
@@ -1375,7 +2138,6 @@ fn analyze_semantics_and_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sy
             fd := ibuf_get(extra, fl_off + fi)
             ft_nid := ast_get(nodes, fd, 3)
             if typespec_has_ref(nodes, extra, ft_nid) {
-                // E0101: Second-class reference `&T` inside struct field!
                 sema_record_err(sym, 101, ast_line(nodes, fd))
             }
             ibuf_push(sym, ast_get(nodes, fd, 1))
@@ -1387,7 +2149,6 @@ fn analyze_semantics_and_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sy
         si += 1
     }
 
-    // Pass 2a & 2b: compute exact field types and slot offsets (2 iterations handles struct-in-struct!)
     mut pass := 0
     mut max_s_slots := 1
     while pass < 2 {
@@ -1427,7 +2188,57 @@ fn analyze_semantics_and_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sy
         ii += 1
     }
 
-    // 3. Register Function Signatures & ABI Layouts + Enforce E0102 (`&T` return)
+    // Allocate SoA Dead-Column Elimination metadata tables (`sym[16..19]`)
+    abase := ibuf_len(sym)
+    ibuf_set(sym, 16, abase)
+    si = 0
+    while si < s_cnt {
+        fc := ibuf_get(sym, s_meta_base + si * 6 + 4)
+        if fc < 1 { ibuf_push(sym, 1) } else { ibuf_push(sym, fc) }
+        si += 1
+    }
+    mbase_ptr := ibuf_len(sym)
+    ibuf_set(sym, 17, mbase_ptr)
+    si = 0
+    while si < s_cnt {
+        ibuf_push(sym, 0)
+        si += 1
+    }
+    ubase_ptr := ibuf_len(sym)
+    ibuf_set(sym, 18, ubase_ptr)
+    si = 0
+    while si < s_cnt {
+        ibuf_push(sym, 0)
+        si += 1
+    }
+    dbase := ibuf_len(sym)
+    ibuf_set(sym, 19, dbase)
+    si = 0
+    while si < s_cnt {
+        ibuf_push(sym, 0)
+        si += 1
+    }
+    si = 0
+    while si < s_cnt {
+        fc := ibuf_get(sym, s_meta_base + si * 6 + 4)
+        mp := ibuf_len(sym)
+        ibuf_set(sym, mbase_ptr + si, mp)
+        mut c := 0
+        while c < fc {
+            ibuf_push(sym, c)
+            c += 1
+        }
+        up := ibuf_len(sym)
+        ibuf_set(sym, ubase_ptr + si, up)
+        c = 0
+        while c < fc {
+            ibuf_push(sym, 0)
+            c += 1
+        }
+        si += 1
+    }
+
+    // Register Function Signatures & ABI Layouts + Enforce E0102 (`&T` return)
     f_meta_base := ibuf_len(sym)
     ibuf_set(sym, 7, f_meta_base)
     ibuf_set(sym, 8, f_cnt)
@@ -1453,14 +2264,12 @@ fn analyze_semantics_and_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sy
         pl_cnt := ast_get(nodes, fnid, 4)
         ret_nid := ast_get(nodes, fnid, 5)
         if typespec_has_ref(nodes, extra, ret_nid) {
-            // E0102: Function returning borrowed reference `&T`!
             sema_record_err(sym, 102, ast_line(nodes, fnid))
         }
         ibuf_set(sym, 13, ret_nid)
         rty := resolve_typespec(pool, nodes, extra, sym)
         rslots := type_slots(sym, rty)
 
-        // Reserve contiguous parameter metadata table FIRST before resolving nested tuple/result types!
         p_meta_base := ibuf_len(sym)
         mut pi := 0
         while pi < pl_cnt {
@@ -1509,19 +2318,58 @@ fn analyze_semantics_and_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sy
         fni += 1
     }
 
-    // 4. Function-by-Function Local Type/Ownership/Capability Verification + Perceus FBIP Planning
-    locals := ibuf_new(512)
+    // Populate 0-Arg Constant-Returning Function Table (`sym[15]`) for Whole-Program Constant Inlining!
+    const_fn_base := ibuf_len(sym)
+    ibuf_set(sym, 15, const_fn_base)
+    fni = 0
+    while fni < f_cnt * 3 {
+        ibuf_push(sym, 0)
+        fni += 1
+    }
     fni = 0
     while fni < f_cnt {
         fo := f_meta_base + fni * 10
         fnid := ibuf_get(sym, fo + 2)
+        pl_cnt := ibuf_get(sym, fo + 4)
+        rty := ibuf_get(sym, fo + 5)
+        flags := ibuf_get(sym, fo + 9)
+        body_nid := ast_get(nodes, fnid, 6) & 0xFFFFFFFF
+        if pl_cnt == 0 and (flags & 1) == 0 and body_nid > 0 and not pool_str_eq_lit(pool, ibuf_get(sym, fo), ibuf_get(sym, fo + 1), "main") {
+            if ast_get(nodes, body_nid, 2) == 1 {
+                st0 := ibuf_get(extra, ast_get(nodes, body_nid, 1))
+                if ast_kind(nodes, st0) == nk_return() {
+                    rv := ast_get(nodes, st0, 1)
+                    if rv > 0 {
+                        rk := ast_kind(nodes, rv)
+                        if rk == nk_int() or rk == nk_bool() or rk == nk_dec() or rk == nk_float() {
+                            ibuf_set(sym, const_fn_base + fni * 3, 1)
+                            ibuf_set(sym, const_fn_base + fni * 3 + 1, ast_get(nodes, rv, 1))
+                            ibuf_set(sym, const_fn_base + fni * 3 + 2, rty)
+                        } else if rk == nk_unary() and ast_get(nodes, rv, 1) == uop_neg() and ast_kind(nodes, ast_get(nodes, rv, 2)) == nk_int() {
+                            ibuf_set(sym, const_fn_base + fni * 3, 1)
+                            ibuf_set(sym, const_fn_base + fni * 3 + 1, 0 - ast_get(nodes, ast_get(nodes, rv, 2), 1))
+                            ibuf_set(sym, const_fn_base + fni * 3 + 2, rty)
+                        }
+                    }
+                }
+            }
+        }
+        fni += 1
+    }
+
+    // Function-by-Function Rigorous Type, Ownership, Return-Path & Perceus Verification
+    fni = 0
+    while fni < f_cnt {
+        fo := f_meta_base + fni * 10
+        fnid := ibuf_get(sym, fo + 2)
+        rty := ibuf_get(sym, fo + 5)
         body_nid := ast_get(nodes, fnid, 6) & 0xFFFFFFFF
         if body_nid > 0 {
-            // Reset `locals` buffer by allocating fresh or reusing? Allocate small `fn_locals` per fn
             fn_locals := ibuf_new(256)
             ibuf_set(sym, 10, 0)
-            ibuf_set(sym, 11, ibuf_get(sym, fo + 5))
+            ibuf_set(sym, 11, rty)
             ibuf_set(sym, 12, 0)
+            ibuf_set(sym, 14, 0)
 
             p_base := ibuf_get(sym, fo + 3)
             p_cnt := ibuf_get(sym, fo + 4)
@@ -1530,6 +2378,13 @@ fn analyze_semantics_and_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sy
                 po := p_base + pi * 6
                 pm := ibuf_get(sym, po + 2)
                 pty := ibuf_get(sym, po + 3)
+                def_nid := ibuf_get(sym, po + 5)
+                if def_nid > 0 {
+                    dty := check_expr_full(pool, nodes, extra, sym, fn_locals, def_nid)
+                    if not types_compatible(sym, pty, dty) {
+                        sema_record_err(sym, 401, ast_line(nodes, fnid))
+                    }
+                }
                 if is_cap_type(pool, sym, pty) {
                     ibuf_set(sym, 12, 1)
                 }
@@ -1541,12 +2396,51 @@ fn analyze_semantics_and_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sy
             }
 
             check_block_full(pool, nodes, extra, sym, fn_locals, body_nid)
-            plan_fn_perceus(pool, nodes, extra, body_nid)
+            if rty != ty_unit() and not block_returns_all_paths(nodes, extra, body_nid) {
+                sema_record_err(sym, 405, ast_line(nodes, fnid))
+            }
+            plan_block_perceus(pool, nodes, extra, body_nid, 0)
             buf_free(move fn_locals)
         }
         fni += 1
     }
-    buf_free(move locals)
+
+    // Finalize SoA Dead-Column Compaction & Remap All `for_each` SIMD Plans
+    si = 0
+    while si < s_cnt {
+        fc := ibuf_get(sym, s_meta_base + si * 6 + 4)
+        if fc > 0 and ibuf_get(sym, dbase + si) == 0 {
+            uptr := ibuf_get(sym, ubase_ptr + si)
+            mptr := ibuf_get(sym, mbase_ptr + si)
+            mut phys := 0
+            mut c := 0
+            while c < fc {
+                if ibuf_get(sym, uptr + c) == 1 {
+                    ibuf_set(sym, mptr + c, phys)
+                    phys += 1
+                } else {
+                    ibuf_set(sym, mptr + c, 0)
+                }
+                c += 1
+            }
+            if phys == 0 {
+                phys = 1
+            }
+            ibuf_set(sym, abase + si, phys)
+        }
+        si += 1
+    }
+
+    fni = 0
+    while fni < f_cnt {
+        fo := f_meta_base + fni * 10
+        fnid := ibuf_get(sym, fo + 2)
+        body_nid := ast_get(nodes, fnid, 6) & 0xFFFFFFFF
+        if body_nid > 0 {
+            remap_simd_plans_in_block(nodes, extra, sym, body_nid)
+        }
+        fni += 1
+    }
 
     return ibuf_get(sym, 0) == 0
 }
