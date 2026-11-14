@@ -14,7 +14,7 @@ pub struct StmtId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypeId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PrimitiveType {
     I8, I16, I32, I64,
     U8, U16, U32, U64, Usize,
@@ -28,6 +28,11 @@ pub enum TypeData {
     Primitive(PrimitiveType, ByteSpan),
     Named(Spur, ByteSpan),
     Table(Spur, ByteSpan),
+    Reference {
+        inner: TypeId,
+        is_mut: bool,
+        span: ByteSpan,
+    },
     Refined {
         base: TypeId,
         predicate: ExprId,
@@ -213,6 +218,27 @@ pub struct Program<'a> {
     pub functions: &'a [FuncDef<'a>],
 }
 
+#[derive(Clone, Copy)]
+pub struct FrozenAst<'b, 'a> {
+    pub exprs: &'b [ExprData<'a>],
+    pub stmts: &'b [StmtData<'a>],
+    pub types: &'b [TypeData],
+}
+
+impl<'b, 'a> FrozenAst<'b, 'a> {
+    pub fn get_expr(&self, id: ExprId) -> &ExprData<'a> {
+        &self.exprs[id.0 as usize]
+    }
+
+    pub fn get_stmt(&self, id: StmtId) -> &StmtData<'a> {
+        &self.stmts[id.0 as usize]
+    }
+
+    pub fn get_type(&self, id: TypeId) -> &TypeData {
+        &self.types[id.0 as usize]
+    }
+}
+
 pub struct AstArena<'a> {
     pub bump: &'a Bump,
     pub exprs: BumpVec<'a, ExprData<'a>>,
@@ -227,6 +253,14 @@ impl<'a> AstArena<'a> {
             exprs: BumpVec::new_in(bump),
             stmts: BumpVec::new_in(bump),
             types: BumpVec::new_in(bump),
+        }
+    }
+
+    pub fn freeze<'b>(&'b self) -> FrozenAst<'b, 'a> {
+        FrozenAst {
+            exprs: self.exprs.as_slice(),
+            stmts: self.stmts.as_slice(),
+            types: self.types.as_slice(),
         }
     }
 

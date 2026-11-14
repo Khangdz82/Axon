@@ -4,6 +4,7 @@ use axon_ast::AstArena;
 use axon_lexer::Lexer;
 use axon_parser::Parser;
 use axon_span::SourceMap;
+use axon_types::TypeChecker;
 use bumpalo::Bump;
 use lasso::Rodeo;
 use std::env;
@@ -54,18 +55,26 @@ fn main() {
     let mut arena = AstArena::new(&bump);
     let mut parser = Parser::new(&tokens, &mut arena, &mut interner);
 
-    match parser.parse_program() {
-        Ok(prog) => {
-            println!(
-                "[+] Successfully parsed '{}': {} struct(s), {} function(s)",
-                file_path,
-                prog.structs.len(),
-                prog.functions.len()
-            );
-        }
+    let prog = match parser.parse_program() {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("{}", sm.format_error(e.span, &e.msg));
             process::exit(1);
         }
+    };
+
+    let mut type_checker = TypeChecker::new(&arena, &interner);
+    if let Err(errors) = type_checker.check_program(&prog) {
+        for err in errors {
+            eprintln!("{}", sm.format_error(err.span, &err.msg));
+        }
+        process::exit(1);
     }
+
+    println!(
+        "[+] Successfully checked '{}': {} struct(s), {} function(s) (Local Reasoning verified)",
+        file_path,
+        prog.structs.len(),
+        prog.functions.len()
+    );
 }

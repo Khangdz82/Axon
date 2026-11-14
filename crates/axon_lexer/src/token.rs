@@ -136,6 +136,8 @@ pub enum RawToken {
     Comma,
     #[token(".")]
     Dot,
+    #[token("&")]
+    Amp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -203,6 +205,7 @@ pub enum TokenKind {
     Semi,
     Comma,
     Dot,
+    Amp,
 
     Eof,
 }

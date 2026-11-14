@@ -9,8 +9,13 @@
   - [x] `axon_parser`: Pratt Parser + recursive descent for struct, fn, Table, where, spawn, join
   - [x] CLI driver: `axc check <file.ax>` with source code error diagnostics
   - [x] Gate M0 verification: 53/53 tests passed (7 lexer tests + 31 valid syntax tests + 15 syntax error tests with exact line/col reporting)
-- [ ] **Milestone M1: Type Checker & Second-Class Reference Verifier (Local Reasoning)** (NEXT)
-- [ ] **Milestone M2: Perceus IR & In-Place Memory Reuse (FBIP)** (LOCKED)
+- [x] **Milestone M1: Type Checker & Second-Class Reference Verifier (Local Reasoning)** (COMPLETED & VERIFIED)
+  - [x] `axon_types`: Type system, GlobalContext, Local Type Inference
+  - [x] Second-Class Reference Verifier: Cấm trường tham chiếu trong struct, cấm trả về tham chiếu từ hàm
+  - [x] Linear Ownership & Isolation Check: Theo dõi chuyển giao quyền sở hữu qua `spawn` và `move`, bắt lỗi Use-After-Move
+  - [x] Local Reasoning với `rayon::par_iter()`: Kiểm tra song song 100% độc lập từng hàm qua `FrozenAst`
+  - [x] Gate M1 verification: 62/62 tests passed trên toàn bộ workspace, từ chối chính xác 100% các vi phạm trong `tests/fail_compile/`
+- [ ] **Milestone M2: Perceus IR & In-Place Memory Reuse (FBIP)** (NEXT)
 - [ ] **Milestone M3: Native SoA (Table[T]) & C23 Transpiler Backend (MVP End-to-End)** (LOCKED)
 - [ ] **Milestone M4: Runtime Đa luồng Colorless Concurrency** (LOCKED)
 - [ ] **Milestone M5: Dual-Backend Production (Cranelift Dev Mode & MLIR Release Mode)** (LOCKED)

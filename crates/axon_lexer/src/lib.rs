@@ -130,6 +130,7 @@ impl<'a> Lexer<'a> {
                 RawToken::Semi => TokenKind::Semi,
                 RawToken::Comma => TokenKind::Comma,
                 RawToken::Dot => TokenKind::Dot,
+                RawToken::Amp => TokenKind::Amp,
             };
 
             tokens.push(Token {

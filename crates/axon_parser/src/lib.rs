@@ -177,6 +177,23 @@ impl<'a, 'b> Parser<'a, 'b> {
     pub fn parse_type(&mut self) -> Result<TypeId, ParseError> {
         let tok = self.current();
         let ty_id = match tok.kind {
+            TokenKind::Amp => {
+                let start = self.advance().span;
+                let is_mut = self.match_token(TokenKind::Mut);
+                let inner = self.parse_type()?;
+                let end = match self.arena.get_type(inner) {
+                    TypeData::Primitive(_, s)
+                    | TypeData::Named(_, s)
+                    | TypeData::Table(_, s)
+                    | TypeData::Reference { span: s, .. }
+                    | TypeData::Refined { span: s, .. } => *s,
+                };
+                self.arena.alloc_type(TypeData::Reference {
+                    inner,
+                    is_mut,
+                    span: start.merge(end),
+                })
+            }
             TokenKind::Table => {
                 let start = self.advance().span;
                 self.expect(TokenKind::LBracket)?;
@@ -218,7 +235,10 @@ impl<'a, 'b> Parser<'a, 'b> {
             let pred = self.parse_expr(0)?;
             let pred_span = self.arena.get_expr(pred).span();
             let base_span = match self.arena.get_type(ty_id) {
-                TypeData::Primitive(_, s) | TypeData::Named(_, s) | TypeData::Table(_, s) => *s,
+                TypeData::Primitive(_, s)
+                | TypeData::Named(_, s)
+                | TypeData::Table(_, s)
+                | TypeData::Reference { span: s, .. } => *s,
                 TypeData::Refined { span, .. } => *span,
             };
             return Ok(self.arena.alloc_type(TypeData::Refined {
