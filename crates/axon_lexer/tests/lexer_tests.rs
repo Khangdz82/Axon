@@ -86,6 +86,7 @@ fn test_multi_char_operators() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)]
 fn test_number_literals_with_underscores() {
     let src = "1_000_000 42 0.016 3.14_159";
     let tokens = tokenize(src);

@@ -37,20 +37,20 @@ impl Type {
 
     pub fn is_numeric(&self) -> bool {
         match self {
-            Type::Primitive(p) => match p {
+            Type::Primitive(p) => matches!(
+                p,
                 PrimitiveType::I8
-                | PrimitiveType::I16
-                | PrimitiveType::I32
-                | PrimitiveType::I64
-                | PrimitiveType::U8
-                | PrimitiveType::U16
-                | PrimitiveType::U32
-                | PrimitiveType::U64
-                | PrimitiveType::Usize
-                | PrimitiveType::F32
-                | PrimitiveType::F64 => true,
-                _ => false,
-            },
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64
+                    | PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64
+                    | PrimitiveType::Usize
+                    | PrimitiveType::F32
+                    | PrimitiveType::F64
+            ),
             _ => false,
         }
     }

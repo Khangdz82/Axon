@@ -93,7 +93,7 @@ impl GlobalContext {
                     is_mut: *is_mut,
                 })
             }
-            TypeData::Refined { base, span: _, .. } => {
+            TypeData::Refined { base, .. } => {
                 let base_ty = self.resolve_ast_type(*base, ast, interner)?;
                 Ok(Type::Refined {
                     base: Box::new(base_ty),
@@ -735,7 +735,7 @@ impl<'a> TypeChecker<'a> {
 
             ExprData::MethodCall {
                 target,
-                method,
+                method: _,
                 args,
                 span: _,
             } => {
@@ -743,11 +743,7 @@ impl<'a> TypeChecker<'a> {
                 for arg in *args {
                     Self::check_expr(*arg, env, ctx, ast, interner)?;
                 }
-                if interner.resolve(method) == "join" {
-                    Ok(Type::Unknown)
-                } else {
-                    Ok(Type::Unknown)
-                }
+                Ok(Type::Unknown)
             }
 
             ExprData::Spawn { body, span } => {

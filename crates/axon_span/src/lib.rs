@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct FileId(pub u32);
 
 impl fmt::Display for FileId {
@@ -16,12 +16,6 @@ pub struct ByteSpan {
     pub start: u32,
     pub end: u32,
     pub file_id: FileId,
-}
-
-impl Default for FileId {
-    fn default() -> Self {
-        FileId(0)
-    }
 }
 
 impl ByteSpan {
