@@ -3,6 +3,7 @@
 use axon_ast::AstArena;
 use axon_lexer::Lexer;
 use axon_parser::Parser;
+use axon_perceus::compile_to_perceus;
 use axon_span::SourceMap;
 use axon_types::TypeChecker;
 use bumpalo::Bump;
@@ -14,7 +15,7 @@ use std::process;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: axc <check|build|run> <file.ax>");
+        eprintln!("Usage: axc <check|ir|build|run> <file.ax>");
         process::exit(1);
     }
 
@@ -53,22 +54,42 @@ fn main() {
 
     let bump = Bump::new();
     let mut arena = AstArena::new(&bump);
-    let mut parser = Parser::new(&tokens, &mut arena, &mut interner);
-
-    let prog = match parser.parse_program() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{}", sm.format_error(e.span, &e.msg));
-            process::exit(1);
+    let prog = {
+        let mut parser = Parser::new(&tokens, &mut arena, &mut interner);
+        match parser.parse_program() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{}", sm.format_error(e.span, &e.msg));
+                process::exit(1);
+            }
         }
     };
 
-    let mut type_checker = TypeChecker::new(&arena, &interner);
-    if let Err(errors) = type_checker.check_program(&prog) {
-        for err in errors {
-            eprintln!("{}", sm.format_error(err.span, &err.msg));
+    let ctx = {
+        let mut type_checker = TypeChecker::new(&arena, &interner);
+        if let Err(errors) = type_checker.check_program(&prog) {
+            for err in errors {
+                eprintln!("{}", sm.format_error(err.span, &err.msg));
+            }
+            process::exit(1);
         }
-        process::exit(1);
+        type_checker.ctx.clone()
+    };
+
+    let frozen = arena.freeze();
+    let (ir_prog, stats) = compile_to_perceus(&prog, frozen, &ctx, &interner);
+
+    if cmd == "ir" || cmd == "emit-ir" {
+        println!("=== PERCEUS IR: {} ===", file_path);
+        for func in &ir_prog.functions {
+            print!("{}", func.display(&interner));
+        }
+        println!("=== PERCEUS STATS ===");
+        println!("  Functions:             {}", stats.total_functions);
+        println!("  FBIP In-Place Reuses:  {}", stats.reused_allocations);
+        println!("  Elided Bounds Checks:  {}", stats.elided_bounds_checks);
+        println!("  Checked Bounds Checks: {}", stats.checked_bounds_checks);
+        return;
     }
 
     println!(
@@ -76,5 +97,9 @@ fn main() {
         file_path,
         prog.structs.len(),
         prog.functions.len()
+    );
+    println!(
+        "    [FBIP] {} in-place allocation reuse(s) | [Refinement] {} bounds check(s) elided, {} checked",
+        stats.reused_allocations, stats.elided_bounds_checks, stats.checked_bounds_checks
     );
 }

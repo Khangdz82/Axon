@@ -15,7 +15,14 @@
   - [x] Linear Ownership & Isolation Check: Theo dõi chuyển giao quyền sở hữu qua `spawn` và `move`, bắt lỗi Use-After-Move
   - [x] Local Reasoning với `rayon::par_iter()`: Kiểm tra song song 100% độc lập từng hàm qua `FrozenAst`
   - [x] Gate M1 verification: 62/62 tests passed trên toàn bộ workspace, từ chối chính xác 100% các vi phạm trong `tests/fail_compile/`
-- [ ] **Milestone M2: Perceus IR & In-Place Memory Reuse (FBIP)** (NEXT)
-- [ ] **Milestone M3: Native SoA (Table[T]) & C23 Transpiler Backend (MVP End-to-End)** (LOCKED)
+- [x] **Milestone M2: Perceus IR & In-Place Memory Reuse (FBIP)** (COMPLETED & VERIFIED)
+  - [x] `axon_perceus`: Flat index-based IR (`IrVar`, `BlockId`, `BasicBlock`, `Instruction`, `Terminator`)
+  - [x] Liveness Analysis & Drop Insertion: Tự động xác định điểm chết của đối tượng composite/heap và chèn `Instruction::Drop`
+  - [x] Perceus FBIP Memory Reuse Pass: Ghép cặp `Drop` + `Alloc` cùng dung lượng thành `ReuseToken` + `AllocInPlace`, tái sử dụng bộ nhớ cũ 100% không qua malloc/free
+  - [x] Refinement Types Bounds Check Elision Pass: Chứng minh biên tĩnh qua mệnh đề `where idx < arr.len` và for-in loop để đánh dấu `BoundsCheckMode::Elided`, triệt tiêu runtime bounds checks thừa
+  - [x] Toán tử số học checked/wrapping/saturating bảo toàn trong IR
+  - [x] CLI driver: `axc check` & `axc ir` (hiển thị Perceus IR và thống kê FBIP / Refinement)
+  - [x] Gate M2 verification: 68/68 tests passed trên toàn bộ workspace (6/6 tests Perceus mới + 62 tests M0/M1), clippy 0 warning
+- [ ] **Milestone M3: Native SoA (Table[T]) & C23 Transpiler Backend (MVP End-to-End)** (NEXT)
 - [ ] **Milestone M4: Runtime Đa luồng Colorless Concurrency** (LOCKED)
 - [ ] **Milestone M5: Dual-Backend Production (Cranelift Dev Mode & MLIR Release Mode)** (LOCKED)

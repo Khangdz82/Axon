@@ -27,7 +27,7 @@ impl TypeError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StructInfo {
     pub name: Spur,
     pub fields: HashMap<Spur, (Type, ByteSpan)>,
@@ -35,7 +35,7 @@ pub struct StructInfo {
     pub span: ByteSpan,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FuncSignature {
     pub name: Spur,
     pub params: Vec<(ParamIntent, Spur, Type)>,
@@ -43,7 +43,7 @@ pub struct FuncSignature {
     pub span: ByteSpan,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct GlobalContext {
     pub structs: HashMap<Spur, StructInfo>,
     pub functions: HashMap<Spur, FuncSignature>,
@@ -113,7 +113,7 @@ struct VarState {
 pub struct TypeChecker<'a> {
     arena: &'a AstArena<'a>,
     interner: &'a Rodeo,
-    ctx: GlobalContext,
+    pub ctx: GlobalContext,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -123,6 +123,10 @@ impl<'a> TypeChecker<'a> {
             interner,
             ctx: GlobalContext::new(),
         }
+    }
+
+    pub fn ctx(&self) -> &GlobalContext {
+        &self.ctx
     }
 
     pub fn check_program(&mut self, program: &Program<'a>) -> Result<(), Vec<TypeError>> {
