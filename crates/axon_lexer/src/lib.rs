@@ -24,6 +24,14 @@ pub struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str, file_id: FileId, interner: &'a mut Rodeo) -> Self {
+        interner.get_or_intern("len");
+        interner.get_or_intern("capacity");
+        interner.get_or_intern("with_capacity");
+        interner.get_or_intern("join");
+        interner.get_or_intern("spawn_fiber");
+        for i in 0..128 {
+            interner.get_or_intern(format!("__axon_fiber_{}", i));
+        }
         Self {
             file_id,
             inner: RawToken::lexer(src),

@@ -36,7 +36,7 @@ pub fn lower_and_optimize_function(
     ast: FrozenAst<'_, '_>,
     ctx: &GlobalContext,
     interner: &Rodeo,
-) -> (IrFunction, PerceusStats) {
+) -> (Vec<IrFunction>, PerceusStats) {
     let mut builder = IrBuilder::new(ctx, interner);
     let mut ir_func = builder.build_function(func, ast);
 
@@ -53,7 +53,7 @@ pub fn lower_and_optimize_function(
     let ref_stats = refinement.run(&mut ir_func);
 
     let stats = PerceusStats {
-        total_functions: 1,
+        total_functions: 1 + builder.outlined_functions.len(),
         reused_allocations: reuse_stats.reused_allocations,
         total_drops: reuse_stats.total_drops,
         total_allocs: reuse_stats.total_allocs,
@@ -61,7 +61,10 @@ pub fn lower_and_optimize_function(
         checked_bounds_checks: ref_stats.checked_bounds_checks,
     };
 
-    (ir_func, stats)
+    let mut funcs = vec![ir_func];
+    funcs.extend(builder.outlined_functions);
+
+    (funcs, stats)
 }
 
 /// Compile an entire typed AST program into optimized Perceus IR in parallel using Rayon.
@@ -71,25 +74,23 @@ pub fn compile_to_perceus(
     ctx: &GlobalContext,
     interner: &Rodeo,
 ) -> (IrProgram, PerceusStats) {
-    let results: Vec<(IrFunction, PerceusStats)> = prog
+    let results: Vec<(Vec<IrFunction>, PerceusStats)> = prog
         .functions
         .par_iter()
         .map(|f| lower_and_optimize_function(f, ast, ctx, interner))
         .collect();
 
-    let mut ir_functions = Vec::with_capacity(results.len());
-    let mut agg_stats = PerceusStats {
-        total_functions: results.len(),
-        ..Default::default()
-    };
+    let mut ir_functions = Vec::new();
+    let mut agg_stats = PerceusStats::default();
 
-    for (func, stats) in results {
-        ir_functions.push(func);
+    for (funcs, stats) in results {
+        agg_stats.total_functions += stats.total_functions;
         agg_stats.reused_allocations += stats.reused_allocations;
         agg_stats.total_drops += stats.total_drops;
         agg_stats.total_allocs += stats.total_allocs;
         agg_stats.elided_bounds_checks += stats.elided_bounds_checks;
         agg_stats.checked_bounds_checks += stats.checked_bounds_checks;
+        ir_functions.extend(funcs);
     }
 
     (

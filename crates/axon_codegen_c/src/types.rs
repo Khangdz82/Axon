@@ -36,6 +36,7 @@ pub fn to_c_type(ty: &Type, interner: &Rodeo) -> String {
             }
         }
         Type::Refined { base } => to_c_type(base, interner),
+        Type::Job(_) => "Axon_Job*".into(),
         Type::Unknown => "int64_t".into(),
     }
 }

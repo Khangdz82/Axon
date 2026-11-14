@@ -24,6 +24,7 @@ pub fn compute_type_size(ty: &Type, ctx: &GlobalContext) -> usize {
         Type::Table(_) => 24, // Pointer (8) + Len (8) + Cap (8)
         Type::Reference { .. } => 0,
         Type::Refined { base } => compute_type_size(base, ctx),
+        Type::Job(_) => 8,
         Type::Unknown => 0,
     }
 }
@@ -44,6 +45,7 @@ pub fn compute_scalar_size(ty: &Type, ctx: &GlobalContext) -> usize {
         Type::Table(_) => 24,
         Type::Reference { .. } => 8,
         Type::Refined { base } => compute_scalar_size(base, ctx),
+        Type::Job(_) => 8,
         Type::Unknown => 8,
     }
 }

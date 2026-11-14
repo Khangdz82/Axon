@@ -31,5 +31,14 @@
   - [x] Refinement bounds elision: Không phát sinh lệnh `assert` khi biên được chứng minh tĩnh
   - [x] CLI driver: `axc emit-c`, `axc build`, `axc run` tự động gọi MSVC `cl.exe` / `clang` / `gcc` biên dịch và chạy file nhị phân trực tiếp
   - [x] Gate M3 verification: 73/73 tests passed trên toàn bộ workspace (2 codegen tests + 9 perceus + 9 types + 46 parser + 7 lexer), biên dịch và chạy thành công `particle_sim.ax` và `fbip_particle_reuse.ax` (exit code 0)
-- [ ] **Milestone M4: Runtime Đa luồng Colorless Concurrency** (NEXT)
-- [ ] **Milestone M5: Dual-Backend Production (Cranelift Dev Mode & MLIR Release Mode)** (LOCKED)
+- [x] **Milestone M4: Runtime Đa luồng Colorless Concurrency** (COMPLETED & VERIFIED)
+  - [x] `axon_codegen_c`: Runtime Header hoàn chỉnh hỗ trợ Colorless Concurrency trên M:N Work-Stealing Fiber Scheduler
+  - [x] Chase-Lev Work-Stealing Deque: Local LIFO push/pop cho worker thread, atomic CAS FIFO stealing cho stealers, global injector queue
+  - [x] Colorless Join (`axon_join`): Luồng chờ không block/sleep thụ động mà hợp tác thực thi các fiber đang chờ hoặc steal tác vụ từ worker khác, triệt tiêu starvation và thread contention
+  - [x] Lock-Free Channel (`Axon_Channel`): Ring-buffer phi khóa SPSC/MPMC chuyển giao quyền sở hữu dữ liệu `isolated` an toàn giữa các fiber không cần Mutex
+  - [x] Perceus IR Spawn Outlining: Tự động tách khối `spawn { ... }` thành hàm IR độc lập (`__axon_fiber_N`) với đầy đủ tối ưu hóa Liveness, FBIP reuse và Refinement bounds elision
+  - [x] Linear Ownership Transfer: Chuyển giao biến qua tham số ngữ cảnh `Axon_Ctx_*` và thunk wrapper `Axon_thunk_*`, cập nhật `LivenessPass` cấm drop biến đã move vào fiber
+  - [x] Linear Isolation Verification (`axon_types`): Bắt lỗi vi phạm khi biến non-primitive bị capture vào `spawn` mà không có `move` (`09_unisolated_capture_spawn.ax`)
+  - [x] Tự động khởi tạo (`axon_scheduler_init`) và tắt (`axon_scheduler_shutdown`) scheduler trong `main()` khi chương trình sử dụng `spawn`
+  - [x] Gate M4 verification: 76/76 tests passed trên toàn bộ workspace (4 codegen tests + 9 perceus + 10 types + 46 parser + 7 lexer), biên dịch và chạy song song thành công `particle_sim.ax` và `multi_fiber_concurrency.ax` (exit code 0), clippy 0 warning
+- [ ] **Milestone M5: Dual-Backend Production (Cranelift Dev Mode & MLIR Release Mode)** (NEXT)

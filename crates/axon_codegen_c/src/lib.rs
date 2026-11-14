@@ -58,6 +58,20 @@ impl<'a> CCodeGen<'a> {
                     out.push_str(&format!("{} v{}", p_c_ty, p.var.0));
                 }
                 out.push_str(");\n");
+
+                if fn_name.starts_with("__axon_fiber_") {
+                    out.push_str(&format!("typedef struct Axon_Ctx_{} {{\n", fn_name));
+                    if func.params.is_empty() {
+                        out.push_str("    char __empty;\n");
+                    } else {
+                        for (i, p) in func.params.iter().enumerate() {
+                            let p_c_ty = to_c_type(&p.ty, self.interner);
+                            out.push_str(&format!("    {} v{};\n", p_c_ty, i));
+                        }
+                    }
+                    out.push_str(&format!("}} Axon_Ctx_{};\n", fn_name));
+                    out.push_str(&format!("void* Axon_thunk_{}(void* __raw_ctx);\n", fn_name));
+                }
             }
         }
         out.push('\n');
@@ -65,8 +79,39 @@ impl<'a> CCodeGen<'a> {
         // 4. Function Implementations
         out.push_str("// === FUNCTION IMPLEMENTATIONS ===\n");
         for func in &self.ir.functions {
+            let fn_name = self.interner.resolve(&func.name);
             out.push_str(&self.generate_function(func));
             out.push('\n');
+
+            if fn_name.starts_with("__axon_fiber_") {
+                out.push_str(&format!("void* Axon_thunk_{}(void* __raw_ctx) {{\n", fn_name));
+                out.push_str(&format!("    Axon_Ctx_{0}* __ctx = (Axon_Ctx_{0}*)__raw_ctx;\n", fn_name));
+                let mut call_args = String::new();
+                for (i, _) in func.params.iter().enumerate() {
+                    if i > 0 {
+                        call_args.push_str(", ");
+                    }
+                    call_args.push_str(&format!("__ctx->v{}", i));
+                }
+                if func.ret_type == Type::VOID {
+                    out.push_str(&format!("    Axon_{}({});\n", fn_name, call_args));
+                    out.push_str("    free(__ctx);\n");
+                    out.push_str("    return NULL;\n");
+                } else if matches!(func.ret_type, Type::Table(_) | Type::Struct(_)) {
+                    let ret_c = to_c_type(&func.ret_type, self.interner);
+                    out.push_str(&format!("    {0} __res = Axon_{1}({2});\n", ret_c, fn_name, call_args));
+                    out.push_str("    free(__ctx);\n");
+                    out.push_str(&format!("    {0}* __boxed = ({0}*)malloc(sizeof({0}));\n", ret_c));
+                    out.push_str("    *__boxed = __res;\n");
+                    out.push_str("    return (void*)__boxed;\n");
+                } else {
+                    let ret_c = to_c_type(&func.ret_type, self.interner);
+                    out.push_str(&format!("    {0} __res = Axon_{1}({2});\n", ret_c, fn_name, call_args));
+                    out.push_str("    free(__ctx);\n");
+                    out.push_str("    return (void*)(intptr_t)__res;\n");
+                }
+                out.push_str("}\n\n");
+            }
         }
 
         out
@@ -79,6 +124,9 @@ impl<'a> CCodeGen<'a> {
 
         if fn_name == "main" {
             out.push_str("int main(void) {\n");
+            if self.program_has_spawn() {
+                out.push_str("    axon_scheduler_init(0);\n");
+            }
         } else {
             out.push_str(&format!("{} Axon_{}(", ret_c, fn_name));
             for (i, p) in func.params.iter().enumerate() {
@@ -149,8 +197,8 @@ impl<'a> CCodeGen<'a> {
                 }
                 if reuse_token_vars.contains(&v) {
                     out.push_str(&format!("    void* v{} = NULL;\n", id));
-                } else if spawn_vars.contains(&v) {
-                    out.push_str(&format!("    Axon_Job v{} = {{0}};\n", id));
+                } else if spawn_vars.contains(&v) || matches!(ty, Type::Job(_)) {
+                    out.push_str(&format!("    Axon_Job* v{} = NULL;\n", id));
                 } else if matches!(ty, Type::Struct(_) | Type::Table(_)) {
                     let c_ty = to_c_type(ty, self.interner);
                     out.push_str(&format!("    {} v{} = {{0}};\n", c_ty, id));
@@ -172,10 +220,16 @@ impl<'a> CCodeGen<'a> {
 
             match &block.terminator {
                 Terminator::Return { value: Some(op), .. } => {
+                    if fn_name == "main" && self.program_has_spawn() {
+                        out.push_str("    axon_scheduler_shutdown();\n");
+                    }
                     out.push_str(&format!("    return {};\n", self.operand_to_c(op)));
                 }
                 Terminator::Return { value: None, .. } => {
                     if fn_name == "main" {
+                        if self.program_has_spawn() {
+                            out.push_str("    axon_scheduler_shutdown();\n");
+                        }
                         out.push_str("    return 0;\n");
                     } else {
                         out.push_str("    return;\n");
@@ -214,6 +268,54 @@ impl<'a> CCodeGen<'a> {
         match inst {
             Instruction::Assign { dest, op, .. } => {
                 let dest_ty = func.var_types.get(dest.0 as usize).unwrap_or(&Type::Unknown);
+                if let IrOp::Spawn { func_name, args } = op {
+                    let fn_str = self.interner.resolve(func_name);
+                    out.push_str(&format!(
+                        "    Axon_Ctx_{0}* __ctx_{1} = (Axon_Ctx_{0}*)malloc(sizeof(Axon_Ctx_{0}));\n",
+                        fn_str, dest.0
+                    ));
+                    for (i, a) in args.iter().enumerate() {
+                        out.push_str(&format!(
+                            "    __ctx_{0}->v{1} = {2};\n",
+                            dest.0,
+                            i,
+                            self.operand_to_c(a)
+                        ));
+                    }
+                    out.push_str(&format!(
+                        "    v{0} = axon_spawn(&Axon_thunk_{1}, __ctx_{0});\n",
+                        dest.0, fn_str
+                    ));
+                    return;
+                }
+
+                if let IrOp::MethodCall { target, method, .. } = op {
+                    let m_str = self.interner.resolve(method);
+                    if m_str == "join" {
+                        if *dest_ty == Type::VOID {
+                            out.push_str(&format!("    axon_join(v{});\n", target.0));
+                        } else if matches!(dest_ty, Type::Table(_) | Type::Struct(_)) {
+                            let c_ty = to_c_type(dest_ty, self.interner);
+                            out.push_str(&format!(
+                                "    void* __res_ptr_{0} = axon_join(v{1});\n",
+                                dest.0, target.0
+                            ));
+                            out.push_str(&format!(
+                                "    v{0} = *({1}*)__res_ptr_{0};\n",
+                                dest.0, c_ty
+                            ));
+                            out.push_str(&format!("    free(__res_ptr_{});\n", dest.0));
+                        } else {
+                            let c_ty = to_c_type(dest_ty, self.interner);
+                            out.push_str(&format!(
+                                "    v{0} = ({1})(intptr_t)axon_join(v{2});\n",
+                                dest.0, c_ty, target.0
+                            ));
+                        }
+                        return;
+                    }
+                }
+
                 if *dest_ty == Type::VOID {
                     out.push_str("    ");
                     self.generate_op(out, op, func);
@@ -307,6 +409,25 @@ impl<'a> CCodeGen<'a> {
                 ));
             }
             Instruction::Eval { op, .. } => {
+                if let IrOp::Spawn { func_name, args } = op {
+                    let fn_str = self.interner.resolve(func_name);
+                    out.push_str(&format!(
+                        "    Axon_Ctx_{0}* __ctx_eval = (Axon_Ctx_{0}*)malloc(sizeof(Axon_Ctx_{0}));\n",
+                        fn_str
+                    ));
+                    for (i, a) in args.iter().enumerate() {
+                        out.push_str(&format!(
+                            "    __ctx_eval->v{0} = {1};\n",
+                            i,
+                            self.operand_to_c(a)
+                        ));
+                    }
+                    out.push_str(&format!(
+                        "    axon_spawn(&Axon_thunk_{}, __ctx_eval);\n",
+                        fn_str
+                    ));
+                    return;
+                }
                 out.push_str("    ");
                 self.generate_op(out, op, func);
                 out.push_str(";\n");
@@ -463,15 +584,35 @@ impl<'a> CCodeGen<'a> {
             IrOp::MethodCall { target, method, .. } => {
                 let m_name = self.interner.resolve(method);
                 if m_name == "join" {
-                    out.push_str(&format!("(int64_t)(intptr_t)axon_join_job({})", target));
+                    out.push_str(&format!("(int64_t)(intptr_t)axon_join({})", target));
                 } else {
                     out.push_str(&format!("{}.{}()", target, m_name));
                 }
             }
-            IrOp::Spawn { .. } => {
-                out.push_str("axon_spawn_job(NULL)");
+            IrOp::Spawn { func_name, .. } => {
+                let fn_str = self.interner.resolve(func_name);
+                out.push_str(&format!("axon_spawn(&Axon_thunk_{}, NULL)", fn_str));
             }
         }
+    }
+
+    fn program_has_spawn(&self) -> bool {
+        self.ir.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.instructions.iter().any(|inst| {
+                    matches!(
+                        inst,
+                        Instruction::Assign {
+                            op: IrOp::Spawn { .. },
+                            ..
+                        } | Instruction::Eval {
+                            op: IrOp::Spawn { .. },
+                            ..
+                        }
+                    )
+                })
+            })
+        })
     }
 
     fn operand_to_c(&self, op: &Operand) -> String {

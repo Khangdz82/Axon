@@ -739,13 +739,19 @@ impl<'a> TypeChecker<'a> {
 
             ExprData::MethodCall {
                 target,
-                method: _,
+                method,
                 args,
                 span: _,
             } => {
-                let _ = Self::check_expr(*target, env, ctx, ast, interner)?;
+                let target_ty = Self::check_expr(*target, env, ctx, ast, interner)?;
                 for arg in *args {
                     Self::check_expr(*arg, env, ctx, ast, interner)?;
+                }
+                let m_str = interner.resolve(method);
+                if m_str == "join" {
+                    if let Type::Job(inner) = target_ty {
+                        return Ok(*inner);
+                    }
                 }
                 Ok(Type::Unknown)
             }
@@ -754,6 +760,26 @@ impl<'a> TypeChecker<'a> {
                 let mut captured_moved = HashSet::new();
                 for &stmt_id in *body {
                     Self::collect_moved_vars(stmt_id, &mut captured_moved, ast);
+                }
+
+                // Verify linear isolation: non-primitive variables captured from parent must be moved
+                let mut used_idents = HashSet::new();
+                for &stmt_id in *body {
+                    Self::collect_stmt_idents(stmt_id, &mut used_idents, ast);
+                }
+
+                for spur in &used_idents {
+                    if let Some(var_state) = env.get(spur) {
+                        if !var_state.ty.is_numeric() && var_state.ty != Type::BOOL && !captured_moved.contains(spur) {
+                            return Err(TypeError {
+                                span: *span,
+                                msg: format!(
+                                    "Linear Isolation Violation: non-primitive variable '{}' captured into concurrent spawn block without 'move'",
+                                    interner.resolve(spur)
+                                ),
+                            });
+                        }
+                    }
                 }
 
                 let mut sub_env = env.clone();
@@ -770,7 +796,18 @@ impl<'a> TypeChecker<'a> {
                     span: *span,
                 };
 
+                let mut ret_type = Type::VOID;
                 for &s in *body {
+                    if let StmtData::Return { value: Some(vid), .. } = ast.get_stmt(s) {
+                        if let ExprData::Ident(spur, _) = ast.get_expr(*vid) {
+                            if let Some(vs) = sub_env.get(spur) {
+                                ret_type = vs.ty.clone();
+                            }
+                        } else {
+                            let mut probe_env = sub_env.clone();
+                            ret_type = Self::check_expr(*vid, &mut probe_env, ctx, ast, interner).unwrap_or(Type::Unknown);
+                        }
+                    }
                     Self::check_stmt(s, &mut sub_env, &dummy_sig, ctx, ast, interner)?;
                 }
 
@@ -781,7 +818,7 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
-                Ok(Type::Unknown)
+                Ok(Type::Job(Box::new(ret_type)))
             }
         }
     }
@@ -810,6 +847,95 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn collect_expr_idents<'b>(expr_id: ExprId, idents: &mut HashSet<Spur>, ast: FrozenAst<'b, 'a>) {
+        match ast.get_expr(expr_id) {
+            ExprData::Ident(spur, _) => {
+                idents.insert(*spur);
+            }
+            ExprData::Binary { left, right, .. } => {
+                Self::collect_expr_idents(*left, idents, ast);
+                Self::collect_expr_idents(*right, idents, ast);
+            }
+            ExprData::Call { args, .. } => {
+                for (_, arg_id) in *args {
+                    Self::collect_expr_idents(*arg_id, idents, ast);
+                }
+            }
+            ExprData::MethodCall { target, args, .. } => {
+                Self::collect_expr_idents(*target, idents, ast);
+                for arg_id in *args {
+                    Self::collect_expr_idents(*arg_id, idents, ast);
+                }
+            }
+            ExprData::StaticMethodCall { args, .. } => {
+                for arg_id in *args {
+                    Self::collect_expr_idents(*arg_id, idents, ast);
+                }
+            }
+            ExprData::FieldAccess { target, .. } => {
+                Self::collect_expr_idents(*target, idents, ast);
+            }
+            ExprData::IndexAccess { target, index, .. } => {
+                Self::collect_expr_idents(*target, idents, ast);
+                Self::collect_expr_idents(*index, idents, ast);
+            }
+            ExprData::Spawn { body, .. } => {
+                for &s in *body {
+                    Self::collect_stmt_idents(s, idents, ast);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_stmt_idents<'b>(stmt_id: StmtId, idents: &mut HashSet<Spur>, ast: FrozenAst<'b, 'a>) {
+        match ast.get_stmt(stmt_id) {
+            StmtData::Let { init, .. } | StmtData::IsolatedLet { init, .. } => {
+                Self::collect_expr_idents(*init, idents, ast);
+            }
+            StmtData::Assign { target, value, .. } => {
+                Self::collect_expr_idents(*target, idents, ast);
+                Self::collect_expr_idents(*value, idents, ast);
+            }
+            StmtData::For { iter_target, body, .. } => {
+                Self::collect_expr_idents(*iter_target, idents, ast);
+                for &s in *body {
+                    Self::collect_stmt_idents(s, idents, ast);
+                }
+            }
+            StmtData::While { cond, body, .. } => {
+                Self::collect_expr_idents(*cond, idents, ast);
+                for &s in *body {
+                    Self::collect_stmt_idents(s, idents, ast);
+                }
+            }
+            StmtData::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                Self::collect_expr_idents(*cond, idents, ast);
+                for &s in *then_branch {
+                    Self::collect_stmt_idents(s, idents, ast);
+                }
+                if let Some(eb) = else_branch {
+                    for &s in *eb {
+                        Self::collect_stmt_idents(s, idents, ast);
+                    }
+                }
+            }
+            StmtData::Expr(eid) => {
+                Self::collect_expr_idents(*eid, idents, ast);
+            }
+            StmtData::Return { value, .. } => {
+                if let Some(vid) = value {
+                    Self::collect_expr_idents(*vid, idents, ast);
+                }
+            }
         }
     }
 }

@@ -9,7 +9,7 @@ use axon_ast::*;
 use axon_span::ByteSpan;
 use axon_types::{GlobalContext, Type};
 use lasso::{Rodeo, Spur};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct IrBuilder<'a> {
     ctx: &'a GlobalContext,
@@ -21,6 +21,8 @@ pub struct IrBuilder<'a> {
     env: HashMap<Spur, IrVar>,
     next_var_id: u32,
     next_block_id: u32,
+    pub outlined_functions: Vec<IrFunction>,
+    fiber_count: u32,
 }
 
 impl<'a> IrBuilder<'a> {
@@ -44,6 +46,8 @@ impl<'a> IrBuilder<'a> {
             env: HashMap::new(),
             next_var_id: 0,
             next_block_id: 1,
+            outlined_functions: Vec::new(),
+            fiber_count: 0,
         }
     }
 
@@ -854,7 +858,16 @@ impl<'a> IrBuilder<'a> {
                     lowered_args.push(self.lower_expr(arg_expr, ast));
                 }
                 if let Operand::Var(target_var) = target_op {
-                    let dest = self.new_var(Type::Unknown, None);
+                    let dest_ty = if self.interner.resolve(&method) == "join" {
+                        if let Some(Type::Job(inner_ty)) = self.var_types.get(target_var.0 as usize) {
+                            (**inner_ty).clone()
+                        } else {
+                            Type::Unknown
+                        }
+                    } else {
+                        Type::Unknown
+                    };
+                    let dest = self.new_var(dest_ty, None);
                     self.emit(Instruction::Assign {
                         dest,
                         op: IrOp::MethodCall {
@@ -870,21 +883,216 @@ impl<'a> IrBuilder<'a> {
                 }
             }
             ExprData::Spawn { body, span } => {
-                let body_stmts: Vec<StmtId> = body.to_vec();
-                for s in body_stmts {
-                    self.lower_stmt(s, ast);
+                let mut used_idents = Vec::new();
+                for &s in body {
+                    collect_stmt_idents(s, &mut used_idents, ast);
                 }
-                let dest = self.new_var(Type::Unknown, None);
+                let mut local_defs = HashSet::new();
+                collect_locally_defined_idents(body, ast, &mut local_defs);
+
+                let mut captured_vars = Vec::new();
+                for spur in used_idents {
+                    if !local_defs.contains(&spur) {
+                        if let Some(&outer_var) = self.env.get(&spur) {
+                            let var_ty = self.var_types[outer_var.0 as usize].clone();
+                            if !captured_vars.iter().any(|(s, _, _)| *s == spur) {
+                                captured_vars.push((spur, outer_var, var_ty));
+                            }
+                        }
+                    }
+                }
+
+                let fiber_id = self.fiber_count;
+                self.fiber_count += 1;
+                let fiber_name = self
+                    .interner
+                    .get(format!("__axon_fiber_{}", fiber_id))
+                    .unwrap_or_else(|| self.interner.get("spawn_fiber").unwrap_or_default());
+
+                let mut fiber_builder = IrBuilder::new(self.ctx, self.interner);
+                let mut fiber_params = Vec::new();
+                for (name, _outer_var, ty) in &captured_vars {
+                    let param_var = fiber_builder.new_var(ty.clone(), Some(*name));
+                    fiber_params.push(IrParam {
+                        name: *name,
+                        var: param_var,
+                        ty: ty.clone(),
+                        intent: ParamIntent::Isolated,
+                        refinement: None,
+                    });
+                }
+
+                for &s in body {
+                    fiber_builder.lower_stmt(s, ast);
+                }
+
+                let last_block_id = fiber_builder.current_block;
+                let last_b = fiber_builder.blocks.iter_mut().find(|b| b.id == last_block_id).unwrap();
+                if !matches!(last_b.terminator, Terminator::Return { .. }) {
+                    last_b.terminator = Terminator::Return { value: None, span };
+                }
+
+                // Determine return type of body directly from lowered return terminator
+                let mut ret_ty = Type::VOID;
+                for b in &fiber_builder.blocks {
+                    if let Terminator::Return { value: Some(op), .. } = &b.terminator {
+                        match op {
+                            Operand::Var(v) => {
+                                ret_ty = fiber_builder.var_types[v.0 as usize].clone();
+                            }
+                            Operand::Const(IrConst::Int(_)) => ret_ty = Type::I32,
+                            Operand::Const(IrConst::Float(_)) => ret_ty = Type::F32,
+                            Operand::Const(IrConst::Bool(_)) => ret_ty = Type::BOOL,
+                        }
+                    }
+                }
+
+                let mut fiber_func = IrFunction {
+                    name: fiber_name,
+                    params: fiber_params,
+                    ret_type: ret_ty.clone(),
+                    blocks: fiber_builder.blocks,
+                    var_types: fiber_builder.var_types,
+                    var_names: fiber_builder.var_names,
+                };
+
+                crate::liveness::LivenessPass::new(self.ctx).run(&mut fiber_func);
+                crate::reuse::MemoryReusePass::new().run(&mut fiber_func);
+                crate::refinement::RefinementPass::new(self.interner).run(&mut fiber_func);
+
+                self.outlined_functions.push(fiber_func);
+
+                let mut spawn_args = Vec::new();
+                for (_, outer_var, _) in captured_vars {
+                    spawn_args.push(Operand::Var(outer_var));
+                }
+
+                let job_dest = self.new_var(Type::Job(Box::new(ret_ty)), None);
                 self.emit(Instruction::Assign {
-                    dest,
+                    dest: job_dest,
                     op: IrOp::Spawn {
-                        func_name: self.interner.get("spawn_fiber").unwrap_or_default(),
-                        args: Vec::new(),
+                        func_name: fiber_name,
+                        args: spawn_args,
                     },
                     span,
                 });
-                Operand::Var(dest)
+                Operand::Var(job_dest)
             }
+        }
+    }
+}
+
+fn collect_expr_idents(eid: ExprId, idents: &mut Vec<Spur>, ast: FrozenAst<'_, '_>) {
+    match ast.get_expr(eid) {
+        ExprData::Ident(s, _) => {
+            if !idents.contains(s) {
+                idents.push(*s);
+            }
+        }
+        ExprData::Binary { left, right, .. } => {
+            collect_expr_idents(*left, idents, ast);
+            collect_expr_idents(*right, idents, ast);
+        }
+        ExprData::Call { args, .. } => {
+            for (_, arg_id) in *args {
+                collect_expr_idents(*arg_id, idents, ast);
+            }
+        }
+        ExprData::MethodCall { target, args, .. } => {
+            collect_expr_idents(*target, idents, ast);
+            for arg_id in *args {
+                collect_expr_idents(*arg_id, idents, ast);
+            }
+        }
+        ExprData::StaticMethodCall { args, .. } => {
+            for arg_id in *args {
+                collect_expr_idents(*arg_id, idents, ast);
+            }
+        }
+        ExprData::FieldAccess { target, .. } => {
+            collect_expr_idents(*target, idents, ast);
+        }
+        ExprData::IndexAccess { target, index, .. } => {
+            collect_expr_idents(*target, idents, ast);
+            collect_expr_idents(*index, idents, ast);
+        }
+        ExprData::Spawn { body, .. } => {
+            for &s in *body {
+                collect_stmt_idents(s, idents, ast);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_stmt_idents(sid: StmtId, idents: &mut Vec<Spur>, ast: FrozenAst<'_, '_>) {
+    match ast.get_stmt(sid) {
+        StmtData::Let { init, .. } | StmtData::IsolatedLet { init, .. } => {
+            collect_expr_idents(*init, idents, ast);
+        }
+        StmtData::Assign { target, value, .. } => {
+            collect_expr_idents(*target, idents, ast);
+            collect_expr_idents(*value, idents, ast);
+        }
+        StmtData::For { iter_target, body, .. } => {
+            collect_expr_idents(*iter_target, idents, ast);
+            for &s in *body {
+                collect_stmt_idents(s, idents, ast);
+            }
+        }
+        StmtData::While { cond, body, .. } => {
+            collect_expr_idents(*cond, idents, ast);
+            for &s in *body {
+                collect_stmt_idents(s, idents, ast);
+            }
+        }
+        StmtData::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_expr_idents(*cond, idents, ast);
+            for &s in *then_branch {
+                collect_stmt_idents(s, idents, ast);
+            }
+            if let Some(eb) = else_branch {
+                for &s in *eb {
+                    collect_stmt_idents(s, idents, ast);
+                }
+            }
+        }
+        StmtData::Expr(eid) => {
+            collect_expr_idents(*eid, idents, ast);
+        }
+        StmtData::Return { value, .. } => {
+            if let Some(vid) = value {
+                collect_expr_idents(*vid, idents, ast);
+            }
+        }
+    }
+}
+
+fn collect_locally_defined_idents(body: &[StmtId], ast: FrozenAst<'_, '_>, locals: &mut HashSet<Spur>) {
+    for &sid in body {
+        match ast.get_stmt(sid) {
+            StmtData::Let { name, .. } | StmtData::IsolatedLet { name, .. } => {
+                locals.insert(*name);
+            }
+            StmtData::For { loop_var, body: inner, .. } => {
+                locals.insert(*loop_var);
+                collect_locally_defined_idents(inner, ast, locals);
+            }
+            StmtData::While { body: inner, .. } => {
+                collect_locally_defined_idents(inner, ast, locals);
+            }
+            StmtData::If { then_branch, else_branch, .. } => {
+                collect_locally_defined_idents(then_branch, ast, locals);
+                if let Some(eb) = else_branch {
+                    collect_locally_defined_idents(eb, ast, locals);
+                }
+            }
+            _ => {}
         }
     }
 }

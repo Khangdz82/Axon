@@ -15,6 +15,7 @@ pub enum Type {
     Refined {
         base: Box<Type>,
     },
+    Job(Box<Type>),
     Unknown,
 }
 

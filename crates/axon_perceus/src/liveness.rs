@@ -37,14 +37,30 @@ impl<'a> LivenessPass<'a> {
             returned_vars.insert(*ret_v);
         }
 
-        // Track variables whose ownership was moved into another variable via Copy
+        // Track variables whose ownership was moved into another variable or fiber
         for inst in &block.instructions {
-            if let Instruction::Assign {
-                op: IrOp::Copy(Operand::Var(src)),
-                ..
-            } = inst
-            {
-                moved_vars.insert(*src);
+            match inst {
+                Instruction::Assign {
+                    op: IrOp::Copy(Operand::Var(src)),
+                    ..
+                } => {
+                    moved_vars.insert(*src);
+                }
+                Instruction::Assign {
+                    op: IrOp::Spawn { args, .. },
+                    ..
+                }
+                | Instruction::Eval {
+                    op: IrOp::Spawn { args, .. },
+                    ..
+                } => {
+                    for a in args {
+                        if let Operand::Var(src) = a {
+                            moved_vars.insert(*src);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 

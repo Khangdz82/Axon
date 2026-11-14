@@ -252,7 +252,8 @@ fn test_full_particle_sim_program_m2() {
     let frozen = arena.freeze();
     let (ir_prog, stats) = compile_to_perceus(&prog, frozen, &ctx, &interner);
 
-    assert_eq!(stats.total_functions, 3);
+    assert_eq!(stats.total_functions, 4); // 3 AST functions + 1 outlined fiber function (__axon_fiber_0)
+    assert!(ir_prog.functions.iter().any(|f| interner.resolve(&f.name) == "__axon_fiber_0"));
     assert!(
         stats.elided_bounds_checks >= 2,
         "safe_get and step_physics for-loop should elide bounds checks (got {})",

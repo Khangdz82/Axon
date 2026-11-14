@@ -119,3 +119,14 @@ fn test_fail_08_return_reference() {
         errs
     );
 }
+
+#[test]
+fn test_fail_09_unisolated_capture_spawn() {
+    let src = include_str!("../../../tests/fail_compile/09_unisolated_capture_spawn.ax");
+    let errs = check_source(src).expect_err("Expected failure");
+    assert!(
+        errs.iter().any(|e| e.contains("Linear Isolation Violation")),
+        "Expected linear isolation error, got: {:?}",
+        errs
+    );
+}
