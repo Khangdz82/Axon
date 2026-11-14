@@ -1,1232 +1,536 @@
-# THE AXON PROGRAMMING LANGUAGE (`.ax`): FROM FOUNDATIONS TO SYSTEMS MASTERY
-**Authors:** Axon Systems Engineering Group  
-**Version:** Axon 0.17.0 (Native AI, Tensor Autograd, Zero-Copy & Multi-Hardware FMV)
+# The Official Axon v5.0 Programming Guide (Zero to Systems Mastery)
+
+This guide covers **Axon v5.0 (`.ax`)**: a self-hosted native systems programming language engineered to combine **Python/Go-level readability** with **bare-metal hardware speed**, **kilobyte-scale standalone executables**, and **compile-time memory and capability safety**.
+
+Every code example in this guide uses genuine Axon v5.0 syntax supported directly by `bin/axc.exe` and `bin/axc0.exe`.
 
 ---
 
-## TABLE OF CONTENTS
-- [Chapter 1: Getting Started in 5 Minutes](#chapter-1-getting-started-in-5-minutes)
-- [Chapter 2: Pythonic Zero-Cost Syntax](#chapter-2-pythonic-zero-cost-syntax)
-- [Chapter 3: Data Structures & Pattern Matching](#chapter-3-data-structures--pattern-matching)
-- [Chapter 4: Memory Safety Without Headaches](#chapter-4-memory-safety-without-headaches)
-- [Chapter 5: Hardware Saturation with Table[T] & SIMD](#chapter-5-hardware-saturation-with-tablet--simd)
-- [Chapter 6: Fast & Clean Error Handling](#chapter-6-fast--clean-error-handling)
-- [Chapter 7: Colorless Concurrency & Race-Free Multi-Threading](#chapter-7-colorless-concurrency--race-free-multi-threading)
-- [Chapter 8: C/Python Ecosystem Interop & Optimization](#chapter-8-cpython-ecosystem-interop--optimization)
-- [Chapter 9: 3 Production Capstone Projects](#chapter-9-3-production-capstone-projects)
-- [Chapter 10: High-Performance Native AI, Tensor, Autograd & GPU Computing](#chapter-10-high-performance-native-ai-tensor-autograd--gpu-computing)
+## Table of Contents
+
+1. [Getting Started in 2 Minutes](#chapter-1-getting-started-in-2-minutes)
+2. [Variables, Types & Pythonic Ergonomics](#chapter-2-variables-types--pythonic-ergonomics)
+3. [Functions, Named/Default Parameters & Pipelines `|>`](#chapter-3-functions-nameddefault-parameters--pipelines-)
+4. [Control Flow & Static Bounds Elision `where`](#chapter-4-control-flow--static-bounds-elision-where)
+5. [Zero-Cost Register Error Unions `T ! Error`](#chapter-5-zero-cost-register-error-unions-t--error)
+6. [Structs, Methods `impl` & Stack-Polymorphic Duck Interfaces](#chapter-6-structs-methods-impl--stack-polymorphic-duck-interfaces)
+7. [Exact Fixed-Point Financial Decimals `dec`](#chapter-7-exact-fixed-point-financial-decimals-dec)
+8. [Perceus Static Memory Management & FBIP In-Place Reuse](#chapter-8-perceus-static-memory-management--fbip-in-place-reuse)
+9. [Columnar `Table[T]` SoA & Automatic 256-Bit AVX2 FMA3 SIMD](#chapter-9-columnar-tablet-soa--automatic-256-bit-avx2-fma3-simd)
+10. [Colorless Concurrency `spawn` & Convergent `CRDT` Types](#chapter-10-colorless-concurrency-spawn--convergent-crdt-types)
+11. [Object-Capability Security, Anti-Tamper & AV-Clean Binaries](#chapter-11-object-capability-security-anti-tamper--av-clean-binaries)
+12. [Self-Hosting Internals, Built-In Intrinsics & Error Reference](#chapter-12-self-hosting-internals-built-in-intrinsics--error-reference)
 
 ---
 
-## CHAPTER 1: GETTING STARTED IN 5 MINUTES
+## Chapter 1: Getting Started in 2 Minutes
 
-### 1.1. The Philosophy of Axon
-Axon was created to dismantle the false dichotomy in modern software engineering:
-- **Python:** Elegant, readable, developer-friendly — yet fundamentally slow, memory-inefficient, and burdened by bloated runtime environments (hundreds of megabytes).
-- **C++23 & Rust:** Blazing fast, hardware-sympathetic — yet burdened by cryptic syntax, grueling multi-minute compile times, and exhausting lifetime annotations (`'a`).
+### 1.1. Why Axon?
 
-**Axon unites both worlds:** Readable, concise syntax inspired by Python; performance meeting or beating optimized C++23; tiny standalone executables (< 50 KB); automated CPU/GPU vectorization; and complete mathematical memory safety (0 GC, 0 Memory Leaks, 0 Undefined Behavior).
+Mainstream languages force developers into painful trade-offs:
+- **Python / JavaScript:** Easy to learn, but orders of magnitude slower on compute loops and dependent on 100+ MB runtimes.
+- **Java / Go:** Garbage collection introduces latency spikes, and deployments require either a ~200 MB JRE or multi-megabyte runtime binaries.
+- **C / C++:** Fast and compact, yet vulnerable to buffer overflows, use-after-free bugs, and silent signed integer overflows.
+- **Rust:** Memory-safe, but steepens the learning curve with `'a` lifetime annotations, borrow-checker friction, and slow clean builds.
 
-### 1.2. Zero-Dependency Toolchain
-The `axc` compiler is a 100% self-hosted standalone binary (166 KB) with zero external dependencies. It directly emits native PE32+, ELF64, Mach-O, and WebAssembly SIMD128 binaries.
+**Axon v5.0** eliminates those trade-offs through four architectural pillars:
+1. **Zero-Ceremony Syntax:** Optional semicolons, `and` / `or` / `not` short-circuit logic, zero-heap `f"..."` strings, and named/default arguments.
+2. **Static Perceus Ownership (0 GC, 0 `'a` Lifetimes):** Deterministic `VirtualFree` insertion on every exit path and Functional-But-In-Place (FBIP) zero-syscall memory reuse.
+3. **Columnar `Table[T]` (SoA) + Automatic AVX2 FMA3:** Struct tables automatically split into contiguous columns and lower `for` loops into 4x-unrolled 256-bit `VFMADD231PS` vector instructions.
+4. **~547 KB Self-Hosted Native Toolchain:** Emits `x86_64` machine code and OS-standard `PE32+` binaries (~5.5 KB for basic apps) directly in memory in milliseconds.
 
-Workspace configuration (`axon.toml`):
-```toml
-[package]
-name = "axon_app"
-version = "0.1.0"
-edition = "2026"
+### 1.2. Installation & Your First Program
 
-[compiler]
-opt-level = "release"
-simd = "auto"
-backend = "direct-machine-code"
+On Windows PowerShell:
+
+```powershell
+# Install axc.exe to ~/.axon/bin and add it to PATH
+.\install.ps1
+
+# Verify compiler version
+.\bin\axc.exe version
 ```
 
-### 1.3. Your First Program (`main.ax`)
-```axon
-fn main() -> i32 {
-    let greeting = "Hello, Axon 2026!";
-    let status = 0;
-    return status;
-}
-```
-
-Compile and execute instantly (< 1 ms):
-```bash
-axc run main.ax
-```
-
----
-
-## CHAPTER 2: PYTHONIC ZERO-COST SYNTAX
-
-### 2.1. Variable Bindings: Immutable by Default
-Bindings created with `let` are strictly immutable. Mutable state requires the explicit `mut` keyword:
+Create `examples/hello.ax`:
 
 ```axon
+fn greet(name: str, role: str = "Systems Engineer") {
+    println(f"Hello, {name}! Welcome to Axon v5.0 ({role}).")
+}
+
+@shield
 fn main() -> i32 {
-    let max_connections = 1000;
-    let mut active_connections = 0;
-    active_connections += 1;
-    if active_connections <= max_connections {
-        return 0;
-    }
-    return 1;
+    greet("World")
+    greet("Khang", role = "Language Architect")
+    return 0
 }
 ```
 
-### 2.2. Natural Boolean Logic (`and`, `or`, `not`)
-Axon discards legacy C-style noise (`&&`, `||`, `!`). Logic expressions read cleanly as natural English:
+Type-check and compile it into a standalone native executable:
 
-```axon
-fn is_authorized(user_role: i32, is_active: i32, is_locked: i32) -> i32 {
-    if user_role >= 2 and is_active == 1 and not (is_locked == 1) {
-        return 1;
-    }
-    return 0;
-}
+```powershell
+# Verify types, Perceus ownership, and capability rules (~1 ms)
+.\bin\axc.exe check examples/hello.ax
 
-fn main() -> i32 {
-    let auth = is_authorized(3, 1, 0);
-    if auth == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 2.3. Default & Named Function Arguments
-Self-documenting APIs with default parameters and explicit named arguments:
-
-```axon
-struct ClientOptions {
-    host_port: i32,
-    timeout_ms: i32,
-    retry_count: i32,
-}
-
-fn make_options(port: i32, timeout_ms: i32, retries: i32) -> ClientOptions {
-    return ClientOptions(port, timeout_ms, retries);
-}
-
-fn main() -> i32 {
-    let opts = make_options(443, 3000, 5);
-    if opts.host_port == 443 and opts.timeout_ms == 3000 {
-        return 0;
-    }
-    return 1;
-}
+# Build a standalone ~5.5 KB native PE32+ executable
+.\bin\axc.exe build examples/hello.ax -o bin/hello.exe
+.\bin\hello.exe
 ```
 
 ---
 
-## CHAPTER 3: DATA STRUCTURES & PATTERN MATCHING
+## Chapter 2: Variables, Types & Pythonic Ergonomics
 
-### 3.1. Flat Structs & Tuple Unpacking
-Axon structs guarantee cache-line contiguous layout with zero abstraction penalty:
+### 2.1. Immutable by Default (`:=`) and Explicit Mutability (`mut`)
+
+Bindings declared with `:=` (or `let`) are **immutable by default**. Add `mut` when a variable needs to change:
 
 ```axon
-struct BoundingBox {
-    min_x: f32,
-    min_y: f32,
-    max_x: f32,
-    max_y: f32,
-}
-
-fn compute_dimensions() -> (f32, f32) {
-    let width: f32 = 1920.0;
-    let height: f32 = 1080.0;
-    return (width, height);
-}
-
 fn main() -> i32 {
-    let bbox = BoundingBox(0.0, 0.0, 1920.0, 1080.0);
-    let dims = compute_dimensions();
-    let w = dims.0;
-    let h = dims.1;
-    
-    if bbox.max_x == w and bbox.max_y == h {
-        return 0;
-    }
-    return 1;
+    limit := 100              // Immutable (inferred i64)
+    let ratio: f64 = 3.5      // Explicit type annotation
+    mut counter := 0          // Mutable binding
+
+    counter += 10
+    println(f"limit={limit}, ratio={ratio}, counter={counter}")
+    return 0
 }
+```
+
+Reassigning an immutable variable or parameter is caught at compile time with **`[SAFETY ERROR E0301]`**.
+
+### 2.2. Primitive Types
+
+| Type | Representation | Literal Examples | Notes |
+| :--- | :--- | :--- | :--- |
+| `i64`, `int`, `usize` | 64-bit signed integer | `42`, `0xFF00` | Default register-sized integer |
+| `i32` | 32-bit integer | `0` | Standard OS exit code for `fn main() -> i32` |
+| `u8`, `byte` | 8-bit byte | `65` | Binary buffers and byte parsing |
+| `f64`, `float` | 64-bit IEEE-754 float | `3.14159` | Default floating-point scalar |
+| `f32` | 32-bit IEEE-754 float | `1.5` | Ideal for `Table[T]` SIMD columns (8 lanes per YMM register) |
+| `dec` | 64-bit scaled decimal | `49.50d`, `0.08d` | Exact 4-decimal fixed-point (scale `10_000`), zero rounding drift |
+| `bool` | Boolean value | `true`, `false` | Short-circuit `and`, `or`, `not` |
+| `str` | UTF-8 string slice (`ptr + len`) | `"Axon"`, `f"x={x}"` | O(1) length, bounds-safe indexing |
+
+### 2.3. Short-Circuit Booleans & Checked vs. Wrapping Arithmetic
+
+- **Short-circuit `and` / `or`:** `i < n and str_byte(s, i) == 65` never evaluates the right-hand side when `i < n` is false.
+- **Hardware Overflow Protection:** Under `@shield`, `+`, `-`, and `*` trap on signed CPU overflow (`JO`), while `/` and `%` always guard against division by zero and `INT64_MIN / -1`.
+- **Explicit Wrapping Operators (`+%`, `-%`, `*%`):** Cryptographic hashes and PRNGs opt into two's-complement modular wraparound explicitly:
+
+```axon
+mut hash := 0xcbf29ce484222325
+hash = (hash ^ byte_val) *% 0x100000001b3
 ```
 
 ---
 
-## CHAPTER 4: MEMORY SAFETY WITHOUT HEADACHES
+## Chapter 3: Functions, Named/Default Parameters & Pipelines `|>`
 
-### 4.1. C++ Speed Without Garbage Collection or Borrow Lifetimes
-Traditional languages force painful compromises:
-- **Garbage Collection (Java, Go, C#):** Stop-The-World latency spikes, 3x–5x RAM overhead.
-- **Borrow Checker (Rust):** Lifetime annotations (`'a`, `'b`) impose significant cognitive friction.
+### 3.1. Default Parameters & Named Arguments
 
-Axon achieves memory safety and maximum performance through **Local Reasoning** and **Perceus FBIP (Functional But In-Place)** reuse:
-1. **Value Semantics:** Data is passed by value or safe temporary borrowed reference.
-2. **Second-Class References:** References cannot be stored in structs or returned from functions. The compiler verifies safety locally per-function in parallel (< 1 ms).
-3. **In-Place Reuse:** When a dead object of size $N$ is replaced by a new object of size $N$, Axon overwrites the allocation in-place — **zero malloc, zero free**.
+Write clean, self-documenting APIs without method overloading or verbose builder structs:
 
 ```axon
-struct FrameBuffer {
-    buffer_id: i64,
-    size_bytes: i32,
-}
-
-fn advance_frame(fb: FrameBuffer) -> FrameBuffer {
-    // Perceus reuses fb memory in-place without heap reallocation
-    return FrameBuffer(fb.buffer_id + 1, fb.size_bytes);
+fn compute_score(base: i64, bonus: i64 = 10, multiplier: i64 = 2) -> i64 {
+    return (base + bonus) * multiplier
 }
 
 fn main() -> i32 {
-    let b1 = FrameBuffer(1, 1920000);
-    let b2 = advance_frame(b1);
-    if b2.buffer_id == 2 and b2.size_bytes == 1920000 {
-        return 0;
-    }
-    return 1;
+    s1 := compute_score(50)                               // (50 + 10) * 2 = 120
+    s2 := compute_score(50, multiplier = 5)               // (50 + 10) * 5 = 300
+    s3 := compute_score(bonus = 20, base = 30)            // (30 + 20) * 2 = 100
+    println(f"s1={s1}, s2={s2}, s3={s3}")
+    return 0
+}
+```
+
+### 3.2. In-Place `mut` Parameters & Tuple Destructuring
+
+- Declare `mut x: i64` on a parameter (and pass `mut val` at the call site) for safe copy-in/write-back mutation without raw pointers.
+- Return multiple values cleanly with tuples and destructuring bindings:
+
+```axon
+fn div_rem(a: i64, b: i64) -> (i64, i64) {
+    return (a / b, a % b)
+}
+
+fn bump_twice(mut v: i64, step: i64) {
+    v += step * 2
+}
+
+fn main() -> i32 {
+    (q, r) := div_rem(29, 5)
+    mut total := q
+    bump_twice(mut total, r)
+    println(f"q={q}, r={r}, total={total}")
+    return 0
+}
+```
+
+### 3.3. The Pipeline Operator `|>`
+
+`x |> f(a, b)` desugars at compile time into `f(x, a, b)` with zero runtime overhead:
+
+```axon
+fn add_offset(x: i64, off: i64) -> i64 { return x + off }
+fn scale_up(x: i64, k: i64) -> i64 { return x * k }
+
+fn main() -> i32 {
+    result := 10 |> add_offset(5) |> scale_up(4)   // 60
+    println(f"piped={result}")
+    return 0
 }
 ```
 
 ---
 
-## CHAPTER 5: HARDWARE SATURATION WITH TABLE[T] & SIMD
+## Chapter 4: Control Flow & Static Bounds Elision `where`
 
-### 5.1. Why `Table[T]` Outperforms Conventional Arrays
-Traditional Array-of-Structures (AoS) pollutes CPU cache lines with unused struct fields. 
-
-Axon's primary collection is **`Table[T]`** (Native Structure-of-Arrays - SoA). Fields are unzipped into 64-byte aligned contiguous columns. The compiler automatically applies vector SIMD instructions (AVX2 / AVX-512 / NEON) processing 8 to 16 elements per clock cycle:
+### 4.1. `if / else if / else`, `while`, and `for .. in`
 
 ```axon
-struct KineticParticle {
-    x: f32,
-    y: f32,
-    vx: f32,
-    vy: f32,
-}
-
-fn simulate_kinetics(count: i32, dt: f32) -> f32 {
-    let mut total_x: f32 = 0.0;
-    let mut i = 0;
-    while i < count {
-        let vx: f32 = 1.25;
-        let dx = vx * dt;
-        total_x = total_x + dx;
-        i += 1;
-    }
-    return total_x;
-}
-
 fn main() -> i32 {
-    let result = simulate_kinetics(1000, 0.016);
-    if result > 0.0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-
-## CHAPTER 6: FAST & CLEAN ERROR HANDLING
-
-### 6.1. Dual-Register Zero-Cost Error Unions (`T ! Error`)
-Axon returns errors directly in hardware CPU registers (`RAX` + `RDX`), completely eliminating exception stack-unwinding overhead:
-
-```axon
-struct StreamStatus {
-    bytes_transferred: i32,
-    status_code: i32,
-}
-
-fn transfer_packets(packet_count: i32) -> StreamStatus {
-    if packet_count < 0 {
-        return StreamStatus(0, 500); // Error
-    }
-    return StreamStatus(packet_count * 64, 0); // OK
-}
-
-fn main() -> i32 {
-    let res = transfer_packets(100);
-    if res.status_code == 0 and res.bytes_transferred == 6400 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 6.2. Scoped Deterministic Resource Management with `with`
-The `with` statement ensures deterministic destruction of files, sockets, and memory handles immediately at block scope exit `{}`:
-
-```axon
-struct FileHandle {
-    fd: i32,
-    is_open: i32,
-}
-
-fn open_log_file(fd: i32) -> FileHandle {
-    return FileHandle(fd, 1);
-}
-
-fn close_log_file(mut file: FileHandle) -> i32 {
-    file.is_open = 0;
-    return 0;
-}
-
-fn main() -> i32 {
-    let mut log = open_log_file(3);
-    let valid = if log.is_open == 1 { 1 } else { 0 };
-    close_log_file(mut log);
-    if valid == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-
-## CHAPTER 7: COLORLESS CONCURRENCY & RACE-FREE MULTI-THREADING
-
-### 7.1. Work-Stealing Fibers & The `isolated` Guarantee
-Axon rejects function coloring (`async`/`await`). Concurrency is managed by a lock-free work-stealing fiber runtime.
-
-To eliminate data races mathematically, Axon enforces the `isolated` boundary: moving data across concurrency domains transfers full ownership, preventing shared mutable state:
-
-```axon
-struct JobResult {
-    job_id: i64,
-    checksum: i64,
-}
-
-fn execute_parallel_job(id: i64, iterations: i32) -> JobResult {
-    let mut sum: i64 = 0;
-    let mut i = 0;
-    while i < iterations {
-        sum += (i as i64);
-        i += 1;
-    }
-    return JobResult(id, sum);
-}
-
-fn main() -> i32 {
-    let job = execute_parallel_job(101, 500);
-    if job.job_id == 101 and job.checksum > 0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-
-## CHAPTER 8: C/PYTHON ECOSYSTEM INTEROP & OPTIMIZATION
-
-### 8.1. Native C Header Auto-Import (`import c`)
-Axon parses C headers directly without intermediate binding glue:
-
-```axon
-struct NativeSqliteBridge {
-    db_handle: i64,
-    initialized: i32,
-}
-
-fn init_sqlite_runtime() -> NativeSqliteBridge {
-    return NativeSqliteBridge(12345678, 1);
-}
-
-fn main() -> i32 {
-    let bridge = init_sqlite_runtime();
-    if bridge.initialized == 1 and bridge.db_handle > 0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 8.2. Ultra-Light Packaging (`axc build --ultra`)
-Deploy production microservices in less than **50 KB**:
-```bash
-axc build --ultra server.ax -o server.exe
-```
-Deduplicates read-only data, strips unneeded symbols, and aligns PE/ELF headers for instantaneous cold starts (< 2 µs).
-
----
-
-## CHAPTER 9: 3 PRODUCTION CAPSTONE PROJECTS
-
-### 9.1. Project 1: High-Speed Text Search Engine
-```axon
-struct FastSearchReport {
-    matches: i32,
-    total_scanned: i32,
-}
-
-fn search_text_tokens(token_count: i32, target_mask: i64) -> FastSearchReport {
-    let mut match_count = 0;
-    let mut i = 0;
-    while i < token_count {
-        let token_hash = ((i as i64) * 1103515245) & 511;
-        if token_hash == target_mask {
-            match_count += 1;
+    mut sum := 0
+    for i in 0..10 {
+        if i % 2 == 0 {
+            sum += i
         }
-        i += 1;
     }
-    return FastSearchReport(match_count, token_count);
-}
 
-fn main() -> i32 {
-    let report = search_text_tokens(50000, 128);
-    if report.total_scanned == 50000 and report.matches > 0 {
-        return 0;
+    mut n := 5
+    while n > 0 {
+        n -= 1
     }
-    return 1;
+    println(f"even_sum={sum}")
+    return 0
 }
 ```
 
-### 9.2. Project 2: High-Performance JSON REST API Server
+### 4.2. Zero-Cost Bounds Check Elision with `where`
+
+Every `table[idx]` access in Axon is bounds-checked by default. When a hot function proves `idx < arr.len` in its parameter refinement clause (or iterates via `for idx in 0..arr.len`), the code generator elides the redundant runtime `CMP + JAE` instructions while preserving 100% memory safety:
+
 ```axon
-struct HttpEndpointResult {
-    http_status: i32,
-    body_length: i32,
-    latency_ns: i32,
-}
-
-fn dispatch_api_call(route_id: i32, req_id: i64) -> HttpEndpointResult {
-    if route_id == 1 {
-        // GET /healthz
-        return HttpEndpointResult(200, 24, 12);
-    }
-    return HttpEndpointResult(404, 0, 5);
-}
-
-fn main() -> i32 {
-    let res = dispatch_api_call(1, 4242);
-    if res.http_status == 200 and res.body_length == 24 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 9.3. Project 3: Multi-Core Physics Simulation Engine
-```axon
-struct PhysicsSimulationMetrics {
-    bodies_simulated: i32,
-    momentum_verified: i32,
-}
-
-fn run_physics_swarm_step(body_count: i32, cycles: i32) -> PhysicsSimulationMetrics {
-    let mut momentum: i64 = 5000;
-    let mut c = 0;
-    while c < cycles {
-        momentum = (momentum + (body_count as i64)) - (body_count as i64);
-        c += 1;
-    }
-    return PhysicsSimulationMetrics(body_count, momentum as i32);
-}
-
-fn main() -> i32 {
-    let sim = run_physics_swarm_step(100000, 50);
-    if sim.bodies_simulated == 100000 and sim.momentum_verified == 5000 {
-        return 0;
-    }
-    return 1;
+fn read_checked(arr: Table[i64], idx: usize where idx < arr.len) -> i64 {
+    return arr[idx]   // Statically proven in-bounds -> zero bounds-check overhead
 }
 ```
 
 ---
 
-## CHAPTER 10: HIGH-PERFORMANCE NATIVE AI, TENSOR, AUTOGRAD & GPU COMPUTING
+## Chapter 5: Zero-Cost Register Error Unions `T ! Error`
 
-### 10.1. Compile-Time Shape-Verified `Tensor[DType, Shape...]`
-Axon embeds multidimensional tensors directly into the type system. Matrix dimension mismatches are eliminated statically at compile time with 0 ms runtime penalty:
+Instead of heap-allocated exceptions or repetitive error-tuple boilerplate, Axon provides unboxed **`PayloadType ! ErrorType`** unions:
+
+- Construct values with `ok(value)` and `err(code)`.
+- Handle errors concisely with:
+  1. **`expr or fallback_expr`**: Evaluates `fallback_expr` only when `expr` is an error.
+  2. **`expr or return ret_val`**: Returns early from the enclosing function on error.
+  3. **`expr?`**: Propagates the error directly to the caller.
 
 ```axon
-struct LayerShapeMetadata {
-    batch: i64,
-    in_features: i64,
-    out_features: i64,
-    is_valid: i32,
+fn parse_port(raw: i64) -> i64 ! i64 {
+    if raw <= 0 or raw > 65535 {
+        return err(400)
+    }
+    return ok(raw)
 }
 
-fn verify_dense_projection(b: i64, in_dim: i64, weight_in: i64, out_dim: i64) -> LayerShapeMetadata {
-    // Compile-time assertion: inner dimensions must match
-    if in_dim == weight_in {
-        return LayerShapeMetadata(b, in_dim, out_dim, 1);
-    }
-    return LayerShapeMetadata(b, in_dim, out_dim, 0);
+fn open_service(raw_port: i64) -> i64 ! i64 {
+    port := parse_port(raw_port)?     // Propagates err(400) on failure
+    return ok(port + 1000)
 }
 
 fn main() -> i32 {
-    let proj = verify_dense_projection(16, 768, 768, 3072);
-    if proj.is_valid == 1 and proj.out_features == 3072 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 10.2. Reverse-Mode Autodiff with Native `@grad`
-Axon performs automatic differentiation at the compiler IR level. Neural network backward passes execute with Perceus in-place buffer reuse, eliminating dynamic graph creation and achieving zero heap allocations during training:
-
-```axon
-struct LinearNeuronStep {
-    loss: f32,
-    weight_gradient: f32,
-    converged: i32,
-}
-
-fn compute_autograd_step(x: f32, weight: f32, label: f32) -> LinearNeuronStep {
-    let pred = x * weight;
-    let delta = pred - label;
-    let loss = delta * delta;
-    
-    // IR-synthesized backward derivative: dLoss/dWeight = 2 * delta * x
-    let grad = 2.0 * delta * x;
-    let is_converged = if loss < 0.05 { 1 } else { 0 };
-    
-    return LinearNeuronStep(loss, grad, is_converged);
-}
-
-fn main() -> i32 {
-    let step = compute_autograd_step(2.0, 1.98, 4.0);
-    if step.loss < 0.05 and step.converged == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 10.3. Sub-Millisecond Multi-Gigabyte Model Loading with `MmapView`
-Using the `@zero_copy` layout guarantee, Axon maps `.safetensors` or `.gguf` weights directly into the process's virtual address space via OS memory mapping:
-
-```axon
-struct LargeWeightsDescriptor {
-    virtual_address: i64,
-    total_bytes: i64,
-    load_time_us: i32,
-}
-
-fn map_large_weights(file_id: i64, bytes_len: i64) -> LargeWeightsDescriptor {
-    // Zero-copy virtual memory mapping: loads 2 GB in < 0.5 ms
-    let addr = 140737488355328 + file_id;
-    return LargeWeightsDescriptor(addr, bytes_len, 420);
-}
-
-fn main() -> i32 {
-    let weights = map_large_weights(202, 2147483648);
-    if weights.load_time_us < 1000 and weights.total_bytes == 2147483648 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 10.4. Zero-Copy Tensor Export to Python/PyTorch (`@py_export`)
-Axon modules can compile to native Python C-extensions (`.pyd` on Windows, `.so` on Linux), exposing `Tensor` buffers to NumPy and PyTorch without copying memory:
-
-```axon
-struct PyTorchSharedTensor {
-    memory_pointer: i64,
-    dimension_0: i64,
-    dimension_1: i64,
-    is_zero_copy: i32,
-}
-
-fn export_shared_tensor(addr: i64, rows: i64, cols: i64) -> PyTorchSharedTensor {
-    // Shares native Axon buffer through Python Array Buffer Protocol
-    return PyTorchSharedTensor(addr, rows, cols, 1);
-}
-
-fn main() -> i32 {
-    let bridge = export_shared_tensor(60001000, 2048, 2048);
-    if bridge.is_zero_copy == 1 and bridge.dimension_0 == 2048 {
-        return 0;
-    }
-    return 1;
+    p_valid := parse_port(8080) or 80
+    p_fallback := parse_port(-5) or 3000
+    svc := open_service(443) or 0
+    println(f"valid={p_valid}, fallback={p_fallback}, svc={svc}")
+    return 0
 }
 ```
 
 ---
 
-## CHAPTER 11: ANTI-REVERSE ENGINEERING, SEALED AI MODELS & BARE-METAL HARDWARE ACCELERATION
+## Chapter 6: Structs, Methods `impl` & Stack-Polymorphic Duck Interfaces
 
-When deploying commercial software or proprietary AI weights to edge devices and client machines, protecting intellectual property against cracking, tampering, and disassembly is critical—without sacrificing raw physical silicon speed.
+### 6.1. Flat Value Structs & `impl` Blocks
 
-### 11.1. Proprietary Algorithm Protection with `@shield`
-The `@shield` attribute applies compile-time Control-Flow Flattening, Opaque Predicates, and Hardware Anti-Debugging. When dynamic analysis or debugger single-stepping is detected, Axon executes Silent Poisoning—corrupting internal cryptographic state rather than triggering a conspicuous crash:
+Axon structs live unboxed on the stack with zero object-header overhead, and support both positional and named-field construction:
 
 ```axon
-struct ShieldLicenseContext {
-    license_key: i64,
-    execution_state: i32,
-    hardware_dbg_flag: i32,
-    is_authorized: i32,
+struct CloudPlan {
+    monthly: dec
+    nodes: i64
 }
 
-fn verify_client_license(key: i64, dbg_active: i32) -> ShieldLicenseContext {
-    // Silent poisoning: shifts and mutates key when debugger is present
-    let effective_key = if dbg_active == 1 { key ^ -2401053088876216593 } else { key };
-    let authorized = if effective_key == 987654321 { 1 } else { 0 };
-    return ShieldLicenseContext(effective_key, 205, dbg_active, authorized);
-}
-
-fn main() -> i32 {
-    let lic = verify_client_license(987654321, 0);
-    if lic.is_authorized == 1 and lic.hardware_dbg_flag == 0 {
-        return 0;
+impl CloudPlan {
+    fn subtotal(self) -> dec {
+        return self.monthly * self.nodes
     }
-    return 1;
 }
 ```
 
-### 11.2. In-Register Compile-Time Secret Encryption (`@secret`)
-Credentials, tokens, and encryption keys marked with `@secret` are encrypted with an ephemeral key during compilation. They are decrypted directly inside CPU registers (`RAX`/`RDX`) at runtime and immediately zeroed from memory:
+### 6.2. Structural Duck-Typed `interface` (Zero Heap Boxing)
+
+Any `struct` implementing the required method signatures satisfies an `interface` automatically without `implements` declarations. Unlike Go or Java interfaces that box values onto the GC heap, Axon packs a concrete type tag + inline value slots directly on the stack:
 
 ```axon
-struct SecretTokenContext {
-    register_value: i64,
-    memory_wiped: i32,
+use std::decimal
+
+interface Billable {
+    fn total_cost(self) -> dec
 }
 
-fn fetch_runtime_api_token(ciphertext: i64, key: i64) -> SecretTokenContext {
-    // In-register decryption thunk: never exists in .rodata as plaintext
-    let plaintext = ciphertext ^ ((key *% 6364136223846793005) ^ -49064778989728563);
-    let wiped = 1; // Volatile zeroing
-    return SecretTokenContext(plaintext, wiped);
+struct DedicatedNode {
+    unit_price: dec
+    count: i64
+}
+
+impl DedicatedNode {
+    fn total_cost(self) -> dec {
+        return apply_tax(self.unit_price * self.count, rate_pct = 0.10d)
+    }
+}
+
+fn print_invoice(item: Billable) {
+    println(f"Invoice total: ${item.total_cost()}")
 }
 
 fn main() -> i32 {
-    let expected: i64 = 9988776655;
-    let key: i64 = 1234567890;
-    let cipher = expected ^ ((key *% 6364136223846793005) ^ -49064778989728563);
-    let sec = fetch_runtime_api_token(cipher, key);
-    if sec.register_value == expected and sec.memory_wiped == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 11.3. Sealed AI Weights Decryption with Hardware AES-NI (`.axsec`)
-Using `axc seal model.axbin --key=...`, proprietary models are packaged into `.axsec` containers. The runtime streams weights directly into L2 Cache / SIMD registers via hardware AES-NI or ARMv8 CE at speeds exceeding 18 GB/s:
-
-```axon
-struct SealedModelView {
-    container_magic: i64,
-    total_blocks: i32,
-    bandwidth_gb_s: f32,
-}
-
-fn stream_sealed_model(blocks: i32) -> SealedModelView {
-    // 4708605273752670257 = 'AXSEC-01'
-    return SealedModelView(4708605273752670257, blocks, 18.42);
-}
-
-fn main() -> i32 {
-    let view = stream_sealed_model(2048);
-    if view.container_magic == 4708605273752670257 and view.bandwidth_gb_s > 15.0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 11.4. Safe Inline Assembly with Clobber Verification (`asm!`)
-When specialized silicon intrinsics (RDTSC, CPUID, VNNI) are required, `asm!` provides clean assembly integration with strict compiler clobber validation:
-
-```axon
-struct AsmCycleReading {
-    cycles_elapsed: i64,
-    clobbers_verified: i32,
-}
-
-fn sample_cpu_cycles() -> AsmCycleReading {
-    // asm! { "rdtsc" : "=a"(eax), "=d"(edx) : : "rax", "rdx" }
-    let measured_cycles: i64 = 1420;
-    return AsmCycleReading(measured_cycles, 1);
-}
-
-fn main() -> i32 {
-    let reading = sample_cpu_cycles();
-    if reading.clobbers_verified == 1 and reading.cycles_elapsed > 0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 11.5. Single-File Zero-Dependency Packaging (`axc bundle`)
-With `axc bundle app.ax --seal-assets=models/ --ultra`, the entire binary, sealed AI models, and static assets merge into a Single-File Executable. End users run the self-contained binary in 1 click without installing Python, CUDA, or extracting archives:
-
-```axon
-struct StandaloneBundleReport {
-    binary_size_kb: i32,
-    sealed_models: i32,
-    zero_dependencies: i32,
-}
-
-fn inspect_standalone_bundle() -> StandaloneBundleReport {
-    // Single-file distribution combining machine code + sealed AI weights
-    return StandaloneBundleReport(112, 1, 1);
-}
-
-fn main() -> i32 {
-    let rep = inspect_standalone_bundle();
-    if rep.zero_dependencies == 1 and rep.sealed_models == 1 {
-        return 0;
-    }
-    return 1;
+    srv := DedicatedNode(unit_price = 100.00d, count = 2)
+    print_invoice(srv)   // $220.00 with 0 heap allocations
+    return 0
 }
 ```
 
 ---
 
-## CHAPTER 12: OS-TRUSTED SECURITY, CODE SIGNING & ANTIVIRUS-CLEAN PROTECTION
+## Chapter 7: Exact Fixed-Point Financial Decimals `dec`
 
-True production security avoids crude obfuscation tricks (packers/crypters) that trigger heuristic false-positives across Windows Defender, CrowdStrike, and SentinelOne. Axon architects binary safety using legitimate OS-native constructs: low Shannon entropy, valid stack unwind directories, formal code signing, and white-box algebraic cryptography.
+Binary floating-point (`0.1 + 0.2 == 0.30000000000000004`) silently corrupts financial ledgers, tax calculations, and billing engines.
 
-### 12.1. Clean Resource Layout with `.axpak` Containers
-To prevent false-positive heuristic detection, Axon segregates encrypted weights and large media assets into an external `Axon Resource Pack (.axpak)` container. Executable `.text` segments maintain low entropy (`< 6.6`), while `.axpak` files are aligned to 4096-byte boundaries for direct OS `mmap`:
-
-```axon
-struct AxpakCleanReport {
-    code_entropy_x100: i32,
-    offset_page_aligned: i32,
-    is_edr_clean: i32,
-}
-
-fn verify_binary_hygiene(text_entropy: i32, file_offset: i64) -> AxpakCleanReport {
-    // .text entropy must remain below 6.60; container offsets must align to 4096 bytes
-    let entropy_ok = if text_entropy < 660 { 1 } else { 0 };
-    let align_ok = if (file_offset % 4096) == 0 { 1 } else { 0 };
-    let clean = if entropy_ok == 1 and align_ok == 1 { 1 } else { 0 };
-    return AxpakCleanReport(text_entropy, align_ok, clean);
-}
-
-fn main() -> i32 {
-    let check = verify_binary_hygiene(582, 8192);
-    if check.is_edr_clean == 1 and check.offset_page_aligned == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 12.2. Integrated Digital Code Signing (`axc sign`) & SBOM
-Axon features built-in signing engines: Authenticode PKCS#7 for Windows `.exe`, Apple Code Signature for macOS Mach-O, and Ed25519 for Linux ELF, accompanied by embedded SPDX/CycloneDX SBOM metadata:
+Axon provides a first-class **`dec`** primitive (literal suffix `d`, scale `10_000`) backed by 64-bit hardware integer registers with signed overflow protection:
 
 ```axon
-struct BinarySigningState {
-    has_authenticode: i32,
-    has_sbom: i32,
-    os_trusted: i32,
-}
-
-fn query_signing_state(target_os_id: i32) -> BinarySigningState {
-    return BinarySigningState(1, 1, 1);
-}
+use std::decimal
 
 fn main() -> i32 {
-    let sig = query_signing_state(1);
-    if sig.has_authenticode == 1 and sig.os_trusted == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
+    a := 0.10d
+    b := 0.20d
+    exact_sum := a + b                                // Exact 0.30d in 1 CPU cycle
 
-### 12.3. White-Box Cryptography (`@whitebox`)
-Replacing crude anti-debug hooks that trip EDR heuristics, `@whitebox` decomposes secrets into randomized dual-affine lookup tables generated during compilation. Attackers dumping RAM observe zero contiguous keys:
+    total := apply_tax(199.99d, rate_pct = 0.08d)     // 8% tax
+    (share, remainder) := split_exact_cents(100.00d, 3)
 
-```axon
-struct WhiteBoxSecurityStatus {
-    token_verified: i32,
-    contiguous_keys_found: i32,
-}
-
-fn verify_whitebox_token(input_byte: i32, mask: i32) -> WhiteBoxSecurityStatus {
-    let sbox = (input_byte ^ mask) *% 127 +% 1;
-    let ok = if (sbox & 255) > 0 { 1 } else { 0 };
-    return WhiteBoxSecurityStatus(ok, 0);
-}
-
-fn main() -> i32 {
-    let status = verify_whitebox_token(42, 17);
-    if status.token_verified == 1 and status.contiguous_keys_found == 0 {
-        return 0;
-    }
-    return 1;
+    println(f"0.10d + 0.20d = {exact_sum}")
+    println(f"Taxed = {total}, 3-way split = {share} (rem = {remainder})")
+    return 0
 }
 ```
 
 ---
 
-## CHAPTER 13: LARGE-SCALE AI PRE-TRAINING & HIGH-THROUGHPUT INFERENCE
+## Chapter 8: Perceus Static Memory Management & FBIP In-Place Reuse
 
-Axon is purpose-built for massive-scale models: from OCP microscaling formats to dynamic activation rematerialization, Mixture-of-Experts, and zero-copy post-training loops.
+Axon guarantees memory safety **without a Garbage Collector** and **without `'a` lifetime annotations** by combining three compile-time rules:
 
-### 13.1. OCP Microscaling `mxfp4` & Neumaier Compensated Summation
-Operating in 4-bit cuts memory bandwidth by 4x–8x. To prevent floating-point drift, Axon pairs microscaling with vector Neumaier summation, yielding FP32-level convergence precision:
+### 8.1. Second-Class References
+References cannot be stored inside structs (**`E0101`**) and cannot be returned from functions (**`E0102`**). Dangling pointers become structurally impossible without needing lifetime parameters.
+
+### 8.2. Linear `move` Tracking & Deterministic Drops
+Passing a buffer or table with `move` transfers ownership linearly; reading a moved variable afterward is rejected at compile time with **`E0201`** (including branch-aware flow analysis across early-return `if` blocks). Unmoved owned allocations automatically emit deterministic `VirtualFree` cleanup on every return path.
+
+### 8.3. Functional-But-In-Place (FBIP) Memory Reuse
+When an owned buffer is released right before allocating a compatible new buffer, the Perceus planner reuses the existing memory block in place with **zero OS syscalls**:
 
 ```axon
-struct NeumaierFloatVerification {
-    final_sum: f32,
-    is_bit_accurate: i32,
-}
+fn process_batch() -> i64 {
+    buf_a := ibuf_new(256)
+    ibuf_push(buf_a, 40)
+    ibuf_push(buf_a, 60)
+    partial := ibuf_get(buf_a, 0) + ibuf_get(buf_a, 1)
+    buf_free(move buf_a)
 
-fn run_compensated_addition(count: i32, delta: f32) -> NeumaierFloatVerification {
-    let mut sum: f32 = 0.0;
-    let mut comp: f32 = 0.0;
-    let mut i = 0;
-    while i < count {
-        let t = sum + delta;
-        if sum >= delta {
-            comp += (sum - t) + delta;
-        } else {
-            comp += (delta - t) + sum;
-        }
-        sum = t;
-        i += 1;
-    }
-    let total = sum + comp;
-    let diff = if total > 10.0 { total - 10.0 } else { 10.0 - total };
-    let accurate = if diff < 0.0001 { 1 } else { 0 };
-    return NeumaierFloatVerification(total, accurate);
+    // Perceus FBIP reuses buf_a's backing allocation in place (0 VirtualAlloc syscalls)
+    buf_b := ibuf_new(256)
+    ibuf_push(buf_b, partial + 45)
+    ans := ibuf_get(buf_b, 0)
+    buf_free(move buf_b)
+    return ans
 }
 
 fn main() -> i32 {
-    let res = run_compensated_addition(100000, 0.0001);
-    if res.is_bit_accurate == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 13.2. Saving 70% VRAM via `@grad(memory_budget: auto)` & Fused Optimizers
-When training deep neural networks, `memory_budget: auto` triggers dynamic programming over the E-Graph: recomputing lightweight elementwise activations during the backward pass while AdamW/Muon updates weights in-place:
-
-```axon
-struct RematMemoryReport {
-    vram_saved_percentage: i32,
-    in_place_updated: i32,
-}
-
-fn evaluate_rematerialization_step(total_act: i64, saved_act: i64) -> RematMemoryReport {
-    let pct = ((saved_act * 100) / total_act) as i32;
-    return RematMemoryReport(pct, 1);
-}
-
-fn main() -> i32 {
-    let rep = evaluate_rematerialization_step(1000000000, 680000000);
-    if rep.vram_saved_percentage >= 65 and rep.in_place_updated == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 13.3. Fused MoE Grouped-GEMM & Blelloch Parallel Associative Scan
-Grouped-GEMM eliminates token scatter/gather overhead for Mixture-of-Experts, while the Blelloch Parallel Associative Scan unlocks linear $O(N)$ execution for State-Space Models (Mamba-2):
-
-```axon
-struct AdvancedArchitectureStatus {
-    moe_scatter_gather_allocations: i64,
-    ssm_scan_linear_time: i32,
-}
-
-fn evaluate_advanced_layers(seq_len: i32) -> AdvancedArchitectureStatus {
-    return AdvancedArchitectureStatus(0, 1);
-}
-
-fn main() -> i32 {
-    let s = evaluate_advanced_layers(2048);
-    if s.moe_scatter_gather_allocations == 0 and s.ssm_scan_linear_time == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 13.4. Zero-Copy Post-Training RL / GRPO Loop
-Axon unifies rollout inference and backpropagation in a shared memory view. The complete GRPO loop (generate 64 branches, score rewards, compute advantage, backpropagate) finishes in under 21 ms with zero inter-process copies:
-
-```axon
-struct GrpoCycleMetrics {
-    rollouts_count: i32,
-    mode_switch_latency_us: i32,
-    ipc_overhead_bytes: i64,
-}
-
-fn run_grpo_cycle(group_k: i32) -> GrpoCycleMetrics {
-    // Switches between rollout and trainer in 45 microseconds
-    return GrpoCycleMetrics(group_k, 45, 0);
-}
-
-fn main() -> i32 {
-    let metrics = run_grpo_cycle(64);
-    if metrics.rollouts_count == 64 and metrics.mode_switch_latency_us < 100 and metrics.ipc_overhead_bytes == 0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 13.5. Multi-GPU Cluster Sharding with `@shard`
-Annotating tensors with `@shard` automatically partitions dimensions and emits non-blocking All-Reduce routines pipelined alongside asynchronous RDMA transfers:
-
-```axon
-struct DistributedTensorMesh {
-    local_elements: i64,
-    rdma_pipeline_active: i32,
-}
-
-fn partition_distributed_tensor(global_size: i64, devices: i32) -> DistributedTensorMesh {
-    let local = global_size / (devices as i64);
-    return DistributedTensorMesh(local, 1);
-}
-
-fn main() -> i32 {
-    let d = partition_distributed_tensor(16777216, 8);
-    if d.local_elements == 2097152 and d.rdma_pipeline_active == 1 {
-        return 0;
-    }
-    return 1;
+    println(f"FBIP result = {process_batch()}")
+    return 0
 }
 ```
 
 ---
 
-## CHAPTER 14: MATHEMATICAL PROVER `@prove`, EDGE NPU ACCELERATION & BARE-METAL UNIKERNELS
+## Chapter 9: Columnar `Table[T]` SoA & Automatic 256-Bit AVX2 FMA3 SIMD
 
-Delivering the highest level of physical reliability, Axon provides compile-time formal theorem proving, heterogeneous edge NPU acceleration, sub-3ms Unikernel images, and zero-glitch live function patching.
+This architecture allows idiomatic Axon loops to outperform idiomatic C++, Rust, and Go by **over 6x** and Python by **over 210x** on data-intensive simulations.
 
-### 14.1. Compile-Time Invariant Proofs with `@prove`
-The built-in SMT engine formally proves data invariants and dimensional bounds at compile-time, providing concrete counter-examples upon failure:
+### 9.1. Why AoS Vectors Bottleneck on Memory Bandwidth
+In C++ (`std::vector<Entity>`) or Rust (`Vec<Entity>`), a 16-field `Entity` (64 bytes) interleaves cold fields (`mass`, `armor`, `shield`, `team`) next to hot fields (`px`, `vx`). Updating `px += vx * dt` forces the CPU to stream all 64 bytes per entity across the memory bus, wasting 75% of cache-line bandwidth.
+
+### 9.2. Automatic Structure-of-Arrays + 4x-Unrolled AVX2 FMA3
+When you allocate `Table[Entity]::with_capacity(n)` in Axon:
+1. Every struct field is stored in its own contiguous column (`px[0..n]`, `vx[0..n]`, ...).
+2. `for p in particles { p.px += p.vx * dt }` streams only the active columns and compiles directly to a **4x-unrolled 128-byte (32 x `f32` per iteration) 256-bit AVX2 `VFMADD231PS` hardware loop**:
 
 ```axon
-struct SmtTheoremVerification {
-    proven_valid: i32,
-    counter_example_found: i32,
+struct Particle {
+    px: f32
+    vx: f32
+    py: f32
+    vy: f32
+    mass: f32
+    heat: f32
 }
 
-fn verify_numeric_range(min_val: i64, max_val: i64, test_val: i64) -> SmtTheoremVerification {
-    if test_val >= min_val and test_val <= max_val {
-        return SmtTheoremVerification(1, 0);
-    }
-    return SmtTheoremVerification(0, 1);
-}
-
+@shield
 fn main() -> i32 {
-    let res = verify_numeric_range(0, 1000, 512);
-    if res.proven_valid == 1 and res.counter_example_found == 0 {
-        return 0;
+    n := 4096
+    particles := Table[Particle]::with_capacity(n)
+    table_fill_f32(particles, 0, 1.0)    // column 0 (px) = 1.0
+    table_fill_f32(particles, 1, 3.5)    // column 1 (vx) = 3.5
+
+    dt := 2.0
+    for p in particles {
+        p.px += p.vx * dt                // Emits 4x-unrolled 256-bit AVX2 VFMADD231PS
     }
-    return 1;
+
+    sample := table_get_f32(particles, 0, n - 1)
+    println(f"Updated {n} particles via AVX2 SoA: px[{n - 1}] = {sample}")
+    return 0
 }
 ```
 
-### 14.2. Heterogeneous Matrix Cores & Edge NPU Lowering (`@npu`)
-Axon emits native Intel AMX, NVIDIA MMA, and ARM SME2 matrix instructions, lowering graphs to edge NPUs (Apple ANE, Qualcomm Hexagon, DirectML) via zero-copy shared memory:
+Run the full 1,048,576-entity x 200-step benchmark yourself in [`examples/bench_soa_simd.ax`](examples/bench_soa_simd.ax):
+
+```powershell
+.\bin\axc.exe build examples/bench_soa_simd.ax -o bin/bench_soa_simd.exe
+.\bin\bench_soa_simd.exe
+```
+
+---
+
+## Chapter 10: Colorless Concurrency `spawn` & Convergent `CRDT` Types
+
+### 10.1. `spawn` Tasks & Compile-Time Isolation Enforcement (`E0202`)
+Axon prevents data races at compile time: capturing an outer `isolated` variable inside `spawn { ... }` without transferring ownership via `move` is rejected with **`[SAFETY ERROR E0202]`**:
 
 ```axon
-struct AcceleratorDescriptor {
-    has_matrix_cores: i32,
-    npu_latency_us: i32,
-}
-
-fn query_silicon_accelerator() -> AcceleratorDescriptor {
-    return AcceleratorDescriptor(1, 12); // 12 microseconds NPU dispatch
+fn compute_chunk(isolated data: i64) -> i64 {
+    task := spawn {
+        moved_val := move data
+        return moved_val * 2
+    }
+    return task.join()
 }
 
 fn main() -> i32 {
-    let d = query_silicon_accelerator();
-    if d.has_matrix_cores == 1 and d.npu_latency_us < 50 {
-        return 0;
-    }
-    return 1;
+    println(f"Joined result = {compute_chunk(67)}")
+    return 0
 }
 ```
 
-### 14.3. Sub-3ms MicroVM Launch with `axc build --target=unikernel`
-Compiles applications into bootable Ring 0 Unikernel images with poll-mode virtio drivers for instant cloud deployment:
+### 10.2. Lock-Free Join-Semilattice CRDTs (`std::crdt`)
+For distributed state replication without locks or coordination bottlenecks, `std::crdt` provides mathematically convergent join-semilattices (`GCounter4`, `LWWReg`) satisfying idempotence, commutativity, and associativity:
 
 ```axon
-struct BootMetricsReport {
-    cold_boot_us: i32,
-    is_ring0: i32,
-}
-
-fn inspect_unikernel_boot() -> BootMetricsReport {
-    return BootMetricsReport(2150, 1); // 2.15 ms cold-boot
-}
+use std::crdt
 
 fn main() -> i32 {
-    let report = inspect_unikernel_boot();
-    if report.cold_boot_us < 3000 and report.is_ring0 == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
+    node_a := gcounter_inc(gcounter_new(), 0, 15)
+    node_b := gcounter_inc(gcounter_new(), 1, 27)
 
-### 14.4. Zero-Glitch Live Function Patching (`axc live`)
-`axc live` uses dual virtual memory mapping (RW for staging, RX for execution), fully complying with W^X while patching functions in 1.45 ms and preserving resident multi-GB Tensor data:
-
-```axon
-struct LivePatchStatusReport {
-    patch_time_us: i32,
-    retained_tensor_gb: f32,
-    wx_safe: i32,
-}
-
-fn verify_live_patch_retention(gb: f32) -> LivePatchStatusReport {
-    return LivePatchStatusReport(1450, gb, 1);
-}
-
-fn main() -> i32 {
-    let p = verify_live_patch_retention(4.0);
-    if p.patch_time_us < 5000 and p.retained_tensor_gb >= 4.0 and p.wx_safe == 1 {
-        return 0;
-    }
-    return 1;
+    // Out-of-order and duplicate merges always converge deterministically to 42
+    merged := gcounter_merge(node_a, gcounter_merge(node_b, node_a))
+    println(f"Converged cluster counter = {gcounter_value(merged)}")
+    return 0
 }
 ```
 
 ---
 
-## CHAPTER 15: OBJECT-CAPABILITY SECURITY (`FsCap`, `NetCap`) & SUPPLY-CHAIN ATTACK DEFENSE
+## Chapter 11: Object-Capability Security, Anti-Tamper & AV-Clean Binaries
 
-Axon completely eliminates supply-chain vulnerabilities via fine-grained Object-Capability Security. If a third-party library or subroutine is not explicitly granted an unforgeable linear capability token, it is mathematically incapable of accessing the filesystem, network, environment variables, or accelerators.
-
-### 15.1. Unforgeable Linear Capability Tokens
-Capability tokens (`RootCap`, `FsCap`, `NetCap`, `EnvCap`, `GpuCap`, `ProcessCap`) are minted solely once by the operating system and passed to `main(root: RootCap)`. Tokens are compile-time type proofs with zero runtime memory overhead (Zero-Sized Types):
+### 11.1. Object-Capability Security (`std::cap`)
+Privileged raw system calls cannot be invoked without holding a capability token in scope (**`E0501`**). Starting from `RootCap` in `main`, applications attenuate permissions down to directory-scoped, read-only `FsCap` tokens that automatically block `..` path traversal, NUL injection, and drive escapes:
 
 ```axon
-struct LinearCapabilityProof {
-    can_access_net: i32,
-    runtime_cost_bytes: i32,
-}
-
-fn verify_capability_sandbox(has_net_cap: i32) -> LinearCapabilityProof {
-    let access = if has_net_cap == 1 { 1 } else { 0 };
-    return LinearCapabilityProof(access, 0); // 0 bytes runtime overhead
-}
+use std::cap
 
 fn main() -> i32 {
-    let proof = verify_capability_sandbox(1);
-    if proof.can_access_net == 1 and proof.runtime_cost_bytes == 0 {
-        return 0;
-    }
-    return 1;
+    root := acquire_root_cap()
+    ro_cap := attenuate_fs(root, base_dir = "examples", read_only = true)
+
+    blocked := not is_safe_subpath("../../Windows/System32/cmd.exe")
+    write_attempt := cap_write_file(ro_cap, "test.txt", buf_new(16)) or -403
+    println(f"Path traversal blocked={blocked}, write on read-only={write_attempt}")
+    return 0
 }
 ```
 
-### 15.2. Attenuated Sub-Capabilities & Directory Traversal Defense
-Applications can attenuate permissions into scoped sub-capabilities before handing them to untrusted plugins. Path escaping attempts (`../`) are detected and rejected at compile and runtime:
+### 11.2. Built-In Anti-Tamper & Key Protection (`@shield`, `@secret`, `@whitebox`)
+1. **`@shield`:** Enables hardware signed-overflow traps, Intel CET `ENDBR64` prologues, and live startup `.text` 64-bit FNV-1a machine-code verification. Modifying a single instruction byte in the compiled `.exe` triggers an immediate integrity halt before `main` executes.
+2. **`@secret("...")`:** Encrypts sensitive literals at compile time, decrypts them onto the local stack frame only while needed, and wipes those stack slots to `0` before `RET` (leaving **zero plaintext bytes** in the binary image).
+3. **`@whitebox` & `whitebox_sbox` (`std::crypto`):** Dissolves secret key material into compile-time $\text{GF}(2^8)$ bijective lookup tables (irreducible polynomial `0x11B`) rather than exposing raw keys in `.rdata`.
 
 ```axon
-struct AttenuatedFsCap {
-    root_hash: i64,
-    mode: i32,
-    traversal_blocked: i32,
-}
+use std::crypto
 
-fn attenuate_filesystem_path(path_hash: i64, mode: i32, has_dotdot: i32) -> AttenuatedFsCap {
-    let blocked = if has_dotdot == 1 { 1 } else { 0 };
-    return AttenuatedFsCap(path_hash, mode, blocked);
-}
-
+@shield
 fn main() -> i32 {
-    let safe = attenuate_filesystem_path(88991122, 1, 0);
-    let attack = attenuate_filesystem_path(99887766, 1, 1);
-    if safe.traversal_blocked == 0 and attack.traversal_blocked == 1 {
-        return 0;
-    }
-    return 1;
+    api_pin := @secret("OMEGA-VAULT-9042")
+    license_mac := whitebox_mac_str("AXON-PRO-LICENSE-2026")
+    println(f"Secret length={api_pin.len}, White-Box MAC={license_mac}")
+    return 0
 }
 ```
 
-### 15.3. Package Capability Auditing with `axc audit --caps`
-The compiler cross-references package declarations in `axon.toml` against its AST, immediately raising security alerts if a utility or math package requests network socket capabilities:
-
-```axon
-struct PackageAuditReport {
-    is_suspicious_leak: i32,
-    audit_passed: i32,
-}
-
-fn audit_package_permissions(category: i32, declared_caps_mask: i32) -> PackageAuditReport {
-    let has_net = if (declared_caps_mask & 2) != 0 { 1 } else { 0 };
-    let leak = if category == 1 and has_net == 1 { 1 } else { 0 };
-    let pass = if leak == 0 { 1 } else { 0 };
-    return PackageAuditReport(leak, pass);
-}
-
-fn main() -> i32 {
-    let r = audit_package_permissions(1, 0); // Math package declaring 0 I/O caps
-    if r.is_suspicious_leak == 0 and r.audit_passed == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
+### 11.3. OS-Standard AV-Clean Binary Architecture
+Packers and naive obfuscators trigger Antivirus false positives due to writable-executable (`RWX`) pages, missing unwind tables, or high-entropy encrypted sections (`> 7.2`). Axon's direct PE32+ linker produces clean OS-compliant binaries:
+- Strict `W^X` page permissions: `.text` is `RX`, `.rdata` and `.pdata` are `R` (**0 `RWX` sections**).
+- Complete `.pdata` `RUNTIME_FUNCTION` and `.xdata` `UNWIND_INFO` tables for every generated function.
+- High-Entropy 64-bit ASLR + Hardware DEP/NX (`0x8160`).
+- Natural `.text` Shannon entropy (`~5.61 < 6.50`).
 
 ---
 
-## CHAPTER 16: DETERMINISTIC DISTRIBUTED SYSTEMS WITH `Crdt[T]` & CLUSTER SIMULATION (DST)
+## Chapter 12: Self-Hosting Internals, Built-In Intrinsics & Error Reference
 
-Engineering distributed consensus systems requires testing against network partitions, packet reordering, and power loss. Axon delivers built-in Deterministic Simulation Testing (DST) and SoA-optimized conflict-free replicated data types (`Crdt[T]`).
+### 12.1. Deterministic 3-Stage Self-Hosting Bootstrap
+[`bin/axc.exe`](bin/axc.exe) is compiled from the 9 pure-Axon modules in [`compiler_ax/`](compiler_ax/):
+- **Stage 1:** `axc0.exe` compiles `compiler_ax/main.ax` $\rightarrow$ `axc_stage1.exe`.
+- **Stage 2:** `axc_stage1.exe` compiles `compiler_ax/main.ax` $\rightarrow$ `axc_stage2.exe`.
+- **Stage 3:** `axc_stage2.exe` compiles `compiler_ax/main.ax` $\rightarrow$ `axc_stage3.exe`.
+- **Fixed-Point Proof:** `SHA256(axc_stage2.exe) == SHA256(axc_stage3.exe)` matches bit-for-bit in ~114 ms, with whole-program dead-function tree-shaking keeping user binaries minimal.
 
-### 16.1. 64-Node Deterministic Cluster Simulation on 1 CPU Thread
-The simulator in `compiler_ax/dst_sim.ax` executes 64 virtual Axon servers on a cooperative fiber scheduler, simulating millions of packet drops and power interruptions 1,000x faster than real-time:
+### 12.2. Built-In Intrinsics Reference
 
-```axon
-struct DstSimulationProof {
-    simulated_nodes: i32,
-    events_per_sec: i64,
-    deterministic: i32,
-}
+| Category | Intrinsics | Purpose |
+| :--- | :--- | :--- |
+| **Output & Timing** | `print(...)`, `println(...)`, `clock_ns()` | Zero-CRT Win64 console output (`f"..."` supported) and nanosecond monotonic timer |
+| **Byte Buffers (`ByteBuf`)** | `buf_new(cap)`, `buf_len(b)`, `buf_get(b, i)`, `buf_set(b, i, v)`, `buf_push(b, v)`, `buf_push_u16/u32/u64`, `buf_put_u32/u64`, `buf_push_str`, `buf_slice_str`, `buf_free(move b)` | Bounds-checked binary buffers for binary linkers, protocols, and file I/O |
+| **Integer Buffers (`IntBuf`)** | `ibuf_new(cap)`, `ibuf_len(b)`, `ibuf_get(b, i)`, `ibuf_set(b, i, v)`, `ibuf_push(b, v)`, `buf_free(move b)` | Dynamic 64-bit integer arenas with hardware bounds checks |
+| **Strings & CLI Args** | `str_len(s)`, `str_byte(s, i)`, `str_slice(s, a, b)`, `str_eq(a, b)`, `args_count()`, `args_get(i)` | O(1) UTF-8 slice operations and command-line argument access |
+| **File I/O (`T ! i64`)** | `fs_read_file(path)`, `fs_write_file(path, buf)` | Direct Win64 binary file read/write returning `T ! i64` error unions |
+| **SoA Tables & Crypto** | `Table[T]::with_capacity(n)`, `table_fill_f32(t, col, v)`, `table_get_f32(t, col, i)`, `whitebox_sbox(seed, byte)` | Columnar SIMD table helpers and $\text{GF}(2^8)$ white-box lookup tables |
 
-fn simulate_cluster_dst_engine(nodes: i32) -> DstSimulationProof {
-    return DstSimulationProof(nodes, 542000, 1);
-}
+### 12.3. Compile-Time Safety Error Codes
 
-fn main() -> i32 {
-    let sim = simulate_cluster_dst_engine(64);
-    if sim.simulated_nodes == 64 and sim.events_per_sec > 500000 and sim.deterministic == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 16.2. Native SoA Conflict-Free Replicated Data Types (`Crdt[T]`)
-`std/crdt.ax` implements `GCounter`, `PNCounter`, `LWWRegister`, `ORSet`, and `RGASequence` strictly satisfying commutativity, associativity, and idempotency:
-
-```axon
-struct CrdtConvergenceProof {
-    resolved_val: i64,
-    laws_verified: i32,
-}
-
-fn test_lww_register_merge(val_a: i64, ts_a: i64, val_b: i64, ts_b: i64) -> CrdtConvergenceProof {
-    let winner = if ts_b > ts_a { val_b } else { val_a };
-    return CrdtConvergenceProof(winner, 1);
-}
-
-fn main() -> i32 {
-    let p = test_lww_register_merge(100, 1000, 200, 2000);
-    if p.resolved_val == 200 and p.laws_verified == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 16.3. Bit-Exact 100% Failure Reproduction via `--seed`
-When a cluster invariant fails at step 500,000, running `axc replay --seed=998123` recreates the identical microsecond interleaving for instant debugging:
-
-```axon
-struct DeterministicReplayReport {
-    original_state_hash: i64,
-    replayed_state_hash: i64,
-    matches_exact: i32,
-}
-
-fn verify_replay_reproducibility(seed: i64) -> DeterministicReplayReport {
-    let h1: i64 = 7640891576956012808;
-    let h2: i64 = 7640891576956012808;
-    let ok = if h1 == h2 { 1 } else { 0 };
-    return DeterministicReplayReport(h1, h2, ok);
-}
-
-fn main() -> i32 {
-    let rep = verify_replay_reproducibility(998123);
-    if rep.matches_exact == 1 and rep.original_state_hash == rep.replayed_state_hash {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-
-## CHAPTER 17: DIRECT GPU 240 FPS UI (`std/ui/`), DEPLOYMENT SPECIALIZATION & AUTOMATED CODE LIFTING
-
-Axon spans the full software development lifecycle from sub-millisecond GPU user interfaces to physical binary specialization and automated multi-language source transpilation.
-
-### 17.1. Single-Draw-Call Signed Distance Field GPU UI Engine (`std/ui/`)
-Eliminating Electron and WebView runtimes, Axon encodes all UI elements into a SoA `Table[UiPrimitive]` rendered in a single `draw_instanced` GPU call with zero heap allocations per frame:
-
-```axon
-struct UiMetricsReport {
-    fps: i32,
-    cpu_render_ms: f32,
-    heap_allocs_per_frame: i32,
-    bundle_size_kb: i32,
-}
-
-fn query_gpu_ui_metrics() -> UiMetricsReport {
-    return UiMetricsReport(240, 0.28, 0, 620);
-}
-
-fn main() -> i32 {
-    let m = query_gpu_ui_metrics();
-    if m.fps >= 240 and m.cpu_render_ms < 0.40 and m.heap_allocs_per_frame == 0 and m.bundle_size_kb < 650 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 17.2. Production Deployment Specialization (`axc specialize`)
-Running `axc specialize server.ax --config=prod.toml` injects real server parameters into the E-Graph optimizer, folding constants into immediate machine operands and unrolling batch loops for +15% to +25% hardware throughput:
-
-```axon
-struct SpecializationThroughputReport {
-    throughput_gain_pct: i32,
-    dead_branches_pruned: i32,
-}
-
-fn measure_hardware_gain(workers: i32) -> SpecializationThroughputReport {
-    return SpecializationThroughputReport(21, 18); // +21% throughput gain, 18 branches eliminated
-}
-
-fn main() -> i32 {
-    let s = measure_hardware_gain(8);
-    if s.throughput_gain_pct >= 15 and s.dead_branches_pruned > 10 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 17.3. Formally Proved C/Python/ONNX Source Lifter (`axc lift`)
-`axc lift` transpiles legacy C, Python, and PyTorch/ONNX models directly into safe Axon SoA `Table[T]`, replacing raw pointers with second-class references and proving memory invariants via integrated SMT:
-
-```axon
-struct CodeLiftSoundnessProof {
-    pointers_eliminated: i32,
-    soa_tables_created: i32,
-    smt_proved: i32,
-    speedup_ratio: f32,
-}
-
-fn verify_code_lifting_soundness() -> CodeLiftSoundnessProof {
-    return CodeLiftSoundnessProof(42, 3, 1, 14.8); // 14.8x speedup vs Python
-}
-
-fn main() -> i32 {
-    let proof = verify_code_lifting_soundness();
-    if proof.pointers_eliminated == 42 and proof.smt_proved == 1 and proof.speedup_ratio > 10.0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-*Congratulations on completing all 17 chapters of the Axon Engineering Guide v4.0! You command the world's most advanced, object-capability secured, deterministically simulated, 240 FPS GPU-accelerated, and computationally saturated systems and AI programming language.*
+| Code | Violation Caught | Fix in Axon |
+| :--- | :--- | :--- |
+| **`E0101`** | Reference type (`&T`) stored inside a `struct` field | Store owned values directly or integer row indices into `Table[T]` |
+| **`E0102`** | Function returns a reference (`-> &T`) risking a dangling pointer | Return values directly in registers/stack slots or via `T ! Error` |
+| **`E0201`** | Variable accessed after linear ownership transfer (`move`) | Read the value before `move`, or pass it by value without `move` |
+| **`E0202`** | Outer `isolated` variable captured in `spawn` without `move` | Explicitly transfer ownership with `move var_name` inside `spawn` |
+| **`E0301`** | Mutation or reassignment of an immutable binding (`:=` / `let`) | Declare the variable with `mut x := ...` or parameter with `mut x: Type` |
+| **`E0401`** | Initializer type does not match declared variable type | Match the declared type or convert explicitly with `as Type` |
+| **`E0402`** | `return` expression type does not match function return signature | Return a compatible type or wrap in `ok(...)` / `err(...)` for `T ! E` |
+| **`E0501`** | Privileged ambient I/O called without a capability token in scope | Pass an attenuated capability token (`RootCap` / `FsCap` / `NetCap`) from `std::cap` |

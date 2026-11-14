@@ -1,0 +1,861 @@
+// Axon v5.0 Self-Hosted Compiler — x86_64 Machine-Code Primitives, GF(2^8) Whitebox & Win64 Helpers
+// (`compiler_ax/codegen_runtime.ax`) — 100% Pure Axon, Zero CRT, Direct `KERNEL32.dll` Win64 ABI.
+
+use compiler_ax::tokens_ast
+use compiler_ax::linker_pe
+
+struct CodegenCtx {
+    pool: ByteBuf
+    nodes: IntBuf
+    extra: IntBuf
+    sym: IntBuf
+    code: ByteBuf
+    rdata: ByteBuf
+    fixups: IntBuf
+    fn_ranges: IntBuf
+    interns: IntBuf
+    state: IntBuf
+}
+
+// Helper Function IDs (stored at `state[32 + id]`)
+fn h_print_bytes() -> i64 { return 2001 }
+fn h_print_i64() -> i64   { return 2002 }
+fn h_print_dec() -> i64   { return 2003 }
+fn h_clock_ns() -> i64    { return 2004 }
+fn h_sec_trap() -> i64    { return 2005 }
+fn h_shield_trap() -> i64 { return 2006 }
+fn h_str_eq() -> i64      { return 2007 }
+fn h_args_get() -> i64    { return 2008 }
+fn h_args_count() -> i64  { return 2009 }
+fn h_fs_read() -> i64     { return 2010 }
+fn h_fs_write() -> i64    { return 2011 }
+
+// Fixup Kinds
+fn fx_iat() -> i64    { return 1 }
+fn fx_rdata() -> i64  { return 2 }
+fn fx_shield() -> i64 { return 3 }
+fn fx_fn() -> i64     { return 4 }
+
+// --- Machine-Code Byte Emitters ---
+fn mc_b1(code: ByteBuf, b0: i64) {
+    buf_push(code, b0 & 255)
+}
+
+fn mc_b2(code: ByteBuf, b0: i64, b1: i64) {
+    buf_push(code, b0 & 255)
+    buf_push(code, b1 & 255)
+}
+
+fn mc_b3(code: ByteBuf, b0: i64, b1: i64, b2: i64) {
+    buf_push(code, b0 & 255)
+    buf_push(code, b1 & 255)
+    buf_push(code, b2 & 255)
+}
+
+fn mc_b4(code: ByteBuf, b0: i64, b1: i64, b2: i64, b3: i64) {
+    buf_push(code, b0 & 255)
+    buf_push(code, b1 & 255)
+    buf_push(code, b2 & 255)
+    buf_push(code, b3 & 255)
+}
+
+fn mc_u32(code: ByteBuf, val: i64) {
+    buf_push_u32(code, val)
+}
+
+fn mc_u64(code: ByteBuf, val: i64) {
+    buf_push_u64(code, val)
+}
+
+fn mc_align16(code: ByteBuf) {
+    while (buf_len(code) & 15) != 0 {
+        buf_push(code, 0xCC)
+    }
+}
+
+fn mc_jcc8(code: ByteBuf, op: i64) -> i64 {
+    buf_push(code, op & 255)
+    pos := buf_len(code)
+    buf_push(code, 0)
+    return pos
+}
+
+fn mc_patch_jcc8(code: ByteBuf, pos: i64, target: i64) {
+    rel := target - (pos + 1)
+    buf_set(code, pos, rel & 255)
+}
+
+fn mc_jcc32(code: ByteBuf, op2: i64) -> i64 {
+    mc_b2(code, 0x0F, op2)
+    pos := buf_len(code)
+    buf_push_u32(code, 0)
+    return pos
+}
+
+fn mc_jmp32(code: ByteBuf) -> i64 {
+    buf_push(code, 0xE9)
+    pos := buf_len(code)
+    buf_push_u32(code, 0)
+    return pos
+}
+
+fn mc_patch_rel32(code: ByteBuf, pos: i64, target: i64) {
+    rel := target - (pos + 4)
+    buf_put_u32(code, pos, rel)
+}
+
+fn mc_slot_disp(slot: i64, sub_off: i64) -> i64 {
+    return 0 - ((slot + sub_off) * 8)
+}
+
+fn mc_load_rax(code: ByteBuf, slot: i64, sub_off: i64) {
+    disp := mc_slot_disp(slot, sub_off)
+    mc_b3(code, 0x48, 0x8B, 0x85)
+    mc_u32(code, disp)
+}
+
+fn mc_store_rax(code: ByteBuf, slot: i64, sub_off: i64) {
+    disp := mc_slot_disp(slot, sub_off)
+    mc_b3(code, 0x48, 0x89, 0x85)
+    mc_u32(code, disp)
+}
+
+fn mc_lea_rax(code: ByteBuf, slot: i64, sub_off: i64) {
+    disp := mc_slot_disp(slot, sub_off)
+    mc_b3(code, 0x48, 0x8D, 0x85)
+    mc_u32(code, disp)
+}
+
+fn mc_mov_rax_imm(code: ByteBuf, val: i64) {
+    if val == 0 {
+        mc_b2(code, 0x31, 0xC0)
+    } else if val > 0 and val <= 0x7FFFFFFF {
+        mc_b1(code, 0xB8)
+        mc_u32(code, val)
+    } else {
+        mc_b2(code, 0x48, 0xB8)
+        mc_u64(code, val)
+    }
+}
+
+// --- Fixup & Range Recorders ---
+fn cg_add_fixup(fixups: IntBuf, disp_pos: i64, next_rip: i64, kind_and_tgt: i64) {
+    // `kind_and_tgt = fx_kind | (target << 8)`
+    ibuf_push(fixups, disp_pos)
+    ibuf_push(fixups, next_rip)
+    ibuf_push(fixups, kind_and_tgt & 255)
+    ibuf_push(fixups, ushr64(kind_and_tgt, 8))
+}
+
+fn cg_call_fn(cg: CodegenCtx, fn_id: i64) {
+    buf_push(cg.code, 0xE8)
+    dp := buf_len(cg.code)
+    buf_push_u32(cg.code, 0)
+    nr := buf_len(cg.code)
+    cg_add_fixup(cg.fixups, dp, nr, fx_fn() | (fn_id << 8))
+}
+
+fn cg_jmp_fn(cg: CodegenCtx, op2: i64, fn_id: i64) {
+    mc_b2(cg.code, 0x0F, op2)
+    dp := buf_len(cg.code)
+    buf_push_u32(cg.code, 0)
+    nr := buf_len(cg.code)
+    cg_add_fixup(cg.fixups, dp, nr, fx_fn() | (fn_id << 8))
+}
+
+fn cg_call_iat(cg: CodegenCtx, slot: i64) {
+    mc_b2(cg.code, 0xFF, 0x15)
+    dp := buf_len(cg.code)
+    buf_push_u32(cg.code, 0)
+    nr := buf_len(cg.code)
+    cg_add_fixup(cg.fixups, dp, nr, fx_iat() | (slot << 8))
+}
+
+fn cg_lea_rax_rdata(cg: CodegenCtx, rdata_off: i64) {
+    mc_b3(cg.code, 0x48, 0x8D, 0x05)
+    dp := buf_len(cg.code)
+    buf_push_u32(cg.code, 0)
+    nr := buf_len(cg.code)
+    cg_add_fixup(cg.fixups, dp, nr, fx_rdata() | (rdata_off << 8))
+}
+
+fn cg_reg_helper(cg: CodegenCtx, hid: i64, start_off: i64, end_off: i64) {
+    ibuf_set(cg.state, 32 + hid, start_off)
+    ibuf_push(cg.fn_ranges, start_off)
+    ibuf_push(cg.fn_ranges, end_off)
+}
+
+// --- `.rdata` String Interning, `@secret` Scrambling & GF(2^8) Whitebox S-Box Tables ---
+fn cg_intern_pool_slice(cg: CodegenCtx, soff: i64, slen: i64) -> i64 {
+    icnt := ibuf_len(cg.interns) / 4
+    mut i := 0
+    while i < icnt {
+        base := i * 4
+        if ibuf_get(cg.interns, base) == 1 and ibuf_get(cg.interns, base + 2) == slen {
+            prev_soff := ibuf_get(cg.interns, base + 1)
+            if pool_str_eq2(cg.pool, prev_soff, slen, soff) {
+                return ibuf_get(cg.interns, base + 3)
+            }
+        }
+        i += 1
+    }
+    roff := buf_len(cg.rdata)
+    mut j := 0
+    while j < slen {
+        buf_push(cg.rdata, buf_get(cg.pool, soff + j))
+        j += 1
+    }
+    buf_push(cg.rdata, 0)
+    ibuf_push(cg.interns, 1)
+    ibuf_push(cg.interns, soff)
+    ibuf_push(cg.interns, slen)
+    ibuf_push(cg.interns, roff)
+    return roff
+}
+
+fn cg_intern_lit(cg: CodegenCtx, lit: str) -> i64 {
+    soff := pool_intern_str(cg.pool, lit)
+    return cg_intern_pool_slice(cg, soff, str_len(lit))
+}
+
+fn rotl64(x: i64, k: i64) -> i64 {
+    s := k & 63
+    if s == 0 {
+        return x
+    }
+    return (x << s) | ushr64(x, 64 - s)
+}
+
+fn gf256_mul_ax(a_in: i64, b_in: i64) -> i64 {
+    mut a := a_in & 255
+    mut b := b_in & 255
+    mut p := 0
+    mut i := 0
+    while i < 8 {
+        if (b & 1) != 0 {
+            p = p ^ a
+        }
+        hi := a & 0x80
+        a = (a << 1) & 255
+        if hi != 0 {
+            a = a ^ 0x1B
+        }
+        b = b >> 1
+        i += 1
+    }
+    return p & 255
+}
+
+fn gf256_inv_ax(x_in: i64) -> i64 {
+    x := x_in & 255
+    if x == 0 {
+        return 0
+    }
+    mut res := 1
+    mut base := x
+    mut exp := 254
+    while exp > 0 {
+        if (exp & 1) != 0 {
+            res = gf256_mul_ax(res, base)
+        }
+        base = gf256_mul_ax(base, base)
+        exp = exp >> 1
+    }
+    return res
+}
+
+fn affine_byte_ax(x_in: i64, c_in: i64) -> i64 {
+    x := x_in & 255
+    r1 := ((x << 1) | (x >> 7)) & 255
+    r2 := ((x << 2) | (x >> 6)) & 255
+    r3 := ((x << 3) | (x >> 5)) & 255
+    r4 := ((x << 4) | (x >> 4)) & 255
+    return (x ^ r1 ^ r2 ^ r3 ^ r4 ^ (c_in & 255)) & 255
+}
+
+fn cg_intern_whitebox(cg: CodegenCtx, seed_key: i64) -> i64 {
+    icnt := ibuf_len(cg.interns) / 4
+    mut i := 0
+    while i < icnt {
+        base := i * 4
+        if ibuf_get(cg.interns, base) == 2 and ibuf_get(cg.interns, base + 1) == seed_key {
+            return ibuf_get(cg.interns, base + 3)
+        }
+        i += 1
+    }
+    while (buf_len(cg.rdata) & 15) != 0 {
+        buf_push(cg.rdata, 0)
+    }
+    roff := buf_len(cg.rdata)
+    k0 := seed_key & 255
+    k1 := (ushr64(seed_key, 8) & 255) | 1
+    mask_out := (ushr64(seed_key, 16) & 255) ^ 0x63
+    mut x := 0
+    while x < 256 {
+        mixed_in := gf256_mul_ax(x ^ k0, k1)
+        sub := affine_byte_ax(gf256_inv_ax(mixed_in), mask_out)
+        buf_push(cg.rdata, sub)
+        buf_push(cg.rdata, sub ^ 0x5A)
+        buf_push(cg.rdata, 0)
+        buf_push(cg.rdata, 0)
+        x += 1
+    }
+    ibuf_push(cg.interns, 2)
+    ibuf_push(cg.interns, seed_key)
+    ibuf_push(cg.interns, 0)
+    ibuf_push(cg.interns, roff)
+    return roff
+}
+
+// --- `_start` Entry Point & Built-In Zero-CRT Runtime Helpers ---
+fn emit_runtime_and_entry(cg: CodegenCtx) {
+    c := cg.code
+    // 1. `_start` at `.text + 0`
+    start_beg := buf_len(c)
+    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+    mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+    mc_b4(c, 0x48, 0x83, 0xEC, 0x40)
+
+    if ibuf_get(cg.state, 0) == 1 {
+        // Live `.text` FNV-1a 64-bit Machine-Code Integrity Verification!
+        mc_b3(c, 0x48, 0x8D, 0x0D)
+        disp0 := 0 - (buf_len(c) + 4)
+        mc_u32(c, disp0)
+        mc_b1(c, 0xBA)
+        ibuf_set(cg.state, 2, buf_len(c))
+        mc_u32(c, 0)
+        mc_b2(c, 0x48, 0xB8)
+        mc_u64(c, 0xcbf29ce484222325)
+        mc_b2(c, 0x49, 0xB8)
+        mc_u64(c, 0x100000001b3)
+
+        ltop := buf_len(c)
+        mc_b4(c, 0x44, 0x0F, 0xB6, 0x09)
+        mc_b3(c, 0x4C, 0x31, 0xC8)
+        mc_b4(c, 0x49, 0x0F, 0xAF, 0xC0)
+        mc_b3(c, 0x48, 0xFF, 0xC1)
+        mc_b2(c, 0xFF, 0xCA)
+        jnz_p := mc_jcc8(c, 0x75)
+        mc_patch_jcc8(c, jnz_p, ltop)
+
+        mc_b3(c, 0x48, 0x8B, 0x0D)
+        dp := buf_len(c)
+        mc_u32(c, 0)
+        nr := buf_len(c)
+        cg_add_fixup(cg.fixups, dp, nr, fx_shield())
+        mc_b3(c, 0x48, 0x39, 0xC8)
+        cg_jmp_fn(cg, 0x85, h_shield_trap())
+    }
+
+    // Call `main` if present
+    main_soff := pool_intern_str(cg.pool, "main")
+    main_idx := find_fn_idx_rt(cg.pool, cg.sym, main_soff, 4)
+    if main_idx >= 0 {
+        f_off := ibuf_get(cg.sym, 7) + main_idx * 10
+        if ibuf_get(cg.sym, f_off + 8) == 0 {
+            mc_b4(c, 0x48, 0x8D, 0x4D, 0xE0)
+            mc_b4(c, 0x48, 0x8D, 0x55, 0xE0)
+        }
+        cg_call_fn(cg, main_idx)
+    } else {
+        mc_b2(c, 0x31, 0xC0)
+    }
+    mc_b2(c, 0x89, 0xC1)
+    cg_call_iat(cg, iat_exit_process())
+    mc_b1(c, 0xCC)
+    ibuf_push(cg.fn_ranges, start_beg)
+    ibuf_push(cg.fn_ranges, buf_len(c))
+
+    // 2. `h_print_bytes`
+    mc_align16(c)
+    s_pb := buf_len(c)
+    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+    mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+    mc_b4(c, 0x48, 0x83, 0xEC, 0x50)
+    mc_b4(c, 0x48, 0x89, 0x4D, 0xF8)
+    mc_b4(c, 0x48, 0x89, 0x55, 0xF0)
+    mc_b1(c, 0xB9)
+    mc_u32(c, 0xFFFFFFF5)
+    cg_call_iat(cg, iat_get_std_handle())
+    mc_b3(c, 0x48, 0x89, 0xC1)
+    mc_b4(c, 0x48, 0x8B, 0x55, 0xF8)
+    mc_b4(c, 0x44, 0x8B, 0x45, 0xF0)
+    mc_b4(c, 0x4C, 0x8D, 0x4D, 0xE8)
+    mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+    mc_b1(c, 0x20)
+    mc_u32(c, 0)
+    cg_call_iat(cg, iat_write_file())
+    mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+    mc_b1(c, 0xC3)
+    cg_reg_helper(cg, h_print_bytes(), s_pb, buf_len(c))
+
+    // 3. `h_print_i64`
+    mc_align16(c)
+    s_pi := buf_len(c)
+    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+    mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+    mc_b4(c, 0x48, 0x83, 0xEC, 0x50)
+    mc_b4(c, 0x4C, 0x8D, 0x45, 0xF8)
+    mc_b3(c, 0x4D, 0x89, 0xC1)
+    mc_b3(c, 0x45, 0x31, 0xD2)
+    mc_b3(c, 0x48, 0x89, 0xC8)
+    mc_b3(c, 0x48, 0x85, 0xC0)
+    jge_pi := mc_jcc8(c, 0x7D)
+    mc_b3(c, 0x48, 0xF7, 0xD8)
+    mc_b3(c, 0x41, 0xB2, 0x01)
+    mc_patch_jcc8(c, jge_pi, buf_len(c))
+    mc_b3(c, 0x49, 0xC7, 0xC3)
+    mc_u32(c, 10)
+    dloop := buf_len(c)
+    mc_b2(c, 0x31, 0xD2)
+    mc_b3(c, 0x49, 0xF7, 0xF3)
+    mc_b3(c, 0x80, 0xC2, 0x30)
+    mc_b3(c, 0x49, 0xFF, 0xC8)
+    mc_b3(c, 0x41, 0x88, 0x10)
+    mc_b3(c, 0x48, 0x85, 0xC0)
+    jnz_dl := mc_jcc8(c, 0x75)
+    mc_patch_jcc8(c, jnz_dl, dloop)
+    mc_b3(c, 0x45, 0x85, 0xD2)
+    jz_sg := mc_jcc8(c, 0x74)
+    mc_b3(c, 0x49, 0xFF, 0xC8)
+    mc_b4(c, 0x41, 0xC6, 0x00, 45)
+    mc_patch_jcc8(c, jz_sg, buf_len(c))
+    mc_b3(c, 0x4C, 0x89, 0xC1)
+    mc_b3(c, 0x4C, 0x89, 0xCA)
+    mc_b3(c, 0x4C, 0x29, 0xC2)
+    cg_call_fn(cg, h_print_bytes())
+    mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+    mc_b1(c, 0xC3)
+    cg_reg_helper(cg, h_print_i64(), s_pi, buf_len(c))
+
+    // 4. `h_print_dec`
+    mc_align16(c)
+    s_pd := buf_len(c)
+    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+    mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+    mc_b4(c, 0x48, 0x83, 0xEC, 0x40)
+    mc_b4(c, 0x48, 0x89, 0x4D, 0xF8)
+    mc_b3(c, 0x48, 0x85, 0xC9)
+    jge_pd := mc_jcc8(c, 0x7D)
+    mc_b4(c, 0xC6, 0x45, 0xEF, 45)
+    mc_b4(c, 0x48, 0x8D, 0x4D, 0xEF)
+    mc_b1(c, 0xBA)
+    mc_u32(c, 1)
+    cg_call_fn(cg, h_print_bytes())
+    mc_b4(c, 0x48, 0x8B, 0x4D, 0xF8)
+    mc_b3(c, 0x48, 0xF7, 0xD9)
+    mc_b4(c, 0x48, 0x89, 0x4D, 0xF8)
+    mc_patch_jcc8(c, jge_pd, buf_len(c))
+    mc_b4(c, 0x48, 0x8B, 0x45, 0xF8)
+    mc_b2(c, 0x31, 0xD2)
+    mc_b3(c, 0x48, 0xC7, 0xC1)
+    mc_u32(c, 10000)
+    mc_b3(c, 0x48, 0xF7, 0xF1)
+    mc_b4(c, 0x48, 0x89, 0x55, 0xF0)
+    mc_b3(c, 0x48, 0x89, 0xC1)
+    cg_call_fn(cg, h_print_i64())
+    mc_b4(c, 0xC6, 0x45, 0xE8, 46)
+    mc_b4(c, 0x48, 0x8B, 0x45, 0xF0)
+    mc_b2(c, 0x31, 0xD2)
+    mc_b3(c, 0x48, 0xC7, 0xC1)
+    mc_u32(c, 100)
+    mc_b3(c, 0x48, 0xF7, 0xF1)
+    mc_b2(c, 0x31, 0xD2)
+    mc_b3(c, 0x48, 0xC7, 0xC1)
+    mc_u32(c, 10)
+    mc_b3(c, 0x48, 0xF7, 0xF1)
+    mc_b2(c, 0x04, 0x30)
+    mc_b3(c, 0x80, 0xC2, 0x30)
+    mc_b3(c, 0x88, 0x45, 0xE9)
+    mc_b3(c, 0x88, 0x55, 0xEA)
+    mc_b4(c, 0x48, 0x8D, 0x4D, 0xE8)
+    mc_b1(c, 0xBA)
+    mc_u32(c, 3)
+    cg_call_fn(cg, h_print_bytes())
+    mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+    mc_b1(c, 0xC3)
+    cg_reg_helper(cg, h_print_dec(), s_pd, buf_len(c))
+
+    // 5. `h_clock_ns`
+    mc_align16(c)
+    s_ck := buf_len(c)
+    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+    mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+    mc_b4(c, 0x48, 0x83, 0xEC, 0x40)
+    mc_b4(c, 0x48, 0x8D, 0x4D, 0xF8)
+    cg_call_iat(cg, iat_qpc())
+    mc_b4(c, 0x48, 0x8D, 0x4D, 0xF0)
+    cg_call_iat(cg, iat_qpf())
+    mc_b4(c, 0x48, 0x8B, 0x45, 0xF8)
+    mc_b3(c, 0x48, 0xC7, 0xC1)
+    mc_u32(c, 1000000000)
+    mc_b3(c, 0x48, 0xF7, 0xE1)
+    mc_b4(c, 0x48, 0x8B, 0x4D, 0xF0)
+    mc_b3(c, 0x48, 0xF7, 0xF1)
+    mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+    mc_b1(c, 0xC3)
+    cg_reg_helper(cg, h_clock_ns(), s_ck, buf_len(c))
+
+    // 6. `h_sec_trap` & `h_shield_trap`
+    sec_msg := "[AXON SECURITY] Memory/Arithmetic safety violation blocked\n"
+    shd_msg := "[AXON SHIELD] Code integrity verification mismatch blocked\n"
+    sec_off := cg_intern_lit(cg, sec_msg)
+    shd_off := cg_intern_lit(cg, shd_msg)
+
+    mc_align16(c)
+    s_t1 := buf_len(c)
+    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+    mc_b4(c, 0x48, 0x83, 0xEC, 0x28)
+    cg_lea_rax_rdata(cg, sec_off)
+    mc_b3(c, 0x48, 0x89, 0xC1)
+    mc_b1(c, 0xBA)
+    mc_u32(c, str_len(sec_msg))
+    cg_call_fn(cg, h_print_bytes())
+    mc_b1(c, 0xB9)
+    mc_u32(c, 101)
+    cg_call_iat(cg, iat_exit_process())
+    mc_b1(c, 0xCC)
+    cg_reg_helper(cg, h_sec_trap(), s_t1, buf_len(c))
+
+    mc_align16(c)
+    s_t2 := buf_len(c)
+    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+    mc_b4(c, 0x48, 0x83, 0xEC, 0x28)
+    cg_lea_rax_rdata(cg, shd_off)
+    mc_b3(c, 0x48, 0x89, 0xC1)
+    mc_b1(c, 0xBA)
+    mc_u32(c, str_len(shd_msg))
+    cg_call_fn(cg, h_print_bytes())
+    mc_b1(c, 0xB9)
+    mc_u32(c, 255)
+    cg_call_iat(cg, iat_exit_process())
+    mc_b1(c, 0xCC)
+    cg_reg_helper(cg, h_shield_trap(), s_t2, buf_len(c))
+
+    // 7. Extended OS I/O & CLI Helpers (`str_eq`, `args_get`, `args_count`, `fs_read`, `fs_write`)
+    emit_io_helpers(cg)
+}
+
+fn find_fn_idx_rt(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
+    base := ibuf_get(sym, 7)
+    cnt := ibuf_get(sym, 8)
+    mut i := 0
+    while i < cnt {
+        off := base + i * 10
+        if ibuf_get(sym, off + 1) == slen and pool_str_eq2(pool, ibuf_get(sym, off), slen, soff) {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn emit_io_helpers(cg: CodegenCtx) {
+    c := cg.code
+
+    // 7a. `h_str_eq(rcx=ap, rdx=al, r8=bp, r9=bl) -> rax`
+    mc_align16(c)
+    s_eq := buf_len(c)
+    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+    mc_b3(c, 0x4C, 0x39, 0xCA)
+    jne_len := mc_jcc8(c, 0x75)
+    mc_b2(c, 0x31, 0xC0)
+    lpos := buf_len(c)
+    mc_b3(c, 0x48, 0x39, 0xD0)
+    jae_t := mc_jcc8(c, 0x73)
+    mc_b4(c, 0x44, 0x8A, 0x14, 0x01)
+    mc_b4(c, 0x45, 0x3A, 0x14, 0x00)
+    jne_b := mc_jcc8(c, 0x75)
+    mc_b3(c, 0x48, 0xFF, 0xC0)
+    jmp_l := mc_jcc8(c, 0xEB)
+    mc_patch_jcc8(c, jmp_l, lpos)
+    r_true := buf_len(c)
+    mc_b1(c, 0xB8)
+    mc_u32(c, 1)
+    mc_b1(c, 0xC3)
+    r_false := buf_len(c)
+    mc_b3(c, 0x31, 0xC0, 0xC3)
+    mc_patch_jcc8(c, jae_t, r_true)
+    mc_patch_jcc8(c, jne_len, r_false)
+    mc_patch_jcc8(c, jne_b, r_false)
+    cg_reg_helper(cg, h_str_eq(), s_eq, buf_len(c))
+
+    // 7b. `h_args_get(rcx = target_idx)` & `h_args_count()`
+    mc_align16(c)
+    s_ag := buf_len(c)
+    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+    mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+    mc_b4(c, 0x48, 0x83, 0xEC, 0x30)
+    mc_b4(c, 0x48, 0x89, 0x4D, 0xF8)
+    cg_call_iat(cg, iat_get_command_line_a())
+    mc_b3(c, 0x49, 0x89, 0xC0)
+    mc_b3(c, 0x45, 0x31, 0xC9)
+    mc_b4(c, 0x4C, 0x8B, 0x55, 0xF8)
+
+    next_tok := buf_len(c)
+    skip_ws := buf_len(c)
+    mc_b4(c, 0x41, 0x0F, 0xB6, 0x00)
+    mc_b2(c, 0x3C, 32)
+    je_sp := mc_jcc8(c, 0x74)
+    mc_b2(c, 0x3C, 9)
+    jne_wsd := mc_jcc8(c, 0x75)
+    mc_patch_jcc8(c, je_sp, buf_len(c))
+    mc_b3(c, 0x49, 0xFF, 0xC0)
+    jmp_ws := mc_jcc8(c, 0xEB)
+    mc_patch_jcc8(c, jmp_ws, skip_ws)
+    mc_patch_jcc8(c, jne_wsd, buf_len(c))
+
+    mc_b2(c, 0x84, 0xC0)
+    jz_done := mc_jcc32(c, 0x84)
+    mc_b2(c, 0x3C, 34)
+    jne_uq := mc_jcc8(c, 0x75)
+
+    // Quoted arg
+    mc_b3(c, 0x49, 0xFF, 0xC0)
+    mc_b3(c, 0x4C, 0x89, 0xC1)
+    ql := buf_len(c)
+    mc_b4(c, 0x41, 0x0F, 0xB6, 0x00)
+    mc_b2(c, 0x84, 0xC0)
+    jz_qe := mc_jcc8(c, 0x74)
+    mc_b2(c, 0x3C, 34)
+    je_qe := mc_jcc8(c, 0x74)
+    mc_b3(c, 0x49, 0xFF, 0xC0)
+    j_ql := mc_jcc8(c, 0xEB)
+    mc_patch_jcc8(c, j_ql, ql)
+    mc_patch_jcc8(c, jz_qe, buf_len(c))
+    mc_patch_jcc8(c, je_qe, buf_len(c))
+    mc_b3(c, 0x4C, 0x89, 0xC2)
+    mc_b3(c, 0x48, 0x29, 0xCA)
+    mc_b2(c, 0x3C, 34)
+    jne_gfq := mc_jcc8(c, 0x75)
+    mc_b3(c, 0x49, 0xFF, 0xC0)
+    jmp_gfq := mc_jcc8(c, 0xEB)
+
+    // Unquoted arg
+    mc_patch_jcc8(c, jne_uq, buf_len(c))
+    mc_b3(c, 0x4C, 0x89, 0xC1)
+    uql := buf_len(c)
+    mc_b4(c, 0x41, 0x0F, 0xB6, 0x00)
+    mc_b2(c, 0x84, 0xC0)
+    jz_uqe := mc_jcc8(c, 0x74)
+    mc_b2(c, 0x3C, 32)
+    je_uqs := mc_jcc8(c, 0x74)
+    mc_b2(c, 0x3C, 9)
+    je_uqt := mc_jcc8(c, 0x74)
+    mc_b3(c, 0x49, 0xFF, 0xC0)
+    j_uql := mc_jcc8(c, 0xEB)
+    mc_patch_jcc8(c, j_uql, uql)
+    mc_patch_jcc8(c, jz_uqe, buf_len(c))
+    mc_patch_jcc8(c, je_uqs, buf_len(c))
+    mc_patch_jcc8(c, je_uqt, buf_len(c))
+    mc_b3(c, 0x4C, 0x89, 0xC2)
+    mc_b3(c, 0x48, 0x29, 0xCA)
+
+    mc_patch_jcc8(c, jne_gfq, buf_len(c))
+    mc_patch_jcc8(c, jmp_gfq, buf_len(c))
+    mc_b3(c, 0x4D, 0x39, 0xD1)
+    je_fnd := mc_jcc8(c, 0x74)
+    mc_b3(c, 0x49, 0xFF, 0xC1)
+    j_nt := mc_jmp32(c)
+    mc_patch_rel32(c, j_nt, next_tok)
+
+    mc_patch_jcc8(c, je_fnd, buf_len(c))
+    mc_b3(c, 0x48, 0x89, 0xC8)
+    mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+    mc_b1(c, 0xC3)
+
+    mc_patch_rel32(c, jz_done, buf_len(c))
+    mc_b3(c, 0x4D, 0x85, 0xD2)
+    jns_nc := mc_jcc8(c, 0x79)
+    mc_b3(c, 0x4C, 0x89, 0xC8)
+    mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+    mc_b1(c, 0xC3)
+    mc_patch_jcc8(c, jns_nc, buf_len(c))
+    mc_b4(c, 0x31, 0xC0, 0x31, 0xD2)
+    mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+    mc_b1(c, 0xC3)
+    cg_reg_helper(cg, h_args_get(), s_ag, buf_len(c))
+
+    mc_align16(c)
+    s_ac := buf_len(c)
+    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+    mc_b3(c, 0x48, 0xC7, 0xC1)
+    mc_u32(c, 0xFFFFFFFF)
+    j_ag := mc_jmp32(c)
+    mc_patch_rel32(c, j_ag, s_ag)
+    cg_reg_helper(cg, h_args_count(), s_ac, buf_len(c))
+
+    // 7c. `h_fs_read` & `h_fs_write`
+    emit_fs_helpers_ax(cg)
+}
+
+fn emit_fs_helpers_ax(cg: CodegenCtx) {
+    c := cg.code
+
+    // `h_fs_read(rcx=path_ptr, rdx=path_len) -> rax=err_tag, rdx=ByteBuf`
+    mc_align16(c)
+    s_fr := buf_len(c)
+    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+    mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+    mc_b3(c, 0x48, 0x81, 0xEC)
+    mc_u32(c, 0x280)
+    mc_b3(c, 0x4C, 0x8D, 0x85)
+    mc_u32(c, 0 - 0x220)
+    mc_b2(c, 0x31, 0xC0)
+    cpl1 := buf_len(c)
+    mc_b3(c, 0x48, 0x39, 0xD0)
+    ja1 := mc_jcc8(c, 0x73)
+    mc_b2(c, 0x48, 0x3D)
+    mc_u32(c, 500)
+    ja2 := mc_jcc8(c, 0x73)
+    mc_b4(c, 0x44, 0x8A, 0x0C, 0x01)
+    mc_b4(c, 0x45, 0x88, 0x0C, 0x00)
+    mc_b3(c, 0x48, 0xFF, 0xC0)
+    jcp1 := mc_jcc8(c, 0xEB)
+    mc_patch_jcc8(c, jcp1, cpl1)
+    mc_patch_jcc8(c, ja1, buf_len(c))
+    mc_patch_jcc8(c, ja2, buf_len(c))
+    mc_b4(c, 0x41, 0xC6, 0x04, 0x00)
+    mc_b1(c, 0)
+
+    mc_b3(c, 0x4C, 0x89, 0xC1)
+    mc_b1(c, 0xBA)
+    mc_u32(c, 0x80000000)
+    mc_b2(c, 0x41, 0xB8)
+    mc_u32(c, 1)
+    mc_b3(c, 0x45, 0x31, 0xC9)
+    mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+    mc_b1(c, 0x20)
+    mc_u32(c, 3)
+    mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+    mc_b1(c, 0x28)
+    mc_u32(c, 0x80)
+    mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+    mc_b1(c, 0x30)
+    mc_u32(c, 0)
+    cg_call_iat(cg, iat_create_file_a())
+
+    mc_b4(c, 0x48, 0x83, 0xF8, 0xFF)
+    je_er1 := mc_jcc32(c, 0x84)
+    mc_b4(c, 0x48, 0x89, 0x45, 0xF8)
+    mc_b3(c, 0x48, 0x89, 0xC1)
+    mc_b4(c, 0x48, 0x8D, 0x55, 0xF0)
+    cg_call_iat(cg, iat_get_file_size_ex())
+
+    mc_b2(c, 0x31, 0xC9)
+    mc_b4(c, 0x48, 0x8B, 0x55, 0xF0)
+    mc_b4(c, 0x48, 0x83, 0xC2, 0x40)
+    mc_b2(c, 0x41, 0xB8)
+    mc_u32(c, 0x3000)
+    mc_b2(c, 0x41, 0xB9)
+    mc_u32(c, 4)
+    cg_call_iat(cg, iat_virtual_alloc())
+
+    mc_b4(c, 0x48, 0x89, 0x45, 0xE8)
+    mc_b4(c, 0x48, 0x8B, 0x55, 0xF0)
+    mc_b4(c, 0x48, 0x83, 0xC2, 0x20)
+    mc_b4(c, 0x48, 0x89, 0x50, 0x08)
+    mc_b4(c, 0x48, 0x8B, 0x4D, 0xF8)
+    mc_b4(c, 0x48, 0x8D, 0x50, 0x10)
+    mc_b4(c, 0x44, 0x8B, 0x45, 0xF0)
+    mc_b4(c, 0x4C, 0x8D, 0x4D, 0xE0)
+    mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+    mc_b1(c, 0x20)
+    mc_u32(c, 0)
+    mc_b4(c, 0x48, 0xC7, 0x45, 0xE0)
+    mc_u32(c, 0)
+    cg_call_iat(cg, iat_read_file())
+
+    mc_b4(c, 0x48, 0x8B, 0x45, 0xE8)
+    mc_b3(c, 0x8B, 0x55, 0xE0)
+    mc_b3(c, 0x48, 0x89, 0x10)
+    mc_b4(c, 0x48, 0x8B, 0x4D, 0xF8)
+    cg_call_iat(cg, iat_close_handle())
+
+    mc_b2(c, 0x31, 0xC0)
+    mc_b4(c, 0x48, 0x8B, 0x55, 0xE8)
+    mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+    mc_b1(c, 0xC3)
+
+    mc_patch_rel32(c, je_er1, buf_len(c))
+    mc_b1(c, 0xB8)
+    mc_u32(c, 1)
+    mc_b2(c, 0x31, 0xD2)
+    mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+    mc_b1(c, 0xC3)
+    cg_reg_helper(cg, h_fs_read(), s_fr, buf_len(c))
+
+    // `h_fs_write(rcx=path_ptr, rdx=path_len, r8=bytebuf_ptr) -> rax=err_tag, rdx=written`
+    mc_align16(c)
+    s_fw := buf_len(c)
+    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+    mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+    mc_b3(c, 0x48, 0x81, 0xEC)
+    mc_u32(c, 0x280)
+    mc_b4(c, 0x4C, 0x89, 0x45, 0xE8)
+    mc_b3(c, 0x4C, 0x8D, 0x85)
+    mc_u32(c, 0 - 0x220)
+    mc_b2(c, 0x31, 0xC0)
+    cpl2 := buf_len(c)
+    mc_b3(c, 0x48, 0x39, 0xD0)
+    jb1 := mc_jcc8(c, 0x73)
+    mc_b2(c, 0x48, 0x3D)
+    mc_u32(c, 500)
+    jb2 := mc_jcc8(c, 0x73)
+    mc_b4(c, 0x44, 0x8A, 0x0C, 0x01)
+    mc_b4(c, 0x45, 0x88, 0x0C, 0x00)
+    mc_b3(c, 0x48, 0xFF, 0xC0)
+    jcp2 := mc_jcc8(c, 0xEB)
+    mc_patch_jcc8(c, jcp2, cpl2)
+    mc_patch_jcc8(c, jb1, buf_len(c))
+    mc_patch_jcc8(c, jb2, buf_len(c))
+    mc_b4(c, 0x41, 0xC6, 0x04, 0x00)
+    mc_b1(c, 0)
+
+    mc_b3(c, 0x4C, 0x89, 0xC1)
+    mc_b1(c, 0xBA)
+    mc_u32(c, 0x40000000)
+    mc_b3(c, 0x45, 0x31, 0xC0)
+    mc_b3(c, 0x45, 0x31, 0xC9)
+    mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+    mc_b1(c, 0x20)
+    mc_u32(c, 2)
+    mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+    mc_b1(c, 0x28)
+    mc_u32(c, 0x80)
+    mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+    mc_b1(c, 0x30)
+    mc_u32(c, 0)
+    cg_call_iat(cg, iat_create_file_a())
+
+    mc_b4(c, 0x48, 0x83, 0xF8, 0xFF)
+    je_er2 := mc_jcc32(c, 0x84)
+    mc_b4(c, 0x48, 0x89, 0x45, 0xF8)
+    mc_b4(c, 0x4C, 0x8B, 0x55, 0xE8)
+    mc_b3(c, 0x48, 0x89, 0xC1)
+    mc_b4(c, 0x49, 0x8D, 0x52, 0x10)
+    mc_b3(c, 0x45, 0x8B, 0x02)
+    mc_b4(c, 0x4C, 0x8D, 0x4D, 0xE0)
+    mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+    mc_b1(c, 0x20)
+    mc_u32(c, 0)
+    mc_b4(c, 0x48, 0xC7, 0x45, 0xE0)
+    mc_u32(c, 0)
+    cg_call_iat(cg, iat_write_file())
+
+    mc_b4(c, 0x48, 0x8B, 0x4D, 0xF8)
+    cg_call_iat(cg, iat_close_handle())
+
+    mc_b2(c, 0x31, 0xC0)
+    mc_b3(c, 0x8B, 0x55, 0xE0)
+    mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+    mc_b1(c, 0xC3)
+
+    mc_patch_rel32(c, je_er2, buf_len(c))
+    mc_b1(c, 0xB8)
+    mc_u32(c, 1)
+    mc_b2(c, 0x31, 0xD2)
+    mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+    mc_b1(c, 0xC3)
+    cg_reg_helper(cg, h_fs_write(), s_fw, buf_len(c))
+}

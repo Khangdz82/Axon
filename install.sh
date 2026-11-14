@@ -1,40 +1,27 @@
 #!/usr/bin/env bash
-# Axon Systems Programming Language: 1-Touch Zero-Dependency Installer (Linux & macOS)
-# Installs self-hosted `axc` compiler (< 1.5 MB single binary) in under 3 seconds.
+# Axon v5.0 Standalone Toolchain Installer (Linux & macOS)
 set -euo pipefail
 
-AXON_VERSION="0.20.0"
+AXON_VERSION="5.0.0"
 INSTALL_DIR="${HOME}/.axon/bin"
 AXC_BIN="${INSTALL_DIR}/axc"
 
-echo "[*] Installing Axon ${AXON_VERSION} (< 1.5 MB Self-Hosted Toolchain)..."
+echo "[*] Installing Axon v${AXON_VERSION} Native Compiler..."
 mkdir -p "${INSTALL_DIR}"
 
-OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
-ARCH_NAME="$(uname -m)"
-
-if [ "${ARCH_NAME}" = "x86_64" ]; then
-    TARGET_ARCH="x86_64"
-elif [ "${ARCH_NAME}" = "aarch64" ] || [ "${ARCH_NAME}" = "arm64" ]; then
-    TARGET_ARCH="arm64"
-else
-    echo "[-] Unsupported architecture: ${ARCH_NAME}" && exit 1
-fi
-
-# Determine source binary or download
 if [ -f "./bin/axc" ]; then
     cp "./bin/axc" "${AXC_BIN}"
-elif [ -f "./bin/axc.exe" ]; then
-    cp "./bin/axc.exe" "${AXC_BIN}"
+elif command -v cargo >/dev/null 2>&1; then
+    echo "[*] Building Stage-0 native compiler from bootstrap_archive/axc_native..."
+    cargo build --release --manifest-path bootstrap_archive/axc_native/Cargo.toml
+    cp "bootstrap_archive/axc_native/target/release/axc" "${AXC_BIN}"
 else
-    # In live installation, downloads exact single-file binary with verified SHA-256
-    echo "[*] Fetching axc-${TARGET_ARCH}-${OS_NAME}..."
-    touch "${AXC_BIN}"
+    echo "[-] ./bin/axc not found and cargo is unavailable to bootstrap Stage-0." >&2
+    exit 1
 fi
 
 chmod +x "${AXC_BIN}"
 
-# Configure PATH
 if ! echo "${PATH}" | grep -q "${INSTALL_DIR}"; then
     SHELL_PROFILE="${HOME}/.bashrc"
     if [ -f "${HOME}/.zshrc" ]; then
@@ -44,5 +31,5 @@ if ! echo "${PATH}" | grep -q "${INSTALL_DIR}"; then
     echo "[+] Added ${INSTALL_DIR} to PATH in ${SHELL_PROFILE}"
 fi
 
-echo "[+] Axon installation complete! Verified in < 1.2s."
-echo "[+] Run 'axc --version' or 'axc --help' to get started."
+echo "[+] Installed Axon compiler to ${AXC_BIN}"
+"${AXC_BIN}" version

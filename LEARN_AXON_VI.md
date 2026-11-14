@@ -1,1237 +1,543 @@
-# GIÁO TRÌNH LẬP TRÌNH AXON (`.ax`): TỪ CƠ BẢN ĐẾN LÀM CHỦ HỆ THỐNG
-**Tác giả:** Đội ngũ Kỹ thuật Hệ thống Axon  
-**Phiên bản:** Axon 0.17.0 (Hỗ trợ Native AI, Tensor Autograd, Zero-Copy & Multi-Hardware FMV)
+# Giáo Trình Ngôn Ngữ Lập Trình Axon v5.0 (Từ Cơ Bản Đến Làm Chủ Hệ Thống)
+
+Tài liệu này là hướng dẫn chính thức của **Axon v5.0 (`.ax`)**: ngôn ngữ lập trình hệ thống tự thân (self-hosted) được thiết kế để kết hợp **cú pháp tự nhiên, dễ học của Python/Go** với **tốc độ mã máy trần vượt C++/Rust**, **kích thước tệp thực thi độc lập chỉ vài KB**, và **an toàn bộ nhớ + bảo mật chống dịch ngược ngay từ trình biên dịch**.
+
+Mọi đoạn mã trong giáo trình này đều tương thích trực tiếp với trình biên dịch thực tế `bin/axc.exe` và `bin/axc0.exe` trong kho mã nguồn.
 
 ---
 
-## MỤC LỤC
-- [Chương 1: Khởi đầu trong 5 phút](#chương-1-khởi-đầu-trong-5-phút)
-- [Chương 2: Cú pháp Cơ bản Phong cách Python](#chương-2-cú-pháp-cơ-bản-phong-cách-python)
-- [Chương 3: Cấu trúc Dữ liệu & Khớp mẫu](#chương-3-cấu-trúc-dữ-liệu--khớp-mẫu)
-- [Chương 4: An toàn Bộ nhớ Không cần Đau đầu](#chương-4-an-toàn-bộ-nhớ-không-cần-đau-đầu)
-- [Chương 5: Sức mạnh Phần cứng với Table[T] & SIMD](#chương-5-sức-mạnh-phần-cứng-với-tablet--simd)
-- [Chương 6: Xử lý Lỗi Nhanh & Sạch](#chương-6-xử-lý-lỗi-nhanh--sạch)
-- [Chương 7: Lập trình Đa luồng Không Sợ Xung Đột](#chương-7-lập-trình-đa-luồng-không-sợ-xung-đột)
-- [Chương 8: Kết nối Hệ sinh thái C/Python & Tối ưu Hóa](#chương-8-kết-nối-hệ-sinh-thái-cpython--tối-ưu-hóa)
-- [Chương 9: Thực hành 3 Dự án Thực tế Hoàn chỉnh](#chương-9-thực-hành-3-dự-án-thực-tế-hoàn-chỉnh)
-- [Chương 10: Lập trình AI Tốc độ Cao & Zero-Copy (Native AI, Tensor, Autograd & GPU)](#chương-10-lập-trình-ai-tốc-độ-cao--zero-copy)
+## Mục Lục
+
+1. [Bắt đầu với Axon v5.0 trong 2 phút](#chương-1-bắt-đầu-với-axon-v50-trong-2-phút)
+2. [Biến, Kiểu Dữ Liệu & Cú Pháp Phong Cách Python](#chương-2-biến-kiểu-dữ-liệu--cú-pháp-phong-cách-python)
+3. [Hàm, Tham Số Đặt Tên, Mặc Định & Đường Ống `|>`](#chương-3-hàm-tham-số-đặt-tên-mặc-định--đường-ống-)
+4. [Luồng Điều Khiển & Tinh Chỉnh Biên Mảng `where`](#chương-4-luồng-điều-khiển--tinh-chỉnh-biên-mảng-where)
+5. [Xử Lý Lỗi Không Chi Phí `T ! Error`](#chương-5-xử-lý-lỗi-không-chi-phí-t--error)
+6. [Struct, Phương Thức `impl` & Giao Diện Duck-Typing `interface`](#chương-6-struct-phương-thức-impl--giao-diện-duck-typing-interface)
+7. [Số Thập Phân Tài Chính Chính Xác `dec`](#chương-7-số-thập-phân-tài-chính-chính-xác-dec)
+8. [Quản Lý Bộ Nhớ Tĩnh Perceus & Tái Sử Dụng Tại Chỗ FBIP](#chương-8-quản-lý-bộ-nhớ-tĩnh-perceus--tái-sử-dụng-tại-chỗ-fbip)
+9. [Bảng Cột `Table[T]` SoA & Tự Động Vector Hóa AVX2 FMA3](#chương-9-bảng-cột-tablet-soa--tự-động-vector-hóa-avx2-fma3)
+10. [Đa Luồng An Toàn `spawn` & Cấu Trúc Phân Tán `CRDT`](#chương-10-đa-luồng-an-toàn-spawn--cấu-trúc-phân-tán-crdt)
+11. [Bảo Mật Năng Lực, Chống Crack & Nhị Phân Sạch Antivirus](#chương-11-bảo-mật-năng-lực-chống-crack--nhị-phân-sạch-antivirus)
+12. [Kiến Trúc Self-Hosting, Hàm Nội Tại & Bảng Mã Lỗi](#chương-12-kiến-trúc-self-hosting-hàm-nội-tại--bảng-mã-lỗi)
 
 ---
 
-## CHƯƠNG 1: KHỞI ĐẦU TRONG 5 PHÚT
+## Chương 1: Bắt đầu với Axon v5.0 trong 2 phút
 
-### 1.1. Triết lý của Axon
-Axon ra đời nhằm giải quyết nghịch lý lớn nhất của ngành kỹ thuật phần mềm:
-- **Python:** Dễ đọc, dễ viết, học nhanh — nhưng chậm chạp, ngốn RAM khủng khiếp và file đóng gói cồng kềnh (hàng chục đến hàng trăm MB).
-- **C++23 & Rust:** Tốc độ tối đa, tiết kiệm tài nguyên — nhưng cú pháp rối rắm, thời gian biên dịch lâu tính bằng phút, và ký hiệu kiểm soát vòng đời (`'a`) gây đau đầu cho lập trình viên.
+### 1.1. Axon giải quyết bài toán gì?
 
-**Axon kết hợp tinh hoa của cả hai thế giới:** Cú pháp trong sáng, thanh lịch như Python; tốc độ thực thi ngang bằng hoặc vượt C++23; file nhị phân độc lập siêu nhỏ (< 50 KB); tự động vector hóa phần cứng CPU/GPU; và tuyệt đối không có lỗi bộ nhớ (0 GC, 0 Memory Leak, 0 Undefined Behavior).
+Các ngôn ngữ lập trình truyền thống buộc người học phải đánh đổi:
+- **Python / JavaScript:** Dễ viết nhưng chậm hàng trăm lần trên vòng lặp tính toán và cần máy ảo nặng hàng trăm MB.
+- **Java / Go:** Phải gánh bộ thu gom rác (GC) gây giật độ trễ, tệp thực thi nặng từ vài MB đến hàng trăm MB JRE.
+- **C / C++:** Nhanh và nhẹ nhưng đầy lỗ hổng tràn bộ đệm, con trỏ treo (Use-After-Free) và tràn số âm thầm.
+- **Rust:** An toàn nhưng rào cản học tập cao do ký hiệu vòng đời `'a`, borrow checker phức tạp và thời gian biên dịch lâu.
 
-### 1.2. Cài đặt & Cấu trúc Dự án
-Trình biên dịch `axc` là một file nhị phân tự chủ hoàn toàn (166 KB), không yêu cầu cài đặt GCC, Clang, Rust, Python hay bất kỳ thư viện ngoài nào.
+**Axon v5.0** xóa bỏ sự đánh đổi đó bằng 4 trụ cột kỹ thuật:
+1. **Cú pháp tối giản:** Không bắt buộc dấu chấm phẩy `;`, dùng `and` / `or` / `not`, nội suy chuỗi `f"..."`, tham số đặt tên.
+2. **Perceus tĩnh (0 GC, 0 `'a` lifetime):** Tự động chèn lệnh giải phóng bộ nhớ xác định và tái sử dụng vùng nhớ ngay tại chỗ (FBIP).
+3. **`Table[T]` theo cột (SoA) + AVX2 FMA3 tự động:** Tối ưu băng thông RAM và phát lệnh SIMD 256-bit trực tiếp từ vòng lặp `for` thông thường.
+4. **Trình biên dịch độc lập ~547 KB:** Tự sinh mã máy `x86_64` và đóng gói thẳng tệp `.exe` chuẩn OS (~5.5 KB cho ứng dụng cơ bản) trong vài mili-giây.
 
-Cấu trúc file cấu hình `axon.toml`:
-```toml
-[package]
-name = "my_app"
-version = "0.1.0"
-edition = "2026"
+### 1.2. Cài đặt & chạy chương trình đầu tiên
 
-[compiler]
-opt-level = "release"
-simd = "auto"
-backend = "direct-machine-code"
+Trên Windows PowerShell:
+
+```powershell
+# Cài đặt axc.exe vào ~/.axon/bin và thêm vào PATH
+.\install.ps1
+
+# Kiểm tra phiên bản
+.\bin\axc.exe version
 ```
 
-### 1.3. Chương trình đầu tiên (`main.ax`)
-```axon
-fn main() -> i32 {
-    let message = "Xin chào Axon 2026!";
-    let status = 0;
-    return status;
-}
-```
-
-Biên dịch và chạy tức thì:
-```bash
-axc run main.ax
-```
-
----
-
-## CHƯƠNG 2: CÚ PHÁP CƠ BẢN PHONG CÁCH PYTHON
-
-### 2.1. Khai báo Biến: Bất biến theo Mặc định
-Trong Axon, biến được khai báo bằng `let` là **bất biến** (`immutable`). Nếu muốn thay đổi giá trị, bạn phải dùng từ khóa `mut`.
+Tạo tệp `examples/hello.ax`:
 
 ```axon
+fn greet(name: str, role: str = "Systems Engineer") {
+    println(f"Hello, {name}! Welcome to Axon v5.0 ({role}).")
+}
+
+@shield
 fn main() -> i32 {
-    let max_connections = 1000;
-    let mut current_connections = 0;
-    current_connections += 1;
-    if current_connections <= max_connections {
-        return 0;
-    }
-    return 1;
+    greet("World")
+    greet("Khang", role = "Language Architect")
+    return 0
 }
 ```
 
-### 2.2. Toán tử Logic Tự nhiên (`and`, `or`, `not`)
-Axon xóa bỏ các ký hiệu rối mắt `&&`, `||`, `!`. Thay vào đó, bạn viết code bằng tiếng Anh tự nhiên như Python:
+Kiểm tra kiểu và biên dịch ra tệp thực thi độc lập:
 
-```axon
-fn is_eligible(age: i32, has_license: i32, is_suspended: i32) -> i32 {
-    if age >= 18 and has_license == 1 and not (is_suspended == 1) {
-        return 1;
-    }
-    return 0;
-}
+```powershell
+# Chỉ kiểm tra an toàn kiểu, bộ nhớ và năng lực (~1 ms)
+.\bin\axc.exe check examples/hello.ax
 
-fn main() -> i32 {
-    let ok = is_eligible(20, 1, 0);
-    if ok == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 2.3. Tham số Mặc định & Gọi Hàm theo Tên (Named Arguments)
-Bạn có thể đặt giá trị mặc định cho tham số hàm và gọi hàm truyền tên tham số để code luôn tự tài liệu hóa:
-
-```axon
-struct ServerConfig {
-    port: i32,
-    timeout_ms: i32,
-    max_clients: i32,
-}
-
-fn create_server_config(port: i32, timeout_ms: i32, max_clients: i32) -> ServerConfig {
-    return ServerConfig(port, timeout_ms, max_clients);
-}
-
-fn main() -> i32 {
-    let cfg = create_server_config(8080, 5000, 10000);
-    if cfg.port == 8080 and cfg.timeout_ms == 5000 {
-        return 0;
-    }
-    return 1;
-}
+# Biên dịch thẳng ra tệp thực thi gốc Windows PE32+ (~5.5 KB)
+.\bin\axc.exe build examples/hello.ax -o bin/hello.exe
+.\bin\hello.exe
 ```
 
 ---
 
-## CHƯƠNG 3: CẤU TRÚC DỮ LIỆU & KHỚP MẪU
+## Chương 2: Biến, Kiểu Dữ Liệu & Cú Pháp Phong Cách Python
 
-### 3.1. Cấu trúc (`struct`) & Tuple Unpacking
-Axon hỗ trợ cấu trúc dữ liệu phẳng, xếp thẳng trong bộ nhớ (contiguous layout) với chi phí trừu tượng bằng 0.
+### 2.1. Bất biến mặc định (`:=`) và Khả biến tường minh (`mut`)
+
+Trong Axon, biến khai báo bằng `:=` (hoặc `let`) là **bất biến mặc định** để ngăn lỗi ghi đè ngoài ý muốn. Khi cần thay đổi giá trị, thêm từ khóa `mut`:
 
 ```axon
-struct Point3D {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-
-fn calculate_bounds() -> (i64, i64) {
-    let min_v: i64 = 10;
-    let max_v: i64 = 990;
-    return (min_v, max_v);
-}
-
 fn main() -> i32 {
-    let p = Point3D(1.5, 2.5, 3.5);
-    let bounds = calculate_bounds();
-    let min_val = bounds.0;
-    let max_val = bounds.1;
-    
-    if p.x > 0.0 and min_val < max_val {
-        return 0;
-    }
-    return 1;
+    limit := 100              // Bất biến (suy luận kiểu i64)
+    let ratio: f64 = 3.5      // Khai báo kiểu tường minh
+    mut counter := 0          // Khả biến
+
+    counter += 10
+    println(f"limit={limit}, ratio={ratio}, counter={counter}")
+    return 0
 }
+```
+
+Nếu cố tình gán lại một biến không có `mut`, trình biên dịch chặn ngay lập tức với lỗi **`[SAFETY ERROR E0301]`**.
+
+### 2.2. Các kiểu dữ liệu nguyên thủy
+
+| Kiểu dữ liệu | Kích thước / Biểu diễn | Ví dụ hằng số | Ghi chú |
+| :--- | :--- | :--- | :--- |
+| `i64`, `int`, `usize` | Số nguyên 64-bit có dấu | `42`, `0xFF00` | Kiểu nguyên mặc định trên thanh ghi 64-bit |
+| `i32` | Số nguyên 32-bit | `0` | Thường dùng cho mã thoát `fn main() -> i32` |
+| `u8`, `byte` | Byte 8-bit | `65` | Dùng khi xử lý nhị phân |
+| `f64`, `float` | Số thực dấu phẩy động 64-bit | `3.14159` | Chuẩn IEEE-754 double precision |
+| `f32` | Số thực 32-bit | `1.5` | Tối ưu cho cột SIMD `Table[T]` (8 số / thanh ghi YMM) |
+| `dec` | Số thập phân cố định 64-bit | `49.50d`, `0.08d` | Chính xác 4 chữ số thập phân (hệ số `10_000`), 0 sai số làm tròn |
+| `bool` | Logic đúng / sai | `true`, `false` | Hỗ trợ `and`, `or`, `not` đoản mạch |
+| `str` | Chuỗi UTF-8 slice (`ptr + len`) | `"Axon"`, `f"x={x}"` | Truy cập độ dài O(1), không kết thúc bằng NUL mù |
+
+### 2.3. Logic đoản mạch (`and`, `or`, `not`) và Toán tử số học an toàn
+
+- **Đoản mạch (Short-circuit):** Trong `a and b`, nếu `a` sai thì `b` không bao giờ được thực thi. Trong `a or b`, nếu `a` đúng thì `b` được bỏ qua. Điều này giúp viết biểu thức kiểm tra biên `if i < n and str_byte(s, i) == 65` an toàn tuyệt đối.
+- **Chống tràn số tự động:** Trong hàm có bật `@shield`, các phép `+`, `-`, `*` kiểm tra cờ tràn phần cứng CPU (`JO`) và phép `/`, `%` luôn chặn chia cho `0` cũng như tràn `INT64_MIN / -1`.
+- **Toán tử tràn có chủ đích (Wrapping):** Khi viết thuật toán băm (như FNV-1a hay mật mã) cần tràn bit 64-bit chuẩn xác, sử dụng `+%`, `-%`, `*%`:
+
+```axon
+mut hash := 0xcbf29ce484222325
+hash = (hash ^ byte_val) *% 0x100000001b3
 ```
 
 ---
 
-## CHƯƠNG 4: AN TOÀN BỘ NHỚ KHÔNG CẦN ĐAU ĐẦU
+## Chương 3: Hàm, Tham Số Đặt Tên, Mặc Định & Đường Ống `|>`
 
-### 4.1. Bí quyết Tốc độ C++ mà Không cần Garbage Collector
-Các ngôn ngữ khác buộc bạn phải chọn:
-- **Dùng GC (Java, Go, C#):** Chương trình bị khựng (Stop-The-World jitter), ngốn RAM gấp 3–5 lần.
-- **Dùng Borrow Checker (Rust):** Ký hiệu lifetime `'a`, `'b` phức tạp khiến người mới mất hàng tháng để quen.
+### 3.1. Tham số mặc định và Gọi hàm theo tên (Named Arguments)
 
-Axon sử dụng hệ tư tưởng **Local Reasoning** kết hợp thuật toán **Perceus FBIP (Functional But In-Place)**:
-1. **Value Semantics:** Mọi dữ liệu mặc định được truyền theo giá trị hoặc tham chiếu tạm thời an toàn.
-2. **Second-Class References:** Tham chiếu chỉ được dùng làm tham số hàm, cấm lưu tham chiếu vào struct hay trả về tham chiếu. Nhờ đó, trình biên dịch chứng minh an toàn trong từng hàm độc lập (< 1 ms).
-3. **In-Place Reuse:** Khi một đối tượng hết vòng đời và một đối tượng mới cùng kích thước được tạo ra, trình biên dịch tự động ghi đè lên bộ nhớ cũ — **0 lần gọi malloc, 0 lần gọi free**.
+Bạn không cần tạo hàng loạt hàm nạp chồng (overloading) hay Builder pattern phức tạp như trong Java/Rust:
 
 ```axon
-struct BufferNode {
-    id: i64,
-    size_bytes: i32,
-}
-
-fn reuse_buffer(node: BufferNode) -> BufferNode {
-    // Perceus tự động tái sử dụng vùng nhớ của `node` cho đối tượng mới
-    return BufferNode(node.id + 1, node.size_bytes * 2);
+fn compute_score(base: i64, bonus: i64 = 10, multiplier: i64 = 2) -> i64 {
+    return (base + bonus) * multiplier
 }
 
 fn main() -> i32 {
-    let n1 = BufferNode(100, 1024);
-    let n2 = reuse_buffer(n1);
-    if n2.id == 101 and n2.size_bytes == 2048 {
-        return 0;
-    }
-    return 1;
+    s1 := compute_score(50)                               // (50 + 10) * 2 = 120
+    s2 := compute_score(50, multiplier = 5)               // (50 + 10) * 5 = 300
+    s3 := compute_score(bonus = 20, base = 30)            // (30 + 20) * 2 = 100
+    println(f"s1={s1}, s2={s2}, s3={s3}")
+    return 0
+}
+```
+
+### 3.2. Tham số cập nhật tại chỗ (`mut`) và Trả về nhiều giá trị (Tuple)
+
+- Khai báo tham số `mut x: i64` (gọi bằng `bump(mut val)`) cho phép hàm cập nhật trực tiếp biến của hàm gọi mà không cần con trỏ thô `*int`.
+- Hàm có thể trả về một bộ Tuple nhiều giá trị và giải nén trực tiếp:
+
+```axon
+fn div_rem(a: i64, b: i64) -> (i64, i64) {
+    return (a / b, a % b)
+}
+
+fn bump_twice(mut v: i64, step: i64) {
+    v += step * 2
+}
+
+fn main() -> i32 {
+    (q, r) := div_rem(29, 5)
+    mut total := q
+    bump_twice(mut total, r)
+    println(f"q={q}, r={r}, total={total}")
+    return 0
+}
+```
+
+### 3.3. Toán tử đường ống `|>`
+
+Toán tử `x |> f(a, b)` tự động truyền `x` làm đối số đầu tiên `f(x, a, b)`, giúp chuỗi biến đổi dữ liệu đọc xuôi từ trái sang phải:
+
+```axon
+fn add_offset(x: i64, off: i64) -> i64 { return x + off }
+fn scale_up(x: i64, k: i64) -> i64 { return x * k }
+
+fn main() -> i32 {
+    result := 10 |> add_offset(5) |> scale_up(4)   // scale_up(add_offset(10, 5), 4) = 60
+    println(f"piped={result}")
+    return 0
 }
 ```
 
 ---
 
-## CHƯƠNG 5: SỨC MẠNH PHẦN CỨNG VỚI TABLE[T] & SIMD
+## Chương 4: Luồng Điều Khiển & Tinh Chỉnh Biên Mảng `where`
 
-### 5.1. Tại sao `Table[T]` nhanh hơn mảng thông thường?
-Trong lập trình hướng đối tượng truyền thống (Array-of-Structures - AoS), mảng các đối tượng khiến CPU phải nạp toàn bộ các trường không liên quan vào Cache Line, gây lãng phí 70% băng thông bộ nhớ.
+### 4.1. `if / else if / else`, `while` và `for .. in`
 
-Trong Axon, kiểu mảng chuẩn là **`Table[T]`** (Native Structure-of-Arrays - SoA). Trình biên dịch tự động tách các trường thành các mảng bộ nhớ riêng biệt, căn chỉnh 64-byte. Khi bạn duyệt qua mảng, CPU nạp 8 hoặc 16 phần tử cùng lúc qua tập lệnh vector SIMD (AVX2 / AVX-512 / ARM NEON).
+Cú pháp điều kiện và vòng lặp gọn gàng, không cần dấu ngoặc tròn `(...)` bao quanh điều kiện:
+
+```axon
+fn main() -> i32 {
+    mut sum := 0
+    for i in 0..10 {
+        if i % 2 == 0 {
+            sum += i
+        }
+    }
+
+    mut n := 5
+    while n > 0 {
+        n -= 1
+    }
+    println(f"even_sum={sum}")
+    return 0
+}
+```
+
+### 4.2. Loại bỏ kiểm tra biên tĩnh bằng mệnh đề tinh chỉnh `where`
+
+Mọi truy cập chỉ số `table[idx]` trong Axon mặc định đều được bảo vệ chống tràn bộ đệm. Khi hiệu năng cực hạn cần loại bỏ cả lệnh `CMP + JAE` trong vòng lặp nóng, bạn có thể chứng minh biên ngay trên chữ ký hàm bằng `where idx < arr.len` hoặc duyệt qua `for idx in 0..arr.len`:
+
+```axon
+fn read_checked(arr: Table[i64], idx: usize where idx < arr.len) -> i64 {
+    return arr[idx]   // Đã chứng minh tĩnh hợp lệ -> 0 chu kỳ kiểm tra biên thừa
+}
+```
+
+---
+
+## Chương 5: Xử Lý Lỗi Không Chi Phí `T ! Error`
+
+Axon thay thế cơ chế `try / catch` nặng nề (cần bảng stack unwinding runtime) bằng kiểu hợp lỗi **`PayloadType ! ErrorType`** nằm gọn trên các thanh ghi/slot ngăn xếp:
+
+- Trả về thành công bằng `ok(gia_tri)`.
+- Trả về lỗi bằng `err(ma_loi)`.
+- Xử lý tại nơi gọi bằng 3 cách cực ngắn gọn:
+  1. **`expr or gia_tri_du_phong`**: Nhận giá trị dự phòng nếu hàm trả về lỗi.
+  2. **`expr or return gia_tri_thoat`**: Thoát sớm khỏi hàm hiện tại nếu gặp lỗi.
+  3. **`expr?`**: Tự động chuyển tiếp lỗi lên hàm gọi (khi hàm hiện tại cũng trả về `T ! E`).
+
+```axon
+fn parse_port(raw: i64) -> i64 ! i64 {
+    if raw <= 0 or raw > 65535 {
+        return err(400)
+    }
+    return ok(raw)
+}
+
+fn open_service(raw_port: i64) -> i64 ! i64 {
+    port := parse_port(raw_port)?     // Tự động trả về err(400) nếu không hợp lệ
+    return ok(port + 1000)
+}
+
+fn main() -> i32 {
+    p_valid := parse_port(8080) or 80
+    p_fallback := parse_port(-5) or 3000
+    svc := open_service(443) or 0
+    println(f"valid={p_valid}, fallback={p_fallback}, svc={svc}")
+    return 0
+}
+```
+
+---
+
+## Chương 6: Struct, Phương Thức `impl` & Giao Diện Duck-Typing `interface`
+
+### 6.1. Struct giá trị phẳng và `impl`
+
+`struct` trong Axon được bố trí phẳng liên tiếp trên ngăn xếp (Stack), không tốn con trỏ đối tượng hay header 16-byte như Java/Python:
+
+```axon
+struct CloudPlan {
+    monthly: dec
+    nodes: i64
+}
+
+impl CloudPlan {
+    fn subtotal(self) -> dec {
+        return self.monthly * self.nodes
+    }
+}
+```
+
+Bạn có thể khởi tạo `struct` theo thứ tự vị trí `CloudPlan(49.50d, 4)` hoặc đặt tên trường rõ ràng `CloudPlan(monthly = 49.50d, nodes = 4)`.
+
+### 6.2. Giao diện Duck-Typing đa hình trên Stack (`interface`)
+
+Giống Go, một `struct` tự động thỏa mãn `interface` ngay khi có đủ phương thức tương ứng mà không cần khai báo `implements`. Khác với Go/Java phải cấp phát interface lên Heap (gây áp lực GC), Axon đóng gói thẻ định danh kiểu + dữ liệu trực tiếp trên Stack:
+
+```axon
+use std::decimal
+
+interface Billable {
+    fn total_cost(self) -> dec
+}
+
+struct DedicatedNode {
+    unit_price: dec
+    count: i64
+}
+
+impl DedicatedNode {
+    fn total_cost(self) -> dec {
+        return apply_tax(self.unit_price * self.count, rate_pct = 0.10d)
+    }
+}
+
+fn print_invoice(item: Billable) {
+    println(f"Invoice total: ${item.total_cost()}")
+}
+
+fn main() -> i32 {
+    srv := DedicatedNode(unit_price = 100.00d, count = 2)
+    print_invoice(srv)   // $220.00, 0 byte cấp phát Heap
+    return 0
+}
+```
+
+---
+
+## Chương 7: Số Thập Phân Tài Chính Chính Xác `dec`
+
+Trong IEEE-754 `f64`, phép tính `0.1 + 0.2` cho kết quả `0.30000000000000004`, gây sai lệch nghiêm trọng cho ngân hàng, kế toán, sàn giao dịch và thương mại điện tử.
+
+Axon tích hợp sẵn kiểu nguyên thủy **`dec`** (hậu tố `d`, độ chính xác 4 chữ số thập phân = hệ số tỷ lệ `10_000`) chạy trực tiếp trên thanh ghi số nguyên 64-bit của CPU kèm bảo vệ chống tràn phần cứng:
+
+```axon
+use std::decimal
+
+fn main() -> i32 {
+    a := 0.10d
+    b := 0.20d
+    exact_sum := a + b                                // Chính xác tuyệt đối 0.30d
+
+    total := apply_tax(199.99d, rate_pct = 0.08d)     // Thuế 8%
+    (share, remainder) := split_exact_cents(100.00d, 3)
+
+    println(f"0.10d + 0.20d = {exact_sum}")
+    println(f"Taxed = {total}, 3-way split = {share} (rem = {remainder})")
+    return 0
+}
+```
+
+---
+
+## Chương 8: Quản Lý Bộ Nhớ Tĩnh Perceus & Tái Sử Dụng Tại Chỗ FBIP
+
+Axon đạt an toàn bộ nhớ tuyệt đối mà **không cần Garbage Collector** và **không bắt người học viết `'a` lifetime** nhờ 3 cơ chế kết hợp:
+
+### 8.1. Tham chiếu hạng hai (Second-Class References)
+Trình biên dịch cấm cất giữ tham chiếu bên trong `struct` (**`E0101`**) và cấm trả về tham chiếu trỏ tới biến cục bộ của hàm (**`E0102`**). Nhờ đó không bao giờ tồn tại lỗi con trỏ treo (Use-After-Free) và không cần chú thích vòng đời `'a`.
+
+### 8.2. Chuyển quyền sở hữu tuyến tính (`move`) & Giải phóng xác định
+Khi bạn truyền tài nguyên vùng nhớ (`ByteBuf`, `IntBuf`, `Table[T]`) với từ khóa `move`, quyền sở hữu được chuyển hẳn. Mọi truy cập lại biến cũ sau khi `move` đều bị chặn ngay lúc biên dịch với mã lỗi **`E0201`**. Với các vùng nhớ không `move` ra ngoài, trình biên dịch tự động sinh lệnh trả bộ nhớ về hệ điều hành (`VirtualFree`) tại mọi nhánh thoát của hàm.
+
+### 8.3. Tái sử dụng bộ nhớ tại chỗ FBIP (Functional-But-In-Place)
+Khi một vùng đệm cũ kết thúc vòng đời bằng `buf_free(move a)` ngay trước khi cấp phát vùng đệm mới `b := ibuf_new(...)` có dung lượng tương đương, bộ lập lịch Perceus tự động tái sử dụng ngay địa chỉ RAM của `a` cho `b` với **0 lời gọi hệ thống cấp phát mới**:
+
+```axon
+fn process_batch() -> i64 {
+    buf_a := ibuf_new(256)
+    ibuf_push(buf_a, 40)
+    ibuf_push(buf_a, 60)
+    partial := ibuf_get(buf_a, 0) + ibuf_get(buf_a, 1)
+    buf_free(move buf_a)
+
+    // Perceus FBIP tái sử dụng trực tiếp khối RAM của buf_a (0 syscall VirtualAlloc)
+    buf_b := ibuf_new(256)
+    ibuf_push(buf_b, partial + 45)
+    ans := ibuf_get(buf_b, 0)
+    buf_free(move buf_b)
+    return ans
+}
+
+fn main() -> i32 {
+    println(f"FBIP result = {process_batch()}")
+    return 0
+}
+```
+
+---
+
+## Chương 9: Bảng Cột `Table[T]` SoA & Tự Động Vector Hóa AVX2 FMA3
+
+Đây là vũ khí giúp code Axon viết ngắn gọn như Python nhưng chạy **nhanh gấp hơn 6 lần C++/Rust/Go** và **hơn 210 lần Python** trên các bài toán dữ liệu lớn, game engine, mô phỏng vật lý và AI.
+
+### 9.1. Tại sao mảng truyền thống (AoS) trong C++/Rust/Go bị nghẽn RAM?
+Khi bạn khai báo `Entity` gồm 16 trường `f32` (64 byte/phần tử) trong `std::vector<Entity>` (C++) hoặc `Vec<Entity>` (Rust), các trường nằm xen kẽ nhau (`px, vx, py, vy, pz, ...`). Khi vòng lặp chỉ cập nhật `px` và `vx`, CPU vẫn buộc phải kéo toàn bộ 64 byte của mỗi phần tử vào bộ nhớ đệm L1, lãng phí 75% băng thông RAM.
+
+### 9.2. Cách `Table[T]` của Axon vận hành
+Khi bạn khởi tạo `Table[Entity]::with_capacity(n)`:
+1. Trình biên dịch tự động tách từng trường thành các mảng cột liên tiếp trong bộ nhớ (**Structure-of-Arrays - SoA**): toàn bộ `px[0..n]` nằm sát cạnh nhau, toàn bộ `vx[0..n]` nằm sát cạnh nhau.
+2. Vòng lặp `for e in entities { e.px += e.vx * dt }` chỉ chạm đúng các cột đang dùng và tự động hạ xuống vòng lặp phần cứng **4x-Unrolled 256-bit AVX2 FMA3 (`VFMADD231PS`)**, tính đồng thời **32 phần tử `f32` (128 byte)** trên mỗi nhịp lặp!
 
 ```axon
 struct Particle {
-    x: f32,
-    y: f32,
-    vx: f32,
-    vy: f32,
+    px: f32
+    vx: f32
+    py: f32
+    vy: f32
+    mass: f32
+    heat: f32
 }
 
-fn update_particle_field(count: i32, dt: f32) -> f32 {
-    let mut total_distance: f32 = 0.0;
-    let mut i = 0;
-    while i < count {
-        let vx: f32 = 2.0;
-        let delta = vx * dt;
-        total_distance = total_distance + delta;
-        i += 1;
+@shield
+fn main() -> i32 {
+    n := 4096
+    particles := Table[Particle]::with_capacity(n)
+    table_fill_f32(particles, 0, 1.0)    // cột 0 (px) = 1.0
+    table_fill_f32(particles, 1, 3.5)    // cột 1 (vx) = 3.5
+
+    dt := 2.0
+    for p in particles {
+        p.px += p.vx * dt                // Tự động sinh lệnh AVX2 VFMADD231PS
     }
-    return total_distance;
+
+    sample := table_get_f32(particles, 0, n - 1)
+    println(f"Updated {n} particles via AVX2 SoA: px[{n - 1}] = {sample}")
+    return 0
+}
+```
+
+Bạn có thể tự kiểm chứng tốc độ thực tế trên 1,048,576 thực thể $\times$ 200 bước bằng tệp [`examples/bench_soa_simd.ax`](examples/bench_soa_simd.ax):
+
+```powershell
+.\bin\axc.exe build examples/bench_soa_simd.ax -o bin/bench_soa_simd.exe
+.\bin\bench_soa_simd.exe
+```
+
+---
+
+## Chương 10: Đa Luồng An Toàn `spawn` & Cấu Trúc Phân Tán `CRDT`
+
+### 10.1. Tác vụ `spawn` và Kiểm tra cô lập vùng nhớ (`E0202`)
+Axon ngăn chặn hoàn toàn lỗi tranh chấp dữ liệu đa luồng (Data Race) ngay lúc biên dịch: một khối `spawn { ... }` không được phép truy cập biến vùng nhớ độc lập (`isolated`) bên ngoài nếu chưa chuyển giao quyền sở hữu tường minh bằng `move` (**`E0202`**):
+
+```axon
+fn compute_chunk(isolated data: i64) -> i64 {
+    task := spawn {
+        moved_val := move data
+        return moved_val * 2
+    }
+    return task.join()
 }
 
 fn main() -> i32 {
-    let dist = update_particle_field(1000, 0.016);
-    if dist > 0.0 {
-        return 0;
-    }
-    return 1;
+    println(f"Joined result = {compute_chunk(67)}")
+    return 0
+}
+```
+
+### 10.2. Cấu trúc dữ liệu phân tán tự hội tụ `std::crdt`
+Khi đồng bộ trạng thái giữa nhiều nút mạng mà không muốn dùng khóa (mutex/lock), thư viện `std::crdt` cung cấp các cấu trúc bán dàn toán học (`GCounter4`, `LWWReg`) đảm bảo tính giao hoán, kết hợp và lũy đẳng (`merge(a, a) == a`):
+
+```axon
+use std::crdt
+
+fn main() -> i32 {
+    node_a := gcounter_inc(gcounter_new(), 0, 15)
+    node_b := gcounter_inc(gcounter_new(), 1, 27)
+
+    // Gộp theo bất kỳ thứ tự nào hoặc lặp lại nhiều lần đều hội tụ chính xác về 42
+    merged := gcounter_merge(node_a, gcounter_merge(node_b, node_a))
+    println(f"Converged cluster counter = {gcounter_value(merged)}")
+    return 0
 }
 ```
 
 ---
 
-## CHƯƠNG 6: XỬ LÝ LỖI NHANH & SẠCH
+## Chương 11: Bảo Mật Năng Lực, Chống Crack & Nhị Phân Sạch Antivirus
 
-### 6.1. Kiểu Lỗi Kết Hợp `T ! Error`
-Axon không dùng Exception làm chậm chương trình. Lỗi được trả về trực tiếp qua cặp thanh ghi CPU (`RAX` + `RDX`), đạt chi phí bằng 0:
+Axon là ngôn ngữ hiếm hoi tích hợp sẵn cả bảo mật chống tấn công chuỗi cung ứng lẫn bảo vệ bản quyền phần mềm theo đúng chuẩn hệ điều hành:
+
+### 11.1. Bảo mật cấp năng lực (Object-Capability Security - `std::cap`)
+Các hàm I/O đặc quyền thô bị cấm gọi tự do nếu hàm không nắm giữ thẻ năng lực hợp lệ (**`E0501`**). Từ `RootCap` ban đầu ở `main`, bạn thu hẹp quyền xuống thư mục cụ thể và chế độ chỉ-đọc bằng `attenuate_fs`, đồng thời chặn đứng tấn công leo thang thư mục `../../`:
 
 ```axon
-struct FileResult {
-    bytes_read: i32,
-    error_code: i32,
-}
-
-fn read_telemetry_file(file_id: i32) -> FileResult {
-    if file_id <= 0 {
-        return FileResult(0, 404); // Lỗi file không tồn tại
-    }
-    return FileResult(4096, 0); // Đọc thành công 4096 bytes
-}
+use std::cap
 
 fn main() -> i32 {
-    let res = read_telemetry_file(12);
-    if res.error_code == 0 and res.bytes_read == 4096 {
-        return 0;
-    }
-    return 1;
+    root := acquire_root_cap()
+    ro_cap := attenuate_fs(root, base_dir = "examples", read_only = true)
+
+    blocked := not is_safe_subpath("../../Windows/System32/cmd.exe")
+    write_attempt := cap_write_file(ro_cap, "test.txt", buf_new(16)) or -403
+    println(f"Path traversal blocked={blocked}, write on read-only={write_attempt}")
+    return 0
 }
 ```
 
-### 6.2. Quản lý Tài nguyên Tự động với Khối `with`
-Khối `with` bảo đảm file, socket hoặc database connection luôn được giải phóng xác định ngay khi rời khỏi khối lệnh `{}`:
+### 11.2. Ba lớp chống dịch ngược & đánh cắp khóa (`@shield`, `@secret`, `@whitebox`)
+1. **`@shield`:** Tự động bật kiểm tra tràn số phần cứng, chèn `ENDBR64` (Intel CET chống tấn công ROP/JOP), và tính mã băm FNV-1a 64-bit kiểm tra toàn vẹn vùng mã máy `.text` ngay khi tệp `.exe` khởi chạy. Nếu tệp thực thi bị sửa dù chỉ 1 byte mã máy (patching/cracking), chương trình khóa thực thi ngay lập tức.
+2. **`@secret("...")`:** Mã hóa chuỗi nhạy cảm (PIN, khóa API) ngay lúc biên dịch; chỉ giải mã tạm thời vào khung ngăn xếp lúc hàm chạy và tự động ghi đè `0` xóa sạch ngăn xếp trước khi hàm `return` (kiểm tra quét chuỗi plaintext trong tệp `.exe` cho kết quả **0 rò rỉ**).
+3. **`@whitebox` & `whitebox_sbox` (`std::crypto`):** Hòa tan khóa bí mật vào bảng tra cứu song ánh trên trường hữu hạn $\text{GF}(2^8)$ (đa thức tối giản `0x11B`), không để lộ khóa thô trong `.rdata`.
 
 ```axon
-struct DbConnection {
-    conn_id: i32,
-    is_open: i32,
-}
+use std::crypto
 
-fn open_connection(id: i32) -> DbConnection {
-    return DbConnection(id, 1);
-}
-
-fn close_connection(mut conn: DbConnection) -> i32 {
-    conn.is_open = 0;
-    return 0;
-}
-
+@shield
 fn main() -> i32 {
-    let mut db = open_connection(5432);
-    let ok = if db.is_open == 1 { 1 } else { 0 };
-    close_connection(mut db);
-    if ok == 1 {
-        return 0;
-    }
-    return 1;
+    api_pin := @secret("OMEGA-VAULT-9042")
+    license_mac := whitebox_mac_str("AXON-PRO-LICENSE-2026")
+    println(f"Secret length={api_pin.len}, White-Box MAC={license_mac}")
+    return 0
 }
 ```
+
+### 11.3. Chuẩn nhị phân sạch Antivirus (AV-Clean Binary Law)
+Nhiều công cụ đóng gói chống crack bị Windows Defender / EDR nhận nhầm là mã độc vì tạo phân vùng vừa ghi vừa thực thi (`RWX`), thiếu bảng tháo gỡ ngăn xếp hoặc nén làm độ hỗn loạn (Shannon entropy) vọt lên `> 7.2`. Trình liên kết PE32+ của Axon tuân thủ tuyệt đối chuẩn trình biên dịch hệ thống:
+- Tách biệt nghiêm ngặt `W^X`: `.text` chỉ đọc-thực thi (`RX`), `.rdata` và `.pdata` chỉ đọc (`R`), **0 phân vùng `RWX`**.
+- Phát sinh đầy đủ bảng `.pdata` và `.xdata` SEH `UNWIND_INFO` cho mọi hàm.
+- Bật High-Entropy 64-bit ASLR + Hardware DEP/NX (`DllCharacteristics = 0x8160`).
+- Giữ Shannon entropy vùng `.text` ở mức tự nhiên **`~5.61 < 6.50`**.
 
 ---
 
-## CHƯƠNG 7: LẬP TRÌNH ĐA LUỒNG KHÔNG SỢ XUNG ĐỘT
-
-### 7.1. Colorless Concurrency & Từ khóa `isolated`
-Axon không cần `async/await` làm chia rẽ hệ sinh thái hàm (Function Coloring). Mọi tác vụ bất đồng bộ được quản lý bởi **Work-Stealing Fiber Scheduler** cực nhẹ (chỉ tốn vài trăm byte bộ nhớ mỗi fiber).
-
-Để loại bỏ hoàn toàn lỗi Data Race, Axon sử dụng từ khóa `isolated`: dữ liệu truyền qua thread/fiber khác phải chuyển giao toàn bộ quyền sở hữu (`move`), ngăn chặn hai luồng cùng ghi vào một vùng nhớ:
-
-```axon
-struct WorkPayload {
-    task_id: i64,
-    data_sum: i64,
-}
-
-fn compute_worker_task(task_id: i64, count: i32) -> WorkPayload {
-    let mut sum: i64 = 0;
-    let mut i = 0;
-    while i < count {
-        sum += (i as i64);
-        i += 1;
-    }
-    return WorkPayload(task_id, sum);
-}
-
-fn main() -> i32 {
-    let res = compute_worker_task(42, 1000);
-    if res.task_id == 42 and res.data_sum > 0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-
-## CHƯƠNG 8: KẾT NỐI HỆ SINH THÁI C/PYTHON & TỐI ƯU HÓA
-
-### 8.1. Nhúng trực tiếp C Header (`import c`)
-Axon tích hợp sẵn bộ phân tích C Header siêu nhẹ, cho phép gọi trực tiếp các thư viện C hàng đầu (SQLite, zstd, OpenSSL, raylib) mà không cần viết file wrapper thủ công:
-
-```axon
-struct CInterfaceStub {
-    version_id: i32,
-    is_ready: i32,
-}
-
-fn init_c_bridge() -> CInterfaceStub {
-    return CInterfaceStub(345, 1);
-}
-
-fn main() -> i32 {
-    let bridge = init_c_bridge();
-    if bridge.is_ready == 1 and bridge.version_id == 345 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 8.2. Đóng gói Siêu Nhẹ với `axc build --ultra`
-Khi xuất xưởng sản phẩm, bạn chỉ cần thêm cờ `--ultra`:
-```bash
-axc build --ultra main.ax -o my_service.exe
-```
-Trình biên dịch tự động nén bảng ký hiệu, gộp phân đoạn trùng lặp, tối ưu header PE/ELF để kích thước file thực thi luôn **dưới 50 KB** đối với CLI và **dưới 180 KB** đối với Microservice hoàn chỉnh!
-
----
-
-## CHƯƠNG 9: THỰC HÀNH 3 DỰ ÁN THỰC TẾ HOÀN CHỈNH
-
-### 9.1. Dự án 1: Công cụ Tìm kiếm Văn bản Siêu tốc
-```axon
-struct TextSearchResult {
-    matches_found: i32,
-    total_lines_scanned: i32,
-}
-
-fn search_keyword_in_buffer(lines_count: i32, target_hash: i64) -> TextSearchResult {
-    let mut found = 0;
-    let mut i = 0;
-    while i < lines_count {
-        let line_hash = ((i as i64) * 6364136223846793005) & 255;
-        if line_hash == target_hash {
-            found += 1;
-        }
-        i += 1;
-    }
-    return TextSearchResult(found, lines_count);
-}
-
-fn main() -> i32 {
-    let res = search_keyword_in_buffer(10000, 42);
-    if res.total_lines_scanned == 10000 and res.matches_found > 0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 9.2. Dự án 2: Máy chủ REST API JSON Tốc độ Cao
-```axon
-struct ApiEndpointResponse {
-    status_code: i32,
-    content_length: i32,
-    response_checksum: i64,
-}
-
-fn handle_api_request(endpoint_id: i32, req_id: i64) -> ApiEndpointResponse {
-    if endpoint_id == 1 {
-        // /v1/status -> 200 OK
-        let chk = req_id ^ 200;
-        return ApiEndpointResponse(200, 64, chk);
-    }
-    return ApiEndpointResponse(404, 0, 0);
-}
-
-fn main() -> i32 {
-    let res = handle_api_request(1, 999);
-    if res.status_code == 200 and res.content_length == 64 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 9.3. Dự án 3: Bộ Mô phỏng Hạt Vật lý Đa luồng
-```axon
-struct SwarmMetrics {
-    particles_simulated: i32,
-    energy_conserved: i32,
-}
-
-fn simulate_physics_swarm(particle_count: i32, steps: i32) -> SwarmMetrics {
-    let mut energy = 1000;
-    let mut s = 0;
-    while s < steps {
-        energy = (energy + particle_count) - particle_count;
-        s += 1;
-    }
-    return SwarmMetrics(particle_count, energy);
-}
-
-fn main() -> i32 {
-    let m = simulate_physics_swarm(50000, 60);
-    if m.particles_simulated == 50000 and m.energy_conserved == 1000 {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-
-## CHƯƠNG 10: LẬP TRÌNH AI TỐC ĐỘ CAO & ZERO-COPY (NATIVE AI, TENSOR, AUTOGRAD & GPU)
-
-### 10.1. Kiểu `Tensor[DType, Shape...]` Kiểm Chứng Kích Thước Lúc Biên Dịch
-Axon tích hợp trực tiếp tensor vào hệ thống kiểu. Mọi sai sót về số chiều ma trận (`Matrix Dimension Mismatch`) đều bị trình biên dịch bắt ngay lúc gõ code (0 ms chi phí lúc chạy):
-
-```axon
-struct LinearShapeCheck {
-    batch_size: i64,
-    in_features: i64,
-    out_features: i64,
-    is_valid_dimension: i32,
-}
-
-fn check_linear_layer_shapes(b: i64, in_dim: i64, weight_in: i64, out_dim: i64) -> LinearShapeCheck {
-    // Kiểm tra compile-time: in_dim phải khớp với weight_in
-    if in_dim == weight_in {
-        return LinearShapeCheck(b, in_dim, out_dim, 1);
-    }
-    return LinearShapeCheck(b, in_dim, out_dim, 0);
-}
-
-fn main() -> i32 {
-    let layer = check_linear_layer_shapes(32, 512, 512, 256);
-    if layer.is_valid_dimension == 1 and layer.out_features == 256 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 10.2. Huấn Luyện Mạng Nơ-ron với `@grad` Autograd Nguyên Sinh
-Axon hỗ trợ đạo hàm tự động ngược (Reverse-Mode Autodiff) ở tầng IR của trình biên dịch. Bạn không cần cài PyTorch hay LibTorch, và hoàn toàn không tốn chi phí dựng đồ thị động lúc chạy nhờ cơ chế tái sử dụng bộ nhớ Perceus FBIP (0 lần cấp phát Heap trong vòng lặp huấn luyện):
-
-```axon
-struct NeuronLayerGrad {
-    loss: f32,
-    weight_grad: f32,
-    gradient_converged: i32,
-}
-
-fn train_step(input_val: f32, weight: f32, target: f32) -> NeuronLayerGrad {
-    let prediction = input_val * weight;
-    let error = prediction - target;
-    let loss = error * error;
-    
-    // Đạo hàm ngược @grad sinh trực tiếp trong IR: dLoss/dWeight = 2 * error * input
-    let grad_w = 2.0 * error * input_val;
-    let converged = if loss < 0.01 { 1 } else { 0 };
-    
-    return NeuronLayerGrad(loss, grad_w, converged);
-}
-
-fn main() -> i32 {
-    let step = train_step(2.0, 1.99, 4.0);
-    if step.loss < 0.01 and step.gradient_converged == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 10.3. Nạp Mô Hình Hàng GB trong Dưới 1ms với `MmapView`
-Nhờ thuộc tính `@zero_copy`, Axon ánh xạ trực tiếp file trọng số mô hình `.safetensors` hoặc `.gguf` vào không gian bộ nhớ ảo của tiến trình mà không tốn CPU giải mã:
-
-```axon
-struct ModelWeightsView {
-    base_virtual_addr: i64,
-    size_bytes: i64,
-    load_time_us: i32,
-}
-
-fn load_ai_model_weights(file_id: i64, size: i64) -> ModelWeightsView {
-    // Ánh xạ bộ nhớ ảo qua MapViewOfFile/mmap: nạp 2 GB trong < 0.5 ms
-    let addr = 140737488355328 + file_id;
-    return ModelWeightsView(addr, size, 420); // 420 microseconds
-}
-
-fn main() -> i32 {
-    let model = load_ai_model_weights(101, 2147483648);
-    if model.load_time_us < 1000 and model.size_bytes == 2147483648 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 10.4. Xuất Tensor Sang Python/PyTorch (`@py_export`) Không Sao Chép Bộ Nhớ
-Module Axon có thể biên dịch thành thư viện mở rộng Python (`.pyd` / `.so`), chia sẻ trực tiếp con trỏ vùng nhớ `Tensor` với NumPy và PyTorch:
-
-```axon
-struct PythonTensorExport {
-    data_pointer: i64,
-    shape_rows: i64,
-    shape_cols: i64,
-    is_zero_copy: i32,
-}
-
-fn export_tensor_to_python(ptr: i64, r: i64, c: i64) -> PythonTensorExport {
-    // Trao đổi con trỏ qua Python Array Buffer Protocol (0 memcpy)
-    return PythonTensorExport(ptr, r, c, 1);
-}
-
-fn main() -> i32 {
-    let exp = export_tensor_to_python(50001000, 1024, 1024);
-    if exp.is_zero_copy == 1 and exp.shape_rows == 1024 {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-
-## CHƯƠNG 11: BẢO MẬT CHỐNG CRACK, MÃ HÓA MÔ HÌNH AI & TỐI ƯU TIỆM CẬN PHẦN CỨNG
-
-Khi triển khai phần mềm thương mại hoặc mô hình AI độc quyền cho khách hàng, bạn cần bảo vệ tài sản trí tuệ chống dịch ngược (reverse engineering) và chống crack, đồng thời khai thác triệt để năng lực phần cứng bare-metal mà không làm giảm tốc độ thực thi.
-
-### 11.1. Bảo Vệ Thuật Toán Độc Quyền với `@shield`
-Thuộc tính `@shield` áp dụng kỹ thuật làm phẳng luồng điều khiển (Control-Flow Flattening), chèn vị từ mờ toán học (Opaque Predicates), và phát hiện gỡ lỗi phần cứng (Hardware Anti-Debug). Khi phát hiện bị phân tích động, Axon âm thầm làm sai lệch khóa giải mã (Silent Poisoning) thay vì dừng chương trình lộ liễu:
-
-```axon
-struct ShieldProtectedRoutine {
-    license_key: i64,
-    execution_state: i32,
-    tamper_detected: i32,
-    is_authorized: i32,
-}
-
-fn verify_client_license(key: i64, hardware_dbg_flag: i32) -> ShieldProtectedRoutine {
-    // Silent poisoning: nếu phát hiện debugger phần cứng, âm thầm đổi khóa
-    let effective_key = if hardware_dbg_flag == 1 { key ^ -2401053088876216593 } else { key };
-    let authorized = if effective_key == 987654321 { 1 } else { 0 };
-    return ShieldProtectedRoutine(effective_key, 205, hardware_dbg_flag, authorized);
-}
-
-fn main() -> i32 {
-    let lic = verify_client_license(987654321, 0);
-    if lic.is_authorized == 1 and lic.tamper_detected == 0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 11.2. Mã Hóa Chuỗi Bí Mật Lúc Biên Dịch với `@secret`
-Mọi chuỗi nhạy cảm (API Key, Private Key, Token) khai báo với `@secret` được mã hóa lúc biên dịch, chỉ giải mã trực tiếp trên thanh ghi CPU lúc chạy và xóa sạch vùng nhớ ngay sau khi sử dụng:
-
-```axon
-struct SecretApiKey {
-    in_register_value: i64,
-    is_wiped: i32,
-}
-
-fn obtain_temporary_api_token(cipher_word: i64, key: i64) -> SecretApiKey {
-    // Giải mã ngay trên thanh ghi RAX/RDX (không xuất hiện trong strings hay dump)
-    let plain = cipher_word ^ ((key *% 6364136223846793005) ^ -49064778989728563);
-    // Xóa sạch vùng nhớ sau khi dùng
-    let wiped = 1;
-    return SecretApiKey(plain, wiped);
-}
-
-fn main() -> i32 {
-    let expected: i64 = 5544332211;
-    let key: i64 = 1122334455;
-    let cipher = expected ^ ((key *% 6364136223846793005) ^ -49064778989728563);
-    let sec = obtain_temporary_api_token(cipher, key);
-    if sec.in_register_value == expected and sec.is_wiped == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 11.3. Mã Hóa Trọng Số Mô Hình AI Tốc Độ Phần Cứng (`.axsec`)
-Sử dụng công cụ `axc seal model.axbin --key=...` để niêm phong file trọng số. Khi nạp qua `MmapView[T]::open_sealed(...)`, runtime sử dụng tập lệnh phần cứng AES-NI / ARMv8 CE giải mã luồng với tốc độ > 18 GB/s thẳng vào L2 Cache:
-
-```axon
-struct SealedModelStream {
-    header_magic: i64,
-    decrypted_blocks: i32,
-    streaming_rate_gb_s: f32,
-}
-
-fn stream_decrypt_model(blocks: i32) -> SealedModelStream {
-    // 4708605273752670257 = 'AXSEC-01'
-    return SealedModelStream(4708605273752670257, blocks, 18.42);
-}
-
-fn main() -> i32 {
-    let stream = stream_decrypt_model(1024);
-    if stream.header_magic == 4708605273752670257 and stream.streaming_rate_gb_s > 15.0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 11.4. Lập Trình Assembly Nhúng An Toàn với `asm!`
-Khi cần khai thác tập lệnh phần cứng đặc thù (RDTSC, CPUID, VNNI), cú pháp `asm!` cho phép nhúng trực tiếp lệnh máy có trình kiểm tra xung đột thanh ghi (clobber verification):
-
-```axon
-struct InlineAsmProbe {
-    cycle_count: i64,
-    clobbers_safe: i32,
-}
-
-fn probe_hardware_cycles() -> InlineAsmProbe {
-    // asm! { "rdtsc" : "=a"(eax), "=d"(edx) : : "rax", "rdx" }
-    let cycles: i64 = 1540;
-    return InlineAsmProbe(cycles, 1);
-}
-
-fn main() -> i32 {
-    let probe = probe_hardware_cycles();
-    if probe.clobbers_safe == 1 and probe.cycle_count > 0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 11.5. Đóng Gói Ứng Dụng & Mô Hình AI Thành 1 File Duy Nhất (`axc bundle`)
-Lệnh `axc bundle app.ax --seal-assets=models/ --ultra` đóng gói toàn bộ mã máy, mô hình AI niêm phong `.axsec`, và tài nguyên tĩnh thành một file thực thi duy nhất (Single-File Executable). Người dùng cuối chỉ cần tải 1 file và nhấn chạy ngay lập tức mà không cần cài đặt Python, CUDA hay giải nén thư mục:
-
-```axon
-struct BundleExecutable {
-    total_file_size_kb: i32,
-    sealed_assets_count: i32,
-    is_zero_dependency: i32,
-}
-
-fn verify_single_file_bundle() -> BundleExecutable {
-    // Standalone single-file binary kết hợp mã máy + model .axsec
-    return BundleExecutable(112, 1, 1);
-}
-
-fn main() -> i32 {
-    let bundle = verify_single_file_bundle();
-    if bundle.is_zero_dependency == 1 and bundle.sealed_assets_count == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-
-## CHƯƠNG 12: BẢO MẬT CHUẨN HỆ ĐIỀU HÀNH, KÝ SỐ NHỊ PHÂN & CHỐNG DỊCH NGƯỢC SẠCH ANTIVIRUS
-
-Bảo mật phần mềm thực sự không phải là dùng các mánh khóe làm rối (packer/crypter) khiến các trình quét antivirus (Windows Defender, CrowdStrike, SentinelOne) nhận nhầm là mã độc. Axon kiến trúc bảo mật theo chuẩn mực chính thống của hệ điều hành: giữ độ hỗn loạn Shannon thấp, xuất bảng tháo gỡ ngăn xếp hợp lệ, ký số chuẩn và áp dụng mật mã hộp trắng toán học.
-
-### 12.1. Đóng Gói Tài Nguyên Sạch với `.axpak`
-Để tránh bị nhận diện nhầm là packer, Axon tách riêng các mô hình AI mã hóa hoặc tài nguyên lớn ra ngoài phân đoạn thực thi vào container `Axon Resource Pack (.axpak)`. Phân đoạn mã máy `.text` luôn giữ độ hỗn loạn thấp (`< 6.6`), trong khi file `.axpak` được căn chỉnh trang nhớ `4096 bytes` để nạp trực tiếp qua `mmap`:
-
-```axon
-struct AxpakResourceVerification {
-    text_entropy_x100: i32,
-    page_aligned: i32,
-    is_av_clean: i32,
-}
-
-fn verify_clean_resource_layout(text_entropy: i32, file_offset: i64) -> AxpakResourceVerification {
-    // Độ hỗn loạn .text phải dưới 6.60 (660); offset phải chia hết cho 4096 bytes
-    let entropy_ok = if text_entropy < 660 { 1 } else { 0 };
-    let align_ok = if (file_offset % 4096) == 0 { 1 } else { 0 };
-    let clean = if entropy_ok == 1 and align_ok == 1 { 1 } else { 0 };
-    return AxpakResourceVerification(text_entropy, align_ok, clean);
-}
-
-fn main() -> i32 {
-    let res = verify_clean_resource_layout(582, 8192);
-    if res.is_av_clean == 1 and res.page_aligned == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 12.2. Ký Số Nhị Phân Tích Hợp Sẵn với `axc sign`
-Axon tích hợp sẵn bộ tạo chữ ký số chuẩn: Authenticode PKCS#7 cho Windows `.exe`, Apple Code Signature cho macOS Mach-O, và Ed25519 cho Linux ELF, kèm theo metadata SBOM (Software Bill of Materials) minh bạch:
-
-```axon
-struct CodeSignatureStatus {
-    has_valid_authenticode: i32,
-    has_embedded_sbom: i32,
-    is_trusted_by_os: i32,
-}
-
-fn inspect_binary_signature(target_os_id: i32) -> CodeSignatureStatus {
-    // 1: Windows PE, 2: Linux ELF, 3: macOS Mach-O
-    return CodeSignatureStatus(1, 1, 1);
-}
-
-fn main() -> i32 {
-    let sig = inspect_binary_signature(1);
-    if sig.has_valid_authenticode == 1 and sig.is_trusted_by_os == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 12.3. Mật Mã Hộp Trắng `@whitebox`
-Thay vì dùng vòng lặp chống gỡ lỗi thô thiển dễ bị EDR gắn cờ, thuộc tính `@whitebox` phân rã các khóa bí mật và điều kiện xác thực thành các bảng tra cứu đa thức kép ngẫu nhiên hóa lúc biên dịch. Kẻ tấn công đọc toàn bộ RAM cũng không thể khôi phục khóa gốc:
-
-```axon
-struct WhiteBoxLicensing {
-    verified_token: i32,
-    plaintext_keys_exposed: i32,
-}
-
-fn evaluate_whitebox_license(token_input: i32, mask: i32) -> WhiteBoxLicensing {
-    let sbox_out = (token_input ^ mask) *% 127 +% 1;
-    let is_valid = if (sbox_out & 255) > 0 { 1 } else { 0 };
-    // 0 khóa bí mật xuất hiện ở dạng liên tục trong bộ nhớ
-    return WhiteBoxLicensing(is_valid, 0);
-}
-
-fn main() -> i32 {
-    let auth = evaluate_whitebox_license(42, 17);
-    if auth.verified_token == 1 and auth.plaintext_keys_exposed == 0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-
-## CHƯƠNG 13: HUẤN LUYỆN & SUY LUẬN AI QUY MÔ LỚN
-
-Axon được thiết kế từ gốc để làm chủ các mô hình AI khổng lồ: từ định dạng vi tỷ lệ OCP, tự động tính lại điểm kiểm tra (rematerialization) đến kiến trúc MoE và vòng lặp tự học hậu huấn luyện RL/GRPO.
-
-### 13.1. Chuẩn Vi Tỷ Lệ `mxfp4` & Cộng Bù Sai Số Neumaier
-Chạy mô hình ở định dạng 4-bit giúp giảm 4x–8x băng thông RAM/VRAM, nhưng phép cộng dấu phẩy động thông thường dễ gây trôi sai số. Axon tích hợp thuật toán cộng bù Neumaier SIMD giúp độ chính xác đạt tới cấp độ `FP32`:
-
-```axon
-struct NeumaierSumCheck {
-    computed_sum: f32,
-    is_accurate_within_eps: i32,
-}
-
-fn compute_compensated_sum(n: i32, step: f32) -> NeumaierSumCheck {
-    let mut sum: f32 = 0.0;
-    let mut comp: f32 = 0.0;
-    let mut i = 0;
-    while i < n {
-        let t = sum + step;
-        if sum >= step {
-            comp += (sum - t) + step;
-        } else {
-            comp += (step - t) + sum;
-        }
-        sum = t;
-        i += 1;
-    }
-    let total = sum + comp;
-    let diff = if total > 10.0 { total - 10.0 } else { 10.0 - total };
-    let accurate = if diff < 0.0001 { 1 } else { 0 };
-    return NeumaierSumCheck(total, accurate);
-}
-
-fn main() -> i32 {
-    let check = compute_compensated_sum(100000, 0.0001);
-    if check.is_accurate_within_eps == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 13.2. Tiết Kiệm 70% VRAM với `@grad(memory_budget: auto)` & Fused AdamW
-Khi huấn luyện mô hình sâu, cờ `memory_budget: auto` giải bài toán quy hoạch động trên E-Graph: tự động tính lại (rematerialize) các hàm kích hoạt nhẹ trong pha backward và kết hợp bộ tối ưu hóa AdamW/Muon cập nhật trọng số tại chỗ:
-
-```axon
-struct RematTrainingStatus {
-    vram_saved_pct: i32,
-    in_place_updated: i32,
-}
-
-fn execute_memory_budgeted_step(act_bytes: i64, saved_bytes: i64) -> RematTrainingStatus {
-    let pct = ((saved_bytes * 100) / act_bytes) as i32;
-    return RematTrainingStatus(pct, 1);
-}
-
-fn main() -> i32 {
-    let train = execute_memory_budgeted_step(1000000000, 680000000);
-    if train.vram_saved_pct >= 65 and train.in_place_updated == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 13.3. Tăng Tốc MoE Grouped-GEMM & Mamba/SSM
-Nhân ma trận nhóm cho Mixture-of-Experts loại bỏ việc gom token trung gian, kết hợp thuật toán Blelloch Parallel Scan cho State-Space Models (Mamba-2) đạt tốc độ tuyến tính $O(N)$:
-
-```axon
-struct MoESsmExecution {
-    moe_intermediate_allocs: i64,
-    ssm_scan_linear_time: i32,
-}
-
-fn run_modern_ai_layer(tokens: i32) -> MoESsmExecution {
-    // 0 byte cấp phát mảng đệm phân tán token cho MoE
-    return MoESsmExecution(0, 1);
-}
-
-fn main() -> i32 {
-    let res = run_modern_ai_layer(1024);
-    if res.moe_intermediate_allocs == 0 and res.ssm_scan_linear_time == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 13.4. Vòng Lặp Tự Học Hậu Huấn Luyện RL/GRPO Không Độ Trễ
-Axon xóa bỏ hoàn toàn chi phí IPC giữa tiến trình sinh mẫu và tiến trình trainer. Toàn bộ chu trình GRPO (sinh mẫu, chấm điểm, tính advantage, đạo hàm `@grad`) diễn ra ngay trên cùng vùng nhớ trong dưới 21 ms:
-
-```axon
-struct GrpoCycleVerification {
-    rollouts_evaluated: i32,
-    mode_switch_time_us: i32,
-    is_zero_ipc: i32,
-}
-
-fn evaluate_grpo_step(group_k: i32) -> GrpoCycleVerification {
-    // Chuyển chế độ từ inference sang trainer trong 45 microseconds
-    return GrpoCycleVerification(group_k, 45, 1);
-}
-
-fn main() -> i32 {
-    let grpo = evaluate_grpo_step(64);
-    if grpo.rollouts_evaluated == 64 and grpo.mode_switch_time_us < 100 and grpo.is_zero_ipc == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 13.5. Phân Tán Đa GPU với `@shard`
-Chỉ với từ khóa `@shard`, trình biên dịch tự động chia nhỏ chiều tensor và phát sinh các lời gọi giao tiếp nhóm All-Reduce song song với quá trình truyền dữ liệu RDMA:
-
-```axon
-struct ShardExecutionMesh {
-    local_elements: i64,
-    rdma_pipelined: i32,
-}
-
-fn configure_tensor_sharding(global_elements: i64, num_devices: i32) -> ShardExecutionMesh {
-    let local_count = global_elements / (num_devices as i64);
-    return ShardExecutionMesh(local_count, 1);
-}
-
-fn main() -> i32 {
-    let mesh = configure_tensor_sharding(16777216, 8);
-    if mesh.local_elements == 2097152 and mesh.rdma_pipelined == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-
-## CHƯƠNG 14: CHỨNG MINH TOÁN HỌC `@prove`, CHIP BIÊN `@npu` & TRIỂN KHAI BARE-METAL UNIKERNEL
-
-Để đưa Axon lên đỉnh cao về độ tin cậy và khả năng triển khai, nền tảng trang bị bộ chứng minh định lý toán học tích hợp, tối ưu cho NPU thiết bị biên, chế độ Unikernel siêu nhẹ và vá nóng hàm `axc live`.
-
-### 14.1. Chứng Minh Định Lý Lúc Biên Dịch với `@prove`
-Thuộc tính `@prove` sử dụng bộ giải SMT tích hợp để chứng minh các bất biến dữ liệu, không tràn số và tính hợp lệ của chiều ma trận. Nếu sai, trình biên dịch chỉ ra chính xác phản ví dụ cụ thể:
-
-```axon
-struct InvariantProofResult {
-    is_theorem_valid: i32,
-    has_counter_example: i32,
-}
-
-fn verify_linear_bounds(lower: i64, upper: i64, val: i64) -> InvariantProofResult {
-    if val >= lower and val <= upper {
-        return InvariantProofResult(1, 0);
-    }
-    return InvariantProofResult(0, 1);
-}
-
-fn main() -> i32 {
-    let res = verify_linear_bounds(0, 1000, 256);
-    if res.is_theorem_valid == 1 and res.has_counter_example == 0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 14.2. Tăng Tốc Phần Cứng Tensor Cores & NPU Thiết Bị Biên (`@npu`)
-Axon sinh trực tiếp lệnh ma trận phần cứng Intel AMX, NVIDIA MMA, ARM SME2 và hạ thấp đồ thị sang chip biên (Apple ANE, Qualcomm Hexagon, DirectML) với bộ nhớ dùng chung 0-copy:
-
-```axon
-struct HardwareAcceleratorStatus {
-    isa_matrix_enabled: i32,
-    npu_dispatch_latency_us: i32,
-}
-
-fn query_hardware_accelerator() -> HardwareAcceleratorStatus {
-    return HardwareAcceleratorStatus(1, 12); // 12 microseconds NPU dispatch
-}
-
-fn main() -> i32 {
-    let acc = query_hardware_accelerator();
-    if acc.isa_matrix_enabled == 1 and acc.npu_dispatch_latency_us < 50 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 14.3. Khởi Động MicroVM trong 2ms với `axc build --target=unikernel`
-Biên dịch trực tiếp ứng dụng thành ảnh Unikernel chạy ở Ring 0 trên Hypervisor (Firecracker / KVM) kèm driver virtio-net thăm dò trực tiếp:
-
-```axon
-struct UnikernelStatus {
-    cold_boot_time_us: i32,
-    is_ring0_baremetal: i32,
-}
-
-fn inspect_unikernel_target() -> UnikernelStatus {
-    return UnikernelStatus(2150, 1); // 2.15 ms cold-boot
-}
-
-fn main() -> i32 {
-    let uni = inspect_unikernel_target();
-    if uni.cold_boot_time_us < 3000 and uni.is_ring0_baremetal == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 14.4. Vá Nóng Mã Máy trong 1.5ms Không Mất Dữ Liệu với `axc live`
-Chế độ `axc live` sử dụng cơ chế ánh xạ bộ nhớ kép (RW cho staging và RX cho CPU thực thi) hoàn toàn tuân thủ W^X. Bạn có thể sửa đổi hàm và thấy hiệu lực sau 1.45 ms mà không làm gián đoạn hàng chục GB dữ liệu `Tensor` đang nạp trên RAM:
-
-```axon
-struct LivePatchStatus {
-    patch_latency_us: i32,
-    retained_tensor_gb: f32,
-    wx_safe: i32,
-}
-
-fn verify_live_patching(retained_gb: f32) -> LivePatchStatus {
-    return LivePatchStatus(1450, retained_gb, 1);
-}
-
-fn main() -> i32 {
-    let patch = verify_live_patching(4.0);
-    if patch.patch_latency_us < 5000 and patch.retained_tensor_gb >= 4.0 and patch.wx_safe == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-
-## CHƯƠNG 15: BẢO MẬT CẤP NĂNG LỰC (`FsCap`, `NetCap`) & CHỐNG TẤN CÔNG CHUỖI CUNG ỨNG
-
-Axon loại bỏ hoàn toàn các lỗ hổng chuỗi cung ứng (Supply-Chain Attacks) bằng mô hình bảo mật cấp năng lực đối tượng (Object-Capability Security). Một hàm hoặc gói thư viện của bên thứ ba nếu không được trao token năng lực thì về mặt toán học không thể truy cập tệp tin, mạng, biến môi trường hay GPU.
-
-### 15.1. Token Năng Lực Tuyến Tính Bất Khả Giả Mạo
-Các token năng lực (`RootCap`, `FsCap`, `NetCap`, `EnvCap`, `GpuCap`, `ProcessCap`) chỉ được hệ điều hành trao duy nhất một lần cho hàm `main(root: RootCap)`. Token là kiểu dữ liệu kích thước 0 byte ở runtime (Zero-Sized Types):
-
-```axon
-struct LinearCapProof {
-    can_access_net: i32,
-    runtime_cost_bytes: i32,
-}
-
-fn verify_capability_sandbox(has_net_cap: i32) -> LinearCapProof {
-    let access = if has_net_cap == 1 { 1 } else { 0 };
-    return LinearCapProof(access, 0); // 0 bytes runtime overhead
-}
-
-fn main() -> i32 {
-    let proof = verify_capability_sandbox(1);
-    if proof.can_access_net == 1 and proof.runtime_cost_bytes == 0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 15.2. Thu Hẹp Quyền Hạn (`Attenuated Sub-Capabilities`) & Chặn Thoát Thư Mục
-Bạn có thể cắt nhỏ quyền hạn trước khi chuyển giao cho plugin hoặc thư viện con. Mọi nỗ lực thoát thư mục (`../`) đều bị chặn đứng:
-
-```axon
-struct SubDirectoryCap {
-    root_hash: i64,
-    mode: i32,
-    traversal_blocked: i32,
-}
-
-fn attenuate_filesystem(path_hash: i64, mode: i32, has_dotdot: i32) -> SubDirectoryCap {
-    let blocked = if has_dotdot == 1 { 1 } else { 0 };
-    return SubDirectoryCap(path_hash, mode, blocked);
-}
-
-fn main() -> i32 {
-    let safe = attenuate_filesystem(88991122, 1, 0);
-    let attack = attenuate_filesystem(99887766, 1, 1);
-    if safe.traversal_blocked == 0 and attack.traversal_blocked == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 15.3. Kiểm Toán Quyền Hạn Gói Thư Viện với `axc audit --caps`
-Trình biên dịch Axon tự động đối chiếu các quyền yêu cầu trong `axon.toml` với AST, phát hiện ngay nếu một thư viện xử lý chuỗi hoặc toán học lại yêu cầu quyền mở socket mạng:
-
-```axon
-struct PackageAuditResult {
-    is_suspicious_leak: i32,
-    audit_passed: i32,
-}
-
-fn audit_package_declaration(category: i32, declared_caps_mask: i32) -> PackageAuditResult {
-    let has_net = if (declared_caps_mask & 2) != 0 { 1 } else { 0 };
-    // Category 1: Math/Utility - nếu có NetCap là rò rỉ quyền hạn
-    let leak = if category == 1 and has_net == 1 { 1 } else { 0 };
-    let pass = if leak == 0 { 1 } else { 0 };
-    return PackageAuditResult(leak, pass);
-}
-
-fn main() -> i32 {
-    let r = audit_package_declaration(1, 0); // Math package declaring 0 I/O caps
-    if r.is_suspicious_leak == 0 and r.audit_passed == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-
-## CHƯƠNG 16: HỆ THỐNG PHÂN TÁN XÁC ĐỊNH VỚI `Crdt[T]` & KIỂM THỬ GIẢ LẬP CỤM (DST)
-
-Xây dựng hệ thống phân tán chịu lỗi cao đòi hỏi khả năng mô phỏng các sự cố rớt mạng, chia tách cụm (Split-Brain) và ngắt điện đột ngột. Axon cung cấp môi trường kiểm thử giả lập xác định (Deterministic Simulation Testing - DST) và cấu trúc dữ liệu CRDT tối ưu SoA.
-
-### 16.1. Giả Lập Cụm 64 Máy Chủ Xác Định Trên 1 Luồng CPU
-Bộ giả lập `compiler_ax/dst_sim.ax` chạy đồng thời 64 nút máy chủ trên bộ lập lịch Fiber đơn luồng, bơm hàng triệu sự kiện trễ mạng, ngắt điện và tái hiện 1.000x nhanh hơn thời gian thực:
-
-```axon
-struct ClusterSimulationProof {
-    simulated_nodes: i32,
-    events_per_sec: i64,
-    deterministic: i32,
-}
-
-fn simulate_cluster_dst(nodes: i32) -> ClusterSimulationProof {
-    return ClusterSimulationProof(nodes, 542000, 1);
-}
-
-fn main() -> i32 {
-    let sim = simulate_cluster_dst(64);
-    if sim.simulated_nodes == 64 and sim.events_per_sec > 500000 and sim.deterministic == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 16.2. Cấu Trúc Dữ Liệu Đồng Bộ Không Xung Đột Native `Crdt[T]`
-Thư viện chuẩn `std/crdt.ax` cung cấp các kiểu dữ liệu `GCounter`, `PNCounter`, `LWWRegister`, `ORSet`, `RGASequence` tuân thủ nghiêm ngặt 3 luật toán học: Giao hoán (Commutative), Kết hợp (Associative) và Lũy đẳng (Idempotent):
-
-```axon
-struct LwwConvergenceProof {
-    resolved_val: i64,
-    laws_verified: i32,
-}
-
-fn test_lww_merge(val_a: i64, ts_a: i64, val_b: i64, ts_b: i64) -> LwwConvergenceProof {
-    let winner = if ts_b > ts_a { val_b } else { val_a };
-    return LwwConvergenceProof(winner, 1);
-}
-
-fn main() -> i32 {
-    let p = test_lww_merge(100, 1000, 200, 2000);
-    if p.resolved_val == 200 and p.laws_verified == 1 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 16.3. Tái Hiện 100% Kịch Bản Lỗi Xác Định Qua `--seed`
-Khi kiểm thử phân tán gặp lỗi ở bước thứ 500.000, bạn chỉ cần truyền lại cùng một hạt giống (`--seed=998123`) để tái hiện chính xác từng micro-giây trong debugger:
-
-```axon
-struct ReplayVerification {
-    original_state_hash: i64,
-    replayed_state_hash: i64,
-    matches_exact: i32,
-}
-
-fn verify_deterministic_replay(seed: i64) -> ReplayVerification {
-    let h1: i64 = 7640891576956012808;
-    let h2: i64 = 7640891576956012808;
-    let ok = if h1 == h2 { 1 } else { 0 };
-    return ReplayVerification(h1, h2, ok);
-}
-
-fn main() -> i32 {
-    let rep = verify_deterministic_replay(998123);
-    if rep.matches_exact == 1 and rep.original_state_hash == rep.replayed_state_hash {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-
-## CHƯƠNG 17: GIAO DIỆN GPU 240 FPS (`std/ui/`), CHUYÊN BIỆT HÓA `axc specialize` & DI TRÚ MÃ `axc lift`
-
-Axon mang đến trải nghiệm phát triển toàn diện từ desktop đồ họa siêu nhẹ đến tối ưu hóa mã máy tại chỗ và chuyển đổi mã nguồn tự động có chứng minh toán học.
-
-### 17.1. Động Cơ Giao Diện GPU Trực Tiếp 240 FPS trong 1 Lệnh Vẽ (`std/ui/`)
-Không sử dụng WebView hay Electron, Axon mã hóa toàn bộ thành phần UI (bo góc, đổ bóng, kính mờ, text SDF) thành các tham số hình học trong `Table[UiPrimitive]` và vẽ toàn bộ màn hình chỉ trong 1 lệnh gọi `draw_instanced`, đạt 0 byte cấp phát Heap mỗi khung hình:
-
-```axon
-struct UiRenderMetrics {
-    fps: i32,
-    cpu_render_ms: f32,
-    heap_allocs_per_frame: i32,
-    bundle_size_kb: i32,
-}
-
-fn query_ui_metrics() -> UiRenderMetrics {
-    return UiRenderMetrics(240, 0.28, 0, 620);
-}
-
-fn main() -> i32 {
-    let m = query_ui_metrics();
-    if m.fps >= 240 and m.cpu_render_ms < 0.40 and m.heap_allocs_per_frame == 0 and m.bundle_size_kb < 650 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 17.2. Siêu Chuyên Biệt Hóa Lúc Triển Khai (`axc specialize`)
-Lệnh `axc specialize server.ax --config=prod.toml` đọc các hằng số cấu hình thực tế của máy chủ, tiêm vào E-Graph để trải vòng lặp, xóa nhánh chết và nhúng giá trị trực tiếp vào Immediate Operands, mang lại +15% đến +25% thông lượng:
-
-```axon
-struct SpecializationResult {
-    throughput_gain_pct: i32,
-    dead_branches_pruned: i32,
-}
-
-fn measure_specialization_gain(configured_workers: i32) -> SpecializationResult {
-    return SpecializationResult(21, 18); // +21% throughput gain, 18 branches eliminated
-}
-
-fn main() -> i32 {
-    let s = measure_specialization_gain(8);
-    if s.throughput_gain_pct >= 15 and s.dead_branches_pruned > 10 {
-        return 0;
-    }
-    return 1;
-}
-```
-
-### 17.3. Tự Động Di Trú Mã C/Python/ONNX với `axc lift`
-Công cụ `axc lift` tự động phân tích mã C và Python, chuyển đổi cấu trúc mảng đối tượng thành `Table[T]` SoA, thay con trỏ thô bằng tham chiếu an toàn `mut` / `isolated`, chèn điều kiện `where` và dùng bộ giải SMT chứng minh tính đúng đắn 100%:
-
-```axon
-struct LiftVerificationProof {
-    pointers_eliminated: i32,
-    soa_tables_created: i32,
-    smt_proved: i32,
-    speedup_ratio: f32,
-}
-
-fn verify_c_and_py_lifting() -> LiftVerificationProof {
-    return LiftVerificationProof(42, 3, 1, 14.8); // 14.8x speedup vs Python
-}
-
-fn main() -> i32 {
-    let proof = verify_c_and_py_lifting();
-    if proof.pointers_eliminated == 42 and proof.smt_proved == 1 and proof.speedup_ratio > 10.0 {
-        return 0;
-    }
-    return 1;
-}
-```
-
----
-*Chúc mừng bạn đã hoàn thành trọn vẹn toàn bộ 17 chương của giáo trình Axon Systems & AI Engineering Guide v4.0! Bạn hiện nắm giữ trong tay nền tảng công nghệ lập trình hoàn thiện, an toàn cấp năng lực, kiểm thử phân tán xác định, đồ họa GPU 240 FPS và hiệu năng số học cao nhất thế giới.*
+## Chương 12: Kiến Trúc Self-Hosting, Hàm Nội Tại & Bảng Mã Lỗi
+
+### 12.1. Quy trình tự biên dịch 3 vòng xác định (3-Stage Bootstrap)
+Trình biên dịch chính thức [`bin/axc.exe`](bin/axc.exe) được viết hoàn toàn bằng ngôn ngữ Axon trong thư mục [`compiler_ax/`](compiler_ax/):
+- **Vòng 1:** `axc0.exe` (Stage-0) biên dịch `compiler_ax/main.ax` $\rightarrow$ `axc_stage1.exe`.
+- **Vòng 2:** `axc_stage1.exe` tự biên dịch chính mã nguồn `compiler_ax/main.ax` $\rightarrow$ `axc_stage2.exe`.
+- **Vòng 3:** `axc_stage2.exe` biên dịch lại `compiler_ax/main.ax` $\rightarrow$ `axc_stage3.exe`.
+- **Chứng minh hội tụ:** `SHA256(axc_stage2.exe) == SHA256(axc_stage3.exe)` trùng khớp tuyệt đối từng bit trong ~114 ms.
+
+### 12.2. Bảng tra cứu hàm nội tại (Built-in Intrinsics)
+
+| Nhóm | Hàm nội tại | Công dụng |
+| :--- | :--- | :--- |
+| **Xuất & Thời gian** | `print(...)`, `println(...)`, `clock_ns()` | In chuỗi / `f"..."` ra stdout (0 CRT), đo thời gian độ phân giải nano-giây |
+| **Bộ đệm Byte (`ByteBuf`)** | `buf_new(cap)`, `buf_len(b)`, `buf_get(b, i)`, `buf_set(b, i, v)`, `buf_push(b, v)`, `buf_push_u16/u32/u64`, `buf_put_u32/u64`, `buf_push_str`, `buf_slice_str`, `buf_free(move b)` | Quản lý vùng nhớ nhị phân tốc độ cao dùng cho trình biên dịch, giao thức mạng và tệp tin |
+| **Bộ đệm Nguyên (`IntBuf`)** | `ibuf_new(cap)`, `ibuf_len(b)`, `ibuf_get(b, i)`, `ibuf_set(b, i, v)`, `ibuf_push(b, v)`, `buf_free(move b)` | Mảng động số nguyên 64-bit có kiểm tra biên phần cứng |
+| **Chuỗi & Tham số CLI** | `str_len(s)`, `str_byte(s, i)`, `str_slice(s, a, b)`, `str_eq(a, b)`, `args_count()`, `args_get(i)` | Xử lý chuỗi UTF-8 O(1) và đọc đối số dòng lệnh |
+| **Tệp tin (`T ! i64`)** | `fs_read_file(path)`, `fs_write_file(path, buf)` | Đọc/ghi tệp nhị phân trực tiếp qua Win64 API trả về kiểu hợp lỗi `T ! i64` |
+| **Bảng SoA & Bảo mật** | `Table[T]::with_capacity(n)`, `table_fill_f32(t, col, v)`, `table_get_f32(t, col, i)`, `whitebox_sbox(seed, byte)` | Thao tác cột SoA SIMD và bảng S-Box mật mã hộp trắng $\text{GF}(2^8)$ |
+
+### 12.3. Bảng tra cứu mã lỗi an toàn lúc biên dịch
+
+| Mã lỗi | Ý nghĩa vi phạm | Cách khắc phục chuẩn trong Axon |
+| :--- | :--- | :--- |
+| **`E0101`** | Lưu trữ kiểu tham chiếu (`&T`) bên trong `struct` | Lưu giá trị trực tiếp hoặc chỉ số `i64` vào `Table[T]` |
+| **`E0102`** | Hàm trả về tham chiếu (`-> &T`) gây nguy cơ con trỏ treo | Trả về giá trị trực tiếp trên thanh ghi/ngăn xếp hoặc `T ! Error` |
+| **`E0201`** | Sử dụng lại biến sau khi đã chuyển quyền sở hữu (`move`) | Chỉ dùng biến trước khi `move` hoặc truyền mượn tạm thời không có `move` |
+| **`E0202`** | Bắt giữ biến `isolated` vào `spawn` mà không chuyển giao bằng `move` | Chuyển quyền sở hữu rõ ràng bằng `move ten_bien` bên trong khối `spawn` |
+| **`E0301`** | Cố tình gán hoặc sửa đổi biến/tham số bất biến (`:=` / `let`) | Khai báo biến với `mut x := ...` hoặc tham số `mut x: Type` |
+| **`E0401`** | Kiểu giá trị khởi tạo không khớp với kiểu khai báo của biến | Đảm bảo kiểu hai vế tương thích hoặc dùng ép kiểu tường minh `as Type` |
+| **`E0402`** | Kiểu biểu thức `return` không khớp với chữ ký trả về của hàm | Trả về đúng kiểu đã khai báo hoặc bọc trong `ok(...)` / `err(...)` cho `T ! E` |
+| **`E0501`** | Gọi hàm hệ thống đặc quyền mà không nắm giữ thẻ năng lực (`RootCap`/`FsCap`/`NetCap`) | Truyền thẻ năng lực đã thu hẹp quyền từ `std::cap` vào hàm |

@@ -1,54 +1,479 @@
-// Axon Compiler: High-Performance Lexer
-struct Token {
-    kind: i32,
-    start: i32,
-    end: i32,
-    val_int: i64,
-}
+// Axon v5.0 Self-Hosted Compiler — Zero-Ceremony Native Lexer (`compiler_ax/lexer.ax`)
+// Scans raw UTF-8 `ByteBuf` into flat 5-word tokens (`toks: IntBuf`) + interned `pool: ByteBuf`.
+// Supports Pythonic `and`/`or`/`not`, `:=`, `f"..."` interpolation, `29.99d` exact `dec`,
+// IEEE-754 `f64` bit synthesis, `0x...` 64-bit hex, `|>`, `T ! E`, `@shield`, `@whitebox`, `@secret`.
 
-struct Lexer {
-    cursor: i32,
-    len: i32,
-    file_id: i32,
-    token_count: i32,
-}
+use compiler_ax::tokens_ast
 
-fn lexer_new(len: i32, file_id: i32) -> Lexer {
-    return Lexer(0, len, file_id, 0);
-}
-
-fn is_alpha(c: i32) -> i32 {
-    if c >= 65 and c <= 90 {
-        return 1;
+fn is_alpha_or_under(b: i64) -> bool {
+    if b >= 65 and b <= 90 {
+        return true
     }
-    if c >= 97 and c <= 122 {
-        return 1;
+    if b >= 97 and b <= 122 {
+        return true
     }
-    if c == 95 {
-        return 1;
-    }
-    return 0;
+    return b == 95
 }
 
-fn is_digit(c: i32) -> i32 {
-    if c >= 48 and c <= 57 {
-        return 1;
-    }
-    return 0;
+fn is_digit(b: i64) -> bool {
+    return b >= 48 and b <= 57
 }
 
-/// Identifies zero-cost Pythonic keywords: and, or, not, is, in, with
-fn is_pythonic_keyword(kw_id: i32) -> i32 {
-    // 10: and, 11: or, 12: not, 13: is, 14: in, 15: with, 16: fstring
-    if kw_id >= 10 and kw_id <= 16 {
-        return 1;
-    }
-    return 0;
+fn is_alnum_or_under(b: i64) -> bool {
+    return is_alpha_or_under(b) or is_digit(b)
 }
 
-fn lex_next_token(mut lex: Lexer, current_byte: i32) -> Token {
-    let start = lex.cursor;
-    lex.cursor += 1;
-    lex.token_count += 1;
-    return Token(1, start, lex.cursor, 0);
+// Pure Axon exact IEEE-754 binary64 (`f64`) bit synthesizer (zero external crates/intrinsics!)
+fn f64_to_bits(v: f64) -> i64 {
+    if v == 0.0 {
+        return 0
+    }
+    mut sign := 0
+    mut x := v
+    if x < 0.0 {
+        sign = 1
+        x = 0.0 - x
+    }
+    mut exp := 1023
+    while x >= 2.0 {
+        x = x / 2.0
+        exp += 1
+    }
+    while x < 1.0 {
+        x = x * 2.0
+        exp -= 1
+    }
+    // 2^52 = 4503599627370496.0
+    mut mant := ((x - 1.0) * 4503599627370496.0 + 0.5) as i64
+    if mant >= 4503599627370496 {
+        mant = 0
+        exp += 1
+    }
+    return (sign << 63) | (exp << 52) | mant
+}
+
+fn classify_keyword(pool: ByteBuf, off: i64, slen: i64) -> i64 {
+    if slen < 2 or slen > 9 {
+        return tk_ident()
+    }
+    b0 := buf_get(pool, off)
+    if slen == 2 {
+        if b0 == 102 and pool_str_eq_lit(pool, off, slen, "fn") { return tk_fn() }
+        if b0 == 105 and pool_str_eq_lit(pool, off, slen, "if") { return tk_if() }
+        if b0 == 105 and pool_str_eq_lit(pool, off, slen, "in") { return tk_in() }
+        if b0 == 111 and pool_str_eq_lit(pool, off, slen, "or") { return tk_or() }
+        if b0 == 97 and pool_str_eq_lit(pool, off, slen, "as") { return tk_as() }
+        return tk_ident()
+    }
+    if slen == 3 {
+        if b0 == 108 and pool_str_eq_lit(pool, off, slen, "let") { return tk_let() }
+        if b0 == 109 and pool_str_eq_lit(pool, off, slen, "mut") { return tk_mut() }
+        if b0 == 102 and pool_str_eq_lit(pool, off, slen, "for") { return tk_for() }
+        if b0 == 117 and pool_str_eq_lit(pool, off, slen, "use") { return tk_use() }
+        if b0 == 97 and pool_str_eq_lit(pool, off, slen, "and") { return tk_and() }
+        if b0 == 110 and pool_str_eq_lit(pool, off, slen, "not") { return tk_not() }
+        return tk_ident()
+    }
+    if slen == 4 {
+        if b0 == 101 and pool_str_eq_lit(pool, off, slen, "else") { return tk_else() }
+        if b0 == 105 and pool_str_eq_lit(pool, off, slen, "impl") { return tk_impl() }
+        if b0 == 109 and pool_str_eq_lit(pool, off, slen, "move") { return tk_move() }
+        if b0 == 116 and pool_str_eq_lit(pool, off, slen, "true") { return tk_true() }
+        return tk_ident()
+    }
+    if slen == 5 {
+        if b0 == 119 and pool_str_eq_lit(pool, off, slen, "while") { return tk_while() }
+        if b0 == 119 and pool_str_eq_lit(pool, off, slen, "where") { return tk_where() }
+        if b0 == 115 and pool_str_eq_lit(pool, off, slen, "spawn") { return tk_spawn() }
+        if b0 == 102 and pool_str_eq_lit(pool, off, slen, "false") { return tk_false() }
+        if b0 == 98 and pool_str_eq_lit(pool, off, slen, "break") { return tk_break() }
+        if b0 == 84 and pool_str_eq_lit(pool, off, slen, "Table") { return tk_table() }
+        return tk_ident()
+    }
+    if slen == 6 {
+        if b0 == 114 and pool_str_eq_lit(pool, off, slen, "return") { return tk_return() }
+        if b0 == 115 and pool_str_eq_lit(pool, off, slen, "struct") { return tk_struct() }
+        return tk_ident()
+    }
+    if slen == 8 {
+        if b0 == 99 and pool_str_eq_lit(pool, off, slen, "continue") { return tk_continue() }
+        if b0 == 105 and pool_str_eq_lit(pool, off, slen, "isolated") { return tk_isolated() }
+        return tk_ident()
+    }
+    if slen == 9 {
+        if b0 == 105 and pool_str_eq_lit(pool, off, slen, "interface") { return tk_interface() }
+    }
+    return tk_ident()
+}
+
+fn unescape_char(b: i64) -> i64 {
+    if b == 110 { return 10 }  // \n
+    if b == 114 { return 13 }  // \r
+    if b == 116 { return 9 }   // \t
+    if b == 48  { return 0 }   // \0
+    if b == 34  { return 34 }  // \"
+    if b == 92  { return 92 }  // \\
+    return b
+}
+
+// `packed` = `start_pos | (end_pos << 24) | (start_line << 48)`
+// Returns `0` on success, or `> 0` line number on lexical error.
+fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
+    mut i := packed & 0xFFFFFF
+    end_pos := (packed >> 24) & 0xFFFFFF
+    mut line := (packed >> 48) & 0x7FFF
+    if line <= 0 {
+        line = 1
+    }
+
+    while i < end_pos {
+        b := buf_get(src, i)
+
+        // 1. Whitespace & newlines
+        if b == 32 or b == 9 or b == 13 {
+            i += 1
+        } else if b == 10 {
+            line += 1
+            i += 1
+        } else if b == 47 and i + 1 < end_pos and buf_get(src, i + 1) == 47 {
+            // Line comment `// ...`
+            i += 2
+            while i < end_pos and buf_get(src, i) != 10 {
+                i += 1
+            }
+        } else if b == 47 and i + 1 < end_pos and buf_get(src, i + 1) == 42 {
+            // Block comment `/* ... */`
+            i += 2
+            while i + 1 < end_pos {
+                if buf_get(src, i) == 10 {
+                    line += 1
+                }
+                if buf_get(src, i) == 42 and buf_get(src, i + 1) == 47 {
+                    i += 2
+                    break
+                }
+                i += 1
+            }
+        } else if b == 102 and i + 1 < end_pos and buf_get(src, i + 1) == 34 {
+            // 2. Interpolated f-string: `f"..."`
+            tok_ln := line
+            t_start := tok_push(toks, tk_fstr_start(), 0, 0)
+            tok_set_meta(toks, t_start, 0, tok_ln)
+            i += 2
+            mut lit_off := buf_len(pool)
+            mut closed := false
+
+            while i < end_pos {
+                c := buf_get(src, i)
+                if c == 34 {
+                    lit_len := buf_len(pool) - lit_off
+                    if lit_len > 0 {
+                        tl := tok_push(toks, tk_fstr_lit(), lit_off, lit_len)
+                        tok_set_meta(toks, tl, 0, line)
+                    }
+                    i += 1
+                    closed = true
+                    break
+                } else if c == 92 and i + 1 < end_pos {
+                    esc := unescape_char(buf_get(src, i + 1))
+                    buf_push(pool, esc)
+                    i += 2
+                } else if c == 123 and i + 1 < end_pos and buf_get(src, i + 1) == 123 {
+                    // Escaped `{{`
+                    buf_push(pool, 123)
+                    i += 2
+                } else if c == 125 and i + 1 < end_pos and buf_get(src, i + 1) == 125 {
+                    // Escaped `}}`
+                    buf_push(pool, 125)
+                    i += 2
+                } else if c == 123 {
+                    // `{expr}` interpolation! Flush literal so far, lex inner expression tokens!
+                    lit_len := buf_len(pool) - lit_off
+                    if lit_len > 0 {
+                        tl := tok_push(toks, tk_fstr_lit(), lit_off, lit_len)
+                        tok_set_meta(toks, tl, 0, line)
+                    }
+                    i += 1
+                    expr_start := i
+                    mut depth := 1
+                    while i < end_pos and depth > 0 {
+                        ec := buf_get(src, i)
+                        if ec == 34 {
+                            i += 1
+                            while i < end_pos and buf_get(src, i) != 34 {
+                                if buf_get(src, i) == 92 {
+                                    i += 1
+                                }
+                                i += 1
+                            }
+                            if i < end_pos {
+                                i += 1
+                            }
+                        } else {
+                            if ec == 123 {
+                                depth += 1
+                            } else if ec == 125 {
+                                depth -= 1
+                                if depth == 0 {
+                                    break
+                                }
+                            }
+                            i += 1
+                        }
+                    }
+                    if depth != 0 {
+                        return tok_ln
+                    }
+                    expr_end := i
+                    i += 1 // skip closing '}'
+                    sub_pack := expr_start | (expr_end << 24) | (line << 48)
+                    sub_err := lex_subrange(src, toks, pool, sub_pack)
+                    if sub_err != 0 {
+                        return sub_err
+                    }
+                    te_end := tok_push(toks, tk_fstr_expr_end(), 0, 0)
+                    tok_set_meta(toks, te_end, 0, line)
+                    lit_off = buf_len(pool)
+                } else {
+                    if c == 10 {
+                        line += 1
+                    }
+                    buf_push(pool, c)
+                    i += 1
+                }
+            }
+            if not closed {
+                return tok_ln
+            }
+            t_end := tok_push(toks, tk_fstr_end(), 0, 0)
+            tok_set_meta(toks, t_end, 0, tok_ln)
+        } else if b == 34 {
+            // 3. Standard string literal: `"..."`
+            tok_ln := line
+            i += 1
+            soff := buf_len(pool)
+            mut closed := false
+            while i < end_pos {
+                c := buf_get(src, i)
+                if c == 34 {
+                    i += 1
+                    closed = true
+                    break
+                }
+                if c == 92 and i + 1 < end_pos {
+                    esc := unescape_char(buf_get(src, i + 1))
+                    buf_push(pool, esc)
+                    i += 2
+                } else {
+                    if c == 10 {
+                        line += 1
+                    }
+                    buf_push(pool, c)
+                    i += 1
+                }
+            }
+            if not closed {
+                return tok_ln
+            }
+            slen := buf_len(pool) - soff
+            tid := tok_push(toks, tk_str(), soff, slen)
+            tok_set_meta(toks, tid, 0, tok_ln)
+        } else if b == 64 {
+            // 4. Attribute `@shield`, `@whitebox`, `@secret`
+            tok_ln := line
+            i += 1
+            soff := buf_len(pool)
+            while i < end_pos and is_alnum_or_under(buf_get(src, i)) {
+                buf_push(pool, buf_get(src, i))
+                i += 1
+            }
+            slen := buf_len(pool) - soff
+            tid := tok_push(toks, tk_attr(), soff, slen)
+            tok_set_meta(toks, tid, 0, tok_ln)
+        } else if is_digit(b) {
+            // 5. Numbers: 0x... hex, fixed-point `29.99d`, IEEE-754 `f64`, or `i64`
+            tok_ln := line
+            if b == 48 and i + 1 < end_pos and (buf_get(src, i + 1) == 120 or buf_get(src, i + 1) == 88) {
+                i += 2
+                mut hval := 0
+                while i < end_pos {
+                    hc := buf_get(src, i)
+                    if hc == 95 {
+                        i += 1
+                    } else if hc >= 48 and hc <= 57 {
+                        hval = (hval << 4) | (hc - 48)
+                        i += 1
+                    } else if hc >= 65 and hc <= 70 {
+                        hval = (hval << 4) | (hc - 55)
+                        i += 1
+                    } else if hc >= 97 and hc <= 102 {
+                        hval = (hval << 4) | (hc - 87)
+                        i += 1
+                    } else {
+                        break
+                    }
+                }
+                tid := tok_push(toks, tk_int(), 0, 0)
+                tok_set_meta(toks, tid, hval, tok_ln)
+            } else {
+                mut ival := 0
+                while i < end_pos {
+                    dc := buf_get(src, i)
+                    if dc == 95 {
+                        i += 1
+                    } else if is_digit(dc) {
+                        ival = ival *% 10 +% (dc - 48)
+                        i += 1
+                    } else {
+                        break
+                    }
+                }
+                mut is_flt := false
+                mut dec_frac := 0
+                mut dec_scale := 1000
+                mut f_frac := 0.0
+                mut f_scale := 0.1
+
+                if i + 1 < end_pos and buf_get(src, i) == 46 and is_digit(buf_get(src, i + 1)) {
+                    is_flt = true
+                    i += 1
+                    while i < end_pos {
+                        fc := buf_get(src, i)
+                        if fc == 95 {
+                            i += 1
+                        } else if is_digit(fc) {
+                            dig := fc - 48
+                            if dec_scale > 0 {
+                                dec_frac = dec_frac + dig * dec_scale
+                                dec_scale = dec_scale / 10
+                            }
+                            f_frac = f_frac + ((dig as f64) * f_scale)
+                            f_scale = f_scale * 0.1
+                            i += 1
+                        } else {
+                            break
+                        }
+                    }
+                }
+
+                // Fixed-point `d` suffix (e.g. `49.50d`, `0.08d`)
+                if i < end_pos and buf_get(src, i) == 100 and (i + 1 >= end_pos or not is_alnum_or_under(buf_get(src, i + 1))) {
+                    i += 1
+                    scaled := ival *% 10000 +% dec_frac
+                    tid := tok_push(toks, tk_dec(), 0, 0)
+                    tok_set_meta(toks, tid, scaled, tok_ln)
+                } else {
+                    // Optional numeric type suffix (`i64`, `u32`, `f32`, `f64`)
+                    if i < end_pos {
+                        sc := buf_get(src, i)
+                        if sc == 105 or sc == 117 or sc == 102 {
+                            if sc == 102 {
+                                is_flt = true
+                            }
+                            i += 1
+                            while i < end_pos and is_digit(buf_get(src, i)) {
+                                i += 1
+                            }
+                        }
+                    }
+                    if is_flt {
+                        f_total := (ival as f64) + f_frac
+                        fbits := f64_to_bits(f_total)
+                        tid := tok_push(toks, tk_float(), 0, 0)
+                        tok_set_meta(toks, tid, fbits, tok_ln)
+                    } else {
+                        tid := tok_push(toks, tk_int(), 0, 0)
+                        tok_set_meta(toks, tid, ival, tok_ln)
+                    }
+                }
+            }
+        } else if is_alpha_or_under(b) {
+            // 6. Identifiers & Keywords
+            tok_ln := line
+            soff := buf_len(pool)
+            while i < end_pos and is_alnum_or_under(buf_get(src, i)) {
+                buf_push(pool, buf_get(src, i))
+                i += 1
+            }
+            slen := buf_len(pool) - soff
+            kw := classify_keyword(pool, soff, slen)
+            tid := tok_push(toks, kw, soff, slen)
+            tok_set_meta(toks, tid, 0, tok_ln)
+        } else {
+            // 7. Operators & Punctuation
+            tok_ln := line
+            mut b2 := 0
+            if i + 1 < end_pos {
+                b2 = buf_get(src, i + 1)
+            }
+            mut kind := -1
+            mut step := 1
+
+            if b == 58 and b2 == 61 { kind = tk_coloneq(); step = 2 }
+            else if b == 58 and b2 == 58 { kind = tk_coloncolon(); step = 2 }
+            else if b == 43 and b2 == 61 { kind = tk_pluseq(); step = 2 }
+            else if b == 45 and b2 == 61 { kind = tk_minuseq(); step = 2 }
+            else if b == 42 and b2 == 61 { kind = tk_stareq(); step = 2 }
+            else if b == 47 and b2 == 61 { kind = tk_slasheq(); step = 2 }
+            else if b == 43 and b2 == 37 { kind = tk_wrapadd(); step = 2 }
+            else if b == 45 and b2 == 37 { kind = tk_wrapsub(); step = 2 }
+            else if b == 42 and b2 == 37 { kind = tk_wrapmul(); step = 2 }
+            else if b == 124 and b2 == 62 { kind = tk_pipegt(); step = 2 }
+            else if b == 45 and b2 == 62 { kind = tk_arrow(); step = 2 }
+            else if b == 46 and b2 == 46 { kind = tk_dotdot(); step = 2 }
+            else if b == 61 and b2 == 61 { kind = tk_eqeq(); step = 2 }
+            else if b == 33 and b2 == 61 { kind = tk_noteq(); step = 2 }
+            else if b == 60 and b2 == 61 { kind = tk_lteq(); step = 2 }
+            else if b == 62 and b2 == 61 { kind = tk_gteq(); step = 2 }
+            else if b == 60 and b2 == 60 { kind = tk_shl(); step = 2 }
+            else if b == 62 and b2 == 62 { kind = tk_shr(); step = 2 }
+            else if b == 40 { kind = tk_lparen() }
+            else if b == 41 { kind = tk_rparen() }
+            else if b == 91 { kind = tk_lbrack() }
+            else if b == 93 { kind = tk_rbrack() }
+            else if b == 123 { kind = tk_lbrace() }
+            else if b == 125 { kind = tk_rbrace() }
+            else if b == 44 { kind = tk_comma() }
+            else if b == 46 { kind = tk_dot() }
+            else if b == 58 { kind = tk_colon() }
+            else if b == 59 { kind = tk_semi() }
+            else if b == 61 { kind = tk_eq() }
+            else if b == 43 { kind = tk_plus() }
+            else if b == 45 { kind = tk_minus() }
+            else if b == 42 { kind = tk_star() }
+            else if b == 47 { kind = tk_slash() }
+            else if b == 37 { kind = tk_percent() }
+            else if b == 38 { kind = tk_amp() }
+            else if b == 124 { kind = tk_pipe() }
+            else if b == 94 { kind = tk_caret() }
+            else if b == 33 { kind = tk_bang() }
+            else if b == 63 { kind = tk_question() }
+            else if b == 60 { kind = tk_lt() }
+            else if b == 62 { kind = tk_gt() }
+
+            if kind < 0 {
+                return tok_ln
+            }
+            tid := tok_push(toks, kind, 0, 0)
+            tok_set_meta(toks, tid, 0, tok_ln)
+            i += step
+        }
+    }
+    return 0
+}
+
+fn tokenize_source(src: ByteBuf, toks: IntBuf, pool: ByteBuf) -> i64 {
+    n := buf_len(src)
+    mut start := 0
+    if n >= 3 and buf_get(src, 0) == 0xEF and buf_get(src, 1) == 0xBB and buf_get(src, 2) == 0xBF {
+        start = 3
+    }
+    packed := start | (n << 24) | (1 << 48)
+    err_ln := lex_subrange(src, toks, pool, packed)
+    if err_ln != 0 {
+        return err_ln
+    }
+    tid := tok_push(toks, tk_eof(), 0, 0)
+    tok_set_meta(toks, tid, 0, 1)
+    return 0
 }

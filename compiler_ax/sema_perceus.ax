@@ -1,0 +1,1552 @@
+// Axon v5.0 Self-Hosted Compiler — Static Type, Capability, Perceus FBIP & SoA SIMD Analyzer
+// (`compiler_ax/sema_perceus.ax`) — 100% Pure Axon, Zero GC, Zero `'a` Lifetimes.
+
+use compiler_ax::tokens_ast
+
+// --- Symbol Lookup Helpers ---
+fn find_struct_idx(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
+    base := ibuf_get(sym, 3)
+    cnt := ibuf_get(sym, 4)
+    mut i := 0
+    while i < cnt {
+        off := base + i * 6
+        if ibuf_get(sym, off + 1) == slen {
+            if pool_str_eq2(pool, ibuf_get(sym, off), slen, soff) {
+                return i
+            }
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn find_iface_idx(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
+    base := ibuf_get(sym, 5)
+    cnt := ibuf_get(sym, 6)
+    mut i := 0
+    while i < cnt {
+        off := base + i * 4
+        if ibuf_get(sym, off + 1) == slen {
+            if pool_str_eq2(pool, ibuf_get(sym, off), slen, soff) {
+                return i
+            }
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn find_fn_idx(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
+    base := ibuf_get(sym, 7)
+    cnt := ibuf_get(sym, 8)
+    mut i := 0
+    while i < cnt {
+        off := base + i * 10
+        if ibuf_get(sym, off + 1) == slen {
+            if pool_str_eq2(pool, ibuf_get(sym, off), slen, soff) {
+                return i
+            }
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn find_struct_field(pool: ByteBuf, sym: IntBuf, s_idx: i64, fpacked: i64) -> i64 {
+    // `fpacked = fsoff | (fslen << 32)` -> returns field entry offset in `sym`, or `-1`
+    fsoff := fpacked & 0xFFFFFFFF
+    fslen := ushr64(fpacked, 32)
+    s_off := ibuf_get(sym, 3) + s_idx * 6
+    f_base := ibuf_get(sym, s_off + 3)
+    f_cnt := ibuf_get(sym, s_off + 4)
+    mut i := 0
+    while i < f_cnt {
+        foff := f_base + i * 4
+        if ibuf_get(sym, foff + 1) == fslen {
+            if pool_str_eq2(pool, ibuf_get(sym, foff), fslen, fsoff) {
+                return foff
+            }
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn find_struct_col_idx(pool: ByteBuf, sym: IntBuf, s_idx: i64, fpacked: i64) -> i64 {
+    fsoff := fpacked & 0xFFFFFFFF
+    fslen := ushr64(fpacked, 32)
+    s_off := ibuf_get(sym, 3) + s_idx * 6
+    f_base := ibuf_get(sym, s_off + 3)
+    f_cnt := ibuf_get(sym, s_off + 4)
+    mut i := 0
+    while i < f_cnt {
+        foff := f_base + i * 4
+        if ibuf_get(sym, foff + 1) == fslen {
+            if pool_str_eq2(pool, ibuf_get(sym, foff), fslen, fsoff) {
+                return i
+            }
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn type_slots(sym: IntBuf, ty: i64) -> i64 {
+    tg := ty_tag(ty)
+    pay := ty_pay(ty)
+    if tg == 5 or tg == 12 {
+        // Str (ptr, len) or Table (ptr, len)
+        return 2
+    }
+    if tg == 10 {
+        // Struct(s_idx)
+        s_off := ibuf_get(sym, 3) + pay * 6
+        sc := ibuf_get(sym, s_off + 2)
+        if sc < 1 { return 1 }
+        return sc
+    }
+    if tg == 11 {
+        // Stack-polymorphic Duck Interface: 1 tag slot + max_struct_slots!
+        return 1 + ibuf_get(sym, 9)
+    }
+    if tg == 13 {
+        // Result(ok_ty): 1 err_tag slot + ok_slots
+        return 1 + type_slots(sym, pay)
+    }
+    if tg == 14 {
+        // Tuple(desc_off)
+        cnt := ibuf_get(sym, pay)
+        mut tot := 0
+        mut i := 0
+        while i < cnt {
+            tot += type_slots(sym, ibuf_get(sym, pay + 1 + i))
+            i += 1
+        }
+        if tot < 1 { return 1 }
+        return tot
+    }
+    return 1
+}
+
+fn typespec_has_ref(nodes: IntBuf, extra: IntBuf, tnid: i64) -> bool {
+    if tnid <= 0 {
+        return false
+    }
+    k := ast_kind(nodes, tnid)
+    if k == nk_ty_ref() {
+        return true
+    }
+    if k == nk_ty_result() {
+        return typespec_has_ref(nodes, extra, ast_get(nodes, tnid, 1)) or typespec_has_ref(nodes, extra, ast_get(nodes, tnid, 2))
+    }
+    if k == nk_ty_refined() {
+        return typespec_has_ref(nodes, extra, ast_get(nodes, tnid, 1))
+    }
+    if k == nk_ty_tuple() {
+        off := ast_get(nodes, tnid, 1)
+        cnt := ast_get(nodes, tnid, 2)
+        mut i := 0
+        while i < cnt {
+            if typespec_has_ref(nodes, extra, ibuf_get(extra, off + i)) {
+                return true
+            }
+            i += 1
+        }
+    }
+    return false
+}
+
+fn resolve_typespec(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf) -> i64 {
+    // Expects `tnid` stored in `sym[13]` so we keep 4-register ABI!
+    tnid := ibuf_get(sym, 13)
+    if tnid <= 0 {
+        return ty_unit()
+    }
+    k := ast_kind(nodes, tnid)
+    if k == nk_ty_unit() {
+        return ty_unit()
+    }
+    if k == nk_ty_ref() or k == nk_ty_refined() {
+        ibuf_set(sym, 13, ast_get(nodes, tnid, 1))
+        return resolve_typespec(pool, nodes, extra, sym)
+    }
+    if k == nk_ty_result() {
+        ibuf_set(sym, 13, ast_get(nodes, tnid, 1))
+        ok_t := resolve_typespec(pool, nodes, extra, sym)
+        return ty_make(13, ok_t)
+    }
+    if k == nk_ty_tuple() {
+        off := ast_get(nodes, tnid, 1)
+        cnt := ast_get(nodes, tnid, 2)
+        // Reserve tuple descriptor in `sym` first so nested tuples don't interleave
+        desc_off := ibuf_len(sym)
+        ibuf_push(sym, cnt)
+        mut i := 0
+        while i < cnt {
+            ibuf_push(sym, ty_int())
+            i += 1
+        }
+        i = 0
+        while i < cnt {
+            ibuf_set(sym, 13, ibuf_get(extra, off + i))
+            et := resolve_typespec(pool, nodes, extra, sym)
+            ibuf_set(sym, desc_off + 1 + i, et)
+            i += 1
+        }
+        return ty_make(14, desc_off)
+    }
+    if k == nk_ty_table() {
+        esoff := ast_get(nodes, tnid, 1)
+        eslen := ast_get(nodes, tnid, 2)
+        if pool_str_eq_lit(pool, esoff, eslen, "f32") {
+            return ty_make(12, 60001)
+        }
+        if pool_str_eq_lit(pool, esoff, eslen, "i64") or pool_str_eq_lit(pool, esoff, eslen, "usize") or pool_str_eq_lit(pool, esoff, eslen, "f64") {
+            return ty_make(12, 60002)
+        }
+        sidx := find_struct_idx(pool, sym, esoff, eslen)
+        if sidx >= 0 {
+            return ty_make(12, sidx)
+        }
+        return ty_make(12, 0)
+    }
+    if k == nk_ty_named() {
+        soff := ast_get(nodes, tnid, 1)
+        slen := ast_get(nodes, tnid, 2)
+        if pool_str_eq_lit(pool, soff, slen, "i64") or pool_str_eq_lit(pool, soff, slen, "i32") or pool_str_eq_lit(pool, soff, slen, "i16") or pool_str_eq_lit(pool, soff, slen, "i8") {
+            return ty_int()
+        }
+        if pool_str_eq_lit(pool, soff, slen, "u64") or pool_str_eq_lit(pool, soff, slen, "u32") or pool_str_eq_lit(pool, soff, slen, "u16") or pool_str_eq_lit(pool, soff, slen, "u8") or pool_str_eq_lit(pool, soff, slen, "usize") or pool_str_eq_lit(pool, soff, slen, "isize") or pool_str_eq_lit(pool, soff, slen, "byte") {
+            return ty_int()
+        }
+        if pool_str_eq_lit(pool, soff, slen, "f64") or pool_str_eq_lit(pool, soff, slen, "f32") or pool_str_eq_lit(pool, soff, slen, "f16") or pool_str_eq_lit(pool, soff, slen, "bf16") {
+            return ty_float()
+        }
+        if pool_str_eq_lit(pool, soff, slen, "dec") or pool_str_eq_lit(pool, soff, slen, "dec128") {
+            return ty_dec()
+        }
+        if pool_str_eq_lit(pool, soff, slen, "bool") {
+            return ty_bool()
+        }
+        if pool_str_eq_lit(pool, soff, slen, "str") {
+            return ty_str()
+        }
+        if pool_str_eq_lit(pool, soff, slen, "void") {
+            return ty_unit()
+        }
+        if pool_str_eq_lit(pool, soff, slen, "ByteBuf") {
+            return ty_bytebuf()
+        }
+        if pool_str_eq_lit(pool, soff, slen, "IntBuf") {
+            return ty_intbuf()
+        }
+        iidx := find_iface_idx(pool, sym, soff, slen)
+        if iidx >= 0 {
+            return ty_make(11, iidx)
+        }
+        sidx := find_struct_idx(pool, sym, soff, slen)
+        if sidx >= 0 {
+            return ty_make(10, sidx)
+        }
+    }
+    return ty_any()
+}
+
+fn sema_record_err(sym: IntBuf, code: i64, ln: i64) {
+    cnt := ibuf_get(sym, 0)
+    if cnt == 0 {
+        ibuf_set(sym, 1, ln)
+        ibuf_set(sym, 2, code)
+    }
+    ibuf_set(sym, 0, cnt + 1)
+}
+
+fn types_compatible(sym: IntBuf, expected: i64, actual: i64) -> bool {
+    et := ty_tag(expected)
+    at := ty_tag(actual)
+    if et == ty_any() or at == ty_any() {
+        return true
+    }
+    if expected == actual {
+        return true
+    }
+    // Duck-typed `interface` accepts any concrete `struct`!
+    if et == 11 and at == 10 {
+        return true
+    }
+    // `Result(ok)` accepts `ok(v)` or `err(e)` (`Result(any)`)
+    if et == 13 and at == 13 {
+        return true
+    }
+    // Structural `Tuple` compatibility: compare element count & element types!
+    if et == 14 and at == 14 {
+        d1 := ty_pay(expected)
+        d2 := ty_pay(actual)
+        c1 := ibuf_get(sym, d1)
+        c2 := ibuf_get(sym, d2)
+        if c1 != c2 {
+            return false
+        }
+        mut i := 0
+        while i < c1 {
+            if not types_compatible(sym, ibuf_get(sym, d1 + 1 + i), ibuf_get(sym, d2 + 1 + i)) {
+                return false
+            }
+            i += 1
+        }
+        return true
+    }
+    return false
+}
+
+fn is_cap_type(pool: ByteBuf, sym: IntBuf, ty: i64) -> bool {
+    if ty_tag(ty) == 10 {
+        sidx := ty_pay(ty)
+        soff := ibuf_get(sym, 3) + sidx * 6
+        n_off := ibuf_get(sym, soff)
+        n_len := ibuf_get(sym, soff + 1)
+        if pool_str_eq_lit(pool, n_off, n_len, "RootCap") or pool_str_eq_lit(pool, n_off, n_len, "FsCap") or pool_str_eq_lit(pool, n_off, n_len, "NetCap") {
+            return true
+        }
+    }
+    return false
+}
+
+// --- Local Variable Scope Table (`locals: IntBuf`, 6 words per local) ---
+// [i*6 + 0] = soff, [+1] = slen, [+2] = ty, [+3] = flags (bit0=mut, bit1=isolated, bit2=outer_before_spawn),
+// [+4] = moved_line (0=not moved), [+5] = spawn_moved (1=moved inside spawn)
+fn local_find(pool: ByteBuf, locals: IntBuf, soff: i64, slen: i64) -> i64 {
+    cnt := ibuf_len(locals) / 6
+    mut i := cnt - 1
+    while i >= 0 {
+        base := i * 6
+        if ibuf_get(locals, base + 1) == slen {
+            if pool_str_eq2(pool, ibuf_get(locals, base), slen, soff) {
+                return base
+            }
+        }
+        i -= 1
+    }
+    return -1
+}
+
+fn local_push(locals: IntBuf, soff: i64, slen: i64, ty_and_flags: i64) {
+    // `ty_and_flags = ty | (flags << 40)`
+    ibuf_push(locals, soff)
+    ibuf_push(locals, slen)
+    ibuf_push(locals, ty_and_flags & 0xFFFFFFFFFF)
+    ibuf_push(locals, ushr64(ty_and_flags, 40))
+    ibuf_push(locals, 0)
+    ibuf_push(locals, 0)
+}
+
+// --- Expression & Statement Semantic + Ownership + Capability Checker ---
+fn check_expr_node(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf) -> i64 {
+    // Reads `enid` from `sym[14]` and `locals_handle`? Wait: keep `locals` as a parameter!
+    return ty_any()
+}
+
+fn sema_expr(pool: ByteBuf, nodes: IntBuf, sym: IntBuf, locals: IntBuf) -> i64 {
+    // `sym[14]` = `enid`, `sym[15]` = `extra`... Wait: `extra` is an `IntBuf`!
+    // Let's check: can a function take 5 args `(pool, nodes, extra, sym, locals)`?
+    // YES! Both `axc0.exe` AND our `codegen_x86_64.ax` support arbitrary parameter counts via General ABI!
+    return ty_any()
+}
+
+fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, locals: IntBuf, enid: i64) -> i64 {
+    if enid <= 0 {
+        return ty_unit()
+    }
+    k := ast_kind(nodes, enid)
+    ln := ast_line(nodes, enid)
+
+    if k == nk_int() { return ty_int() }
+    if k == nk_float() { return ty_float() }
+    if k == nk_dec() { return ty_dec() }
+    if k == nk_bool() { return ty_bool() }
+    if k == nk_str() or k == nk_secret_str() { return ty_str() }
+
+    if k == nk_fstr() {
+        off := ast_get(nodes, enid, 1)
+        cnt := ast_get(nodes, enid, 2)
+        mut i := 0
+        while i < cnt {
+            check_expr_full(pool, nodes, extra, sym, locals, ibuf_get(extra, off + i))
+            i += 1
+        }
+        return ty_str()
+    }
+
+    if k == nk_ident() {
+        soff := ast_get(nodes, enid, 1)
+        slen := ast_get(nodes, enid, 2)
+        lbase := local_find(pool, locals, soff, slen)
+        if lbase >= 0 {
+            if ibuf_get(locals, lbase + 4) > 0 {
+                // E0201: Use after linear `move`!
+                sema_record_err(sym, 201, ln)
+            }
+            lflags := ibuf_get(locals, lbase + 3)
+            if ibuf_get(sym, 10) == 1 and (lflags & 4) != 0 and (lflags & 2) != 0 and ibuf_get(locals, lbase + 5) == 0 {
+                // E0202: Capturing outer `isolated` variable inside `spawn` without `move`!
+                sema_record_err(sym, 202, ln)
+            }
+            return ibuf_get(locals, lbase + 2)
+        }
+        return ty_any()
+    }
+
+    if k == nk_move_ident() {
+        soff := ast_get(nodes, enid, 1)
+        slen := ast_get(nodes, enid, 2)
+        lbase := local_find(pool, locals, soff, slen)
+        if lbase >= 0 {
+            if ibuf_get(locals, lbase + 4) > 0 {
+                sema_record_err(sym, 201, ln)
+            } else {
+                ibuf_set(locals, lbase + 4, ln)
+            }
+            if ibuf_get(sym, 10) == 1 {
+                ibuf_set(locals, lbase + 5, 1)
+            }
+            return ibuf_get(locals, lbase + 2)
+        }
+        return ty_any()
+    }
+
+    if k == nk_tuple() {
+        off := ast_get(nodes, enid, 1)
+        cnt := ast_get(nodes, enid, 2)
+        desc_off := ibuf_len(sym)
+        ibuf_push(sym, cnt)
+        mut i := 0
+        while i < cnt {
+            ibuf_push(sym, ty_int())
+            i += 1
+        }
+        i = 0
+        while i < cnt {
+            et := check_expr_full(pool, nodes, extra, sym, locals, ibuf_get(extra, off + i))
+            ibuf_set(sym, desc_off + 1 + i, et)
+            i += 1
+        }
+        return ty_make(14, desc_off)
+    }
+
+    if k == nk_unary() {
+        uop := ast_get(nodes, enid, 1)
+        it := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 2))
+        if uop == uop_not() {
+            return ty_bool()
+        }
+        return it
+    }
+
+    if k == nk_binary() {
+        op := ast_get(nodes, enid, 1)
+        lt := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 2))
+        rt := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 3))
+        if op == op_or() {
+            if ty_tag(lt) == 13 {
+                return ty_pay(lt)
+            }
+            return ty_bool()
+        }
+        if op >= op_eq() and op <= op_and() {
+            return ty_bool()
+        }
+        if lt == ty_dec() or rt == ty_dec() { return ty_dec() }
+        if lt == ty_float() or rt == ty_float() { return ty_float() }
+        return ty_int()
+    }
+
+    if k == nk_or_return() {
+        lt := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 1))
+        rv := ast_get(nodes, enid, 2)
+        if rv > 0 {
+            check_expr_full(pool, nodes, extra, sym, locals, rv)
+        }
+        if ty_tag(lt) == 13 {
+            return ty_pay(lt)
+        }
+        return lt
+    }
+
+    if k == nk_cast() {
+        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 1))
+        ibuf_set(sym, 13, ast_get(nodes, enid, 2))
+        return resolve_typespec(pool, nodes, extra, sym)
+    }
+
+    if k == nk_field() {
+        bt := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 1))
+        fsoff := ast_get(nodes, enid, 2)
+        fslen := ast_get(nodes, enid, 3)
+        if pool_str_eq_lit(pool, fsoff, fslen, "len") {
+            return ty_int()
+        }
+        if ty_tag(bt) == 10 {
+            foff := find_struct_field(pool, sym, ty_pay(bt), fsoff | (fslen << 32))
+            if foff >= 0 {
+                return ibuf_get(sym, foff + 3)
+            }
+        }
+        return ty_int()
+    }
+
+    if k == nk_tuple_idx() {
+        bt := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 1))
+        idx := ast_get(nodes, enid, 2)
+        if ty_tag(bt) == 14 {
+            doff := ty_pay(bt)
+            cnt := ibuf_get(sym, doff)
+            if idx >= 0 and idx < cnt {
+                return ibuf_get(sym, doff + 1 + idx)
+            }
+        }
+        return ty_int()
+    }
+
+    if k == nk_index() {
+        bt := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 1))
+        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 2))
+        if ty_tag(bt) == 12 and ty_pay(bt) == 60001 {
+            return ty_float()
+        }
+        return ty_int()
+    }
+
+    if k == nk_table_alloc() {
+        esoff := ast_get(nodes, enid, 1)
+        eslen := ast_get(nodes, enid, 2)
+        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 3))
+        if pool_str_eq_lit(pool, esoff, eslen, "f32") {
+            return ty_make(12, 60001)
+        }
+        if pool_str_eq_lit(pool, esoff, eslen, "i64") or pool_str_eq_lit(pool, esoff, eslen, "usize") or pool_str_eq_lit(pool, esoff, eslen, "f64") {
+            return ty_make(12, 60002)
+        }
+        sidx := find_struct_idx(pool, sym, esoff, eslen)
+        if sidx >= 0 {
+            return ty_make(12, sidx)
+        }
+        return ty_make(12, 0)
+    }
+
+    if k == nk_spawn() {
+        prev_spawn := ibuf_get(sym, 10)
+        // Mark current locals as outer_before_spawn (bit 2 = 4)
+        lcnt := ibuf_len(locals) / 6
+        mut i := 0
+        while i < lcnt {
+            fl := ibuf_get(locals, i * 6 + 3)
+            ibuf_set(locals, i * 6 + 3, fl | 4)
+            i += 1
+        }
+        ibuf_set(sym, 10, 1)
+        blk := ast_get(nodes, enid, 1)
+        b_off := ast_get(nodes, blk, 1)
+        b_cnt := ast_get(nodes, blk, 2)
+        mut ret_inner := ty_int()
+        i = 0
+        while i < b_cnt {
+            st := ibuf_get(extra, b_off + i)
+            if ast_kind(nodes, st) == nk_return() {
+                rv := ast_get(nodes, st, 1)
+                if rv > 0 {
+                    ret_inner = check_expr_full(pool, nodes, extra, sym, locals, rv)
+                }
+            } else {
+                check_stmt_full(pool, nodes, extra, sym, locals, st)
+            }
+            i += 1
+        }
+        ibuf_set(sym, 10, prev_spawn)
+        return ty_make(15, ret_inner)
+    }
+
+    if k == nk_if_expr() {
+        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 1))
+        tb := ast_get(nodes, enid, 2)
+        check_block_full(pool, nodes, extra, sym, locals, tb)
+        tt := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, tb, 3))
+        eb := ast_get(nodes, enid, 3)
+        if eb > 0 {
+            check_block_full(pool, nodes, extra, sym, locals, eb)
+            check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, eb, 3))
+        }
+        return tt
+    }
+
+    if k == nk_method_call() {
+        rt := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, enid, 1))
+        msoff := ast_get(nodes, enid, 2)
+        mslen := ast_get(nodes, enid, 3)
+        aoff := ast_get(nodes, enid, 4)
+        acnt := ast_get(nodes, enid, 5)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            check_call_arg_node(pool, nodes, extra, sym, locals, ca)
+            i += 1
+        }
+        if pool_str_eq_lit(pool, msoff, mslen, "join") and ty_tag(rt) == 15 {
+            return ty_pay(rt)
+        }
+        if ty_tag(rt) == 10 or ty_tag(rt) == 11 {
+            // Find any `Struct__method` signature to get return type
+            f_base := ibuf_get(sym, 7)
+            f_cnt := ibuf_get(sym, 8)
+            mut fi := 0
+            while fi < f_cnt {
+                fo := f_base + fi * 10
+                fn_off := ibuf_get(sym, fo)
+                fn_len := ibuf_get(sym, fo + 1)
+                if fn_len > mslen + 2 {
+                    tail_off := fn_off + fn_len - mslen
+                    if buf_get(pool, tail_off - 1) == 95 and buf_get(pool, tail_off - 2) == 95 {
+                        if pool_str_eq2(pool, tail_off, mslen, msoff) {
+                            return ibuf_get(sym, fo + 5)
+                        }
+                    }
+                }
+                fi += 1
+            }
+        }
+        return ty_int()
+    }
+
+    if k == nk_call() {
+        csoff := ast_get(nodes, enid, 1)
+        cslen := ast_get(nodes, enid, 2)
+        aoff := ast_get(nodes, enid, 3)
+        acnt := ast_get(nodes, enid, 4)
+
+        // Capability security gate (`10_ambient_io_without_cap.ax`):
+        // Raw privileged `sys_fs_*` / `sys_net_*` / `ambient_*` require holding a capability token!
+        if pool_str_eq_lit(pool, csoff, cslen, "sys_fs_write") or pool_str_eq_lit(pool, csoff, cslen, "sys_fs_read") or pool_str_eq_lit(pool, csoff, cslen, "sys_net_connect") or pool_str_eq_lit(pool, csoff, cslen, "ambient_open") {
+            if ibuf_get(sym, 12) == 0 {
+                sema_record_err(sym, 501, ln)
+            }
+        }
+
+        mut first_arg_ty := ty_any()
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            aty := check_call_arg_node(pool, nodes, extra, sym, locals, ca)
+            if i == 0 {
+                first_arg_ty = aty
+            }
+            i += 1
+        }
+
+        // Built-in intrinsics
+        if pool_str_eq_lit(pool, csoff, cslen, "print") or pool_str_eq_lit(pool, csoff, cslen, "println") { return ty_unit() }
+        if pool_str_eq_lit(pool, csoff, cslen, "clock_ns") or pool_str_eq_lit(pool, csoff, cslen, "time_ns") { return ty_int() }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_new") { return ty_bytebuf() }
+        if pool_str_eq_lit(pool, csoff, cslen, "ibuf_new") { return ty_intbuf() }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_len") or pool_str_eq_lit(pool, csoff, cslen, "ibuf_len") { return ty_int() }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_get") or pool_str_eq_lit(pool, csoff, cslen, "ibuf_get") { return ty_int() }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_set") or pool_str_eq_lit(pool, csoff, cslen, "ibuf_set") { return ty_unit() }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_push") or pool_str_eq_lit(pool, csoff, cslen, "buf_push_u16") or pool_str_eq_lit(pool, csoff, cslen, "buf_push_u32") or pool_str_eq_lit(pool, csoff, cslen, "buf_push_u64") { return ty_unit() }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_put_u32") or pool_str_eq_lit(pool, csoff, cslen, "buf_put_u64") or pool_str_eq_lit(pool, csoff, cslen, "buf_push_str") or pool_str_eq_lit(pool, csoff, cslen, "buf_free") or pool_str_eq_lit(pool, csoff, cslen, "ibuf_push") { return ty_unit() }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_slice_str") or pool_str_eq_lit(pool, csoff, cslen, "str_slice") or pool_str_eq_lit(pool, csoff, cslen, "args_get") { return ty_str() }
+        if pool_str_eq_lit(pool, csoff, cslen, "str_len") or pool_str_eq_lit(pool, csoff, cslen, "str_byte") or pool_str_eq_lit(pool, csoff, cslen, "args_count") or pool_str_eq_lit(pool, csoff, cslen, "whitebox_sbox") { return ty_int() }
+        if pool_str_eq_lit(pool, csoff, cslen, "str_eq") { return ty_bool() }
+        if pool_str_eq_lit(pool, csoff, cslen, "table_fill_f32") { return ty_unit() }
+        if pool_str_eq_lit(pool, csoff, cslen, "table_get_f32") { return ty_float() }
+        if pool_str_eq_lit(pool, csoff, cslen, "fs_read_file") { return ty_make(13, ty_bytebuf()) }
+        if pool_str_eq_lit(pool, csoff, cslen, "fs_write_file") { return ty_make(13, ty_int()) }
+        if pool_str_eq_lit(pool, csoff, cslen, "ok") { return ty_make(13, first_arg_ty) }
+        if pool_str_eq_lit(pool, csoff, cslen, "err") { return ty_make(13, ty_any()) }
+
+        sidx := find_struct_idx(pool, sym, csoff, cslen)
+        if sidx >= 0 {
+            return ty_make(10, sidx)
+        }
+        fidx := find_fn_idx(pool, sym, csoff, cslen)
+        if fidx >= 0 {
+            return ibuf_get(sym, ibuf_get(sym, 7) + fidx * 10 + 5)
+        }
+        return ty_any()
+    }
+
+    return ty_any()
+}
+
+fn check_call_arg_node(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, locals: IntBuf, ca: i64) -> i64 {
+    mode := ast_get(nodes, ca, 1)
+    aexpr := ast_get(nodes, ca, 4)
+    ln := ast_line(nodes, ca)
+    if mode == pmode_move() and ast_kind(nodes, aexpr) == nk_ident() {
+        soff := ast_get(nodes, aexpr, 1)
+        slen := ast_get(nodes, aexpr, 2)
+        lbase := local_find(pool, locals, soff, slen)
+        if lbase >= 0 {
+            if ibuf_get(locals, lbase + 4) > 0 {
+                sema_record_err(sym, 201, ln)
+            } else {
+                ibuf_set(locals, lbase + 4, ln)
+            }
+            if ibuf_get(sym, 10) == 1 {
+                ibuf_set(locals, lbase + 5, 1)
+            }
+            return ibuf_get(locals, lbase + 2)
+        }
+    }
+    if mode == pmode_mut() and ast_kind(nodes, aexpr) == nk_ident() {
+        soff := ast_get(nodes, aexpr, 1)
+        slen := ast_get(nodes, aexpr, 2)
+        lbase := local_find(pool, locals, soff, slen)
+        if lbase >= 0 {
+            lflags := ibuf_get(locals, lbase + 3)
+            if ibuf_get(sym, 10) == 1 and (lflags & 4) != 0 and (lflags & 2) != 0 and ibuf_get(locals, lbase + 5) == 0 {
+                sema_record_err(sym, 202, ln)
+            }
+        }
+    }
+    return check_expr_full(pool, nodes, extra, sym, locals, aexpr)
+}
+
+// --- SoA `Table[T]` Hardware AVX2 SIMD Loop Pattern Detector ---
+fn try_plan_foreach_simd(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, fe_nid: i64, tbl_ty: i64) {
+    if ty_tag(tbl_ty) != 12 {
+        return
+    }
+    s_idx := ty_pay(tbl_ty)
+    if s_idx < 0 or s_idx >= 60000 {
+        return
+    }
+    // Check all struct fields are `f32`/`Float`
+    s_off := ibuf_get(sym, 3) + s_idx * 6
+    f_base := ibuf_get(sym, s_off + 3)
+    f_cnt := ibuf_get(sym, s_off + 4)
+    if f_cnt <= 0 {
+        return
+    }
+    mut fi := 0
+    while fi < f_cnt {
+        if ibuf_get(sym, f_base + fi * 4 + 3) != ty_float() {
+            return
+        }
+        fi += 1
+    }
+
+    vsoff := ast_get(nodes, fe_nid, 1)
+    vslen := ast_get(nodes, fe_nid, 2)
+    body := ast_get(nodes, fe_nid, 4)
+    st_off := ast_get(nodes, body, 1)
+    st_cnt := ast_get(nodes, body, 2)
+    if st_cnt <= 0 {
+        return
+    }
+
+    ops_tmp := ibuf_new(64)
+    mut si := 0
+    while si < st_cnt {
+        st := ibuf_get(extra, st_off + si)
+        if ast_kind(nodes, st) != nk_assign() {
+            return
+        }
+        aop := ast_get(nodes, st, 1)
+        tgt := ast_get(nodes, st, 2)
+        rhs := ast_get(nodes, st, 3)
+        if ast_kind(nodes, tgt) != nk_field() {
+            return
+        }
+        tbase := ast_get(nodes, tgt, 1)
+        if ast_kind(nodes, tbase) != nk_ident() or ast_get(nodes, tbase, 2) != vslen {
+            return
+        }
+        if not pool_str_eq2(pool, ast_get(nodes, tbase, 1), vslen, vsoff) {
+            return
+        }
+        dst_col := find_struct_col_idx(pool, sym, s_idx, ast_get(nodes, tgt, 2) | (ast_get(nodes, tgt, 3) << 32))
+        if dst_col < 0 {
+            return
+        }
+
+        if aop == aop_add() and ast_kind(nodes, rhs) == nk_binary() and ast_get(nodes, rhs, 1) == op_mul() {
+            // `p.x += p.vx * dt` -> AVX2 FMA3 `VFMADD231PS`!
+            rl := ast_get(nodes, rhs, 2)
+            rr := ast_get(nodes, rhs, 3)
+            if ast_kind(nodes, rl) == nk_field() {
+                rb := ast_get(nodes, rl, 1)
+                if ast_kind(nodes, rb) == nk_ident() and ast_get(nodes, rb, 2) == vslen and pool_str_eq2(pool, ast_get(nodes, rb, 1), vslen, vsoff) {
+                    src_col := find_struct_col_idx(pool, sym, s_idx, ast_get(nodes, rl, 2) | (ast_get(nodes, rl, 3) << 32))
+                    if src_col >= 0 {
+                        ibuf_push(ops_tmp, 1) // 1 = FMA
+                        ibuf_push(ops_tmp, dst_col)
+                        ibuf_push(ops_tmp, src_col)
+                        ibuf_push(ops_tmp, rr)
+                    } else { return }
+                } else { return }
+            } else { return }
+        } else if aop == aop_mul() {
+            // `p.y *= 3.0` -> AVX2 `VMULPS`!
+            ibuf_push(ops_tmp, 2) // 2 = SCALE
+            ibuf_push(ops_tmp, dst_col)
+            ibuf_push(ops_tmp, 0)
+            ibuf_push(ops_tmp, rhs)
+        } else if aop == aop_add() and ast_kind(nodes, rhs) == nk_field() {
+            rb := ast_get(nodes, rhs, 1)
+            if ast_kind(nodes, rb) == nk_ident() and ast_get(nodes, rb, 2) == vslen and pool_str_eq2(pool, ast_get(nodes, rb, 1), vslen, vsoff) {
+                src_col := find_struct_col_idx(pool, sym, s_idx, ast_get(nodes, rhs, 2) | (ast_get(nodes, rhs, 3) << 32))
+                if src_col >= 0 {
+                    ibuf_push(ops_tmp, 3) // 3 = ADDCOL
+                    ibuf_push(ops_tmp, dst_col)
+                    ibuf_push(ops_tmp, src_col)
+                    ibuf_push(ops_tmp, 0)
+                } else { return }
+            } else { return }
+        } else {
+            return
+        }
+        si += 1
+    }
+
+    plan_off := ibuf_len(extra)
+    ops_cnt := ibuf_len(ops_tmp) / 4
+    ibuf_push(extra, s_idx)
+    ibuf_push(extra, ops_cnt)
+    mut k := 0
+    while k < ibuf_len(ops_tmp) {
+        ibuf_push(extra, ibuf_get(ops_tmp, k))
+        k += 1
+    }
+    ast_set(nodes, fe_nid, 5, plan_off)
+}
+
+fn block_diverges(nodes: IntBuf, extra: IntBuf, bnid: i64) -> bool {
+    if bnid <= 0 {
+        return false
+    }
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    if cnt <= 0 {
+        return false
+    }
+    last_st := ibuf_get(extra, off + cnt - 1)
+    lk := ast_kind(nodes, last_st)
+    if lk == nk_return() or lk == nk_break() or lk == nk_continue() {
+        return true
+    }
+    if lk == nk_if() {
+        tb := ast_get(nodes, last_st, 2)
+        eb := ast_get(nodes, last_st, 3)
+        if eb > 0 and block_diverges(nodes, extra, tb) and block_diverges(nodes, extra, eb) {
+            return true
+        }
+    }
+    return false
+}
+
+fn check_stmt_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, locals: IntBuf, snid: i64) {
+    k := ast_kind(nodes, snid)
+    ln := ast_line(nodes, snid)
+
+    if k == nk_var_decl() {
+        vsoff := ast_get(nodes, snid, 1)
+        vslen := ast_get(nodes, snid, 2)
+        is_mut := ast_get(nodes, snid, 3)
+        ty_nid := ast_get(nodes, snid, 4)
+        init_e := ast_get(nodes, snid, 5)
+        init_ty := check_expr_full(pool, nodes, extra, sym, locals, init_e)
+        mut final_ty := init_ty
+        if ty_nid > 0 {
+            ibuf_set(sym, 13, ty_nid)
+            decl_ty := resolve_typespec(pool, nodes, extra, sym)
+            if not types_compatible(sym, decl_ty, init_ty) {
+                // E0401: Type mismatch (`05_type_mismatch.ax`)!
+                sema_record_err(sym, 401, ln)
+            }
+            final_ty = decl_ty
+        }
+        if is_cap_type(pool, sym, final_ty) {
+            ibuf_set(sym, 12, 1)
+        }
+        mut fl := 0
+        if is_mut == 1 { fl = 1 }
+        local_push(locals, vsoff, vslen, final_ty | (fl << 40))
+        return
+    }
+
+    if k == nk_tuple_destruct() {
+        noff := ast_get(nodes, snid, 1)
+        ncnt := ast_get(nodes, snid, 2)
+        init_ty := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 3))
+        mut i := 0
+        while i < ncnt {
+            ns_off := ibuf_get(extra, noff + i * 2)
+            ns_len := ibuf_get(extra, noff + i * 2 + 1)
+            mut et := ty_int()
+            if ty_tag(init_ty) == 14 {
+                doff := ty_pay(init_ty)
+                if i < ibuf_get(sym, doff) {
+                    et = ibuf_get(sym, doff + 1 + i)
+                }
+            }
+            local_push(locals, ns_off, ns_len, et)
+            i += 1
+        }
+        return
+    }
+
+    if k == nk_assign() {
+        aop := ast_get(nodes, snid, 1)
+        tgt := ast_get(nodes, snid, 2)
+        rhs := ast_get(nodes, snid, 3)
+        // Check root variable mutability (`04_mutate_immutable_let.ax`, `07_mutate_param_let.ax`)!
+        mut root := tgt
+        while ast_kind(nodes, root) == nk_field() {
+            root = ast_get(nodes, root, 1)
+        }
+        mut root_lbase := -1
+        if ast_kind(nodes, root) == nk_ident() {
+            root_lbase = local_find(pool, locals, ast_get(nodes, root, 1), ast_get(nodes, root, 2))
+            if root_lbase >= 0 {
+                lflags := ibuf_get(locals, root_lbase + 3)
+                if (lflags & 1) == 0 {
+                    sema_record_err(sym, 301, ln)
+                }
+            }
+        }
+        check_expr_full(pool, nodes, extra, sym, locals, rhs)
+        if aop == aop_eq() and ast_kind(nodes, tgt) == nk_ident() and root_lbase >= 0 {
+            ibuf_set(locals, root_lbase + 4, 0)
+        } else {
+            check_expr_full(pool, nodes, extra, sym, locals, tgt)
+        }
+        return
+    }
+
+    if k == nk_if() {
+        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 1))
+        tb := ast_get(nodes, snid, 2)
+        eb := ast_get(nodes, snid, 3)
+        lcnt := ibuf_len(locals) / 6
+        snap := ibuf_new(lcnt + 4)
+        mut li := 0
+        while li < lcnt {
+            ibuf_push(snap, ibuf_get(locals, li * 6 + 4))
+            li += 1
+        }
+        check_block_full(pool, nodes, extra, sym, locals, tb)
+        t_div := block_diverges(nodes, extra, tb)
+        then_moves := ibuf_new(lcnt + 4)
+        li = 0
+        while li < lcnt {
+            ibuf_push(then_moves, ibuf_get(locals, li * 6 + 4))
+            ibuf_set(locals, li * 6 + 4, ibuf_get(snap, li))
+            li += 1
+        }
+        if eb > 0 {
+            check_block_full(pool, nodes, extra, sym, locals, eb)
+            e_div := block_diverges(nodes, extra, eb)
+            li = 0
+            while li < lcnt {
+                tm := ibuf_get(then_moves, li)
+                em := ibuf_get(locals, li * 6 + 4)
+                if t_div and e_div {
+                    ibuf_set(locals, li * 6 + 4, ibuf_get(snap, li))
+                } else if t_div {
+                    ibuf_set(locals, li * 6 + 4, em)
+                } else if e_div {
+                    ibuf_set(locals, li * 6 + 4, tm)
+                } else {
+                    if tm > em { ibuf_set(locals, li * 6 + 4, tm) }
+                    else { ibuf_set(locals, li * 6 + 4, em) }
+                }
+                li += 1
+            }
+        } else {
+            if not t_div {
+                li = 0
+                while li < lcnt {
+                    ibuf_set(locals, li * 6 + 4, ibuf_get(then_moves, li))
+                    li += 1
+                }
+            }
+        }
+        buf_free(move snap)
+        buf_free(move then_moves)
+        return
+    }
+
+    if k == nk_while() {
+        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 1))
+        check_block_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 2))
+        return
+    }
+
+    if k == nk_for_range() {
+        vsoff := ast_get(nodes, snid, 1)
+        vslen := ast_get(nodes, snid, 2)
+        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 3))
+        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 4))
+        saved_lcnt := ibuf_len(locals) / 6
+        local_push(locals, vsoff, vslen, ty_int() | (1 << 40))
+        check_block_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 5))
+        ibuf_set(locals, saved_lcnt * 6 + 1, -1)
+        return
+    }
+
+    if k == nk_for_each() {
+        vsoff := ast_get(nodes, snid, 1)
+        vslen := ast_get(nodes, snid, 2)
+        cty := check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 3))
+        mut elem_ty := ty_int()
+        if ty_tag(cty) == 12 {
+            ep := ty_pay(cty)
+            if ep == 60001 { elem_ty = ty_float() }
+            else if ep == 60002 { elem_ty = ty_int() }
+            else { elem_ty = ty_make(10, ep) }
+        }
+        saved_lcnt := ibuf_len(locals) / 6
+        local_push(locals, vsoff, vslen, elem_ty | (1 << 40))
+        check_block_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 4))
+        ibuf_set(locals, saved_lcnt * 6 + 1, -1)
+        try_plan_foreach_simd(pool, nodes, extra, sym, snid, cty)
+        return
+    }
+
+    if k == nk_return() {
+        rv := ast_get(nodes, snid, 1)
+        fn_ret := ibuf_get(sym, 11)
+        if rv > 0 {
+            rty := check_expr_full(pool, nodes, extra, sym, locals, rv)
+            if fn_ret != ty_unit() and not types_compatible(sym, fn_ret, rty) {
+                // E0402: Return type mismatch (`06_return_mismatch.ax`)!
+                sema_record_err(sym, 402, ln)
+            }
+        }
+        return
+    }
+
+    if k == nk_expr_stmt() {
+        check_expr_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 1))
+    }
+}
+
+fn check_block_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, locals: IntBuf, bnid: i64) {
+    if bnid <= 0 {
+        return
+    }
+    saved_lcnt := ibuf_len(locals) / 6
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt {
+        check_stmt_full(pool, nodes, extra, sym, locals, ibuf_get(extra, off + i))
+        i += 1
+    }
+    end_lcnt := ibuf_len(locals) / 6
+    mut li := saved_lcnt
+    while li < end_lcnt {
+        ibuf_set(locals, li * 6 + 1, -1)
+        li += 1
+    }
+}
+
+// --- Static Perceus Liveness, FBIP In-Place Reuse & Deterministic Drop Planner ---
+fn classify_owned_alloc(pool: ByteBuf, nodes: IntBuf, init_nid: i64) -> i64 {
+    // Returns `0` if not a fresh owned buffer/table, `1` = ByteBuf, `2` = IntBuf, `3` = Table
+    if init_nid <= 0 {
+        return 0
+    }
+    k := ast_kind(nodes, init_nid)
+    if k == nk_table_alloc() {
+        return 3
+    }
+    if k == nk_call() {
+        cs := ast_get(nodes, init_nid, 1)
+        cl := ast_get(nodes, init_nid, 2)
+        if pool_str_eq_lit(pool, cs, cl, "buf_new") { return 1 }
+        if pool_str_eq_lit(pool, cs, cl, "ibuf_new") { return 2 }
+    }
+    return 0
+}
+
+fn scan_expr_var_use(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, enid: i64, target_soff: i64, target_slen: i64, in_ret: bool) -> i64 {
+    // Returns bitmask: bit 0 = used, bit 1 = escaped!
+    if enid <= 0 {
+        return 0
+    }
+    k := ast_kind(nodes, enid)
+    if k == nk_ident() {
+        if ast_get(nodes, enid, 2) == target_slen and pool_str_eq2(pool, ast_get(nodes, enid, 1), target_slen, target_soff) {
+            if in_ret { return 3 }
+            return 1
+        }
+        return 0
+    }
+    if k == nk_move_ident() {
+        if ast_get(nodes, enid, 2) == target_slen and pool_str_eq2(pool, ast_get(nodes, enid, 1), target_slen, target_soff) {
+            return 3
+        }
+        return 0
+    }
+    if k == nk_unary() or k == nk_cast() {
+        mut child := ast_get(nodes, enid, 2)
+        if k == nk_cast() { child = ast_get(nodes, enid, 1) }
+        return scan_expr_var_use(pool, nodes, extra, child, target_soff, target_slen, in_ret)
+    }
+    if k == nk_binary() {
+        m1 := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, enid, 2), target_soff, target_slen, false)
+        m2 := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, enid, 3), target_soff, target_slen, false)
+        return m1 | m2
+    }
+    if k == nk_or_return() {
+        m1 := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, enid, 1), target_soff, target_slen, in_ret)
+        m2 := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, enid, 2), target_soff, target_slen, true)
+        return m1 | m2
+    }
+    if k == nk_field() or k == nk_tuple_idx() {
+        return scan_expr_var_use(pool, nodes, extra, ast_get(nodes, enid, 1), target_soff, target_slen, false)
+    }
+    if k == nk_index() {
+        m1 := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, enid, 1), target_soff, target_slen, false)
+        m2 := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, enid, 2), target_soff, target_slen, false)
+        return m1 | m2
+    }
+    if k == nk_table_alloc() {
+        return scan_expr_var_use(pool, nodes, extra, ast_get(nodes, enid, 3), target_soff, target_slen, false)
+    }
+    if k == nk_tuple() or k == nk_fstr() {
+        off := ast_get(nodes, enid, 1)
+        cnt := ast_get(nodes, enid, 2)
+        mut res := 0
+        mut i := 0
+        while i < cnt {
+            res = res | scan_expr_var_use(pool, nodes, extra, ibuf_get(extra, off + i), target_soff, target_slen, in_ret)
+            i += 1
+        }
+        return res
+    }
+    if k == nk_call() {
+        cs := ast_get(nodes, enid, 1)
+        cl := ast_get(nodes, enid, 2)
+        aoff := ast_get(nodes, enid, 3)
+        acnt := ast_get(nodes, enid, 4)
+        mut is_ctor := false
+        if cl > 0 {
+            b0 := buf_get(pool, cs)
+            if b0 >= 65 and b0 <= 90 { is_ctor = true }
+        }
+        if pool_str_eq_lit(pool, cs, cl, "ok") or pool_str_eq_lit(pool, cs, cl, "buf_free") {
+            is_ctor = true
+        }
+        mut res := 0
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            amode := ast_get(nodes, ca, 1)
+            ae := ast_get(nodes, ca, 4)
+            mut m := scan_expr_var_use(pool, nodes, extra, ae, target_soff, target_slen, in_ret and is_ctor)
+            if (amode == pmode_move() or is_ctor) and (m & 1) != 0 {
+                m = m | 2
+            }
+            res = res | m
+            i += 1
+        }
+        return res
+    }
+    if k == nk_method_call() {
+        mut res := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, enid, 1), target_soff, target_slen, in_ret)
+        aoff := ast_get(nodes, enid, 4)
+        acnt := ast_get(nodes, enid, 5)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            res = res | scan_expr_var_use(pool, nodes, extra, ast_get(nodes, ca, 4), target_soff, target_slen, false)
+            i += 1
+        }
+        return res
+    }
+    if k == nk_spawn() {
+        return scan_block_var_use(pool, nodes, extra, ast_get(nodes, enid, 1), target_soff, target_slen)
+    }
+    return 0
+}
+
+fn scan_stmt_var_use(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, snid: i64, target_soff: i64, target_slen: i64) -> i64 {
+    k := ast_kind(nodes, snid)
+    if k == nk_var_decl() {
+        ie := ast_get(nodes, snid, 5)
+        mut m := scan_expr_var_use(pool, nodes, extra, ie, target_soff, target_slen, false)
+        if ast_kind(nodes, ie) == nk_ident() and (m & 1) != 0 {
+            m = m | 2
+        }
+        return m
+    }
+    if k == nk_tuple_destruct() {
+        return scan_expr_var_use(pool, nodes, extra, ast_get(nodes, snid, 3), target_soff, target_slen, false)
+    }
+    if k == nk_assign() {
+        m1 := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, snid, 2), target_soff, target_slen, false)
+        m2 := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, snid, 3), target_soff, target_slen, false)
+        return m1 | m2
+    }
+    if k == nk_if() {
+        mut m := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, snid, 1), target_soff, target_slen, false)
+        m = m | scan_block_var_use(pool, nodes, extra, ast_get(nodes, snid, 2), target_soff, target_slen)
+        eb := ast_get(nodes, snid, 3)
+        if eb > 0 {
+            m = m | scan_block_var_use(pool, nodes, extra, eb, target_soff, target_slen)
+        }
+        return m
+    }
+    if k == nk_while() {
+        m1 := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, snid, 1), target_soff, target_slen, false)
+        m2 := scan_block_var_use(pool, nodes, extra, ast_get(nodes, snid, 2), target_soff, target_slen)
+        return m1 | m2
+    }
+    if k == nk_for_range() {
+        mut m := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, snid, 3), target_soff, target_slen, false)
+        m = m | scan_expr_var_use(pool, nodes, extra, ast_get(nodes, snid, 4), target_soff, target_slen, false)
+        m = m | scan_block_var_use(pool, nodes, extra, ast_get(nodes, snid, 5), target_soff, target_slen)
+        return m
+    }
+    if k == nk_for_each() {
+        m1 := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, snid, 3), target_soff, target_slen, false)
+        m2 := scan_block_var_use(pool, nodes, extra, ast_get(nodes, snid, 4), target_soff, target_slen)
+        return m1 | m2
+    }
+    if k == nk_return() {
+        return scan_expr_var_use(pool, nodes, extra, ast_get(nodes, snid, 1), target_soff, target_slen, true)
+    }
+    if k == nk_expr_stmt() {
+        return scan_expr_var_use(pool, nodes, extra, ast_get(nodes, snid, 1), target_soff, target_slen, false)
+    }
+    return 0
+}
+
+fn scan_block_var_use(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, bnid: i64, target_soff: i64, target_slen: i64) -> i64 {
+    if bnid <= 0 {
+        return 0
+    }
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut res := 0
+    mut i := 0
+    while i < cnt {
+        res = res | scan_stmt_var_use(pool, nodes, extra, ibuf_get(extra, off + i), target_soff, target_slen)
+        i += 1
+    }
+    return res
+}
+
+fn plan_fn_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, body_nid: i64) {
+    if body_nid <= 0 {
+        return
+    }
+    st_off := ast_get(nodes, body_nid, 1)
+    st_cnt := ast_get(nodes, body_nid, 2)
+
+    // Collect owned top-level `nk_var_decl`: `[stmt_idx, decl_nid, akind, last_use, escaped, consumed]` (6 words)
+    owned := ibuf_new(128)
+    mut i := 0
+    while i < st_cnt {
+        st := ibuf_get(extra, st_off + i)
+        if ast_kind(nodes, st) == nk_var_decl() {
+            ak := classify_owned_alloc(pool, nodes, ast_get(nodes, st, 5))
+            if ak > 0 {
+                vsoff := ast_get(nodes, st, 1)
+                vslen := ast_get(nodes, st, 2)
+                mut last_u := i
+                mut esc := 0
+                mut j := i + 1
+                while j < st_cnt {
+                    m := scan_stmt_var_use(pool, nodes, extra, ibuf_get(extra, st_off + j), vsoff, vslen)
+                    if (m & 1) != 0 { last_u = j }
+                    if (m & 2) != 0 { esc = 1 }
+                    j += 1
+                }
+                ibuf_push(owned, i)
+                ibuf_push(owned, st)
+                ibuf_push(owned, ak)
+                ibuf_push(owned, last_u)
+                ibuf_push(owned, esc)
+                ibuf_push(owned, 0)
+            }
+        }
+        i += 1
+    }
+
+    ocnt := ibuf_len(owned) / 6
+    // Pair dead non-escaped allocations with subsequent allocations of the same `akind` (FBIP Reuse!)
+    mut ni := 0
+    while ni < ocnt {
+        nb := ni * 6
+        n_stmt := ibuf_get(owned, nb)
+        n_nid := ibuf_get(owned, nb + 1)
+        n_ak := ibuf_get(owned, nb + 2)
+        mut donor_nid := 0
+
+        mut oi := 0
+        while oi < ni {
+            ob := oi * 6
+            if ibuf_get(owned, ob + 2) == n_ak and ibuf_get(owned, ob + 4) == 0 and ibuf_get(owned, ob + 5) == 0 {
+                if ibuf_get(owned, ob + 3) < n_stmt {
+                    donor_nid = ibuf_get(owned, ob + 1)
+                    ibuf_set(owned, ob + 5, 1) // consumed by FBIP reuse!
+                    break
+                }
+            }
+            oi += 1
+        }
+        if donor_nid > 0 {
+            ast_set(nodes, n_nid, 6, donor_nid << 2)
+        }
+        ni += 1
+    }
+
+    // Mark remaining non-escaped, non-consumed owned variables for deterministic `VirtualFree` drop!
+    ni = 0
+    while ni < ocnt {
+        nb := ni * 6
+        if ibuf_get(owned, nb + 4) == 0 and ibuf_get(owned, nb + 5) == 0 {
+            nid := ibuf_get(owned, nb + 1)
+            prev_tag := ast_get(nodes, nid, 6)
+            ast_set(nodes, nid, 6, prev_tag | 1)
+        }
+        ni += 1
+    }
+}
+
+// --- Top-Level Semantic & Perceus Entry Point ---
+fn analyze_semantics_and_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf) -> bool {
+    // Initialize `sym[0..16]` header
+    mut z := 0
+    while z < 16 {
+        ibuf_push(sym, 0)
+        z += 1
+    }
+
+    prog := ibuf_get(nodes, 7)
+    s_list_off := ast_get(nodes, prog, 3)
+    s_cnt := ast_get(nodes, prog, 4)
+    i_list_off := ast_get(nodes, prog, 5)
+    i_cnt := ast_get(nodes, prog, 6)
+    f_list_off := ibuf_get(nodes, 8)
+    f_cnt := ibuf_get(nodes, 9)
+
+    // 1. Register struct headers & interfaces first so recursive/cross-struct types resolve
+    s_meta_base := ibuf_len(sym)
+    ibuf_set(sym, 3, s_meta_base)
+    ibuf_set(sym, 4, s_cnt)
+    mut si := 0
+    while si < s_cnt {
+        snid := ibuf_get(extra, s_list_off + si)
+        ibuf_push(sym, ast_get(nodes, snid, 1))
+        ibuf_push(sym, ast_get(nodes, snid, 2))
+        ibuf_push(sym, 1)
+        ibuf_push(sym, 0)
+        ibuf_push(sym, ast_get(nodes, snid, 4))
+        ibuf_push(sym, snid)
+        si += 1
+    }
+
+    i_meta_base := ibuf_len(sym)
+    ibuf_set(sym, 5, i_meta_base)
+    ibuf_set(sym, 6, i_cnt)
+    mut ii := 0
+    while ii < i_cnt {
+        inid := ibuf_get(extra, i_list_off + ii)
+        ibuf_push(sym, ast_get(nodes, inid, 1))
+        ibuf_push(sym, ast_get(nodes, inid, 2))
+        ibuf_push(sym, 2)
+        ibuf_push(sym, inid)
+        ii += 1
+    }
+
+    // 2. Resolve struct fields in two passes (handles nested structs!) & enforce E0101 (`&T` in struct)
+    si = 0
+    while si < s_cnt {
+        s_off := s_meta_base + si * 6
+        snid := ibuf_get(sym, s_off + 5)
+        fl_off := ast_get(nodes, snid, 3)
+        fl_cnt := ast_get(nodes, snid, 4)
+        f_meta_base := ibuf_len(sym)
+        ibuf_set(sym, s_off + 3, f_meta_base)
+        mut fi := 0
+        while fi < fl_cnt {
+            fd := ibuf_get(extra, fl_off + fi)
+            ft_nid := ast_get(nodes, fd, 3)
+            if typespec_has_ref(nodes, extra, ft_nid) {
+                // E0101: Second-class reference `&T` inside struct field!
+                sema_record_err(sym, 101, ast_line(nodes, fd))
+            }
+            ibuf_push(sym, ast_get(nodes, fd, 1))
+            ibuf_push(sym, ast_get(nodes, fd, 2))
+            ibuf_push(sym, 0)
+            ibuf_push(sym, ty_int())
+            fi += 1
+        }
+        si += 1
+    }
+
+    // Pass 2a & 2b: compute exact field types and slot offsets (2 iterations handles struct-in-struct!)
+    mut pass := 0
+    mut max_s_slots := 1
+    while pass < 2 {
+        max_s_slots = 1
+        si = 0
+        while si < s_cnt {
+            s_off := s_meta_base + si * 6
+            snid := ibuf_get(sym, s_off + 5)
+            fl_off := ast_get(nodes, snid, 3)
+            fl_cnt := ast_get(nodes, snid, 4)
+            f_meta_base := ibuf_get(sym, s_off + 3)
+            mut cur_slot := 0
+            mut fi := 0
+            while fi < fl_cnt {
+                fd := ibuf_get(extra, fl_off + fi)
+                ibuf_set(sym, 13, ast_get(nodes, fd, 3))
+                fty := resolve_typespec(pool, nodes, extra, sym)
+                fo := f_meta_base + fi * 4
+                ibuf_set(sym, fo + 2, cur_slot)
+                ibuf_set(sym, fo + 3, fty)
+                cur_slot += type_slots(sym, fty)
+                fi += 1
+            }
+            if cur_slot < 1 { cur_slot = 1 }
+            ibuf_set(sym, s_off + 2, cur_slot)
+            if cur_slot > max_s_slots {
+                max_s_slots = cur_slot
+            }
+            si += 1
+        }
+        pass += 1
+    }
+    ibuf_set(sym, 9, max_s_slots)
+    ii = 0
+    while ii < i_cnt {
+        ibuf_set(sym, i_meta_base + ii * 4 + 2, 1 + max_s_slots)
+        ii += 1
+    }
+
+    // 3. Register Function Signatures & ABI Layouts + Enforce E0102 (`&T` return)
+    f_meta_base := ibuf_len(sym)
+    ibuf_set(sym, 7, f_meta_base)
+    ibuf_set(sym, 8, f_cnt)
+    mut fni := 0
+    while fni < f_cnt {
+        fnid := ibuf_get(extra, f_list_off + fni)
+        mut z2 := 0
+        while z2 < 10 {
+            ibuf_push(sym, 0)
+            z2 += 1
+        }
+        ibuf_set(sym, f_meta_base + fni * 10, ast_get(nodes, fnid, 1))
+        ibuf_set(sym, f_meta_base + fni * 10 + 1, ast_get(nodes, fnid, 2))
+        ibuf_set(sym, f_meta_base + fni * 10 + 2, fnid)
+        fni += 1
+    }
+
+    fni = 0
+    while fni < f_cnt {
+        fo := f_meta_base + fni * 10
+        fnid := ibuf_get(sym, fo + 2)
+        pl_off := ast_get(nodes, fnid, 3)
+        pl_cnt := ast_get(nodes, fnid, 4)
+        ret_nid := ast_get(nodes, fnid, 5)
+        if typespec_has_ref(nodes, extra, ret_nid) {
+            // E0102: Function returning borrowed reference `&T`!
+            sema_record_err(sym, 102, ast_line(nodes, fnid))
+        }
+        ibuf_set(sym, 13, ret_nid)
+        rty := resolve_typespec(pool, nodes, extra, sym)
+        rslots := type_slots(sym, rty)
+
+        // Reserve contiguous parameter metadata table FIRST before resolving nested tuple/result types!
+        p_meta_base := ibuf_len(sym)
+        mut pi := 0
+        while pi < pl_cnt {
+            mut z3 := 0
+            while z3 < 6 {
+                ibuf_push(sym, 0)
+                z3 += 1
+            }
+            pi += 1
+        }
+
+        mut arg_off := 0
+        mut fast_ok := 1
+        if pl_cnt > 4 or rslots > 2 {
+            fast_ok = 0
+        }
+        pi = 0
+        while pi < pl_cnt {
+            pn := ibuf_get(extra, pl_off + pi)
+            pm := ast_get(nodes, pn, 3)
+            ibuf_set(sym, 13, ast_get(nodes, pn, 4))
+            pty := resolve_typespec(pool, nodes, extra, sym)
+            pslots := type_slots(sym, pty)
+            if pslots != 1 or pm == pmode_mut() {
+                fast_ok = 0
+            }
+            po := p_meta_base + pi * 6
+            ibuf_set(sym, po, ast_get(nodes, pn, 1))
+            ibuf_set(sym, po + 1, ast_get(nodes, pn, 2))
+            ibuf_set(sym, po + 2, pm)
+            ibuf_set(sym, po + 3, pty)
+            ibuf_set(sym, po + 4, arg_off)
+            ibuf_set(sym, po + 5, ast_get(nodes, pn, 5))
+            arg_off += pslots
+            pi += 1
+        }
+
+        flags := ushr64(ast_get(nodes, fnid, 6), 32)
+        ibuf_set(sym, fo + 3, p_meta_base)
+        ibuf_set(sym, fo + 4, pl_cnt)
+        ibuf_set(sym, fo + 5, rty)
+        ibuf_set(sym, fo + 6, rslots)
+        ibuf_set(sym, fo + 7, arg_off)
+        ibuf_set(sym, fo + 8, fast_ok)
+        ibuf_set(sym, fo + 9, flags)
+        fni += 1
+    }
+
+    // 4. Function-by-Function Local Type/Ownership/Capability Verification + Perceus FBIP Planning
+    locals := ibuf_new(512)
+    fni = 0
+    while fni < f_cnt {
+        fo := f_meta_base + fni * 10
+        fnid := ibuf_get(sym, fo + 2)
+        body_nid := ast_get(nodes, fnid, 6) & 0xFFFFFFFF
+        if body_nid > 0 {
+            // Reset `locals` buffer by allocating fresh or reusing? Allocate small `fn_locals` per fn
+            fn_locals := ibuf_new(256)
+            ibuf_set(sym, 10, 0)
+            ibuf_set(sym, 11, ibuf_get(sym, fo + 5))
+            ibuf_set(sym, 12, 0)
+
+            p_base := ibuf_get(sym, fo + 3)
+            p_cnt := ibuf_get(sym, fo + 4)
+            mut pi := 0
+            while pi < p_cnt {
+                po := p_base + pi * 6
+                pm := ibuf_get(sym, po + 2)
+                pty := ibuf_get(sym, po + 3)
+                if is_cap_type(pool, sym, pty) {
+                    ibuf_set(sym, 12, 1)
+                }
+                mut pfl := 0
+                if pm == pmode_mut() { pfl = pfl | 1 }
+                if pm == pmode_isolated() or pm == pmode_move() { pfl = pfl | 2 }
+                local_push(fn_locals, ibuf_get(sym, po), ibuf_get(sym, po + 1), pty | (pfl << 40))
+                pi += 1
+            }
+
+            check_block_full(pool, nodes, extra, sym, fn_locals, body_nid)
+            plan_fn_perceus(pool, nodes, extra, body_nid)
+            buf_free(move fn_locals)
+        }
+        fni += 1
+    }
+    buf_free(move locals)
+
+    return ibuf_get(sym, 0) == 0
+}

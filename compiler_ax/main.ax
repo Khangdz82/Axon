@@ -1,99 +1,353 @@
-// Axon Self-Hosted Compiler Driver (`axc`)
-struct CompilerDriver {
-    mode: i32, // 1: build, 2: run, 3: test, 4: fmt, 5: lsp, 6: bench, 7: audit, 8: clean, 9: fix, 10: bundle, 11: seal, 12: sign, 13: live, 14: specialize, 15: lift
-    target_arch: i32, // 1: x86_64, 2: arm64, 3: wasm32, 4: riscv64, 5: unikernel
-    target_os: i32,   // 1: windows (pe), 2: linux (elf), 3: macos (macho), 4: wasi, 5: bare-metal
-    is_release: i32,
-    is_ultra: i32,
-    parsed_nodes: i32,
-    compiled_bytes: i32,
-    incremental_hit: i32,
-    pruned_symbols: i32,
+// Axon v5.0 Self-Hosted Native Compiler Driver (`compiler_ax/main.ax`)
+// 100% Pure Axon Self-Hosting Compiler:
+//   `.ax` Source -> Lexer -> Recursive-Descent/Pratt Parser -> Static Type/Capability/Perceus/SIMD Analyzer
+//   -> Direct x86_64 + AVX2/FMA3 Machine Code -> Standalone Win64 PE32+ Executable (Zero LLVM/Rustc/Clang/Link.exe!)
+
+use std::cap
+use compiler_ax::tokens_ast
+use compiler_ax::lexer
+use compiler_ax::parser
+use compiler_ax::sema_perceus
+use compiler_ax::linker_pe
+use compiler_ax::codegen_runtime
+use compiler_ax::codegen_calls
+use compiler_ax::codegen_x86_64
+
+fn print_axc_usage() {
+    println("Axon v5.0 Self-Hosted Native Compiler (100% Pure Axon, Zero External Toolchain)")
+    println("Usage:")
+    println("  axc build <file.ax> [-o out.exe] [--shield]  Compile .ax directly to standalone Win64 PE32+")
+    println("  axc check <file.ax>                          Verify types, Perceus FBIP & capabilities")
+    println("  axc version                                  Show compiler version & architecture")
 }
 
-fn driver_new(mode: i32, is_release: i32) -> CompilerDriver {
-    return CompilerDriver(mode, 1, 1, is_release, 0, 0, 0, 0, 0);
-}
-
-fn compile_program(mut drv: CompilerDriver, src_len: i32) -> i32 {
-    // 1. Lexing
-    let tokens = src_len / 4;
-    // 2. Parsing into Arena AST
-    drv.parsed_nodes = tokens / 2;
-    // 3. Local Reasoning Type Check (par_iter parallel verification)
-    // 4. Content-Addressed Incremental Cache Lookup (.axon_cache/)
-    drv.incremental_hit = 1;
-    // 5. Perceus In-Place Reuse Pass (FBIP)
-    // 6. Native SoA Lowering & Dead Column Elimination
-    // 7. Whole-Program Tree Shaking (prune unused stdlib symbols)
-    drv.pruned_symbols = 42;
-    // 8. Direct Machine Code Instruction Encoding (Register Coalescing)
-    let code_bytes = drv.parsed_nodes * 12;
-    drv.compiled_bytes = if drv.is_ultra == 1 { (code_bytes * 7) / 10 } else { code_bytes };
-    // 9. Direct Binary Packaging (PE/ELF/Mach-O/WASM/Unikernel)
-    return 0; // Success
-}
-
-fn execute_clean_prune() -> i32 {
-    return 0;
-}
-
-fn execute_audit() -> i32 {
-    return 0;
-}
-
-fn execute_audit_caps() -> i32 {
-    // axc audit --caps: Verifies package capabilities against supply-chain leaks
-    return 0;
-}
-
-fn execute_simulate_cluster(nodes: i32, seed: i64) -> i32 {
-    // axc test --simulate-cluster: Deterministic Distributed Simulation
-    return 0;
-}
-
-fn execute_specialize(config_hash: i64) -> i32 {
-    // axc specialize: Partial evaluation and direct immediate machine operand folding
-    return 0;
-}
-
-fn execute_lift(source_kind: i32) -> i32 {
-    // axc lift: Translates C, Python, and PyTorch/ONNX models into verified Axon Table[T] SoA
-    return 0;
-}
-
-fn execute_fix_modernize() -> i32 {
-    return 0;
-}
-
-fn execute_ultra_build(mut drv: CompilerDriver, src_len: i32) -> i32 {
-    drv.is_ultra = 1;
-    return compile_program(mut drv, src_len);
-}
-
-fn execute_bundle() -> i32 {
-    return 0;
-}
-
-fn execute_seal() -> i32 {
-    return 0;
-}
-
-fn execute_sign() -> i32 {
-    // axc sign: Embeds Authenticode / Ed25519 / Apple signature and SBOM
-    return 0;
-}
-
-fn execute_live() -> i32 {
-    // axc live: Dual-mapping W^X live code patcher without restarting process
-    return 0;
-}
-
-fn main() -> i32 {
-    isolated drv = driver_new(1, 1);
-    let status = compile_program(mut drv, 4096);
-    if status != 0 {
-        return 1;
+fn has_decl_named(pool: ByteBuf, nodes: IntBuf, list: IntBuf, soff: i64, slen: i64) -> bool {
+    cnt := ibuf_len(list)
+    mut i := 0
+    while i < cnt {
+        nid := ibuf_get(list, i)
+        if ast_get(nodes, nid, 2) == slen {
+            if pool_str_eq2(pool, ast_get(nodes, nid, 1), slen, soff) {
+                return true
+            }
+        }
+        i += 1
     }
-    return 0;
+    return false
+}
+
+fn is_mod_loaded(pool: ByteBuf, loaded: IntBuf, s0_off: i64, s0_len: i64, s1_off: i64, s1_len: i64) -> bool {
+    cnt := ibuf_len(loaded) / 4
+    mut i := 0
+    while i < cnt {
+        b := i * 4
+        if ibuf_get(loaded, b + 1) == s0_len and ibuf_get(loaded, b + 3) == s1_len {
+            if pool_str_eq2(pool, ibuf_get(loaded, b), s0_len, s0_off) and pool_str_eq2(pool, ibuf_get(loaded, b + 2), s1_len, s1_off) {
+                return true
+            }
+        }
+        i += 1
+    }
+    return false
+}
+
+fn build_mod_rel_path(pool: ByteBuf, path_buf: ByteBuf, prefix: str, s0_off: i64, s0_len: i64, s1_off: i64, s1_len: i64) -> str {
+    start := buf_len(path_buf)
+    if str_len(prefix) > 0 {
+        buf_push_str(path_buf, prefix)
+    }
+    buf_push_str(path_buf, buf_slice_str(pool, s0_off, s0_off + s0_len))
+    buf_push_str(path_buf, "/")
+    buf_push_str(path_buf, buf_slice_str(pool, s1_off, s1_off + s1_len))
+    buf_push_str(path_buf, ".ax")
+    end := buf_len(path_buf)
+    buf_push(path_buf, 0)
+    return buf_slice_str(path_buf, start, end)
+}
+
+fn derive_default_exe_path(path_buf: ByteBuf, in_path: str) -> str {
+    n := str_len(in_path)
+    mut stem_len := n
+    if n > 3 {
+        if str_slice(in_path, n - 3, n) == ".ax" {
+            stem_len = n - 3
+        }
+    }
+    start := buf_len(path_buf)
+    buf_push_str(path_buf, str_slice(in_path, 0, stem_len))
+    buf_push_str(path_buf, ".exe")
+    end := buf_len(path_buf)
+    buf_push(path_buf, 0)
+    return buf_slice_str(path_buf, start, end)
+}
+
+fn push_extra_slice(dst: IntBuf, extra: IntBuf, off: i64, cnt: i64) {
+    mut i := 0
+    while i < cnt {
+        ibuf_push(dst, ibuf_get(extra, off + i))
+        i += 1
+    }
+}
+
+fn push_use_queue(mod_queue: IntBuf, nodes: IntBuf, extra: IntBuf, u_off: i64, u_cnt: i64) {
+    mut i := 0
+    while i < u_cnt {
+        un := ibuf_get(extra, u_off + i)
+        ibuf_push(mod_queue, ast_get(nodes, un, 1))
+        ibuf_push(mod_queue, ast_get(nodes, un, 2))
+        ibuf_push(mod_queue, ast_get(nodes, un, 3))
+        ibuf_push(mod_queue, ast_get(nodes, un, 4))
+        i += 1
+    }
+}
+
+fn load_and_merge_program(in_path: str, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> bool {
+    entry_src := fs_read_file(in_path) or return false
+    toks := ibuf_new(131072)
+    lex_err := tokenize_source(entry_src, toks, pool)
+    buf_free(move entry_src)
+    if lex_err != 0 {
+        println(f"[LEX ERROR] Invalid token in `{in_path}` at line {lex_err}")
+        buf_free(move toks)
+        return false
+    }
+
+    parser_init(toks, nodes, extra)
+    entry_prog := parse_program_into_ast(toks, pool, nodes, extra)
+    p_errs := ibuf_get(nodes, 2)
+    p_err_ln := ibuf_get(nodes, 3)
+    buf_free(move toks)
+    if p_errs > 0 {
+        println(f"[PARSE ERROR] Syntax error in `{in_path}` at line {p_err_ln}")
+        return false
+    }
+
+    all_structs := ibuf_new(1024)
+    all_ifaces := ibuf_new(512)
+    all_funcs := ibuf_new(4096)
+    mod_queue := ibuf_new(512)
+    loaded_mods := ibuf_new(512)
+    path_scratch := buf_new(16384)
+
+    push_use_queue(mod_queue, nodes, extra, ast_get(nodes, entry_prog, 1), ast_get(nodes, entry_prog, 2))
+    push_extra_slice(all_structs, extra, ast_get(nodes, entry_prog, 3), ast_get(nodes, entry_prog, 4))
+    push_extra_slice(all_ifaces, extra, ast_get(nodes, entry_prog, 5), ast_get(nodes, entry_prog, 6))
+    push_extra_slice(all_funcs, extra, ibuf_get(nodes, 8), ibuf_get(nodes, 9))
+
+    // Recursively load & parse imported `.ax` modules into the shared arena
+    mut qi := 0
+    while qi < ibuf_len(mod_queue) / 4 {
+        qb := qi * 4
+        s0_off := ibuf_get(mod_queue, qb)
+        s0_len := ibuf_get(mod_queue, qb + 1)
+        s1_off := ibuf_get(mod_queue, qb + 2)
+        s1_len := ibuf_get(mod_queue, qb + 3)
+        qi += 1
+
+        if s1_len > 0 and not is_mod_loaded(pool, loaded_mods, s0_off, s0_len, s1_off, s1_len) {
+            ibuf_push(loaded_mods, s0_off)
+            ibuf_push(loaded_mods, s0_len)
+            ibuf_push(loaded_mods, s1_off)
+            ibuf_push(loaded_mods, s1_len)
+
+            p1 := build_mod_rel_path(pool, path_scratch, "", s0_off, s0_len, s1_off, s1_len)
+            p2 := build_mod_rel_path(pool, path_scratch, "../", s0_off, s0_len, s1_off, s1_len)
+            msrc := fs_read_file(p1) or (fs_read_file(p2) or buf_new(64))
+            if buf_len(msrc) > 0 {
+                mtoks := ibuf_new(131072)
+                ml_err := tokenize_source(msrc, mtoks, pool)
+                buf_free(move msrc)
+                if ml_err != 0 {
+                    println(f"[LEX ERROR] Invalid token in module `{p1}` at line {ml_err}")
+                    buf_free(move mtoks)
+                    return false
+                }
+                parser_init(mtoks, nodes, extra)
+                mprog := parse_program_into_ast(mtoks, pool, nodes, extra)
+                mp_errs := ibuf_get(nodes, 2)
+                mp_ln := ibuf_get(nodes, 3)
+                buf_free(move mtoks)
+                if mp_errs > 0 {
+                    println(f"[PARSE ERROR] Syntax error in module `{p1}` at line {mp_ln}")
+                    return false
+                }
+
+                push_use_queue(mod_queue, nodes, extra, ast_get(nodes, mprog, 1), ast_get(nodes, mprog, 2))
+
+                ms_off := ast_get(nodes, mprog, 3)
+                ms_cnt := ast_get(nodes, mprog, 4)
+                mut k := 0
+                while k < ms_cnt {
+                    sn := ibuf_get(extra, ms_off + k)
+                    if not has_decl_named(pool, nodes, all_structs, ast_get(nodes, sn, 1), ast_get(nodes, sn, 2)) {
+                        ibuf_push(all_structs, sn)
+                    }
+                    k += 1
+                }
+
+                mi_off := ast_get(nodes, mprog, 5)
+                mi_cnt := ast_get(nodes, mprog, 6)
+                k = 0
+                while k < mi_cnt {
+                    inid := ibuf_get(extra, mi_off + k)
+                    if not has_decl_named(pool, nodes, all_ifaces, ast_get(nodes, inid, 1), ast_get(nodes, inid, 2)) {
+                        ibuf_push(all_ifaces, inid)
+                    }
+                    k += 1
+                }
+
+                mf_off := ibuf_get(nodes, 8)
+                mf_cnt := ibuf_get(nodes, 9)
+                k = 0
+                while k < mf_cnt {
+                    fnid := ibuf_get(extra, mf_off + k)
+                    fn_soff := ast_get(nodes, fnid, 1)
+                    fn_slen := ast_get(nodes, fnid, 2)
+                    if not pool_str_eq_lit(pool, fn_soff, fn_slen, "main") {
+                        if not has_decl_named(pool, nodes, all_funcs, fn_soff, fn_slen) {
+                            ibuf_push(all_funcs, fnid)
+                        }
+                    }
+                    k += 1
+                }
+            } else {
+                buf_free(move msrc)
+            }
+        }
+    }
+
+    final_soff := ibuf_len(extra)
+    final_scnt := ibuf_len(all_structs)
+    push_extra_slice(extra, all_structs, 0, final_scnt)
+
+    final_ioff := ibuf_len(extra)
+    final_icnt := ibuf_len(all_ifaces)
+    push_extra_slice(extra, all_ifaces, 0, final_icnt)
+
+    final_foff := ibuf_len(extra)
+    final_fcnt := ibuf_len(all_funcs)
+    push_extra_slice(extra, all_funcs, 0, final_fcnt)
+
+    merged_prog := ast_alloc(nodes, nk_program(), 1)
+    ast_set(nodes, merged_prog, 1, 0)
+    ast_set(nodes, merged_prog, 2, 0)
+    ast_set(nodes, merged_prog, 3, final_soff)
+    ast_set(nodes, merged_prog, 4, final_scnt)
+    ast_set(nodes, merged_prog, 5, final_ioff)
+    ast_set(nodes, merged_prog, 6, final_icnt)
+    ibuf_set(nodes, 7, merged_prog)
+    ibuf_set(nodes, 8, final_foff)
+    ibuf_set(nodes, 9, final_fcnt)
+
+    buf_free(move path_scratch)
+    buf_free(move loaded_mods)
+    buf_free(move mod_queue)
+    buf_free(move all_funcs)
+    buf_free(move all_ifaces)
+    buf_free(move all_structs)
+    return true
+}
+
+@shield
+fn main() -> i32 {
+    t0 := clock_ns()
+    root_cap := acquire_root_cap()
+    argc := args_count()
+    if argc < 2 {
+        print_axc_usage()
+        return 1
+    }
+
+    cmd := args_get(1)
+    if cmd == "version" or cmd == "-v" or cmd == "--version" {
+        println("axc 5.0.0-selfhosted (100% Pure Axon Self-Hosted Native x86_64/AVX2/PE32+ Compiler)")
+        return 0
+    }
+    if cmd == "help" or cmd == "-h" or cmd == "--help" {
+        print_axc_usage()
+        return 0
+    }
+
+    if cmd != "check" and cmd != "build" and cmd != "bundle" and cmd != "specialize" {
+        println(f"Unknown command `{cmd}`")
+        print_axc_usage()
+        return 1
+    }
+
+    mut in_path := ""
+    mut out_path := ""
+    mut force_shield := false
+    if cmd == "bundle" {
+        force_shield = true
+    }
+
+    mut ai := 2
+    while ai < argc {
+        arg := args_get(ai)
+        if arg == "-o" and ai + 1 < argc {
+            out_path = args_get(ai + 1)
+            ai += 2
+        } else if arg == "--target" and ai + 1 < argc {
+            ai += 2
+        } else if arg == "--shield" or arg == "--ultra" {
+            force_shield = true
+            ai += 1
+        } else if str_len(arg) > 0 and str_byte(arg, 0) == 45 {
+            ai += 1
+        } else {
+            if str_len(in_path) == 0 {
+                in_path = arg
+            }
+            ai += 1
+        }
+    }
+
+    if str_len(in_path) == 0 {
+        println("Error: missing `.ax` input file")
+        return 1
+    }
+
+    path_buf := buf_new(4096)
+    if str_len(out_path) == 0 {
+        out_path = derive_default_exe_path(path_buf, in_path)
+    }
+
+    pool := buf_new(1048576)
+    nodes := ibuf_new(524288)
+    extra := ibuf_new(524288)
+    sym := ibuf_new(262144)
+
+    if not load_and_merge_program(in_path, pool, nodes, extra) {
+        println(f"Compilation aborted for `{in_path}`")
+        return 1
+    }
+
+    if not analyze_semantics_and_perceus(pool, nodes, extra, sym) {
+        err_ln := ibuf_get(sym, 1)
+        err_code := ibuf_get(sym, 2)
+        println(f"[SAFETY ERROR E0{err_code}] Compile-time safety violation in `{in_path}` at line {err_ln}")
+        return 1
+    }
+
+    if cmd == "check" {
+        elapsed_us := (clock_ns() - t0) / 1000
+        println(f"[OK] `{in_path}` verified in {elapsed_us} us (Perceus 0-GC, Capabilities & Types clean)")
+        return 0
+    }
+
+    pe_out := buf_new(4194304)
+    f_cnt := compile_module_to_pe_ax(pool, nodes, extra, sym, force_shield, pe_out)
+
+    written := fs_write_file(out_path, pe_out) or -1
+    if written < 0 {
+        println(f"Error: cannot write output executable `{out_path}`")
+        return 1
+    }
+
+    elapsed_ms := (clock_ns() - t0) / 1000000
+    println(f"[AXC SELF-HOSTED] Built `{out_path}` ({written} bytes, {f_cnt} native fns, W^X + @shield) in {elapsed_ms} ms")
+    if root_cap.token_id == 0 {
+        return 1
+    }
+    return 0
 }

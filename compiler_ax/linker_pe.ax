@@ -1,88 +1,315 @@
-// Axon Compiler: Direct PE32+ Binary Packaging (Zero External Linker)
-// Strict W^X Enforcement, High-Entropy ASLR, DEP/NX, Hardware CET Guard, and .pdata/.xdata Unwind Tables.
+// Axon v5.0 Self-Hosted Compiler — Standalone Win64 PE32+ Direct Linker (`compiler_ax/linker_pe.ax`)
+// Zero `link.exe` / `lld` / `gcc`. Directly emits deterministic, AV-clean, W^X, High-Entropy ASLR,
+// NX/DEP, `.pdata`/`.xdata` SEH-compliant PE32+ executables in memory.
 
-struct PeHeader {
-    magic_mz: i32,           // 0x5A4D ('MZ')
-    pe_offset: i32,          // 0x40
-    signature: i32,          // 0x00004550 ('PE\0\0')
-    machine: i32,            // 0x8664 (x86_64)
-    sections_count: i32,
-    entry_point_rva: i32,
-    image_base: i64,
-    dll_characteristics: i32, // Dynamic Base + High Entropy VA + NX + Guard CF + CET
-}
+use compiler_ax::tokens_ast
 
-struct SectionHeader {
-    virtual_size: i32,
-    virtual_address: i32,
-    raw_data_size: i32,
-    raw_data_offset: i32,
-    characteristics: i32,
-}
+// IAT slot indices in `KERNEL32.dll` (matching `pe.rs` 1-for-1)
+fn iat_get_std_handle() -> i64    { return 0 }
+fn iat_write_file() -> i64        { return 1 }
+fn iat_exit_process() -> i64      { return 2 }
+fn iat_qpc() -> i64               { return 3 }
+fn iat_qpf() -> i64               { return 4 }
+fn iat_virtual_alloc() -> i64     { return 5 }
+fn iat_virtual_free() -> i64      { return 6 }
+fn iat_create_file_a() -> i64     { return 7 }
+fn iat_read_file() -> i64         { return 8 }
+fn iat_close_handle() -> i64      { return 9 }
+fn iat_get_file_size_ex() -> i64  { return 10 }
+fn iat_get_command_line_a() -> i64 { return 11 }
+fn iat_total_count() -> i64       { return 12 }
+fn pe_text_rva() -> i64           { return 0x1000 }
 
-/// Windows x64 SEH Runtime Function Entry for .pdata
-struct RuntimeFunctionEntry {
-    begin_address_rva: i32,
-    end_address_rva: i32,
-    unwind_info_rva: i32,
-}
-
-/// Windows x64 Unwind Info Structure for .xdata
-struct UnwindInfo {
-    version_and_flags: i32, // Version 1, UNW_FLAG_NHANDLER
-    size_of_prolog: i32,
-    count_of_codes: i32,
-    frame_register: i32,
-}
-
-fn create_pe_header(entry_rva: i32) -> PeHeader {
-    // 0x4160: DYNAMIC_BASE (0x40) | HIGH_ENTROPY_VA (0x20) | NX_COMPAT (0x100) | GUARD_CF (0x4000)
-    let dll_chars = 16736;
-    return PeHeader(23117, 64, 17744, 34404, 5, entry_rva, 5368709120, dll_chars);
-}
-
-/// Creates `.text` section: MEM_EXECUTE | MEM_READ | CNT_CODE (Strict W^X: NO MEM_WRITE)
-fn create_text_section(code_size: i32) -> SectionHeader {
-    let aligned_raw = (code_size + 511) / 512 * 512;
-    let aligned_virt = (code_size + 4095) / 4096 * 4096;
-    // 0x60000020: MEM_EXECUTE (0x20000000) | MEM_READ (0x40000000) | CNT_CODE (0x20)
-    return SectionHeader(aligned_virt, 4096, aligned_raw, 512, 1610612768);
-}
-
-/// Creates `.rdata` section: MEM_READ | CNT_INITIALIZED_DATA
-fn create_rdata_section(rdata_size: i32, prev_rva: i32, prev_raw_off: i32) -> SectionHeader {
-    let aligned_raw = (rdata_size + 511) / 512 * 512;
-    let aligned_virt = (rdata_size + 4095) / 4096 * 4096;
-    return SectionHeader(aligned_virt, prev_rva + 4096, aligned_raw, prev_raw_off + 512, 1073741888);
-}
-
-/// Creates `.data` section: MEM_READ | MEM_WRITE | CNT_INITIALIZED_DATA (Strict W^X: NO MEM_EXECUTE)
-fn create_data_section(data_size: i32, prev_rva: i32, prev_raw_off: i32) -> SectionHeader {
-    let aligned_raw = (data_size + 511) / 512 * 512;
-    let aligned_virt = (data_size + 4095) / 4096 * 4096;
-    return SectionHeader(aligned_virt, prev_rva + 4096, aligned_raw, prev_raw_off + 512, -1073741760);
-}
-
-/// Creates `.pdata` section: Windows x64 Structured Exception Handling Unwind Directory
-fn create_pdata_section(entry_count: i32, prev_rva: i32, prev_raw_off: i32) -> SectionHeader {
-    let byte_size = entry_count * 12; // 12 bytes per RUNTIME_FUNCTION
-    let aligned_raw = (byte_size + 511) / 512 * 512;
-    let aligned_virt = (byte_size + 4095) / 4096 * 4096;
-    // 0x40000040: MEM_READ | CNT_INITIALIZED_DATA
-    return SectionHeader(aligned_virt, prev_rva + 4096, aligned_raw, prev_raw_off + 512, 1073741888);
-}
-
-/// Creates standard UNWIND_INFO descriptor for .xdata
-fn create_unwind_info(prolog_bytes: i32) -> UnwindInfo {
-    return UnwindInfo(1, prolog_bytes, 0, 0);
-}
-
-/// Verifies strict W^X conformance on PE section: returns 1 if valid, 0 if violation (both W and X set)
-fn verify_pe_section_wx(s: SectionHeader) -> i32 {
-    let mem_write = if (s.characteristics & -2147483648) != 0 { 1 } else { 0 }; // 0x80000000
-    let mem_exec = if (s.characteristics & 536870912) != 0 { 1 } else { 0 };   // 0x20000000
-    if mem_write == 1 and mem_exec == 1 {
-        return 0; // W^X Violation
+fn emit_zeros(buf: ByteBuf, count: i64) {
+    mut i := 0
+    while i < count {
+        buf_push(buf, 0)
+        i += 1
     }
-    return 1; // Strict W^X compliant
+}
+
+fn append_hint_name(buf: ByteBuf, rdata_rva: i64, fname: str) -> i64 {
+    if (buf_len(buf) & 1) != 0 {
+        buf_push(buf, 0)
+    }
+    hn_rva := rdata_rva + buf_len(buf)
+    buf_push_u16(buf, 0)
+    buf_push_str(buf, fname)
+    buf_push(buf, 0)
+    return hn_rva
+}
+
+// Builds `.rdata` import + `.xdata` + `@shield` prefix and fills `info: IntBuf` (`[0..16]`)
+fn prepare_pe_rdata_prefix(rdata_rva: i64, prefix: ByteBuf, info: IntBuf) {
+    iat_cnt := iat_total_count()
+    iat_off := 0
+    ilt_off := (iat_cnt + 1) * 8
+
+    // Reserve IAT + ILT (`(12 + 1) * 16 = 208` bytes) + Import Descriptor Table (`40` bytes)
+    emit_zeros(prefix, (iat_cnt + 1) * 16)
+    idt_off := buf_len(prefix)
+    emit_zeros(prefix, 40)
+
+    dll_name_rva := rdata_rva + buf_len(prefix)
+    buf_push_str(prefix, "KERNEL32.dll")
+    buf_push(prefix, 0)
+    if (buf_len(prefix) & 1) != 0 {
+        buf_push(prefix, 0)
+    }
+
+    thunks := ibuf_new(16)
+    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "GetStdHandle"))
+    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "WriteFile"))
+    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "ExitProcess"))
+    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "QueryPerformanceCounter"))
+    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "QueryPerformanceFrequency"))
+    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "VirtualAlloc"))
+    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "VirtualFree"))
+    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "CreateFileA"))
+    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "ReadFile"))
+    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "CloseHandle"))
+    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "GetFileSizeEx"))
+    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "GetCommandLineA"))
+
+    // Patch IAT & ILT entries + populate `info[0..11]` = IAT entry RVAs
+    mut idx := 0
+    while idx < iat_cnt {
+        trva := ibuf_get(thunks, idx)
+        buf_put_u64(prefix, iat_off + idx * 8, trva)
+        buf_put_u64(prefix, ilt_off + idx * 8, trva)
+        ibuf_push(info, rdata_rva + iat_off + idx * 8)
+        idx += 1
+    }
+    buf_free(move thunks)
+
+    // Patch Import Descriptor 0 (`OriginalFirstThunk`, `Name`, `FirstThunk`)
+    buf_put_u32(prefix, idt_off, rdata_rva + ilt_off)
+    buf_put_u32(prefix, idt_off + 12, dll_name_rva)
+    buf_put_u32(prefix, idt_off + 16, rdata_rva + iat_off)
+
+    // Align to 4 bytes for `.xdata` Win64 SEH `UNWIND_INFO` (`ENDBR64; PUSH RBP; MOV RBP, RSP`)
+    while (buf_len(prefix) & 3) != 0 {
+        buf_push(prefix, 0)
+    }
+    unwind_info_rva := rdata_rva + buf_len(prefix)
+    buf_push(prefix, 0x01)
+    buf_push(prefix, 0x08)
+    buf_push(prefix, 0x01)
+    buf_push(prefix, 0x05)
+    buf_push(prefix, 0x05)
+    buf_push(prefix, 0x50)
+    buf_push(prefix, 0x00)
+    buf_push(prefix, 0x00)
+
+    // Align to 8 bytes for `@shield` `.text` 64-bit FNV-1a integrity digest
+    while (buf_len(prefix) & 7) != 0 {
+        buf_push(prefix, 0)
+    }
+    shield_hash_off := buf_len(prefix)
+    shield_hash_rva := rdata_rva + shield_hash_off
+    buf_push_u64(prefix, 0)
+
+    data_start_rva := rdata_rva + buf_len(prefix)
+    ibuf_push(info, rdata_rva)       // [12]
+    ibuf_push(info, unwind_info_rva) // [13]
+    ibuf_push(info, shield_hash_rva) // [14]
+    ibuf_push(info, shield_hash_off) // [15]
+    ibuf_push(info, data_start_rva)  // [16]
+}
+
+fn compute_fnv1a_64_prefix(buf: ByteBuf, nbytes: i64) -> i64 {
+    mut limit := nbytes
+    if limit > buf_len(buf) {
+        limit = buf_len(buf)
+    }
+    mut h := 0xcbf29ce484222325
+    mut i := 0
+    while i < limit {
+        b := buf_get(buf, i)
+        h = (h ^ b) *% 0x100000001b3
+        i += 1
+    }
+    return h
+}
+
+fn emit_section_header(out: ByteBuf, name_str: str, vsize: i64, vrva: i64, raw_size: i64, raw_ptr: i64, chars: i64) {
+    nlen := str_len(name_str)
+    mut i := 0
+    while i < 8 {
+        if i < nlen {
+            buf_push(out, str_byte(name_str, i))
+        } else {
+            buf_push(out, 0)
+        }
+        i += 1
+    }
+    buf_push_u32(out, vsize)
+    buf_push_u32(out, vrva)
+    buf_push_u32(out, raw_size)
+    buf_push_u32(out, raw_ptr)
+    buf_push_u32(out, 0)
+    buf_push_u32(out, 0)
+    buf_push_u16(out, 0)
+    buf_push_u16(out, 0)
+    buf_push_u32(out, chars)
+}
+
+fn append_padded_section(out: ByteBuf, sec_data: ByteBuf, target_raw_size: i64) {
+    slen := buf_len(sec_data)
+    mut i := 0
+    while i < slen {
+        buf_push(out, buf_get(sec_data, i))
+        i += 1
+    }
+    if target_raw_size > slen {
+        emit_zeros(out, target_raw_size - slen)
+    }
+}
+
+// Emits full standalone Win64 PE32+ executable into `pe_out: ByteBuf`
+fn build_pe32_executable(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBuf, info: IntBuf, fn_ranges: IntBuf, pe_out: ByteBuf) {
+    // 1. Patch `.text` FNV-1a 64-bit digest into `.rdata` `@shield` slot
+    digest := compute_fnv1a_64_prefix(text_code, shield_len)
+    buf_put_u64(rdata_full, ibuf_get(info, 15), digest)
+
+    // 2. Build `.pdata` Win64 SEH `RUNTIME_FUNCTION` table (12 bytes per function)
+    unwind_rva := ibuf_get(info, 13)
+    pdata := buf_new(4096)
+    rcnt := ibuf_len(fn_ranges) / 2
+    if rcnt == 0 {
+        buf_push_u32(pdata, pe_text_rva())
+        buf_push_u32(pdata, pe_text_rva() + buf_len(text_code))
+        buf_push_u32(pdata, unwind_rva)
+    } else {
+        mut ri := 0
+        while ri < rcnt {
+            s_off := ibuf_get(fn_ranges, ri * 2)
+            e_off := ibuf_get(fn_ranges, ri * 2 + 1)
+            buf_push_u32(pdata, pe_text_rva() + s_off)
+            buf_push_u32(pdata, pe_text_rva() + e_off)
+            buf_push_u32(pdata, unwind_rva)
+            ri += 1
+        }
+    }
+
+    // 3. Build `.reloc` High-Entropy ASLR base relocation block (12 bytes, RIP-relative clean)
+    reloc := buf_new(256)
+    buf_push_u32(reloc, pe_text_rva())
+    buf_push_u32(reloc, 12)
+    buf_push_u32(reloc, 0)
+
+    // 4. Compute section RVAs & file offsets
+    file_align := 0x200
+    sect_align := 0x1000
+    headers_size := 0x200
+
+    text_vsize := buf_len(text_code)
+    mut text_v_nz := text_vsize
+    if text_v_nz < 1 { text_v_nz = 1 }
+    text_raw_size := align_up(text_v_nz, file_align)
+    text_raw_ptr := headers_size
+
+    rdata_rva := ibuf_get(info, 12)
+    rdata_vsize := buf_len(rdata_full)
+    rdata_raw_size := align_up(rdata_vsize, file_align)
+    rdata_raw_ptr := text_raw_ptr + text_raw_size
+
+    pdata_rva := rdata_rva + align_up(rdata_vsize, sect_align)
+    pdata_vsize := buf_len(pdata)
+    pdata_raw_size := align_up(pdata_vsize, file_align)
+    pdata_raw_ptr := rdata_raw_ptr + rdata_raw_size
+
+    reloc_rva := pdata_rva + align_up(pdata_vsize, sect_align)
+    reloc_vsize := buf_len(reloc)
+    reloc_raw_size := align_up(reloc_vsize, file_align)
+    reloc_raw_ptr := pdata_raw_ptr + pdata_raw_size
+
+    size_of_image := reloc_rva + align_up(reloc_vsize, sect_align)
+
+    // 5. DOS Header (`0x00..0x40`, `e_lfanew = 0x40`)
+    buf_push(pe_out, 77) // 'M'
+    buf_push(pe_out, 90) // 'Z'
+    emit_zeros(pe_out, 0x3A)
+    buf_push_u32(pe_out, 0x40)
+
+    // 6. PE Signature + COFF File Header (`20` bytes)
+    buf_push(pe_out, 80) // 'P'
+    buf_push(pe_out, 69) // 'E'
+    buf_push(pe_out, 0)
+    buf_push(pe_out, 0)
+    buf_push_u16(pe_out, 0x8664)       // IMAGE_FILE_MACHINE_AMD64
+    buf_push_u16(pe_out, 4)            // 4 sections (.text, .rdata, .pdata, .reloc)
+    buf_push_u32(pe_out, 0x67350000)   // Deterministic reproducible build timestamp!
+    buf_push_u32(pe_out, 0)
+    buf_push_u32(pe_out, 0)
+    buf_push_u16(pe_out, 240)          // SizeOfOptionalHeader
+    buf_push_u16(pe_out, 0x0022)       // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+
+    // 7. PE32+ Optional Header (`240` bytes)
+    buf_push_u16(pe_out, 0x020B)       // PE32+ magic
+    buf_push(pe_out, 5)                // MajorLinkerVersion = 5
+    buf_push(pe_out, 0)                // MinorLinkerVersion = 0
+    buf_push_u32(pe_out, text_raw_size)
+    buf_push_u32(pe_out, rdata_raw_size + pdata_raw_size + reloc_raw_size)
+    buf_push_u32(pe_out, 0)
+    buf_push_u32(pe_out, pe_text_rva()) // AddressOfEntryPoint
+    buf_push_u32(pe_out, pe_text_rva()) // BaseOfCode
+    buf_push_u64(pe_out, 0x140000000)   // ImageBase
+    buf_push_u32(pe_out, sect_align)
+    buf_push_u32(pe_out, file_align)
+    buf_push_u16(pe_out, 6)             // MajorOperatingSystemVersion
+    buf_push_u16(pe_out, 0)
+    buf_push_u16(pe_out, 0)
+    buf_push_u16(pe_out, 0)
+    buf_push_u16(pe_out, 6)             // MajorSubsystemVersion
+    buf_push_u16(pe_out, 0)
+    buf_push_u32(pe_out, 0)             // Win32VersionValue
+    buf_push_u32(pe_out, size_of_image)
+    buf_push_u32(pe_out, headers_size)
+    buf_push_u32(pe_out, 0)             // CheckSum
+    buf_push_u16(pe_out, 3)             // IMAGE_SUBSYSTEM_WINDOWS_CUI
+    buf_push_u16(pe_out, 0x8160)        // HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT | TSAWARE
+    buf_push_u64(pe_out, 0x00400000)    // 4 MB Stack Reserve
+    buf_push_u64(pe_out, 0x00040000)    // 256 KB Initial Stack Commit
+    buf_push_u64(pe_out, 0x00100000)    // 1 MB Heap Reserve
+    buf_push_u64(pe_out, 0x00001000)    // 4 KB Initial Heap Commit
+    buf_push_u32(pe_out, 0)
+    buf_push_u32(pe_out, 16)            // NumberOfRvaAndSizes
+
+    // Data Directories (16 * 8 = 128 bytes)
+    idt_rva := rdata_rva + (iat_total_count() + 1) * 16
+    iat_size := (iat_total_count() + 1) * 8
+    buf_push_u64(pe_out, 0)               // [0] Export
+    buf_push_u32(pe_out, idt_rva)         // [1] Import RVA
+    buf_push_u32(pe_out, 40)              // [1] Import Size
+    buf_push_u64(pe_out, 0)               // [2] Resource
+    buf_push_u32(pe_out, pdata_rva)       // [3] Exception (.pdata) RVA
+    buf_push_u32(pe_out, pdata_vsize)     // [3] Exception Size
+    buf_push_u64(pe_out, 0)               // [4] Security
+    buf_push_u32(pe_out, reloc_rva)       // [5] BaseReloc RVA
+    buf_push_u32(pe_out, reloc_vsize)     // [5] BaseReloc Size
+    emit_zeros(pe_out, 6 * 8)             // [6..11]
+    buf_push_u32(pe_out, rdata_rva)       // [12] IAT RVA
+    buf_push_u32(pe_out, iat_size)        // [12] IAT Size
+    emit_zeros(pe_out, 3 * 8)             // [13..15]
+
+    // 8. 4 Strict W^X Section Headers (`4 * 40 = 160` bytes)
+    emit_section_header(pe_out, ".text", text_vsize, pe_text_rva(), text_raw_size, text_raw_ptr, 0x60000020)
+    emit_section_header(pe_out, ".rdata", rdata_vsize, rdata_rva, rdata_raw_size, rdata_raw_ptr, 0x40000040)
+    emit_section_header(pe_out, ".pdata", pdata_vsize, pdata_rva, pdata_raw_size, pdata_raw_ptr, 0x40000040)
+    emit_section_header(pe_out, ".reloc", reloc_vsize, reloc_rva, reloc_raw_size, reloc_raw_ptr, 0x42000040)
+
+    // Pad headers up to `0x200`
+    if buf_len(pe_out) < headers_size {
+        emit_zeros(pe_out, headers_size - buf_len(pe_out))
+    }
+
+    // 9. Emit padded section bodies
+    append_padded_section(pe_out, text_code, text_raw_size)
+    append_padded_section(pe_out, rdata_full, rdata_raw_size)
+    append_padded_section(pe_out, pdata, pdata_raw_size)
+    append_padded_section(pe_out, reloc, reloc_raw_size)
+
+    buf_free(move pdata)
+    buf_free(move reloc)
 }
