@@ -183,6 +183,16 @@ pub enum Terminator {
     },
 }
 
+impl Terminator {
+    pub fn span(&self) -> ByteSpan {
+        match self {
+            Terminator::Return { span, .. } => *span,
+            Terminator::Branch { span, .. } => *span,
+            Terminator::CondBranch { span, .. } => *span,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BasicBlock {
     pub id: BlockId,

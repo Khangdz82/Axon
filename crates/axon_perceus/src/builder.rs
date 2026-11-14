@@ -96,6 +96,18 @@ impl<'a> IrBuilder<'a> {
         b.terminator = term;
     }
 
+    fn is_block_terminated(&self) -> bool {
+        let b = self
+            .blocks
+            .iter()
+            .find(|b| b.id == self.current_block)
+            .expect("Current block not found");
+        match &b.terminator {
+            Terminator::Return { span, .. } => *span != ByteSpan::DUMMY,
+            Terminator::Branch { .. } | Terminator::CondBranch { .. } => true,
+        }
+    }
+
     pub fn build_function(&mut self, func: &FuncDef<'_>, ast: FrozenAst<'_, '_>) -> IrFunction {
         let mut params = Vec::new();
 
@@ -307,6 +319,22 @@ impl<'a> IrBuilder<'a> {
                     } => {
                         let obj_op = self.lower_expr(obj_expr, ast);
                         if let Operand::Var(target_var) = obj_op {
+                            let target_ty = self
+                                .var_types
+                                .get(target_var.0 as usize)
+                                .cloned()
+                                .unwrap_or(Type::Unknown);
+                            let field_ty = match &target_ty {
+                                Type::Struct(s_name) => self
+                                    .ctx
+                                    .structs
+                                    .get(s_name)
+                                    .and_then(|s| s.fields.get(&field))
+                                    .map(|(t, _)| t.clone())
+                                    .unwrap_or(Type::Unknown),
+                                _ => Type::Unknown,
+                            };
+
                             let final_val = match op {
                                 AssignOp::Assign => val_operand,
                                 _ => {
@@ -317,7 +345,7 @@ impl<'a> IrBuilder<'a> {
                                         AssignOp::SlashAssign => BinOp::Div,
                                         _ => unreachable!(),
                                     };
-                                    let cur_val_var = self.new_var(Type::Unknown, None);
+                                    let cur_val_var = self.new_var(field_ty.clone(), None);
                                     self.emit(Instruction::Assign {
                                         dest: cur_val_var,
                                         op: IrOp::GetField {
@@ -326,7 +354,7 @@ impl<'a> IrBuilder<'a> {
                                         },
                                         span: f_span,
                                     });
-                                    let tmp = self.new_var(Type::Unknown, None);
+                                    let tmp = self.new_var(field_ty, None);
                                     self.emit(Instruction::Assign {
                                         dest: tmp,
                                         op: IrOp::Binary {
@@ -392,10 +420,12 @@ impl<'a> IrBuilder<'a> {
                 for s in then_stmts {
                     self.lower_stmt(s, ast);
                 }
-                self.set_terminator(Terminator::Branch {
-                    target: merge_bb,
-                    span,
-                });
+                if !self.is_block_terminated() {
+                    self.set_terminator(Terminator::Branch {
+                        target: merge_bb,
+                        span,
+                    });
+                }
 
                 // Else block
                 self.current_block = else_bb;
@@ -405,10 +435,12 @@ impl<'a> IrBuilder<'a> {
                         self.lower_stmt(s, ast);
                     }
                 }
-                self.set_terminator(Terminator::Branch {
-                    target: merge_bb,
-                    span,
-                });
+                if !self.is_block_terminated() {
+                    self.set_terminator(Terminator::Branch {
+                        target: merge_bb,
+                        span,
+                    });
+                }
 
                 self.current_block = merge_bb;
             }
