@@ -23,6 +23,13 @@
   - [x] Toán tử số học checked/wrapping/saturating bảo toàn trong IR
   - [x] CLI driver: `axc check` & `axc ir` (hiển thị Perceus IR và thống kê FBIP / Refinement)
   - [x] Gate M2 verification: 68/68 tests passed trên toàn bộ workspace (6/6 tests Perceus mới + 62 tests M0/M1), clippy 0 warning
-- [ ] **Milestone M3: Native SoA (Table[T]) & C23 Transpiler Backend (MVP End-to-End)** (NEXT)
-- [ ] **Milestone M4: Runtime Đa luồng Colorless Concurrency** (LOCKED)
+- [x] **Milestone M3: Native SoA (Table[T]) & C23 Transpiler Backend (MVP End-to-End)** (COMPLETED & VERIFIED)
+  - [x] `axon_codegen_c`: Transpiler C23 / C11 chuẩn xác với runtime header hiệu năng cao
+  - [x] Native Structure-of-Arrays (SoA): Băm trường struct thành mảng riêng biệt căn chỉnh 64-byte cache line (`axon_aligned_alloc(64, ...)`), con trỏ `AXON_RESTRICT` và `AXON_SIMD_LOOP` pragma
+  - [x] Toán tử số học C: Checked (`assert`), wrapping, saturating được dịch sang hàm nội tuyến tối ưu
+  - [x] FBIP C emission: Ánh xạ `ReuseToken` + `AllocInPlace` ghi đè trực tiếp buffer cũ, không gọi `malloc`/`free`
+  - [x] Refinement bounds elision: Không phát sinh lệnh `assert` khi biên được chứng minh tĩnh
+  - [x] CLI driver: `axc emit-c`, `axc build`, `axc run` tự động gọi MSVC `cl.exe` / `clang` / `gcc` biên dịch và chạy file nhị phân trực tiếp
+  - [x] Gate M3 verification: 73/73 tests passed trên toàn bộ workspace (2 codegen tests + 9 perceus + 9 types + 46 parser + 7 lexer), biên dịch và chạy thành công `particle_sim.ax` và `fbip_particle_reuse.ax` (exit code 0)
+- [ ] **Milestone M4: Runtime Đa luồng Colorless Concurrency** (NEXT)
 - [ ] **Milestone M5: Dual-Backend Production (Cranelift Dev Mode & MLIR Release Mode)** (LOCKED)

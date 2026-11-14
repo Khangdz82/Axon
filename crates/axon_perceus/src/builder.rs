@@ -498,7 +498,22 @@ impl<'a> IrBuilder<'a> {
                 });
 
                 self.current_block = body_bb;
-                let item_var = self.new_var(Type::Unknown, Some(loop_var));
+                let target_ty = self
+                    .var_types
+                    .get(target_var.0 as usize)
+                    .cloned()
+                    .unwrap_or(Type::Unknown);
+                let elem_ty = match target_ty {
+                    Type::Table(s_name) => {
+                        if self.ctx.structs.contains_key(&s_name) {
+                            Type::Struct(s_name)
+                        } else {
+                            Type::Unknown
+                        }
+                    }
+                    _ => Type::Unknown,
+                };
+                let item_var = self.new_var(elem_ty, Some(loop_var));
                 // In for-in loops, bounds check is elided because 0 <= idx < len
                 self.emit(Instruction::Assign {
                     dest: item_var,
@@ -577,7 +592,54 @@ impl<'a> IrBuilder<'a> {
             } => {
                 let left_op = self.lower_expr(left, ast);
                 let right_op = self.lower_expr(right, ast);
-                let dest = self.new_var(Type::Unknown, None);
+
+                let left_ty = if let Operand::Var(v) = &left_op {
+                    self.var_types
+                        .get(v.0 as usize)
+                        .cloned()
+                        .unwrap_or(Type::Unknown)
+                } else if let Operand::Const(IrConst::Float(_)) = &left_op {
+                    Type::F32
+                } else {
+                    Type::Unknown
+                };
+
+                let right_ty = if let Operand::Var(v) = &right_op {
+                    self.var_types
+                        .get(v.0 as usize)
+                        .cloned()
+                        .unwrap_or(Type::Unknown)
+                } else if let Operand::Const(IrConst::Float(_)) = &right_op {
+                    Type::F32
+                } else {
+                    Type::Unknown
+                };
+
+                let bin_ty = match op {
+                    BinOp::Eq
+                    | BinOp::NotEq
+                    | BinOp::Lt
+                    | BinOp::LtEq
+                    | BinOp::Gt
+                    | BinOp::GtEq
+                    | BinOp::And
+                    | BinOp::Or => Type::BOOL,
+                    _ => {
+                        if left_ty == Type::F32 || right_ty == Type::F32 {
+                            Type::F32
+                        } else if left_ty == Type::F64 || right_ty == Type::F64 {
+                            Type::F64
+                        } else if left_ty == Type::I64 || right_ty == Type::I64 {
+                            Type::I64
+                        } else if left_ty == Type::USIZE || right_ty == Type::USIZE {
+                            Type::USIZE
+                        } else {
+                            Type::I32
+                        }
+                    }
+                };
+
+                let dest = self.new_var(bin_ty, None);
                 self.emit(Instruction::Assign {
                     dest,
                     op: IrOp::Binary {
@@ -596,7 +658,35 @@ impl<'a> IrBuilder<'a> {
             } => {
                 let target_op = self.lower_expr(target, ast);
                 if let Operand::Var(target_var) = target_op {
-                    let dest = self.new_var(Type::Unknown, None);
+                    let target_ty = self
+                        .var_types
+                        .get(target_var.0 as usize)
+                        .cloned()
+                        .unwrap_or(Type::Unknown);
+                    let field_ty = match &target_ty {
+                        Type::Struct(s_name) => {
+                            if let Some(s_info) = self.ctx.structs.get(s_name) {
+                                s_info
+                                    .fields
+                                    .get(&field)
+                                    .map(|(t, _)| t.clone())
+                                    .unwrap_or(Type::Unknown)
+                            } else {
+                                Type::Unknown
+                            }
+                        }
+                        Type::Table(_) => {
+                            let f_str = self.interner.resolve(&field);
+                            if f_str == "len" || f_str == "capacity" {
+                                Type::USIZE
+                            } else {
+                                Type::Unknown
+                            }
+                        }
+                        _ => Type::Unknown,
+                    };
+
+                    let dest = self.new_var(field_ty, None);
                     self.emit(Instruction::Assign {
                         dest,
                         op: IrOp::GetField {
@@ -618,7 +708,30 @@ impl<'a> IrBuilder<'a> {
                 let target_op = self.lower_expr(target, ast);
                 let idx_op = self.lower_expr(index, ast);
                 if let Operand::Var(target_var) = target_op {
-                    let dest = self.new_var(Type::Unknown, None);
+                    let target_ty = self
+                        .var_types
+                        .get(target_var.0 as usize)
+                        .cloned()
+                        .unwrap_or(Type::Unknown);
+                    let elem_ty = match target_ty {
+                        Type::Table(elem_name) => {
+                            if self.ctx.structs.contains_key(&elem_name) {
+                                Type::Struct(elem_name)
+                            } else {
+                                match self.interner.resolve(&elem_name) {
+                                    "i64" => Type::I64,
+                                    "i32" => Type::I32,
+                                    "f32" => Type::F32,
+                                    "f64" => Type::F64,
+                                    "usize" => Type::USIZE,
+                                    _ => Type::Unknown,
+                                }
+                            }
+                        }
+                        _ => Type::Unknown,
+                    };
+
+                    let dest = self.new_var(elem_ty, None);
                     self.emit(Instruction::Assign {
                         dest,
                         op: IrOp::GetIndex {
@@ -667,7 +780,13 @@ impl<'a> IrBuilder<'a> {
                     });
                     Operand::Var(dest)
                 } else {
-                    let dest = self.new_var(Type::Unknown, None);
+                    let ret_ty = self
+                        .ctx
+                        .functions
+                        .get(&callee)
+                        .map(|sig| sig.ret_type.clone())
+                        .unwrap_or(Type::Unknown);
+                    let dest = self.new_var(ret_ty, None);
                     self.emit(Instruction::Assign {
                         dest,
                         op: IrOp::Call {
