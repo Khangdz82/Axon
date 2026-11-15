@@ -1,120 +1,200 @@
-# Axon Programming Language (`.ax`) v1.0.0
+# Axon Programming Language (`.ax`) — v1.0.0
 
-Axon is a self-hosted, multi-OS native systems programming language engineered around **Python-level readability, bare-metal speed across CPU, GPU, WebAssembly, and Unikernels, sub-1 MB compiler binaries, zero-GC predictability via Perceus ownership, full-stack stdlib modules (`AI/ML`, `2D/3D Game`, `Web/HTTP`, `Crypto`, `Math`), and fail-closed compile-time & runtime security**.
+**Axon** is a self-hosted, multi-OS native systems programming language combining **Pythonic readability**, **bare-metal execution speed across CPU, GPU, WebAssembly, and Unikernels**, **sub-1 MB standalone compiler binaries**, **zero-GC predictability via Perceus ownership**, and **fail-closed compile-time & runtime security**.
 
-The Axon `v1.0.0` compiler (`bin/axc.exe`, **973.50 KB** / `996,864 bytes` built with `--shield`, alongside `bin/axc-linux-x64` at **928.67 KB** / `950,960 bytes` and `bin/axc-macos-arm64` at **720.06 KB** / `737,344 bytes` — every standalone compiler binary is strictly **under 1 MB**) is written 100% in Axon (`compiler_ax/`, `17` modules, `23,763` lines) and emits native machine code and standalone executables across **11 hardware/OS targets** directly in memory without `LLVM`, `Clang`, `GCC`, `MSVC`, `link.exe`, `lld`, or external runtimes.
-
-- **Interactive Browser Playground (Zero Install):** Open [`playground/index.html`](playground/index.html) directly in any browser — compiles live Axon code to W3C WebAssembly + `0xFD SIMD128` + WASI in `< 1 ms` (~`1.2–2.1 KB` `.wasm`), with live Canvas2D + binary hex/opcode inspector.
-- **Rigorous 10-Suite Benchmark Report:** See [`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) for methodology, checksums, RSS, CV%, and candid engineering analysis vs MSVC C++23, Rust 1.100, Go 1.26.4, OpenJDK 21, Node V8 WASM, and Python 3.11.
-- **Tiếng Việt:** Xem giáo trình 16 chương đầy đủ tại [`LEARN_AXON_VI.md`](LEARN_AXON_VI.md)
-- **English:** Read the complete 16-chapter language guide at [`LEARN_AXON_EN.md`](LEARN_AXON_EN.md)
-- **AI Coding Agents:** Ultra-compact grammar & sub-millisecond feedback spec at [`AXON_LLM_SPEC.md`](AXON_LLM_SPEC.md) (`axc check --json`, `axc mcp`)
+The entire compiler (`compiler_ax/`, `17` modules, `23,763` lines) is written in 100% pure Axon and compiles `.ax` source and `.h` C headers directly in memory into standalone executables, shared libraries, GPU kernels, and WASI WebAssembly modules across **11 hardware/OS targets** — with **zero** dependency on `LLVM`, `Clang`, `GCC`, `MSVC`, `link.exe`, `lld`, or external SDKs.
 
 ---
 
-## Core Architecture (`v1.0.0`)
+## Why Axon?
 
-1. **11 Direct Native Cross-Compilation Targets (Zero External Linker / Zero SDK):**
-   - **Desktop & Server OS:** `win-x64` (`PE32+` `.exe` & `--shared` `.dll`/`.pyd`), `linux-x64` (`ELF64` direct `SYSCALL`), `linux-arm64` (`ELF64` AArch64 + `NEON`), `macos-arm64` (`Mach-O 64` 16KB page-aligned Apple Silicon + `NEON`), `macos-x64` (`Mach-O 64`).
-   - **Web, Cloud & Bare-Metal:** `wasm32` (`W3C WASI preview1` + `0xFD` `SIMD128` + dynamic `memory.grow` — compiles & executes standalone without emscripten/wasmtime SDKs), `unikernel-x64` (`Multiboot2` Ring-0 + `COM1 UART`), `freestanding-x64`, `freestanding-riscv64` (`RV64GC` `EM_RISCV=243`).
-   - **Direct GPU Offloading (`--emit-gpu`):** `spirv` (binary Khronos `SPIR-V 1.6` `.spv`) and `ptx` (NVIDIA `PTX 8.0` `.ptx`).
-2. **Browser-Native Zero-Dependency Playground (`playground/index.html`):**
-   - Standalone static HTML/JS IDE running a real recursive-descent Axon -> `WASM32 + 0xFD SIMD128 + WASI` compiler directly in the browser.
-   - Includes **1M SIMD Particles**, **`T ! Error` Union Handling**, **Small AI Inference (Linear + ReLU + Softmax)**, and **Mini 2D Game** interactive simulations, compilation/runtime/hex metrics, and `.wasm` download.
-3. **Compile-Time Execution (`comptime`) & Direct C Header Reader (`@cImport` + Static COFF `.obj`/`.lib` Linker):**
-   - Embedded `comptime` AST VM (`compiler_ax/comptime.ax`) runs real Axon code at compile time to synthesize zero-alloc `.rdata` tables, enforce `comptime_assert`, and emit zero-reflection `to_json(struct_val)`.
-   - `@cImport("header.h", link = "lib.dll")` parses C `#define` constants, `typedef struct` layouts, and function prototypes directly without `libclang`; `--link-lib foo.obj` statically links Win64 COFF `.obj` and `.lib` archives.
-4. **Runtime CPUID Multi-Versioning + Multi-Core `par_for` + OS-Native `async/await` (`IOCP`):**
-   - Startup `CPUID` + `XGETBV` dispatches `Table[T]` SoA kernels across **Tier 0 (`SSE2`)**, **Tier 1 (`AVX2 + FMA3`)**, and **Tier 2 (`AVX-512 EVEX`)**.
-   - `par_for p in table` partitions columnar blocks across hardware cores with compile-time data-race rejection (`E0204`), alongside stackless `async`/`await` coroutines (`std/async_io.ax`).
-5. **Production Batteries-Included Stdlib (`34` Pure Axon Modules, `9,710` Lines, Tree-Shaken):**
-   - **New in `v1.0.0` (Portable Native & WASM32 + Native CLI):**
-     - `std/math.ax` — Overflow-safe integer math (`min`/`max`/`clamp`/`abs`/`gcd`/`lcm`/`mod_pow`/`isqrt`), fixed-point `1e6` helpers, geometry/lerp/easing, fast vector/scalar math.
-     - `std/rand.ax` — Deterministic SplitMix64 + Xoshiro128++ PRNG (`rng_new`, `rng_next_u64`, `rng_range_i64`, `rng_next_f64`, `rng_free`).
-     - `std/path.ax` — POSIX/Windows normalization (`path_join`, `path_dirname`, `path_basename`, `path_ext`) and CWE-22 traversal guards (`path_is_safe_rel`).
-     - `std/encoding.ax` — Portable Hex, Base64/Base64URL, CRC32, FNV-1a 64-bit, HTML entity escaping (worst-case `&quot;` safe), URL percent encoding/decoding.
-     - `std/log.ax` — Structured JSON logger with CWE-117 CRLF/control-byte sanitization (`log_sanitize` capacity-safe on worst-case escapes).
-     - `std/time.ax` — Portable nanosecond monotonic `Stopwatch` (`sw_start`, `sw_elapsed_ns`/`us`/`ms`, `sw_lap`) across Native and WASI `clock_time_get`.
-     - `std/cli.ax` — Typed flag/option extraction (`cli_get_i64`, `cli_require_opt` returning `str ! i64`, positional arguments).
-   - **Core, Web & Data:** `std/str.ax`, `std/http.ax` (with CWE-22 backslash/`..`/`%2e`/`%5c` traversal & CRLF/NUL guards), `std/data.ax`, `std/test_kit.ax`, `std/json.ax`, `std/collections.ax`, `std/os.ax`, `std/decimal.ax`, `std/ringbuf.ax`.
-   - **AI/ML/DL/LoRA/Serve (`9` modules):** `std/ai.ax`, `std/ai_math.ax`, `std/ai_nn.ax`, `std/ai_autograd.ax`, `std/ai_quant.ax` (Q4/Q8/NF4/FP16/BF16), `std/ai_lora.ax` (LoRA/DoRA/QLoRA), `std/ai_local.ax` (GGUF/AXM/BPE), `std/ai_serve.ax`, `std/ai_engine.ax` (`VramArena`, `PagedKvCache`, Symbolic Shapes `E0602`, `DLPack`).
-   - **2D & 3D Game Engine:** `std/game.ax`, `std/game2d.ax`, `std/game3d.ax`, `std/math3d.ax` (AABB/Circle/SAT physics, sprites/tilemaps/A*/particles, quaternion skinning, BVH ray-triangle, PBR + CSM shadows, ECS).
-6. **Hardened `v1.0.0` Compile-Time & Runtime Security:**
-   - Wrapping `INT64_MIN` constant negation fix (`0 -% v` in `sema_perceus.ax`, `comptime.ax`, `c_import.ax`) under `--shield` self-protection.
-   - Fail-closed hardware/bounds traps (`exit 101`) for integer divide-by-zero, `INT64_MIN / -1`, checked `--shield` signed overflow, and `ByteBuf`/`str_byte` out-of-bounds indexing.
-   - Compile-time checks for `tainted[str]` SQL & OS shell sinks (`E0502`), capability attenuation (`E0501`), Perceus linear ownership (`E0201`–`E0204`), parser depth DoS (`E0020`, cap `256`), CWE-158 embedded `NUL` FS/exec rejection, NIST FIPS 180-4 SHA-256 + RFC 2104 HMAC + `ct_eq_str`, Polymorphic `@shield` v2, and `@whitebox` $\text{GF}(2^8)$.
+- **Kilobyte-Scale Standalone Toolchain:** Every prebuilt `--shield`-protected compiler binary is strictly **under 1 MB** — Windows x64 (`bin/axc.exe`, `973.50 KB` / `996,864 B`), Linux x64 (`bin/axc-linux-x64`, `928.67 KB` / `950,960 B`), and macOS Apple Silicon (`bin/axc-macos-arm64`, `720.06 KB` / `737,344 B`). A minimal native Windows `PE32+` executable (`examples/hello.ax`) is **`5,120 B` (`5.00 KB`)**.
+- **Sub-Millisecond Static Feedback & Fast Cold Builds:** `axc check` verifies types, Perceus `move` ownership, taint sinks, `@no_alloc`, and symbolic tensor shapes in **`565 us`** (`9.34 ms` CLI wall-clock); cold clean compilation of the `B9` HTTP/JSON router takes **`15.90 ms`** (`win-x64`) and **`15.94 ms`** (`wasm32`), **19x–100x faster** than Go, Rust, `javac`, or MSVC on the same workload ([`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md)).
+- **Browser-Native Live Playground:** Open [`playground/index.html`](playground/index.html) directly in any modern browser to edit, compile, and run Axon in real time via an embedded pure-JS compiler emitting W3C WebAssembly + `0xFD SIMD128` + WASI (`1.19–2.05 KB` `.wasm`, zero installation).
+- **Data-Oriented SoA + Multi-Versioned SIMD:** `Table[T]` stores struct fields as cache-aligned columnar arrays (`Structure-of-Arrays`), eliminates unread columns automatically, and dispatches across `SSE2`, `AVX2 + FMA3`, `AVX-512` (`CPUID + XGETBV`), `ARM64 NEON`, and `WASM SIMD128`, paired with multi-core `par_for`.
+- **Full-Stack Production Stdlib (`34` Modules, `9,710` Lines):** Covers portable integer/fixed-point math, deterministic PRNGs, path/traversal safety, Hex/Base64/CRC32/FNV-1a/HTML/URL encoding, structured logging, monotonic stopwatches, CLI flags, HTTP/1.1, JSON/CSV/KV, AI/ML/LoRA/GGUF inference, 2D/3D game engines, lock-free SPSC rings, and FIPS 180-4 cryptography — tree-shaken at compile time so unused modules cost `0` bytes.
+- **Documentation & Learning:**
+  - **English Complete Guide (16 Chapters):** [`LEARN_AXON_EN.md`](LEARN_AXON_EN.md)
+  - **Giáo trình Tiếng Việt (16 Chương):** [`LEARN_AXON_VI.md`](LEARN_AXON_VI.md)
+  - **AI Coding Agents Spec (`axc check --json`, `axc mcp`):** [`AXON_LLM_SPEC.md`](AXON_LLM_SPEC.md)
+  - **Milestone Tracker & Architecture Memory:** [`PROGRESS.md`](PROGRESS.md) | [`memory.md`](memory.md)
 
 ---
 
-## Quickstart
+## Language Tour at a Glance
 
+Axon adopts indentation-friendly Pythonic declarations, `and`/`or`/`not` logic operators, default & named `=` arguments, zero-cost `T ! Error` unions in CPU registers, and explicit linear ownership (`move`) without garbage-collector pauses or Rust-style lifetime annotations (`0 'a`):
+
+```axon
+// 1. Readable functions, default parameters, named arguments & @shield protection (`examples/hello.ax`)
+fn greet(name: str, role: str = "Systems Engineer") {
+    println(f"Hello, {name}! Welcome to Axon ({role}).")
+}
+
+@shield
+fn main() -> i32 {
+    greet("World")
+    greet("Khang", role = "Language Architect")
+    return 0
+}
+```
+
+```axon
+// 2. Zero-cost Error Unions (`T ! E`) with register-passed propagation (`AXON_LLM_SPEC.md`)
+fn parse_port(raw: i64) -> i64 ! i64 {
+    if raw <= 0 or raw > 65535 { return err(400) }
+    return ok(raw)
+}
+
+fn boot() -> i64 ! i64 {
+    p1 := parse_port(-1) or 8080      // fallback default on error
+    p2 := parse_port(443) or return   // propagate error directly without exceptions
+    return ok(p1 + p2)
+}
+```
+
+```axon
+// 3. Columnar `Table[T]` SoA + Auto-SIMD + Dead-Column Elimination (`tests/pass/04_table_soa_avx2_simd.ax`)
+struct Particle { x: f32, vx: f32, y: f32, vy: f32, mass: f32, charge: f32 }
+
+fn step(world: Table[Particle], dt: f32) {
+    // Compiles to 256-bit AVX2 `VFMADD231PS` / `VMULPS`; skips `vy`, `mass`, `charge` from RAM traffic
+    for p in world {
+        p.x += p.vx * dt
+        p.y *= 3.0
+    }
+}
+```
+
+---
+
+## Quickstart: CLI, `axpm` & Browser Playground
+
+### Install & Run Native Toolchain
 ```powershell
-# Install Axon v1.0.0 compiler + stdlib to ~/.axon
+# Windows x64 — installs `axc.exe` + 34 stdlib modules + AXON_LLM_SPEC.md to ~/.axon
 .\install.ps1
 axc version
 
-# Sub-millisecond static verification (human-readable or AI JSON)
+# Static verification (human diagnostics or AI-agent JSON)
 .\bin\axc.exe check examples/hello.ax
 .\bin\axc.exe check --json tests/pass/16_v7_ai_llm_supremacy.ax
 
-# Compile & run native binaries, unit tests, and cross-OS/WebAssembly binaries
+# Compile, execute, and test natively
 .\bin\axc.exe build examples/hello.ax -o bin/hello.exe
 .\bin\axc.exe run tests/pass/26_v1_stdlib_production.ax
 .\bin\axc.exe test tests/pass/17_v7_unit_tests.ax
 
-# One-command cross-compilation (zero Docker, zero external SDKs)
-.\bin\axc.exe build examples/hello.ax --target linux-x64 -o bin/hello-linux
-.\bin\axc.exe build examples/hello.ax --target macos-arm64 -o bin/hello-macos
-.\bin\axc.exe build tests/pass/27_wasm32_portable_suite.ax --target wasm32 -o bin/portable.wasm
-.\bin\axc.exe build examples/hello.ax --target unikernel-x64 -o bin/unikernel.elf
+# Initialize a managed project (`axon.toml` + `axon.lock`) or launch MCP JSON-RPC server
+.\bin\axc.exe init my_service
+.\bin\axc.exe mcp
 ```
 
----
+*(Linux / macOS users can run `./install.sh` to install `bin/axc-linux-x64` or `bin/axc-macos-arm64` alongside `std/` into `~/.axon`.)*
 
-## Verified Benchmark Highlights (`B1 – B10`, Measured on Host)
-
-Hardware: **Intel Core i5-10400F (6C/12T), 32 GB DDR4, Windows 10 x64**. Full tables, min/p95/CV%, RSS, checksums, and caveats are documented in [`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md).
-
-| Benchmark | Workload | Axon `win-x64` | Axon `wasm32` | C++23 MSVC | Rust 1.100 | Go 1.26.4 | Java 21 | Python 3.11 |
-| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **B1b** | Vector `f32` Dot (`409.6M` FMAs) | **`15.67 ms`** | — | `25.57 ms` | `49.69 ms` | `411.77 ms` | `409.95 ms` | `24,186.91 ms` |
-| **B2** | Coupled Particle SoA (`32.8M` updates) | **`5.11 ms`** (`Table`) | `10.58 ms` (`2.9 KB`) | `4.10 ms` | `5.60 ms` | `50.00 ms` | `7.28 ms` | `22,329.02 ms` |
-| **B3** | Dense FP32 GEMM `512x512` | `12.97 ms` | — | `10.52 ms` | `9.79 ms` | `62.57 ms` | `61.68 ms` | `12,689.96 ms` |
-| **B7** | Dynamic `4 KB` Frame Churn (`500K`) | `94.67 ms` (`3.0 MB` RSS) | — | `24.75 ms` | `25.74 ms` | `334.17 ms` | `163.36 ms` | `390.25 ms` |
-| **B8 (1T)** | `Table[Agent]` Compute (`134.2M` updates) | `173.80 ms` | — | `172.89 ms` | `174.43 ms` | `285.17 ms` | `178.02 ms` | — |
-| **B10 Build** | Cold Clean Build Time (`B9` App) | **`15.90 ms`** (`34.0 KB`) | **`15.94 ms`** (`14.1 KB`) | `1,602.68 ms` (`169 KB`) | `431.70 ms` (`163 KB`) | `303.62 ms` (`1.63 MB`) | `519.29 ms` (bytecode) | Interpreted |
-
-- `examples/hello.ax` checks in **`565 us`** (internal verifier) and builds a standalone `PE32+` executable of **`5,120 bytes` (`5.00 KB`)** in **`1 ms`**.
+### Run Directly in the Browser ([`playground/index.html`](playground/index.html))
+Open [`playground/index.html`](playground/index.html) directly in Chrome/Edge/Firefox (`file://` or any static host). No backend or compiler download required:
+- **1M SIMD128 Particles:** Compiles SoA particle simulation to `1,740 B` (`1.70 KB`) `.wasm` (`26` `0xFD SIMD128` opcodes) with live Canvas2D streaming.
+- **`T ! Error` Error Unions:** Compiles multi-value `(result i32 i64)` error handling to `1,215 B` (`1.19 KB`) `.wasm`.
+- **Small AI Inference:** Compiles Linear + ReLU + Softmax inference to `2,095 B` (`2.05 KB`) `.wasm` (`195 us` WASI inference).
+- **Mini 2D Game:** Compiles interactive arcade physics to `1,726 B` (`1.69 KB`) `.wasm` with live Canvas2D input loop and hex opcode inspector.
 
 ---
 
-## Repository Structure
+## 11 Built-In Cross-Compilation Targets
+
+| Category | Target Flag (`--target`) | Binary / Output Format | Key Capabilities |
+| :--- | :--- | :--- | :--- |
+| **Desktop / Server** | `win-x64` (default) | Win64 `PE32+` (`.exe`, `--shared` `.dll`/`.pyd`) | Multi-DLL `.idata`, `.edata`, `.pdata` SEH, strict `W^X`, static COFF `.obj`/`.lib`, `IOCP` |
+| **Desktop / Server** | `linux-x64` | Linux x86_64 `ELF64` | Direct `SYSCALL` zero-CRT runtime, `.eh_frame`, `SSE2`/`AVX2`/`AVX-512` |
+| **Desktop / Server** | `linux-arm64` | Linux AArch64 `ELF64` | Native ARM64 machine code + 128-bit `NEON` |
+| **Desktop / Server** | `macos-arm64` | Apple Silicon `Mach-O 64` | 16 KB page-aligned `LC_MAIN` + `NEON` |
+| **Desktop / Server** | `macos-x64` | Intel macOS `Mach-O 64` | Direct Darwin BSD `SYSCALL` |
+| **Web / Edge** | `wasm32` | W3C WebAssembly (`.wasm`) | `wasi_snapshot_preview1`, `0xFD SIMD128`, dynamic `memory.grow`, 0 external SDK |
+| **Bare-Metal** | `unikernel-x64` | `Multiboot2` (`0xE85250D6`) | Ring-0 bare-metal kernel image + `COM1 UART` |
+| **Bare-Metal** | `freestanding-x64` | Zero-OS x86_64 `ELF64` | Embedded / bootloader bare-metal output |
+| **Bare-Metal** | `freestanding-riscv64` | `RV64GC` `ELF64` (`EM_RISCV=243`) | Native RISC-V 64 machine code |
+| **GPU (`--emit-gpu`)** | `spirv` | Khronos `SPIR-V 1.6` (`.spv`) | Direct compute kernels from `@gpu_kernel` / `@shader` |
+| **GPU (`--emit-gpu`)** | `ptx` | NVIDIA `PTX 8.0` (`.ptx`) | Direct `sm_80` GPU kernels without `nvcc` |
+
+---
+
+## Standard Library (`34` Pure Axon Modules, `9,710` Lines)
+
+- **Portable Core (`v1.0.0` Native + `--target wasm32`):**
+  - `std/math.ax` (`283` lines) — Overflow-safe integer math (`min`/`max`/`clamp`/`abs`/`gcd`/`lcm`/`mod_pow`/`isqrt`), fixed-point `1e6`, interpolation/easing.
+  - `std/rand.ax` (`102` lines) — Deterministic SplitMix64 + Xoshiro128++ PRNG (`rng_new`, `rng_next_u64`, `rng_range_i64`, `rng_next_f64`, `rng_free`).
+  - `std/path.ax` (`182` lines) — POSIX/Windows normalization (`path_join`, `path_dirname`, `path_basename`, `path_ext`) + CWE-22 traversal guards (`path_is_safe_rel`).
+  - `std/encoding.ax` (`247` lines) — Hex, Base64/Base64URL, CRC32, FNV-1a 64-bit, worst-case safe HTML escaping (`n * 6 + 8` capacity), URL percent coding.
+  - `std/log.ax` (`76` lines) — CWE-117 CRLF/control-byte sanitized JSON logger (`log_sanitize` capacity-safe).
+  - `std/time.ax` (`49` lines) — Monotonic nanosecond `Stopwatch` (`sw_start`, `sw_elapsed_ns`/`us`/`ms`, `sw_lap`) across native OS clocks and WASI `clock_time_get`.
+- **CLI, Web, Data & Core Runtime:**
+  - `std/cli.ax`, `std/str.ax`, `std/http.ax` (HTTP/1.1 parser/router/SSE + CRLF & path traversal hardening), `std/data.ax` (CSV/CLI flags/`KvStore`), `std/json.ax`, `std/collections.ax`, `std/os.ax`, `std/test_kit.ax`, `std/decimal.ax`, `std/ringbuf.ax`, `std/async_io.ax`.
+- **AI, ML, LoRA & Local/Hybrid Inference (`9` Modules):**
+  - `std/ai.ax`, `std/ai_engine.ax`, `std/ai_math.ax`, `std/ai_nn.ax`, `std/ai_autograd.ax`, `std/ai_quant.ax` (Q4/Q8/NF4/FP16/BF16), `std/ai_lora.ax` (LoRA/DoRA/QLoRA), `std/ai_local.ax` (GGUF/AXM/BPE), `std/ai_serve.ax` (tiled FlashAttention, RoPE, RMSNorm, SwiGLU, GQA/MoE, K-Means/PCA/Linear/Logistic, `VramArena`, `PagedKvCache`, Symbolic Shapes `E0602`, Zero-Copy `DLPack`).
+- **2D & 3D Game Engine (`4` Modules):**
+  - `std/game.ax`, `std/game2d.ax`, `std/game3d.ax`, `std/math3d.ax` (AABB/Circle/SAT physics, spatial hash broadphase, camera/sprites/A*/particles, quaternion skinning, BVH ray-triangle, PBR + CSM shadows, ECS).
+- **Security & Distributed Systems:**
+  - `std/cap.ax`, `std/taint.ax`, `std/crypto.ax` (NIST FIPS 180-4 SHA-256, RFC 2104 HMAC-SHA256, constant-time `ct_eq_str`), `std/crdt.ax`.
+
+---
+
+## Security, Ownership & Verification Summary
+
+- **Compile-Time Safety Enforcements (`25/25` gates verified in `tests/fail_compile/`):**
+  Second-class reference isolation (`E0101`–`E0102`), Perceus linear ownership / move-in-loop / `par_for` race detection (`E0201`–`E0204`), immutability (`E0301`), capability attenuation (`E0501`), unsanitized `tainted[str]` SQL & shell sinks (`E0502`), `@no_alloc` verification (`E0601`), symbolic tensor shapes (`E0602`), `comptime_assert` (`E0604`), and parser recursion cap (`E0020`, depth limit `256`).
+- **Fail-Closed Runtime Protection (`6/6` runtime traps -> `exit 101`):**
+  Hardware/runtime traps for integer `/ 0`, `% 0`, `INT64_MIN / -1`, checked `--shield` signed overflow, and `ByteBuf` / `str_byte` out-of-bounds accesses, alongside CWE-158 embedded `NUL` rejection in filesystem/`os_exec` calls, wrapping `INT64_MIN` constant folding (`0 -% v`), Polymorphic `@shield` v2, and `@whitebox` $\text{GF}(2^8)$.
+- **Post-Edit `v1.0.0` Test Suite Verification:**
+  - `29/29` Native & `--shield` pass checks (`27` files in `tests/pass/` incl. `axc test` + `--shield` on `25` and `26`)
+  - `25/25` `tests/fail_compile/` negative safety gates rejected cleanly
+  - `3/3` `--target wasm32` WASI + SIMD128 suites validated via `node tests/wasm/wasi_run.mjs`
+  - `6/6` adversarial runtime traps (`exit 101`)
+  - `4/4` browser playground WASM modules validated & executed in Node WASI (`WebAssembly.validate = true`, `rc = 0`)
+
+---
+
+## Verified Benchmark Highlights (`B1 – B10`)
+
+Measured live on **Intel Core i5-10400F (6C/12T), 31.87 GB RAM, Windows 10 x64** against `MSVC 19.51` (`C++23`), `rustc 1.100.0`, `go1.26.4`, `OpenJDK 21.0.13`, `Node.js v24.15.0` WASI SIMD128, and `Python 3.11.0`. Full methodology, checksums, CV%, RSS, and transparent headroom analysis (`B1a`, `B4`, `B5`, `B6`, `B9` WASM bump allocator) are in [`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md):
+
+| Benchmark | Workload | Axon `win-x64` | Axon `wasm32` | C++23 MSVC | Rust 1.100 | Go 1.26.4 | Java 21 |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **B1b** | Vector `f32` Dot (`409.6M` FMAs) | **`15.67 ms`** | — | `25.57 ms` | `49.69 ms` | `411.77 ms` | `409.95 ms` |
+| **B2** | Particle SoA (`16,384 x 2,000` steps) | **`5.11 ms`** (`Table`) | `10.58 ms` (`2.9 KB`) | `4.10 ms` | `5.60 ms` | `50.00 ms` | `7.28 ms` |
+| **B3** | Dense FP32 GEMM `512x512` | `12.97 ms` | — | `10.52 ms` | `9.79 ms` | `62.57 ms` | `61.68 ms` |
+| **B7** | Dynamic `4 KB` Frame Churn (`500K`) | `94.67 ms` (`3.0 MB` RSS) | — | `24.75 ms` | `25.74 ms` | `334.17 ms` | `163.36 ms` |
+| **B10 Build** | Cold Clean Build Time (`B9` App) | **`15.90 ms`** (`34.0 KB`) | **`15.94 ms`** (`14.1 KB`) | `1,602.68 ms` (`169 KB`) | `431.70 ms` (`163 KB`) | `303.62 ms` (`1.63 MB`) | `519.29 ms` (`.class`) |
+
+---
+
+## Repository Structure & Self-Hosting Reproduction
 
 ```text
 ├── bin/
-│   ├── axc.exe                 # Self-hosted Axon v1.0.0 compiler for Windows x64 (973.50 KB / 996,864 B, --shield)
-│   ├── axc-linux-x64           # Cross-compiled standalone Axon v1.0.0 compiler for Linux x86_64 (928.67 KB / 950,960 B)
-│   └── axc-macos-arm64         # Cross-compiled standalone Axon v1.0.0 compiler for macOS Apple Silicon (720.06 KB / 737,344 B)
+│   ├── axc.exe                 # Self-hosted Axon v1.0.0 Windows x64 compiler (973.50 KB / 996,864 B, --shield)
+│   ├── axc-linux-x64           # Cross-compiled Axon v1.0.0 Linux x86_64 compiler (928.67 KB / 950,960 B)
+│   └── axc-macos-arm64         # Cross-compiled Axon v1.0.0 Apple Silicon compiler (720.06 KB / 737,344 B)
 ├── playground/
-│   └── index.html              # Zero-dependency browser Axon -> WASM32+SIMD128 IDE & runner (< 1 ms, ~1.2-2.1 KB)
-├── compiler_ax/                # 100% pure Axon self-hosted compiler source (17 modules, 23,763 lines)
-├── std/                        # 34 pure Axon stdlib modules (9,710 lines: math, rand, path, encoding, log, time, cli, str, http, data, test_kit, ai*, game*, math3d, async_io, cap, crypto, taint, ...)
+│   └── index.html              # Zero-dependency browser Axon -> WASM32+SIMD128 IDE & runner
+├── compiler_ax/                # 17 pure Axon compiler modules (23,763 lines)
+├── std/                        # 34 pure Axon standard library modules (9,710 lines)
+├── examples/                   # Quickstart & benchmark examples (`hello.ax`, `v5_showcase.ax`, ...)
 ├── tests/
-│   ├── pass/                   # 27 end-to-end native execution & stdlib/security verification programs
-│   ├── fail_compile/           # 25 static compile-time safety rejection gates (Perceus, taint, cap, shape, @no_alloc, depth)
-│   └── wasm/                   # WASM32 dynamic growth & Node.js WASI preview1 runner (`wasi_run.mjs`)
+│   ├── pass/                   # 27 end-to-end native, AI, Game2D/3D, stdlib & security tests
+│   ├── fail_compile/           # 25 static compile-time rejection gates
+│   └── wasm/                   # WASM32 dynamic growth test + Node WASI runner (`wasi_run.mjs`)
 ├── docs/
-│   └── BENCHMARK_REPORT.md     # Honest, reproducible B1-B10 benchmark report & engineering notes
-├── AXON_LLM_SPEC.md            # Compact grammar & error reference for AI Coding Agents
-├── LEARN_AXON_VI.md            # Official Vietnamese learning guide (16 chapters)
-└── LEARN_AXON_EN.md            # Official English learning guide (16 chapters)
+│   └── BENCHMARK_REPORT.md     # Reproducible B1-B10 benchmark report & honest caveats
+├── AXON_LLM_SPEC.md            # Compact spec for AI coding agents (`axc mcp`)
+├── LEARN_AXON_EN.md            # Complete 16-chapter English textbook
+├── LEARN_AXON_VI.md            # Complete 16-chapter Vietnamese textbook
+├── PROGRESS.md                 # Full milestone tracker (M0-M36, v5.0-v1.0.0)
+└── memory.md                   # Canonical project architecture & invariant summary
 ```
 
----
-
-## Verifying Deterministic 3-Stage Self-Hosting
-
 ```powershell
+# Reproduce bit-exact 3-stage `--shield` self-hosting on Windows x64:
 .\bin\axc.exe build compiler_ax/main.ax --shield -o axc_stage1.exe
 .\axc_stage1.exe build compiler_ax/main.ax --shield -o axc_stage2.exe
 .\axc_stage2.exe build compiler_ax/main.ax --shield -o axc_stage3.exe

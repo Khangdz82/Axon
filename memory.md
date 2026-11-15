@@ -1,34 +1,32 @@
 # AXON PROGRAMMING LANGUAGE (`.ax`) : PROJECT MEMORY (v1.0.0)
 
 ## Objective
-- Hoàn thiện phiên bản chính thức **Axon (`.ax`) v1.0.0** — ngôn ngữ lập trình hệ thống đa nền tảng viết 100% bằng chính Axon (`compiler_ax/`, `17` module, `23,763` dòng), 0 phụ thuộc `LLVM`/`Clang`/`GCC`/`link.exe`/`lld`/`CRT`, kích thước mỗi bộ biên dịch **dưới 1 MB** trên Windows/Linux/macOS, kèm bộ thư viện chuẩn toàn diện (`34` module, `9,710` dòng), backend `--target wasm32` (`SIMD128` + `WASI` không cần SDK), Playground WebAssembly tĩnh trong trình duyệt (`playground/index.html`), và kiểm chứng bảo mật production + benchmark `B1–B10` trung thực.
+- Duy trì và phát triển **Axon (`.ax`) v1.0.0** — ngôn ngữ lập trình hệ thống đa nền tảng viết 100% bằng chính Axon (`compiler_ax/`, `17` module, `23,763` dòng), `0` phụ thuộc `LLVM`/`Clang`/`GCC`/`link.exe`/`lld`/`CRT`, kích thước mỗi binary biên dịch **dưới 1 MB**, kèm `34` module `std/` (`9,710` dòng), Playground WebAssembly trình duyệt ([`playground/index.html`](playground/index.html)), và hệ thống bảo mật fail-closed.
 
-## Important Details & Verified Invariants (v1.0.0)
-1. **11 Đích Biên Dịch Chéo Mã Máy Trực Tiếp & Binary `< 1 MB` Với `--shield`:**
-   - [`bin/axc.exe`](bin/axc.exe): **`996,864 B`** (**`973.50 KB`**), tự biên dịch `--shield` trong `399 ms` (`471 units`).
-   - [`bin/axc-linux-x64`](bin/axc-linux-x64): **`950,960 B`** (**`928.67 KB`**), biên dịch chéo `--shield` trong `359 ms`.
-   - [`bin/axc-macos-arm64`](bin/axc-macos-arm64): **`737,344 B`** (**`720.06 KB`**), biên dịch chéo `--shield` trong `329 ms`.
-   - `examples/hello.ax`: `axc check` **`565 us`**, xuất `PE32+` **`5,120 B`** (**`5.00 KB`**) trong **`1 ms`**.
-2. **Self-Hosting 3 Vòng Xác Định Bit-Exact (`v1.0.0` `--shield`):**
-   - `Stage 2 SHA256 == Stage 3 SHA256 == D9B85D3CB1FE4E66C4198DC1BF2FC37CC9168B4169FA3669B6AAC340C2984677`.
-3. **Sửa Lỗi Bảo Mật Sâu & Hardening (`v1.0.0`):**
-   - Sửa trap `--shield` khi fold hằng `-9223372036854775808` (`INT64_MIN`): đổi `0 - v` sang `0 -% v` trong `compiler_ax/sema_perceus.ax`, `compiler_ax/comptime.ax`, và `compiler_ax/c_import.ax`.
-   - `std/http.ax` (`http_is_safe_path`): chặn backslash `\`, traversal segment `..`, `%5c`/`%5C`, `%2e`/`%2E`, NUL và ký tự điều khiển `< 32`.
-   - Sửa capacity `ByteBuf` trường hợp xấu nhất trong `std/encoding.ax` (`html_escape`: `n * 6 + 8` cho `&quot;`) và `std/log.ax` (`log_sanitize`: `n * 2 + 8` cho escapes).
-   - Hệ thống runtime fail-closed (`rc = 101`): chia `0`, modulo `0`, `INT64_MIN / -1`, `buf_get` OOB, `str_byte` OOB, và tràn số nguyên dưới `--shield`.
-4. **Playground Trình Duyệt & Thư Viện Chuẩn Production (`34` Module, `9,710` Dòng):**
-   - [`playground/index.html`](playground/index.html): Trình biên dịch + thực thi Axon -> `W3C WASM32 + 0xFD SIMD128 + WASI preview1` viết thuần HTML/JS (`0` dependency, không cần tải compiler), 4 mẫu tương tác (**1M SIMD Particles**, **`T ! Error`**, **Small AI Inference**, **Mini 2D Game**), Canvas2D trực tiếp & hex inspector (`~1.2–2.1 KB`, `< 1 ms` warm compile).
-   - 7 module stdlib mới v1.0.0: `std/math.ax`, `std/rand.ax`, `std/path.ax`, `std/encoding.ax`, `std/log.ax`, `std/time.ax` (chạy song song Native + `--target wasm32`) và `std/cli.ax` (Native CLI).
-   - [`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md): Báo cáo `B1–B10` trung thực đo thực tế (AVX2 vector dot `B1b` `15.67 ms`, Particle `Table[Body]` `B2` `5.11 ms`, GEMM `B3` `12.97 ms`, Build speed `B10` `15.90 ms` nhanh hơn `19x–100x`, kèm phân tích rõ vùng cần tối ưu tiếp ở `B1a`, `B4`, `B5`, `B6`, `B9` WASM bump allocator).
+## Verified Architecture & Release Invariants (`v1.0.0`)
+1. **Toolchain `< 1 MB` Đa Hệ Điều Hành & Self-Hosting Bit-Exact:**
+   - [`bin/axc.exe`](bin/axc.exe): **`996,864 B`** (**`973.50 KB`**, `--shield`, tự biên dịch `399 ms`).
+   - [`bin/axc-linux-x64`](bin/axc-linux-x64): **`950,960 B`** (**`928.67 KB`**, build `359 ms`).
+   - [`bin/axc-macos-arm64`](bin/axc-macos-arm64): **`737,344 B`** (**`720.06 KB`**, build `329 ms`).
+   - Hội tụ 4 vòng `--shield`: `SHA256 = D9B85D3CB1FE4E66C4198DC1BF2FC37CC9168B4169FA3669B6AAC340C2984677`.
+   - [`examples/hello.ax`](examples/hello.ax): `axc check` **`565 us`**, xuất `PE32+` **`5,120 B`** (**`5.00 KB`**) trong **`1 ms`**.
+2. **Bảo Mật Compile-Time & Runtime Fail-Closed:**
+   - Sửa wrapping fold `-9223372036854775808` (`INT64_MIN`: `0 -% v` trong `sema_perceus.ax`, `comptime.ax`, `c_import.ax`) tránh trap giả dưới `--shield`.
+   - Chống traversal `std/http.ax` (`http_is_safe_path`: chặn `\`, `..`, `%5c`/`%2e`, NUL) và vá worst-case buffer sizing ở `std/encoding.ax` (`html_escape`: `n*6+8`) & `std/log.ax` (`log_sanitize`: `n*2+8`).
+   - 25 cổng tĩnh (`E0020`, `E0101`–`E0204`, `E0501`–`E0502`, `E0601`–`E0604`, ...) và 6 bẫy runtime `exit 101` (`/0`, `%0`, `INT64_MIN/-1`, `buf_get` OOB, `str_byte` OOB, `--shield` add overflow).
+3. **Browser Playground, Stdlib `34` Module & Benchmark Trung Thực:**
+   - [`playground/index.html`](playground/index.html): Trình biên dịch Axon -> W3C WASM32 + `0xFD SIMD128` + WASI thuần HTML/JS (`1.19–2.05 KB` `.wasm`, `0.824–1.894 ms` compile trong Node VM, Canvas2D + hex inspector).
+   - `7` module mới `v1.0.0`: `math`, `rand`, `path`, `encoding`, `log`, `time` (Native + WASM32) và `cli` (Native).
+   - [`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md): Báo cáo `B1–B10` đo thực tế vs MSVC C++23 / Rust 1.100 / Go 1.26.4 / Java 21 / Node V8 / Python 3.11 (`B1b` `15.67 ms`, `B2 Table` `5.11 ms`, `B10` cold build `15.90 ms`, cùng phân tích trung thực `B1a`, `B4`, `B5`, `B6`, `B9` WASM linear allocator).
 
 ## Work State
 ### Completed
-- Phát hành chính thức Axon `v1.0.0` (`axon.toml`, `axon.lock`, `install.ps1`, `install.sh`, `compiler_ax/main.ax`, `compiler_ax/pkg_mcp.ax`, `std/`, `docs/BENCHMARK_REPORT.md`, `playground/index.html`, `README.md`, `memory.md`).
-- Toàn bộ bộ kiểm thử `tests/pass/` (`27` bài + `--shield`), `tests/fail_compile/` (`25` cổng), `tests/wasm/` + `wasm32` (`3` bài WASI), runtime trap matrix (`6` bẫy `rc=101`), và `playground/index.html` Node WASM verification (`4/4`) đạt chuẩn trước/sau build release.
+- Phát hành chính thức **`v1.0.0`** (commit `b141ebf`, tag `v1.0.0`, bộ cài `install.ps1` `1267.84 KB` -> `axc 1.0.0-selfhosted`).
+- Verification sau chỉnh sửa cuối đạt 100%: Native+Shield **`29/29`**, `fail_compile` **`25/25`**, WASM32+WASI **`3/3`**, Trap Matrix **`6/6`**, Playground Node **`4/4`**.
 
 ### Active / Blocked
 - (none)
 
 ## Next Move
-1. Tối ưu register allocation vòng lặp số nguyên phụ thuộc (`B1a`), inline atomic trong `std/ringbuf.ax` (`B4`), và bổ sung free-list allocator cho backend `wasm32` (`B9`).
-2. Thêm `io_uring` cho Linux kernel >= 6.1 và debug info DWARF v5 / CodeView PDB (`--debug`).
+1. Tối ưu register allocation cho chuỗi số nguyên phụ thuộc (`B1a`), inline atomics trong `std/ringbuf.ax` (`B4`), và free-list allocator cho backend `wasm32` (`B9`).
+2. Bổ sung `io_uring` (Linux kernel >= 6.1) và debug symbols DWARF v5 / CodeView PDB (`--debug`).
