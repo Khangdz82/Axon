@@ -1,0 +1,306 @@
+// Axon Standard Library: Native DOM Scripting & JS Event Dispatcher (`std/ui_js.ax`)
+// High-speed zero-CEF JavaScript-like reactivity: DOM manipulation, class toggling,
+// reactive state store, and HTML `onclick` event dispatching.
+
+use std::os
+use std::str
+use std::html
+use std::collections
+
+// 1. DOM Document Manipulation (JS-like `document.getElementById`)
+fn document_get_element_by_id(tree: DomTree, id: str) -> i64 {
+    return dom_find_by_id(tree, id)
+}
+
+fn document_set_inner_text(mut tree: DomTree, id: str, text: str) -> bool {
+    idx := dom_find_by_id(tree, id)
+    if idx < 0 { return false }
+    dom_set_text(mut tree, idx, text)
+    return true
+}
+
+fn document_get_inner_text(tree: DomTree, id: str) -> str {
+    idx := dom_find_by_id(tree, id)
+    if idx < 0 { return "" }
+    return dom_get_text(tree, idx)
+}
+
+fn js_has_class_token(cls_list: str, cls_name: str) -> bool {
+    tn := str_len(cls_name)
+    ln := str_len(cls_list)
+    if tn == 0 or ln == 0 { return false }
+    mut i := 0
+    while i < ln {
+        while i < ln and (str_byte(cls_list, i) == 32 or str_byte(cls_list, i) == 9 or str_byte(cls_list, i) == 10 or str_byte(cls_list, i) == 13) {
+            i += 1
+        }
+        mut j := i
+        while j < ln and str_byte(cls_list, j) != 32 and str_byte(cls_list, j) != 9 and str_byte(cls_list, j) != 10 and str_byte(cls_list, j) != 13 {
+            j += 1
+        }
+        if j - i == tn and str_eq(str_slice(cls_list, i, j), cls_name) {
+            return true
+        }
+        i = j + 1
+    }
+    return false
+}
+
+fn document_add_class(mut tree: DomTree, id: str, cls_to_add: str) -> bool {
+    idx := dom_find_by_id(tree, id)
+    if idx < 0 { return false }
+    add_clean := str_trim(cls_to_add)
+    if str_len(add_clean) == 0 { return true }
+    cur_cls := dom_get_class(tree, idx)
+    if js_has_class_token(cur_cls, add_clean) {
+        return true // Already has class
+    }
+    cur_trim := str_trim(cur_cls)
+    new_cls := if str_len(cur_trim) == 0 { add_clean } else { cur_trim + " " + add_clean }
+    dom_set_class(mut tree, idx, new_cls)
+    return true
+}
+
+fn document_remove_class(mut tree: DomTree, id: str, cls_to_remove: str) -> bool {
+    idx := dom_find_by_id(tree, id)
+    if idx < 0 { return false }
+    rem_clean := str_trim(cls_to_remove)
+    if str_len(rem_clean) == 0 { return true }
+    cur_cls := dom_get_class(tree, idx)
+    ln := str_len(cur_cls)
+    out := buf_new(ln + 4)
+    mut i := 0
+    mut any := false
+    while i < ln {
+        while i < ln and (str_byte(cur_cls, i) == 32 or str_byte(cur_cls, i) == 9 or str_byte(cur_cls, i) == 10 or str_byte(cur_cls, i) == 13) {
+            i += 1
+        }
+        mut j := i
+        while j < ln and str_byte(cur_cls, j) != 32 and str_byte(cur_cls, j) != 9 and str_byte(cur_cls, j) != 10 and str_byte(cur_cls, j) != 13 {
+            j += 1
+        }
+        if j > i {
+            tok := str_slice(cur_cls, i, j)
+            if not str_eq(tok, rem_clean) {
+                if any { buf_push(out, 32) }
+                buf_push_str(out, tok)
+                any = true
+            }
+        }
+        i = j + 1
+    }
+    new_cls := buf_to_owned_str(move out)
+    dom_set_class(mut tree, idx, new_cls)
+    return true
+}
+
+fn document_toggle_class(mut tree: DomTree, id: str, cls_name: str) -> bool {
+    idx := dom_find_by_id(tree, id)
+    if idx < 0 { return false }
+    cur_cls := dom_get_class(tree, idx)
+    if js_has_class_token(cur_cls, str_trim(cls_name)) {
+        return document_remove_class(mut tree, id, cls_name)
+    } else {
+        return document_add_class(mut tree, id, cls_name)
+    }
+}
+
+fn document_set_style(mut tree: DomTree, id: str, style_str: str) -> bool {
+    idx := dom_find_by_id(tree, id)
+    if idx < 0 { return false }
+    dom_set_style(mut tree, idx, style_str)
+    return true
+}
+
+// 2. Reactive State Store (backed by fast FNV-1a Map)
+struct JsStateStore {
+    map: IntBuf
+}
+
+fn js_state_new() -> JsStateStore {
+    return JsStateStore(map = map_new(64))
+}
+
+fn js_state_set(store: JsStateStore, key: str, val: i64) {
+    k_hash := fnv1a_64(key)
+    map_put(store.map, k_hash, val)
+}
+
+fn js_state_get(store: JsStateStore, key: str, default_val: i64 = 0) -> i64 {
+    k_hash := fnv1a_64(key)
+    return map_get(store.map, k_hash, default_val)
+}
+
+fn js_state_inc(store: JsStateStore, key: str, step: i64 = 1) -> i64 {
+    cur := js_state_get(store, key, 0)
+    new_val := cur + step
+    js_state_set(store, key, new_val)
+    return new_val
+}
+
+// 3. Script & OnClick Action Dispatcher
+// Supports standard DOM JavaScript syntax:
+// - `document.getElementById('id').innerText = 'new text'`
+// - `document.getElementById('id').classList.toggle('class')`
+// - `#id.innerText = 'new text'`
+// - `#id.classList.toggle('class')`
+// - Declarative micro-actions:
+//   - "toggle:<id>:<class>" (e.g. "toggle:sidebar:hidden")
+//   - "set_text:<id>:<text>"
+//   - "increment:<state_key>:<target_elem_id>:<label_prefix>"
+fn js_eval_action(mut tree: DomTree, store: JsStateStore, action_str: str) -> bool {
+    act := str_trim(action_str)
+    n := str_len(act)
+    if n == 0 { return false }
+
+    // --- Standard JS: document.getElementById('id')... ---
+    p_dgi := str_find(act, "document.getElementById(", 0)
+    if p_dgi >= 0 {
+        mut q1 := str_find_byte(act, 39, p_dgi) // single quote '
+        mut q_char := 39
+        if q1 < 0 {
+            q1 = str_find_byte(act, 34, p_dgi) // double quote "
+            q_char = 34
+        }
+        if q1 >= 0 {
+            q2 := str_find_byte(act, q_char, q1 + 1)
+            if q2 >= 0 {
+                elem_id := str_slice(act, q1 + 1, q2)
+
+                // Check .innerText = '...'
+                p_it := str_find(act, ".innerText", q2)
+                if p_it >= 0 {
+                    eq := str_find_byte(act, 61, p_it) // '='
+                    if eq >= 0 {
+                        mut vq1 := str_find_byte(act, 39, eq)
+                        mut vq_char := 39
+                        if vq1 < 0 {
+                            vq1 = str_find_byte(act, 34, eq)
+                            vq_char = 34
+                        }
+                        if vq1 >= 0 {
+                            vq2 := str_find_byte(act, vq_char, vq1 + 1)
+                            if vq2 >= 0 {
+                                val := str_slice(act, vq1 + 1, vq2)
+                                return document_set_inner_text(mut tree, elem_id, val)
+                            }
+                        }
+                    }
+                }
+
+                // Check .classList.toggle('...')
+                p_tog := str_find(act, ".classList.toggle(", q2)
+                if p_tog >= 0 {
+                    mut cq1 := str_find_byte(act, 39, p_tog)
+                    mut cq_char := 39
+                    if cq1 < 0 {
+                        cq1 = str_find_byte(act, 34, p_tog)
+                        cq_char = 34
+                    }
+                    if cq1 >= 0 {
+                        cq2 := str_find_byte(act, cq_char, cq1 + 1)
+                        if cq2 >= 0 {
+                            cls := str_slice(act, cq1 + 1, cq2)
+                            return document_toggle_class(mut tree, elem_id, cls)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Modern QuerySelector / jQuery shorthand: #id.innerText = '...' or #id.classList.toggle(...) ---
+    if str_byte(act, 0) == 35 { // '#'
+        dot := str_find_byte(act, 46, 1) // '.'
+        if dot >= 0 {
+            elem_id := str_slice(act, 1, dot)
+
+            p_it := str_find(act, "innerText", dot)
+            if p_it >= 0 {
+                eq := str_find_byte(act, 61, p_it)
+                if eq >= 0 {
+                    mut vq1 := str_find_byte(act, 39, eq)
+                    mut vq_char := 39
+                    if vq1 < 0 {
+                        vq1 = str_find_byte(act, 34, eq)
+                        vq_char = 34
+                    }
+                    if vq1 >= 0 {
+                        vq2 := str_find_byte(act, vq_char, vq1 + 1)
+                        if vq2 >= 0 {
+                            val := str_slice(act, vq1 + 1, vq2)
+                            return document_set_inner_text(mut tree, elem_id, val)
+                        }
+                    }
+                }
+            }
+
+            p_tog := str_find(act, "classList.toggle(", dot)
+            if p_tog >= 0 {
+                mut cq1 := str_find_byte(act, 39, p_tog)
+                mut cq_char := 39
+                if cq1 < 0 {
+                    cq1 = str_find_byte(act, 34, p_tog)
+                    cq_char = 34
+                }
+                if cq1 >= 0 {
+                    cq2 := str_find_byte(act, cq_char, cq1 + 1)
+                    if cq2 >= 0 {
+                        cls := str_slice(act, cq1 + 1, cq2)
+                        return document_toggle_class(mut tree, elem_id, cls)
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Declarative: toggle:id:class ---
+    if str_starts_with(act, "toggle:") {
+        sub := str_slice(act, 7, n)
+        colon := str_find_byte(sub, 58, 0)
+        if colon >= 0 {
+            target_id := str_slice(sub, 0, colon)
+            cls_name := str_slice(sub, colon + 1, str_len(sub))
+            return document_toggle_class(mut tree, target_id, cls_name)
+        } else {
+            return document_toggle_class(mut tree, sub, "hidden")
+        }
+    }
+
+    // --- Declarative: set_text:id:val ---
+    if str_starts_with(act, "set_text:") {
+        sub := str_slice(act, 9, n)
+        colon := str_find_byte(sub, 58, 0)
+        if colon >= 0 {
+            target_id := str_slice(sub, 0, colon)
+            val := str_slice(sub, colon + 1, str_len(sub))
+            return document_set_inner_text(mut tree, target_id, val)
+        }
+    }
+
+    // --- Declarative: increment:key:target_elem:prefix ---
+    if str_starts_with(act, "increment:") {
+        sub := str_slice(act, 10, n)
+        colon1 := str_find_byte(sub, 58, 0)
+        if colon1 >= 0 {
+            key := str_slice(sub, 0, colon1)
+            rem := str_slice(sub, colon1 + 1, str_len(sub))
+            colon2 := str_find_byte(rem, 58, 0)
+            target_id := if colon2 >= 0 { str_slice(rem, 0, colon2) } else { rem }
+            prefix := if colon2 >= 0 { str_slice(rem, colon2 + 1, str_len(rem)) } else { "" }
+
+            new_val := js_state_inc(store, key, 1)
+            mut new_text := f"{new_val}"
+            if str_len(prefix) > 0 {
+                if str_ends_with(prefix, ":") {
+                    new_text = f"{prefix} {new_val}"
+                } else {
+                    new_text = f"{prefix}{new_val}"
+                }
+            }
+            return document_set_inner_text(mut tree, target_id, new_text)
+        }
+    }
+
+    return false
+}

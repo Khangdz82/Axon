@@ -1,0 +1,266 @@
+// Axon Standard Library: Native Flexbox & Box Layout Engine (`std/ui_layout.ax`)
+// Pure native zero-CEF layout solver: Computes exact bounding boxes (x, y, w, h)
+// for DOM elements according to CSS display, flex-direction, justify-content,
+// align-items, gap, padding, and margin.
+
+use std::os
+use std::str
+use std::html
+use std::css
+
+// Layout box per node: [x, y, w, h] (4 integers per node)
+struct LayoutTree {
+    boxes: IntBuf // node_idx * 4 -> [x, y, w, h]
+    count: i64
+}
+
+fn layout_tree_new(cap_nodes: i64) -> LayoutTree {
+    mut b := ibuf_new(cap_nodes * 4 + 16)
+    mut i := 0
+    total_slots := cap_nodes * 4
+    while i < total_slots {
+        ibuf_push(b, 0)
+        i += 1
+    }
+    return LayoutTree(boxes = b, count = cap_nodes)
+}
+
+fn layout_get_x(lt: LayoutTree, node_idx: i64) -> i64 {
+    if node_idx < 0 or node_idx >= lt.count { return 0 }
+    return ibuf_get(lt.boxes, node_idx * 4)
+}
+
+fn layout_get_y(lt: LayoutTree, node_idx: i64) -> i64 {
+    if node_idx < 0 or node_idx >= lt.count { return 0 }
+    return ibuf_get(lt.boxes, node_idx * 4 + 1)
+}
+
+fn layout_get_w(lt: LayoutTree, node_idx: i64) -> i64 {
+    if node_idx < 0 or node_idx >= lt.count { return 0 }
+    return ibuf_get(lt.boxes, node_idx * 4 + 2)
+}
+
+fn layout_get_h(lt: LayoutTree, node_idx: i64) -> i64 {
+    if node_idx < 0 or node_idx >= lt.count { return 0 }
+    return ibuf_get(lt.boxes, node_idx * 4 + 3)
+}
+
+fn layout_set_box(lt: LayoutTree, node_idx: i64, x: i64, y: i64, w: i64, h: i64) {
+    if node_idx < 0 or node_idx >= lt.count { return }
+    base := node_idx * 4
+    ibuf_set(lt.boxes, base, x)
+    ibuf_set(lt.boxes, base + 1, y)
+    ibuf_set(lt.boxes, base + 2, w)
+    ibuf_set(lt.boxes, base + 3, h)
+}
+
+fn layout_shift_subtree(tree: DomTree, lt: LayoutTree, node_idx: i64, dx: i64, dy: i64) {
+    if node_idx < 0 or node_idx >= lt.count { return }
+    if dx == 0 and dy == 0 { return }
+    base := node_idx * 4
+    ibuf_set(lt.boxes, base, ibuf_get(lt.boxes, base) + dx)
+    ibuf_set(lt.boxes, base + 1, ibuf_get(lt.boxes, base + 1) + dy)
+    mut ch := dom_first_child(tree, node_idx)
+    while ch >= 0 {
+        layout_shift_subtree(tree, lt, ch, dx, dy)
+        ch = dom_next_sibling(tree, ch)
+    }
+}
+
+// Estimates text content width based on character count and font size
+fn layout_estimate_text_width(text: str, font_size: i64 = 14) -> i64 {
+    n := str_len(text)
+    if n == 0 { return 0 }
+    char_w := (font_size * 6) / 10 // ~0.6 aspect ratio
+    return n * char_w
+}
+
+// Solves layout recursively starting from node_idx
+fn layout_solve_node(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, node_idx: i64, avail_x: i64, avail_y: i64, avail_w: i64, avail_h: i64) {
+    if node_idx < 0 or node_idx >= tree.count { return }
+
+    style := css_compute_node_style(tree, node_idx, sheet)
+    if style.display == 3 { // display: none
+        layout_set_box(lt, node_idx, 0, 0, 0, 0)
+        return
+    }
+
+    mut box_w := style.width
+    mut box_h := style.height
+
+    pad_w := style.padding_x
+    pad_h := style.padding_y
+    margin_x := style.margin_x / 2
+    margin_y := style.margin_y / 2
+
+    pos_x := avail_x + margin_x
+    pos_y := avail_y + margin_y
+
+    if box_w < 0 {
+        box_w = avail_w - style.margin_x
+        if box_w < 0 { box_w = 0 }
+    }
+
+    txt := dom_get_text(tree, node_idx)
+    if box_h < 0 and str_len(txt) > 0 {
+        c_tag := dom_get_tag(tree, node_idx)
+        if str_eq_ignore_case(c_tag, "button") or str_eq_ignore_case(c_tag, "input") or str_eq_ignore_case(c_tag, "h1") {
+            box_h = 36 + pad_h
+        } else if str_eq_ignore_case(c_tag, "h2") {
+            box_h = 28 + pad_h
+        } else {
+            box_h = 24 + pad_h
+        }
+    }
+
+    fc := dom_first_child(tree, node_idx)
+    if fc >= 0 {
+        content_x := pos_x + pad_w / 2
+        content_y := pos_y + pad_h / 2
+        mut content_w := box_w - pad_w
+        if content_w < 0 { content_w = 0 }
+
+        // Block containers and flex-direction: column stack vertically; flex-row / inline lay out horizontally
+        is_col := (style.display == 0) or (style.display == 1 and style.flex_direction == 1)
+        gap := style.gap
+
+        mut cur_child := fc
+        mut cursor_x := content_x
+        mut cursor_y := content_y
+        mut total_main := 0
+        mut max_child_w := 0
+        mut max_child_h := 0
+        mut vis_count := 0
+
+        while cur_child >= 0 {
+            c_style := css_compute_node_style(tree, cur_child, sheet)
+            if c_style.display == 3 {
+                layout_set_box(lt, cur_child, 0, 0, 0, 0)
+                cur_child = dom_next_sibling(tree, cur_child)
+                continue
+            }
+
+            mut cw := c_style.width
+            mut ch := c_style.height
+            c_tag := dom_get_tag(tree, cur_child)
+            if ch < 0 and dom_first_child(tree, cur_child) < 0 {
+                if str_eq_ignore_case(c_tag, "button") or str_eq_ignore_case(c_tag, "input") { ch = 36 + c_style.padding_y }
+                else if str_eq_ignore_case(c_tag, "h1") { ch = 36 + c_style.padding_y }
+                else if str_eq_ignore_case(c_tag, "h2") { ch = 28 + c_style.padding_y }
+                else { ch = 24 + c_style.padding_y }
+            }
+            if cw < 0 {
+                c_txt := dom_get_text(tree, cur_child)
+                if not is_col {
+                    if str_len(c_txt) > 0 {
+                        cw = layout_estimate_text_width(c_txt) + c_style.padding_x + 16
+                    } else {
+                        cw = 100
+                    }
+                } else if str_eq_ignore_case(c_tag, "button") and str_len(c_txt) > 0 {
+                    cw = layout_estimate_text_width(c_txt) + c_style.padding_x + 16
+                } else {
+                    cw = content_w - c_style.margin_x
+                    if cw < 0 { cw = 0 }
+                }
+            }
+
+            if vis_count > 0 {
+                if is_col {
+                    cursor_y += gap
+                    total_main += gap
+                } else {
+                    cursor_x += gap
+                    total_main += gap
+                }
+            }
+
+            child_avail_w := cw + c_style.margin_x
+            child_avail_h := if ch >= 0 { ch + c_style.margin_y } else { avail_h }
+            layout_solve_node(tree, sheet, lt, cur_child, cursor_x, cursor_y, child_avail_w, child_avail_h)
+
+            actual_w := layout_get_w(lt, cur_child)
+            actual_h := layout_get_h(lt, cur_child)
+            if actual_w + c_style.margin_x > max_child_w { max_child_w = actual_w + c_style.margin_x }
+            if actual_h + c_style.margin_y > max_child_h { max_child_h = actual_h + c_style.margin_y }
+
+            if is_col {
+                step := actual_h + c_style.margin_y
+                cursor_y += step
+                total_main += step
+            } else {
+                step := actual_w + c_style.margin_x
+                cursor_x += step
+                total_main += step
+            }
+            vis_count += 1
+            cur_child = dom_next_sibling(tree, cur_child)
+        }
+
+        if box_h < 0 {
+            if vis_count == 0 {
+                box_h = 32 + pad_h
+            } else if is_col {
+                box_h = total_main + pad_h
+            } else {
+                box_h = max_child_h + pad_h
+            }
+        }
+
+        mut content_h := box_h - pad_h
+        if content_h < 0 { content_h = 0 }
+
+        // Apply flex alignment (justify-content / align-items) when container is flex
+        if style.display == 1 and vis_count > 0 and (style.justify_content != 0 or style.align_items != 0) {
+            content_main := if is_col { content_h } else { content_w }
+            content_cross := if is_col { content_w } else { content_h }
+            rem := content_main - total_main
+
+            mut k := 0
+            mut ch_node := fc
+            while ch_node >= 0 {
+                cs := css_compute_node_style(tree, ch_node, sheet)
+                if cs.display != 3 {
+                    mut main_shift := 0
+                    if rem > 0 {
+                        if style.justify_content == 1 { main_shift = rem / 2 }
+                        else if style.justify_content == 2 { main_shift = rem }
+                        else if style.justify_content == 3 and vis_count > 1 { main_shift = (rem * k) / (vis_count - 1) }
+                        else if style.justify_content == 4 {
+                            slot := rem / vis_count
+                            main_shift = (slot / 2) + k * slot
+                        }
+                    }
+
+                    mut cross_shift := 0
+                    child_cross := if is_col { layout_get_w(lt, ch_node) + cs.margin_x } else { layout_get_h(lt, ch_node) + cs.margin_y }
+                    cross_rem := content_cross - child_cross
+                    if cross_rem > 0 {
+                        if style.align_items == 1 { cross_shift = cross_rem / 2 }
+                        else if style.align_items == 3 { cross_shift = cross_rem }
+                    }
+
+                    if is_col {
+                        layout_shift_subtree(tree, lt, ch_node, cross_shift, main_shift)
+                    } else {
+                        layout_shift_subtree(tree, lt, ch_node, main_shift, cross_shift)
+                    }
+                    k += 1
+                }
+                ch_node = dom_next_sibling(tree, ch_node)
+            }
+        }
+    } else {
+        if box_h < 0 { box_h = 32 + pad_h }
+    }
+
+    layout_set_box(lt, node_idx, pos_x, pos_y, box_w, box_h)
+}
+
+fn layout_compute(tree: DomTree, sheet: Stylesheet, window_w: i64, window_h: i64) -> LayoutTree {
+    lt := layout_tree_new(tree.count)
+    if tree.root_idx >= 0 {
+        layout_solve_node(tree, sheet, lt, tree.root_idx, 0, 0, window_w, window_h)
+    }
+    return lt
+}
