@@ -1,0 +1,149 @@
+use std::compress
+use std::regex
+use std::html
+use std::css
+use std::ui_js
+use std::ui_layout
+use std::ui
+
+fn expect_decomp_err(b: ByteBuf) -> bool {
+    d := decompress_bytes(b) or return true
+    buf_free(move d)
+    return false
+}
+
+@test fn test_compress_empty_and_corrupt() -> i64 {
+    empty_b := buf_new(0)
+    c_empty := compress_bytes(empty_b)
+    if buf_len(c_empty) != 4 { return 1 }
+    d_empty := decompress_bytes(c_empty) or return 2
+    if buf_len(d_empty) != 0 { return 3 }
+    buf_free(move empty_b)
+    buf_free(move c_empty)
+    buf_free(move d_empty)
+
+    cs := compress_str("")
+    ds := decompress_to_str(cs) or return 4
+    if not str_eq(ds, "") { return 5 }
+    buf_free(move cs)
+
+    // Corrupt compressed payload claiming 100 bytes with truncated literal length (0xF0 + 255 without terminator)
+    bad := buf_new(8)
+    buf_push(bad, 100)
+    buf_push(bad, 0)
+    buf_push(bad, 0)
+    buf_push(bad, 0)
+    buf_push(bad, 0xF0)
+    buf_push(bad, 255)
+    ok_err := expect_decomp_err(bad)
+    buf_free(move bad)
+    if not ok_err { return 6 }
+    return 0
+}
+
+@test fn test_regex_quantifiers_classes_alt_and_redos() -> i64 {
+    if not regex_is_match("^a+b+c?$", "aaabbb") { return 1 }
+    if not regex_is_match("^a+b+c?$", "aaabbbc") { return 2 }
+    if regex_is_match("^a+b+c?$", "aaabbbcc") { return 3 }
+
+    m_opt := regex_find("[a-z]?", "abc") or return 4
+    if m_opt.end != 1 { return 5 }
+
+    m_set := regex_find("^[abc]+$", "cabba") or return 6
+    if m_set.len != 5 { return 7 }
+    if regex_is_match("^[abc]+$", "cabd") { return 8 }
+
+    if not regex_is_match("^[a-z0-9_]+$", "axon_v1") { return 9 }
+    if regex_is_match("^[^0-9]+$", "ab3cd") { return 10 }
+    if not regex_is_match("^[^0-9]+$", "abcd") { return 11 }
+
+    if not regex_is_match("cat|dog|bird", "i like dogs") { return 12 }
+    if regex_is_match("cat|dog", "fish") { return 13 }
+    if not regex_is_match("^foo|bar$", "bar") { return 14 }
+
+    // ReDoS catastrophic backtracking pattern must terminate quickly with false
+    if regex_is_match(".*.*.*.*.*.*.*.*X", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") { return 15 }
+    return 0
+}
+
+@test fn test_css_and_js_token_class_safety() -> i64 {
+    html := "<div id=\"box\" class=\"btn-primary\"><span id=\"inner\" class=\"btn btn-primary\">Hi</span></div>"
+    mut tree := html_parse(html) or return 1
+    css_src := "/* header comment */ .btn { color: #ff0000; } h1, .glow { border: 2px solid #38bdf8; margin-left: -4px; }"
+    sheet := css_parse_stylesheet(css_src)
+
+    // .btn must NOT match "btn-primary" on #box
+    box_idx := dom_find_by_id(tree, "box")
+    st_box := css_compute_node_style(tree, box_idx, sheet)
+    if st_box.text_color == 0xFFFF0000 { return 2 }
+
+    // .btn MUST match #inner with "btn btn-primary"
+    inner_idx := dom_find_by_id(tree, "inner")
+    st_inner := css_compute_node_style(tree, inner_idx, sheet)
+    if st_inner.text_color != 0xFFFF0000 { return 3 }
+
+    // Toggling "btn" on "btn-primary" adds "btn" instead of corrupting "-primary"
+    document_toggle_class(mut tree, "box", "btn")
+    if not str_eq(dom_get_class(tree, box_idx), "btn-primary btn") { return 4 }
+
+    // Toggling "btn" again removes only "btn"
+    document_toggle_class(mut tree, "box", "btn")
+    if not str_eq(dom_get_class(tree, box_idx), "btn-primary") { return 5 }
+
+    buf_free(move sheet.rules)
+    dom_tree_free(move tree)
+    return 0
+}
+
+@test fn test_html_malformed_and_dynamic_compaction() -> i64 {
+    // Quoted '>' and attribute boundary 'data-id="id=fake"' + newline whitespace
+    raw := "<html><head><title>Hidden</title></head><body><div\ntitle=\"a>b\" data-id=\"id=fake\" id=\"real\">OK</div><style>.x{}</style><script>if(a<b){}</script></body></html>"
+    mut tree := html_parse(raw) or return 1
+    ridx := dom_find_by_id(tree, "real")
+    if ridx < 0 { return 2 }
+    if not str_eq(dom_get_text(tree, ridx), "OK") { return 3 }
+
+    // Buffer exhaustion check: 3000 x ~100 byte updates (~300KB > old 1KB/256KB limits)
+    payload := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123"
+    mut it := 0
+    while it < 3000 {
+        dom_set_text(mut tree, ridx, payload)
+        it += 1
+    }
+    if not str_eq(dom_get_text(tree, ridx), payload) { return 4 }
+
+    // Continuous growth check
+    mut grow := "x"
+    mut g := 0
+    while g < 200 {
+        grow = grow + "0123456789"
+        dom_set_text(mut tree, ridx, grow)
+        g += 1
+    }
+    if str_len(dom_get_text(tree, ridx)) != 2001 { return 5 }
+
+    dom_tree_free(move tree)
+    return 0
+}
+
+@test fn test_layout_box_and_flex_geometry() -> i64 {
+    html := "<html><head><title>Title</title></head><body style=\"padding: 10px;\"><div id=\"row\" style=\"display: flex; gap: 10px;\"><div id=\"a\" style=\"width: 100px; height: 80px;\"></div><div id=\"b\" style=\"width: 100px; height: 50px;\"></div></div></body></html>"
+    tree := html_parse(html) or return 1
+    sheet := css_parse_stylesheet("")
+    lt := layout_compute(tree, sheet, 800, 600)
+
+    head_idx := 1
+    if layout_get_w(lt, head_idx) != 0 or layout_get_h(lt, head_idx) != 0 { return 2 }
+
+    row_idx := dom_find_by_id(tree, "row")
+    a_idx := dom_find_by_id(tree, "a")
+    b_idx := dom_find_by_id(tree, "b")
+    // Row auto-height must be max child height (80), not hardcoded 40
+    if layout_get_h(lt, row_idx) != 80 { return 3 }
+    // Sibling b must be to the right of a by 100 + gap 10
+    if layout_get_x(lt, b_idx) != layout_get_x(lt, a_idx) + 110 { return 4 }
+
+    buf_free(move lt.boxes)
+    buf_free(move sheet.rules)
+    return 0
+}
