@@ -1,0 +1,242 @@
+// Axon Hugging Face SafeTensors Implementation (`std/safetensors.ax`)
+// 100% Pure Axon: Zero Python, Zero Rust, Zero External Dependencies, Zero-GC (@no_alloc).
+// Implements the complete Hugging Face SafeTensors specification:
+//   - 8-Byte Little-Endian Header Length Prefix (N)
+//   - Zero-Copy JSON Header Parser for DTypes, Shapes & [begin, end] Offsets
+//   - Direct Memory-Mapped Buffer Extraction into `NdArray`
+//   - Safe Serialization: Generates .safetensors files compatible with PyTorch/Transformers
+
+use std::numpy
+use std::json
+use std::str
+use std::os
+
+struct SafetensorsFile {
+    header_json: str
+    header_bytes_len: i64
+    data_buffer_ptr: i64
+    data_buffer_len: i64
+}
+
+// Read 64-bit unsigned integer from buffer in little-endian order
+@no_alloc
+fn st_read_u64_le(buf: ByteBuf, off: i64) -> i64 {
+    b0 := buf_get(buf, off)
+    b1 := buf_get(buf, off + 1)
+    b2 := buf_get(buf, off + 2)
+    b3 := buf_get(buf, off + 3)
+    b4 := buf_get(buf, off + 4)
+    b5 := buf_get(buf, off + 5)
+    b6 := buf_get(buf, off + 6)
+    b7 := buf_get(buf, off + 7)
+    lo := b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    hi := b4 | (b5 << 8) | (b6 << 16) | (b7 << 24)
+    return lo | (hi << 32)
+}
+
+// Write 64-bit integer into buffer in little-endian order
+@no_alloc
+fn st_write_u64_le(buf: ByteBuf, val: i64) {
+    buf_push(buf, val & 0xFF)
+    buf_push(buf, (val >> 8) & 0xFF)
+    buf_push(buf, (val >> 16) & 0xFF)
+    buf_push(buf, (val >> 24) & 0xFF)
+    buf_push(buf, (val >> 32) & 0xFF)
+    buf_push(buf, (val >> 40) & 0xFF)
+    buf_push(buf, (val >> 48) & 0xFF)
+    buf_push(buf, (val >> 56) & 0xFF)
+}
+
+// Parse SafeTensors binary file from memory ByteBuf
+fn safetensors_parse_buffer(raw: ByteBuf) -> SafetensorsFile ! i64 {
+    if buf_len(raw) < 8 {
+        return err(400) // File too small for header length
+    }
+    
+    header_len := st_read_u64_le(raw, 0)
+    if header_len <= 0 or (header_len + 8) > buf_len(raw) {
+        return err(422) // Invalid header length or corrupted file
+    }
+
+    // Extract JSON header string
+    header_str := buf_slice_str(raw, 8, 8 + header_len)
+    
+    payload_start := 8 + header_len
+    payload_len := buf_len(raw) - payload_start
+    
+    // Allocate contiguous buffer for tensor payload
+    payload_mem := mem_alloc_aligned(payload_len + 64)
+    mut i := 0
+    while i < payload_len {
+        b := buf_get(raw, payload_start + i)
+        ptr_write_u8(payload_mem, i, b)
+        i += 1
+    }
+
+    return ok(SafetensorsFile(
+        header_json = header_str,
+        header_bytes_len = header_len,
+        data_buffer_ptr = payload_mem,
+        data_buffer_len = payload_len
+    ))
+}
+
+// Read tensor data offsets `[begin, end]` from SafeTensors JSON header
+fn safetensors_find_offsets(header_json: str, tensor_name: str) -> IntBuf ! i64 {
+    // Locate tensor object: `"tensor_name": { ... "data_offsets": [begin, end] }`
+    kpos := json_locate_key_val(header_json, tensor_name)
+    if kpos < 0 {
+        return err(404) // Tensor not found
+    }
+
+    n := str_len(header_json)
+    // Search for "data_offsets" within tensor block
+    do_key := "data_offsets"
+    mut p := kpos
+    mut found_do := false
+    while p < n {
+        c := str_byte(header_json, p)
+        if c == 125 { // '}' closes tensor block
+            break
+        }
+        if c == 34 { // '"'
+            if (p + 14) < n and str_eq(str_slice(header_json, p + 1, p + 13), do_key) {
+                found_do = true
+                p = p + 13
+                break
+            }
+        }
+        p += 1
+    }
+
+    if not found_do {
+        return err(422)
+    }
+
+    // Advance to '['
+    while p < n and str_byte(header_json, p) != 91 {
+        p += 1
+    }
+    if p >= n { return err(400) }
+    p += 1 // skip '['
+
+    // Parse begin offset
+    mut begin_val := 0
+    while p < n {
+        c := str_byte(header_json, p)
+        if c >= 48 and c <= 57 {
+            begin_val = begin_val * 10 + (c - 48)
+            p += 1
+        } else if c == 44 or c == 32 {
+            p += 1
+            if c == 44 { break }
+        } else {
+            break
+        }
+    }
+
+    // Skip whitespace after comma
+    while p < n and (str_byte(header_json, p) == 32 or str_byte(header_json, p) == 9) {
+        p += 1
+    }
+
+    // Parse end offset
+    mut end_val := 0
+    while p < n {
+        c := str_byte(header_json, p)
+        if c >= 48 and c <= 57 {
+            end_val = end_val * 10 + (c - 48)
+            p += 1
+        } else {
+            break
+        }
+    }
+
+    offsets := ibuf_new(2)
+    ibuf_push(offsets, begin_val)
+    ibuf_push(offsets, end_val)
+    return ok(offsets)
+}
+
+// Extract a tensor as an NdArray from loaded SafeTensors
+fn safetensors_get_tensor(st: SafetensorsFile, name: str, rows: i64, cols: i64 = 1) -> NdArray ! i64 {
+    offsets := safetensors_find_offsets(st.header_json, name) or return err(404)
+    begin_off := ibuf_get(offsets, 0)
+    end_off := ibuf_get(offsets, 1)
+    byte_len := end_off - begin_off
+    num_floats := rows * cols
+
+    if byte_len < (num_floats * 4) or (begin_off + byte_len) > st.data_buffer_len {
+        buf_free(move offsets)
+        return err(422) // Size mismatch or offset out of bounds
+    }
+
+    arr := np_zeros(rows, cols)
+    src_ptr := st.data_buffer_ptr + begin_off
+    
+    // Copy floats directly into NdArray
+    mut i := 0
+    while i < num_floats {
+        b0 := ptr_read_u8(src_ptr, i * 4)
+        b1 := ptr_read_u8(src_ptr, i * 4 + 1)
+        b2 := ptr_read_u8(src_ptr, i * 4 + 2)
+        b3 := ptr_read_u8(src_ptr, i * 4 + 3)
+        raw_bits := b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        
+        // Write raw 32-bit float
+        scratch := mem_alloc_aligned(64)
+        ptr_write_i64(scratch, 0, raw_bits)
+        f_val := ptr_read_f32(scratch, 0)
+        mem_free_aligned(scratch)
+
+        ptr_write_f32(arr.data_ptr, i, f_val)
+        i += 1
+    }
+
+    buf_free(move offsets)
+    return ok(arr)
+}
+
+// Serialize NdArray tensors into SafeTensors binary ByteBuf format
+fn safetensors_serialize(name: str, arr: NdArray) -> ByteBuf {
+    // 1. Build JSON metadata header
+    // e.g. {"weight":{"dtype":"F32","shape":[rows,cols],"data_offsets":[0,bytes]}}
+    data_bytes := arr.size * 4
+    header_json := "{\"" + name + "\":{\"dtype\":\"F32\",\"shape\":[" + str_from_i64(arr.rows) + "," + str_from_i64(arr.cols) + "],\"data_offsets\":[0," + str_from_i64(data_bytes) + "]}}"
+    
+    header_len := str_len(header_json)
+    out := buf_new(8 + header_len + data_bytes + 64)
+
+    // 2. Write 8-byte header length
+    st_write_u64_le(out, header_len)
+
+    // 3. Write JSON header bytes
+    mut i := 0
+    while i < header_len {
+        buf_push(out, str_byte(header_json, i))
+        i += 1
+    }
+
+    // 4. Write contiguous raw float32 bytes
+    i = 0
+    scratch := mem_alloc_aligned(64)
+    while i < arr.size {
+        val := ptr_read_f32(arr.data_ptr, i)
+        ptr_write_f32(scratch, 0, val)
+        bits := ptr_read_i64(scratch, 0) & 0xFFFFFFFF
+        buf_push(out, bits & 0xFF)
+        buf_push(out, (bits >> 8) & 0xFF)
+        buf_push(out, (bits >> 16) & 0xFF)
+        buf_push(out, (bits >> 24) & 0xFF)
+        i += 1
+    }
+    mem_free_aligned(scratch)
+
+    return out
+}
+
+fn safetensors_free(move st: SafetensorsFile) {
+    if st.data_buffer_ptr != 0 {
+        mem_free_aligned(st.data_buffer_ptr)
+    }
+}

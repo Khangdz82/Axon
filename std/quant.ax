@@ -1,0 +1,542 @@
+// Axon Complete Multi-Precision & Ultra-Low-Bit Quantization Engine (`std/quant.ax`)
+// 100% Pure Axon: Zero CRT, Zero-GC (@no_alloc), Zero External Dependencies.
+// Supports:
+//   - 16-bit: FP16 (IEEE 754 half) & BF16 (Brain Float 16)
+//   - 8-bit:  Q8_0 (Block-32 Symmetric INT8)
+//   - 4-bit:  Q4_0 (Block-32 Nibble-Packed INT4) & NF4 (NormalFloat4 QLoRA)
+//   - 2-bit:  Q2_0 (Block-32 4-Weights-Per-Byte Quaternary/Ternary)
+//   - 1.58-bit: BitNet b1.58 (Multiplication-Free Ternary {-1, 0, +1})
+//   - 1-bit:  BNN / XNOR-Net (Bitwise 64-Weights-Per-Word POPCOUNT-XNOR)
+
+use std::ai_math
+use std::os
+
+// --- DType Identifiers ---
+fn dtype_fp32() -> i64       { return 0 }
+fn dtype_fp16() -> i64       { return 1 }
+fn dtype_bf16() -> i64       { return 2 }
+fn dtype_q8_0() -> i64       { return 3 }
+fn dtype_q4_0() -> i64       { return 4 }
+fn dtype_nf4() -> i64        { return 5 }
+fn dtype_q2_0() -> i64       { return 6 }
+fn dtype_bitnet_158() -> i64 { return 7 }
+fn dtype_bnn_1bit() -> i64   { return 8 }
+
+// --- 1. 16-Bit: FP16 & BF16 Bit-Level Converters ---
+
+@no_alloc
+fn quant_f32_to_bits(scratch_ptr: i64, val: f64) -> i64 {
+    ptr_write_i64(scratch_ptr, 0, 0)
+    ptr_write_f32(scratch_ptr, 0, val)
+    return ptr_read_i64(scratch_ptr, 0) & 0xFFFFFFFF
+}
+
+@no_alloc
+fn quant_bits_to_f32(scratch_ptr: i64, bits: i64) -> f64 {
+    ptr_write_i64(scratch_ptr, 0, bits & 0xFFFFFFFF)
+    return ptr_read_f32(scratch_ptr, 0)
+}
+
+// Convert FP32 to BF16 (Round to Nearest Even)
+@no_alloc
+fn f32_to_bf16(scratch_ptr: i64, val: f64) -> i64 {
+    b := quant_f32_to_bits(scratch_ptr, val)
+    abs_b := b & 0x7FFFFFFF
+    if abs_b > 0x7F800000 {
+        return ((b >> 16) & 0xFFFF) | 0x0040
+    }
+    bias := 0x7FFF + ((b >> 16) & 1)
+    return ((b + bias) >> 16) & 0xFFFF
+}
+
+@no_alloc
+fn bf16_to_f32(scratch_ptr: i64, bf: i64) -> f64 {
+    bits := (bf & 0xFFFF) << 16
+    return quant_bits_to_f32(scratch_ptr, bits)
+}
+
+// Convert FP32 to IEEE-754 Half-Precision FP16
+@no_alloc
+fn f32_to_fp16(scratch_ptr: i64, val: f64) -> i64 {
+    b := quant_f32_to_bits(scratch_ptr, val)
+    sign := (b >> 31) & 1
+    exp := (b >> 23) & 0xFF
+    frac := b & 0x7FFFFF
+
+    if exp == 255 {
+        // Inf or NaN
+        mut f16_frac := 0
+        if frac != 0 { f16_frac = 0x200 }
+        return (sign << 15) | (31 << 10) | f16_frac
+    }
+
+    new_exp := exp - 127 + 15
+    if new_exp >= 31 {
+        // Overflow to Inf
+        return (sign << 15) | (31 << 10)
+    }
+    if new_exp <= 0 {
+        // Subnormal or underflow to zero
+        if (10 - new_exp) >= 32 {
+            return sign << 15
+        }
+        sub_frac := (frac | 0x800000) >> (14 - new_exp)
+        return (sign << 15) | sub_frac
+    }
+
+    new_frac := (frac + 0x1000) >> 13
+    return (sign << 15) | (new_exp << 10) | (new_frac & 0x3FF)
+}
+
+// Convert IEEE-754 FP16 to FP32
+@no_alloc
+fn fp16_to_f32(scratch_ptr: i64, h: i64) -> f64 {
+    sign := (h >> 15) & 1
+    exp := (h >> 10) & 0x1F
+    frac := h & 0x3FF
+
+    if exp == 0 {
+        if frac == 0 {
+            return quant_bits_to_f32(scratch_ptr, sign << 31)
+        }
+        // Subnormal
+        mut f := frac
+        mut shift := 0
+        while (f & 0x400) == 0 {
+            f = f << 1
+            shift += 1
+        }
+        f = f & 0x3FF
+        exp32 := 127 - 14 - shift
+        b32 := (sign << 31) | (exp32 << 23) | (f << 13)
+        return quant_bits_to_f32(scratch_ptr, b32)
+    }
+    if exp == 31 {
+        // Inf / NaN
+        mut f32 := 0
+        if frac != 0 { f32 = 0x400000 }
+        return quant_bits_to_f32(scratch_ptr, (sign << 31) | (255 << 23) | f32)
+    }
+
+    exp32 := exp - 15 + 127
+    b32 := (sign << 31) | (exp32 << 23) | (frac << 13)
+    return quant_bits_to_f32(scratch_ptr, b32)
+}
+
+// --- 2. 8-Bit: Q8_0 Symmetric Block-32 Quantization ---
+// Block layout (36 bytes for 32 weights):
+//   [0..4]   float32 scale `d`
+//   [4..36]  32 signed 8-bit integers
+
+@no_alloc
+fn quantize_q8_0_block(src_f32_ptr: i64, dst_block_ptr: i64, scratch_ptr: i64) {
+    // Find maximum absolute value in block of 32
+    mut max_abs := 0.0
+    mut i := 0
+    while i < 32 {
+        v := ptr_read_f32(src_f32_ptr, i)
+        abs_v := if v < 0.0 { 0.0 - v } else { v }
+        if abs_v > max_abs {
+            max_abs = abs_v
+        }
+        i += 1
+    }
+
+    scale := max_abs / 127.0
+    inv_scale := if max_abs > 0.000000001 { 127.0 / max_abs } else { 0.0 }
+    
+    // Store scale at offset 0
+    ptr_write_f32(dst_block_ptr, 0, scale)
+
+    // Quantize 32 elements into 8-bit signed
+    i = 0
+    while i < 32 {
+        v := ptr_read_f32(src_f32_ptr, i)
+        q := (v * inv_scale + 0.5) as i64
+        mut clamped := q
+        if clamped > 127 { clamped = 127 }
+        if clamped < -127 { clamped = -127 }
+        ptr_write_u8(dst_block_ptr, 4 + i, clamped & 0xFF)
+        i += 1
+    }
+}
+
+@no_alloc
+fn gemv_q8_0(act_f32_ptr: i64, q8_blocks_ptr: i64, num_blocks: i64) -> f64 {
+    mut total := 0.0
+    mut b := 0
+    while b < num_blocks {
+        block_addr := q8_blocks_ptr + b * 36
+        d := ptr_read_f32(block_addr, 0)
+        act_base := b * 32
+        
+        mut block_sum := 0.0
+        mut i := 0
+        while i < 32 {
+            raw_b := ptr_read_u8(block_addr, 4 + i)
+            s_b := if (raw_b & 0x80) != 0 { raw_b - 256 } else { raw_b }
+            act := ptr_read_f32(act_f32_ptr, act_base + i)
+            block_sum = block_sum + act * (s_b as f64)
+            i += 1
+        }
+        total = total + d * block_sum
+        b += 1
+    }
+    return total
+}
+
+// --- 3. 4-Bit: Q4_0 & NF4 (NormalFloat4) Block Quantization ---
+// Q4_0 Block layout (20 bytes for 32 weights):
+//   [0..4]   float32 scale `d`
+//   [4..20]  16 bytes (32 packed 4-bit nibbles: low nibble = even, high nibble = odd)
+
+@no_alloc
+fn quantize_q4_0_block(src_f32_ptr: i64, dst_block_ptr: i64) {
+    mut max_abs := 0.0
+    mut i := 0
+    while i < 32 {
+        v := ptr_read_f32(src_f32_ptr, i)
+        abs_v := if v < 0.0 { 0.0 - v } else { v }
+        if abs_v > max_abs { max_abs = abs_v }
+        i += 1
+    }
+
+    scale := max_abs / 7.0
+    inv_scale := if max_abs > 0.000000001 { 7.0 / max_abs } else { 0.0 }
+    ptr_write_f32(dst_block_ptr, 0, scale)
+
+    i = 0
+    while i < 16 {
+        v0 := ptr_read_f32(src_f32_ptr, i * 2)
+        v1 := ptr_read_f32(src_f32_ptr, i * 2 + 1)
+        
+        q0 := (v0 * inv_scale + 8.5) as i64
+        mut c0 := q0
+        if c0 > 15 { c0 = 15 }
+        if c0 < 0  { c0 = 0 }
+
+        q1 := (v1 * inv_scale + 8.5) as i64
+        mut c1 := q1
+        if c1 > 15 { c1 = 15 }
+        if c1 < 0  { c1 = 0 }
+
+        packed_byte := (c0 & 0x0F) | ((c1 & 0x0F) << 4)
+        ptr_write_u8(dst_block_ptr, 4 + i, packed_byte)
+        i += 1
+    }
+}
+
+@no_alloc
+fn gemv_q4_0(act_f32_ptr: i64, q4_blocks_ptr: i64, num_blocks: i64) -> f64 {
+    mut total := 0.0
+    mut b := 0
+    while b < num_blocks {
+        block_addr := q4_blocks_ptr + b * 20
+        d := ptr_read_f32(block_addr, 0)
+        act_base := b * 32
+
+        mut block_sum := 0.0
+        mut i := 0
+        while i < 16 {
+            byte_val := ptr_read_u8(block_addr, 4 + i)
+            nib0 := (byte_val & 0x0F) - 8
+            nib1 := ((byte_val >> 4) & 0x0F) - 8
+
+            act0 := ptr_read_f32(act_f32_ptr, act_base + i * 2)
+            act1 := ptr_read_f32(act_f32_ptr, act_base + i * 2 + 1)
+
+            block_sum = block_sum + act0 * (nib0 as f64) + act1 * (nib1 as f64)
+            i += 1
+        }
+        total = total + d * block_sum
+        b += 1
+    }
+    return total
+}
+
+// NF4 Quantile Table (NormalFloat4 scaled by 1e6)
+fn nf4_lut_level(idx: i64) -> f64 {
+    i := idx & 15
+    if i == 0  { return -1.0 }
+    if i == 1  { return -0.696193 }
+    if i == 2  { return -0.525073 }
+    if i == 3  { return -0.394917 }
+    if i == 4  { return -0.284441 }
+    if i == 5  { return -0.184773 }
+    if i == 6  { return -0.091050 }
+    if i == 7  { return 0.0 }
+    if i == 8  { return 0.079580 }
+    if i == 9  { return 0.160930 }
+    if i == 10 { return 0.246112 }
+    if i == 11 { return 0.337915 }
+    if i == 12 { return 0.440710 }
+    if i == 13 { return 0.562617 }
+    if i == 14 { return 0.722957 }
+    return 1.0
+}
+
+@no_alloc
+fn gemv_nf4(act_f32_ptr: i64, nf4_blocks_ptr: i64, num_blocks: i64) -> f64 {
+    mut total := 0.0
+    mut b := 0
+    while b < num_blocks {
+        block_addr := nf4_blocks_ptr + b * 20
+        d := ptr_read_f32(block_addr, 0)
+        act_base := b * 32
+
+        mut block_sum := 0.0
+        mut i := 0
+        while i < 16 {
+            byte_val := ptr_read_u8(block_addr, 4 + i)
+            q0 := byte_val & 0x0F
+            q1 := (byte_val >> 4) & 0x0F
+
+            w0 := nf4_lut_level(q0)
+            w1 := nf4_lut_level(q1)
+
+            act0 := ptr_read_f32(act_f32_ptr, act_base + i * 2)
+            act1 := ptr_read_f32(act_f32_ptr, act_base + i * 2 + 1)
+
+            block_sum = block_sum + act0 * w0 + act1 * w1
+            i += 1
+        }
+        total = total + d * block_sum
+        b += 1
+    }
+    return total
+}
+
+// --- 4. 2-Bit: Q2_0 Quaternary Block-32 Quantization ---
+// Block layout (12 bytes for 32 weights):
+//   [0..4]   float32 scale `d`
+//   [4..12]  8 bytes (4 weights per byte, 2 bits each: 00, 01, 10, 11)
+// Quantization mapping: 0 -> -1.5, 1 -> -0.5, 2 -> +0.5, 3 -> +1.5
+
+@no_alloc
+fn quantize_q2_0_block(src_f32_ptr: i64, dst_block_ptr: i64) {
+    mut max_abs := 0.0
+    mut i := 0
+    while i < 32 {
+        v := ptr_read_f32(src_f32_ptr, i)
+        abs_v := if v < 0.0 { 0.0 - v } else { v }
+        if abs_v > max_abs { max_abs = abs_v }
+        i += 1
+    }
+
+    scale := max_abs / 1.5
+    inv_scale := if max_abs > 0.000000001 { 1.0 / scale } else { 0.0 }
+    ptr_write_f32(dst_block_ptr, 0, scale)
+
+    i = 0
+    while i < 8 {
+        mut packed_byte := 0
+        mut k := 0
+        while k < 4 {
+            v := ptr_read_f32(src_f32_ptr, i * 4 + k) * inv_scale
+            mut q := 0
+            if v < -1.0      { q = 0 } // -1.5
+            else if v < 0.0  { q = 1 } // -0.5
+            else if v < 1.0  { q = 2 } // +0.5
+            else             { q = 3 } // +1.5
+            packed_byte = packed_byte | ((q & 3) << (k * 2))
+            k += 1
+        }
+        ptr_write_u8(dst_block_ptr, 4 + i, packed_byte)
+        i += 1
+    }
+}
+
+@no_alloc
+fn gemv_q2_0(act_f32_ptr: i64, q2_blocks_ptr: i64, num_blocks: i64) -> f64 {
+    mut total := 0.0
+    mut b := 0
+    while b < num_blocks {
+        block_addr := q2_blocks_ptr + b * 12
+        d := ptr_read_f32(block_addr, 0)
+        act_base := b * 32
+
+        mut block_sum := 0.0
+        mut i := 0
+        while i < 8 {
+            byte_val := ptr_read_u8(block_addr, 4 + i)
+            mut k := 0
+            while k < 4 {
+                q := (byte_val >> (k * 2)) & 3
+                mut w := 0.0
+                if q == 0      { w = -1.5 }
+                else if q == 1 { w = -0.5 }
+                else if q == 2 { w = 0.5 }
+                else           { w = 1.5 }
+                act := ptr_read_f32(act_f32_ptr, act_base + i * 4 + k)
+                block_sum = block_sum + act * w
+                k += 1
+            }
+            i += 1
+        }
+        total = total + d * block_sum
+        b += 1
+    }
+    return total
+}
+
+// --- 5. 1.58-Bit: BitNet b1.58 Ternary Weights {-1, 0, +1} ---
+// Multiplication-Free Matrix Engine!
+// Encoded in 2 bits per weight (4 weights per byte):
+//   00 = 0
+//   01 = +1
+//   10 = -1
+//   11 = reserved (treated as 0)
+// Block layout (12 bytes for 32 weights):
+//   [0..4]   float32 scale `d`
+//   [4..12]  8 bytes (32 ternary weights)
+
+@no_alloc
+fn quantize_bitnet_158_block(src_f32_ptr: i64, dst_block_ptr: i64) {
+    // Mean absolute scale: d = (1/N) * sum(|W|)
+    mut sum_abs := 0.0
+    mut i := 0
+    while i < 32 {
+        v := ptr_read_f32(src_f32_ptr, i)
+        abs_v := if v < 0.0 { 0.0 - v } else { v }
+        sum_abs = sum_abs + abs_v
+        i += 1
+    }
+    scale := sum_abs / 32.0
+    half_scale := scale * 0.5
+    ptr_write_f32(dst_block_ptr, 0, scale)
+
+    i = 0
+    while i < 8 {
+        mut packed := 0
+        mut k := 0
+        while k < 4 {
+            v := ptr_read_f32(src_f32_ptr, i * 4 + k)
+            mut code := 0
+            if v > half_scale {
+                code = 1 // +1
+            } else if v < (0.0 - half_scale) {
+                code = 2 // -1
+            } else {
+                code = 0 // 0
+            }
+            packed = packed | ((code & 3) << (k * 2))
+            k += 1
+        }
+        ptr_write_u8(dst_block_ptr, 4 + i, packed)
+        i += 1
+    }
+}
+
+// Multiplication-free GEMV: uses only ADD and SUB!
+@no_alloc
+fn gemv_bitnet_158(act_f32_ptr: i64, bitnet_blocks_ptr: i64, num_blocks: i64) -> f64 {
+    mut total := 0.0
+    mut b := 0
+    while b < num_blocks {
+        block_addr := bitnet_blocks_ptr + b * 12
+        d := ptr_read_f32(block_addr, 0)
+        act_base := b * 32
+
+        mut block_accum := 0.0
+        mut i := 0
+        while i < 8 {
+            byte_val := ptr_read_u8(block_addr, 4 + i)
+            mut k := 0
+            while k < 4 {
+                code := (byte_val >> (k * 2)) & 3
+                act := ptr_read_f32(act_f32_ptr, act_base + i * 4 + k)
+                if code == 1 {
+                    block_accum = block_accum + act
+                } else if code == 2 {
+                    block_accum = block_accum - act
+                }
+                k += 1
+            }
+            i += 1
+        }
+        // Multiply by scale only once per block of 32!
+        total = total + d * block_accum
+        b += 1
+    }
+    return total
+}
+
+// --- 6. 1-Bit: BNN / XNOR-Net Binary Weights {-1, +1} ---
+// Block layout (8 bytes for 32 weights):
+//   [0..4]  float32 scale `d`
+//   [4..8]  4 bytes (32 1-bit weights, bit 1 = +1, bit 0 = -1)
+
+@no_alloc
+fn quantize_bnn_1bit_block(src_f32_ptr: i64, dst_block_ptr: i64) {
+    mut sum_abs := 0.0
+    mut packed_bits := 0
+    mut i := 0
+    while i < 32 {
+        v := ptr_read_f32(src_f32_ptr, i)
+        if v >= 0.0 {
+            sum_abs = sum_abs + v
+            packed_bits = packed_bits | (1 << i)
+        } else {
+            sum_abs = sum_abs - v
+        }
+        i += 1
+    }
+    scale := sum_abs / 32.0
+    ptr_write_f32(dst_block_ptr, 0, scale)
+
+    ptr_write_u8(dst_block_ptr, 4, packed_bits & 0xFF)
+    ptr_write_u8(dst_block_ptr, 5, (packed_bits >> 8) & 0xFF)
+    ptr_write_u8(dst_block_ptr, 6, (packed_bits >> 16) & 0xFF)
+    ptr_write_u8(dst_block_ptr, 7, (packed_bits >> 24) & 0xFF)
+}
+
+// Binarize 32 float activations into a 32-bit bitmask (bit 1 if >= 0, bit 0 if < 0)
+@no_alloc
+fn binarize_act32(act_f32_ptr: i64, start_idx: i64) -> i64 {
+    mut bits := 0
+    mut i := 0
+    while i < 32 {
+        if ptr_read_f32(act_f32_ptr, start_idx + i) >= 0.0 {
+            bits = bits | (1 << i)
+        }
+        i += 1
+    }
+    return bits
+}
+
+// Ultra-fast 1-bit GEMV: POPCOUNT(XNOR(A, W)) * scale
+@no_alloc
+fn gemv_bnn_1bit(act_f32_ptr: i64, bnn_blocks_ptr: i64, num_blocks: i64) -> f64 {
+    mut total := 0.0
+    mut b := 0
+    while b < num_blocks {
+        block_addr := bnn_blocks_ptr + b * 8
+        d := ptr_read_f32(block_addr, 0)
+        
+        // Read 32-bit packed weight bits
+        w0 := ptr_read_u8(block_addr, 4)
+        w1 := ptr_read_u8(block_addr, 5)
+        w2 := ptr_read_u8(block_addr, 6)
+        w3 := ptr_read_u8(block_addr, 7)
+        w_bits := w0 | (w1 << 8) | (w2 << 16) | (w3 << 24)
+
+        act_bits := binarize_act32(act_f32_ptr, b * 32)
+        
+        // 32-bit XNOR: matching bits are 1
+        xnor_bits := ((act_bits ^ w_bits) ^ 0xFFFFFFFF) & 0xFFFFFFFF
+        
+        // Count matching bits (popcount on 32-bit)
+        mut v := xnor_bits
+        v = v - ((v >> 1) & 0x55555555)
+        v = (v & 0x33333333) + ((v >> 2) & 0x33333333)
+        v = (v + (v >> 4)) & 0x0F0F0F0F
+        pop := (v *% 0x01010101) >> 24
+        matching := pop & 0x3F
+
+        // Dot product: matching (+1) - mismatched (-1) = 2 * matching - 32
+        dot := (2 * matching - 32) as f64
+        total = total + d * dot
+        b += 1
+    }
+    return total
+}
