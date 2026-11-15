@@ -1,0 +1,440 @@
+use std::ui_signal
+use std::html
+use std::tiktoken
+use std::faiss
+use std::quant
+use std::safetensors
+use std::torch
+use std::llama
+use std::vllm
+use std::onnx
+use std::sklearn
+use std::numpy
+use std::transformers
+use std::iot
+use std::ai_math
+use std::os
+
+fn st_expect_parse_err(raw: ByteBuf) -> bool {
+    st := safetensors_parse_buffer(raw) or return true
+    safetensors_free(move st)
+    return false
+}
+
+@test fn test_ui_signal_bindings_and_growth() -> i64 {
+    mut g := signal_graph_new()
+    html_src := "<div id=\"wrap\" class=\"@reactive(cls_sig)\"><span id=\"pair\">{a}-{b}</span><em id=\"dbl\">{{x}}</em><p id=\"flag\" style=\"color: @reactive(col_sig)\">flag</p></div>"
+    mut tree := html_parse(html_src) or return 1
+
+    wired := signal_compile_template(mut g, tree)
+    if wired < 5 { return 2 }
+
+    // bind extra boolean signal with prefix/suffix and class/style check
+    s_on := signal_register_bool(mut g, "is_on", false)
+    wrap_idx := dom_find_by_id(tree, "wrap")
+    _ := signal_bind_node(mut g, s_on, wrap_idx, signal_target_text(), "State=", "!")
+
+    // signal_get_str after signal_set_int & signal_set_bool
+    _ := signal_set_int(mut g, mut tree, "a", 7)
+    if not str_eq(signal_get_str(g, "a"), "7") { return 3 }
+
+    _ := signal_set_bool(mut g, mut tree, "is_on", true)
+    if not str_eq(signal_get_str(g, "is_on"), "true") { return 4 }
+    if not str_eq(dom_get_text(tree, wrap_idx), "State=true!") { return 5 }
+
+    // Multi-placeholder template {a}-{b}
+    _ := signal_set_str(mut g, mut tree, "b", "nine")
+    pair_idx := dom_find_by_id(tree, "pair")
+    if not str_eq(dom_get_text(tree, pair_idx), "7-nine") { return 6 }
+
+    // Double brace {{x}} and style binding
+    _ := signal_set_str(mut g, mut tree, "x", "ready")
+    dbl_idx := dom_find_by_id(tree, "dbl")
+    if not str_eq(dom_get_text(tree, dbl_idx), "ready") { return 7 }
+
+    _ := signal_set_str(mut g, mut tree, "cls_sig", "card active")
+    if not str_eq(dom_get_class(tree, wrap_idx), "card active") { return 8 }
+
+    // Stress 3000 overwrites + growth to verify values_buf compaction and table resize
+    mut i := 0
+    while i < 3000 {
+        _ := signal_set_int(mut g, mut tree, "a", i)
+        i += 1
+    }
+    if not str_eq(dom_get_text(tree, pair_idx), "2999-nine") { return 9 }
+
+    dom_tree_free(move tree)
+    signal_graph_free(move g)
+    return 0
+}
+
+@test fn test_tiktoken_bpe_merges_and_decode() -> i64 {
+    mut v := tiktoken_vocab_new(64)
+    tiktoken_add_token(mut v, "a", 0)
+    tiktoken_add_token(mut v, "b", 1)
+    tiktoken_add_token(mut v, "c", 2)
+    tiktoken_add_token(mut v, "ab", 10)
+    tiktoken_add_token(mut v, "abc", 4200) // arbitrary rank > table capacity
+
+    enc := tiktoken_encode(v, "abc a")
+    if ibuf_len(enc) != 3 {
+        buf_free(move enc)
+        tiktoken_vocab_free(move v)
+        return 1
+    }
+    if ibuf_get(enc, 0) != 4200 or ibuf_get(enc, 1) != 32 or ibuf_get(enc, 2) != 0 {
+        buf_free(move enc)
+        tiktoken_vocab_free(move v)
+        return 2
+    }
+
+    dec := tiktoken_decode(v, enc)
+    buf_free(move enc)
+    tiktoken_vocab_free(move v)
+    if not str_eq(dec, "abc a") { return 3 }
+    return 0
+}
+
+@test fn test_faiss_topk_and_empty() -> i64 {
+    mut idx := faiss_index_flat_new(2, faiss_metric_l2(), 4)
+    q := mem_alloc_aligned(16)
+    ptr_write_f32(q, 0, 0.0)
+    ptr_write_f32(q, 1, 0.0)
+
+    // Empty index must return 0 results
+    empty_res := faiss_search_flat(idx, q, 3)
+    if ibuf_len(empty_res.indices) != 0 {
+        buf_free(move empty_res.indices)
+        mem_free_aligned(q)
+        faiss_index_flat_free(move idx)
+        return 1
+    }
+    buf_free(move empty_res.indices)
+
+    // Add 5 vectors: (0,0), (4,0), (1,0), (3,0), (2,0)
+    v := mem_alloc_aligned(16)
+    ptr_write_f32(v, 0, 0.0)
+    ptr_write_f32(v, 1, 0.0)
+    _ := faiss_index_flat_add(mut idx, v)
+    ptr_write_f32(v, 0, 4.0)
+    _ := faiss_index_flat_add(mut idx, v)
+    ptr_write_f32(v, 0, 1.0)
+    _ := faiss_index_flat_add(mut idx, v)
+    ptr_write_f32(v, 0, 3.0)
+    _ := faiss_index_flat_add(mut idx, v)
+    ptr_write_f32(v, 0, 2.0)
+    _ := faiss_index_flat_add(mut idx, v)
+
+    res := faiss_search_flat(idx, q, 3)
+    ok := ibuf_len(res.indices) == 3 and ibuf_get(res.indices, 0) == 0 and ibuf_get(res.indices, 1) == 2 and ibuf_get(res.indices, 2) == 4
+    buf_free(move res.indices)
+    mem_free_aligned(v)
+    mem_free_aligned(q)
+    faiss_index_flat_free(move idx)
+    if not ok { return 2 }
+    return 0
+}
+
+@test fn test_quant_fp16_q8_nf4() -> i64 {
+    scratch := mem_alloc_aligned(64)
+    // Mantissa carry-out: 1.9999 in FP16 rounds to 2.0 (0x4000)
+    h := f32_to_fp16(scratch, 1.9999)
+    if h != 0x4000 {
+        mem_free_aligned(scratch)
+        return 1
+    }
+    f_back := fp16_to_f32(scratch, h)
+    if f_back < 1.99 or f_back > 2.01 {
+        mem_free_aligned(scratch)
+        return 2
+    }
+
+    // Q8_0 symmetric negative rounding (-1.0 -> -127, i.e. 129 unsigned)
+    src := mem_alloc_aligned(128)
+    act := mem_alloc_aligned(128)
+    mut i := 0
+    while i < 32 {
+        ptr_write_f32(src, i, 0.0)
+        ptr_write_f32(act, i, 1.0)
+        i += 1
+    }
+    ptr_write_f32(src, 0, 1.0)
+    ptr_write_f32(src, 1, -1.0)
+    q8_blk := mem_alloc_aligned(64)
+    quantize_q8_0_block(src, q8_blk, scratch)
+    b0 := ptr_read_u8(q8_blk, 4)
+    b1 := ptr_read_u8(q8_blk, 5)
+    if b0 != 127 or b1 != 129 {
+        mem_free_aligned(scratch)
+        mem_free_aligned(src)
+        mem_free_aligned(act)
+        mem_free_aligned(q8_blk)
+        return 3
+    }
+
+    // NF4 quantize + gemv roundtrip
+    i = 0
+    while i < 32 {
+        ptr_write_f32(src, i, 0.5)
+        ptr_write_f32(act, i, 2.0)
+        i += 1
+    }
+    nf4_blk := mem_alloc_aligned(64)
+    quantize_nf4_block(src, nf4_blk)
+    dot := gemv_nf4(act, nf4_blk, 1)
+
+    mem_free_aligned(scratch)
+    mem_free_aligned(src)
+    mem_free_aligned(act)
+    mem_free_aligned(q8_blk)
+    mem_free_aligned(nf4_blk)
+    // 32 * 0.5 * 2.0 = 32.0
+    if dot < 31.0 or dot > 33.0 { return 4 }
+    return 0
+}
+
+@test fn test_safetensors_bounds_and_roundtrip() -> i64 {
+    // Crafted huge header_len must fail safely
+    bad := buf_new(16)
+    mut i := 0
+    while i < 7 {
+        buf_push(bad, 0xFF)
+        i += 1
+    }
+    buf_push(bad, 0x7F)
+    buf_push(bad, 0x7B)
+    rejected := st_expect_parse_err(bad)
+    buf_free(move bad)
+    if not rejected { return 1 }
+
+    // Roundtrip serialize -> parse -> get_tensor
+    arr := np_zeros(1, 2)
+    np_set(arr, 0, 0, 1.5)
+    np_set(arr, 0, 1, -2.25)
+    raw := safetensors_serialize("w", arr)
+    np_free(move arr)
+
+    st := safetensors_parse_buffer(raw) or return 2
+    got := safetensors_get_tensor(st, "w", 1, 2) or return 3
+    v0 := np_get(got, 0, 0)
+    v1 := np_get(got, 0, 1)
+    np_free(move got)
+    safetensors_free(move st)
+    buf_free(move raw)
+
+    if v0 < 1.49 or v0 > 1.51 { return 4 }
+    if v1 > -2.24 or v1 < -2.26 { return 5 }
+    return 0
+}
+
+@test fn test_torch_autograd_and_adamw() -> i64 {
+    layer := torch_linear_new(2, 1)
+    np_set(layer.weight.data, 0, 0, 0.1)
+    np_set(layer.weight.data, 1, 0, -0.1)
+
+    mut opt := optim_adamw_new(2, 0.1, 0.9, 0.999, 0.01)
+    inp := tensor_new(1, 2, false)
+    np_set(inp.data, 0, 0, 1.0)
+    np_set(inp.data, 0, 1, 2.0)
+    tgt := tensor_new(1, 1, false)
+    np_set(tgt.data, 0, 0, 3.0)
+
+    mut init_loss := 0.0
+    mut last_loss := 0.0
+    mut step := 0
+    while step < 20 {
+        tensor_zero_grad(layer.weight)
+        tensor_zero_grad(layer.bias)
+        pred := torch_linear_forward(layer, inp)
+        mut loss_t := tensor_new(1, 1, true)
+        loss_val := nn_mse_loss(pred, tgt, mut loss_t)
+        if step == 0 { init_loss = loss_val }
+        last_loss = loss_val
+        torch_linear_backward(layer, inp, loss_t)
+        optim_adamw_step(mut opt, layer.weight, 0)
+        tensor_free(move loss_t)
+        tensor_free(move pred)
+        step += 1
+    }
+
+    // Invalid cross entropy class guard
+    logits := tensor_new(1, 4, true)
+    mut ce_t := tensor_new(1, 1, true)
+    ce_bad := nn_cross_entropy_loss(logits, 99, mut ce_t)
+    tensor_free(move logits)
+    tensor_free(move ce_t)
+    tensor_free(move inp)
+    tensor_free(move tgt)
+    tensor_free(move layer.weight)
+    tensor_free(move layer.bias)
+    mem_free_aligned(opt.m_ptr)
+    mem_free_aligned(opt.v_ptr)
+
+    if last_loss >= init_loss { return 1 }
+    if ce_bad != 0.0 { return 2 }
+    return 0
+}
+
+@test fn test_llama_rope_theta_and_top_p() -> i64 {
+    // RoPE with theta_base = 500000.0, head_dim = 4, pos = 3
+    v := mem_alloc_aligned(32)
+    ptr_write_f32(v, 0, 1.0)
+    ptr_write_f32(v, 1, 0.0)
+    ptr_write_f32(v, 2, 1.0)
+    ptr_write_f32(v, 3, 0.0)
+
+    llama_apply_rope(v, 3, 4, 500000.0)
+    // pair i=2: exponent 2/4=0.5, freq = 500000^-0.5 = 1/sqrt(500000), angle = 3 * freq
+    expected_angle := 3.0 / sqrt_f64(500000.0)
+    v2 := ptr_read_f32(v, 2)
+    v3 := ptr_read_f32(v, 3)
+    mem_free_aligned(v)
+
+    diff_cos := if v2 >= cos_f64(expected_angle) { v2 - cos_f64(expected_angle) } else { cos_f64(expected_angle) - v2 }
+    diff_sin := if v3 >= sin_f64(expected_angle) { v3 - sin_f64(expected_angle) } else { sin_f64(expected_angle) - v3 }
+    if diff_cos > 0.001 or diff_sin > 0.001 { return 1 }
+
+    // Top-p sampling must return dominant index 5 even when not at index 0
+    logits := mem_alloc_aligned(64)
+    mut i := 0
+    while i < 8 {
+        ptr_write_f32(logits, i, -10.0)
+        i += 1
+    }
+    ptr_write_f32(logits, 5, 10.0)
+    tok := llama_sample_top_p(logits, 8, 0.5, 0.5, 0.42)
+    mem_free_aligned(logits)
+    if tok != 5 { return 2 }
+    return 0
+}
+
+@test fn test_vllm_prompt_len_and_double_free() -> i64 {
+    mut eng := vllm_engine_new(4, 8)
+    initial_free := eng.block_table.free_count
+
+    // Double free guard on a single block
+    blk := vllm_alloc_block(mut eng.block_table)
+    if blk < 0 {
+        vllm_engine_free(move eng)
+        return 1
+    }
+    vllm_free_block(mut eng.block_table, blk)
+    vllm_free_block(mut eng.block_table, blk) // must be a no-op!
+    if eng.block_table.free_count != initial_free {
+        vllm_engine_free(move eng)
+        return 2
+    }
+
+    // Request initialized with prompt_len = 5 appends 20 tokens across block size 16
+    mut req := vllm_request_new(1, 5, 40)
+    k := mem_alloc_aligned(256)
+    v := mem_alloc_aligned(256)
+    mut i := 0
+    while i < 20 {
+        ok := vllm_request_append_token(mut eng, mut req, k, v)
+        if not ok {
+            mem_free_aligned(k)
+            mem_free_aligned(v)
+            vllm_request_free_blocks(mut eng, mut req)
+            buf_free(move req.logical_to_physical)
+            vllm_engine_free(move eng)
+            return 3
+        }
+        i += 1
+    }
+    mem_free_aligned(k)
+    mem_free_aligned(v)
+    vllm_request_free_blocks(mut eng, mut req)
+    buf_free(move req.logical_to_physical)
+    vllm_engine_free(move eng)
+    return 0
+}
+
+@test fn test_onnx_gemm_bias_and_clip() -> i64 {
+    mut sess := onnx_session_new(16)
+    a := np_zeros(1, 2)
+    np_set(a, 0, 0, 2.0)
+    np_set(a, 0, 1, 3.0)
+    b := np_zeros(2, 1)
+    np_set(b, 0, 0, 4.0)
+    np_set(b, 1, 0, 5.0)
+    bias := np_zeros(1, 1)
+    np_set(bias, 0, 0, 10.0) // 2*4 + 3*5 + 10 = 33 -> clip [0,6] -> 6.0
+
+    onnx_set_tensor_slot(sess, 1, b)
+    onnx_set_tensor_slot(sess, 2, bias)
+    onnx_add_node(mut sess, onnx_op_gemm(), 0, 1, 2)
+    onnx_add_node(mut sess, onnx_op_clip(), 2, 0, 3)
+
+    out := onnx_session_run(mut sess, 0, a, 3)
+    res := np_get(out, 0, 0)
+
+    onnx_session_free(move sess)
+    np_free(move a)
+    np_free(move b)
+    np_free(move bias)
+
+    if res < 5.99 or res > 6.01 { return 1 }
+    return 0
+}
+
+@test fn test_sklearn_numpy_transformers_iot() -> i64 {
+    // 1. np_reshape & np_matmul bounds guards
+    mut arr := np_zeros(2, 2)
+    if np_reshape(mut arr, -1, 0) { return 1 }
+    b_bad := np_zeros(3, 1)
+    bad_mm := np_matmul(arr, b_bad)
+    np_free(move b_bad)
+    np_free(move arr)
+    if bad_mm.size != 0 { return 2 }
+
+    // 2. Batch LinearRegression with 2 features: y = 2*x0 - 3*x1 + 1
+    x := np_zeros(4, 2)
+    y := np_zeros(4, 1)
+    np_set(x, 0, 0, 1.0)
+    np_set(x, 0, 1, 0.0)
+    np_set_1d(y, 0, 3.0)
+    np_set(x, 1, 0, 0.0)
+    np_set(x, 1, 1, 1.0)
+    np_set_1d(y, 1, -2.0)
+    np_set(x, 2, 0, 1.0)
+    np_set(x, 2, 1, 1.0)
+    np_set_1d(y, 2, 0.0)
+    np_set(x, 3, 0, 2.0)
+    np_set(x, 3, 1, 1.0)
+    np_set_1d(y, 3, 2.0)
+
+    mut lin := sklearn_linear_regression_new(2)
+    sklearn_linear_regression_fit(mut lin, x, y, 0.1, 200)
+    w0 := np_get_1d(lin.weights, 0)
+    w1 := np_get_1d(lin.weights, 1)
+    sklearn_linear_regression_free(move lin)
+    np_free(move x)
+    np_free(move y)
+    if w0 < 1.8 or w0 > 2.2 or w1 > -2.8 or w1 < -3.2 { return 3 }
+
+    // 3. StandardScaler empty matrix guard
+    empty_x := np_zeros(0, 2)
+    scaler := sklearn_standard_scaler_fit(empty_x)
+    std0 := np_get_1d(scaler.std, 0)
+    sklearn_standard_scaler_free(move scaler)
+    np_free(move empty_x)
+    if std0 != 1.0 { return 4 }
+
+    // 4. Empty prompt pipeline_text_generation must not crash OOB
+    cfg := TransformerConfig(vocab_size = 16, hidden_size = 8, num_layers = 1, num_heads = 1, num_kv_heads = 1, intermediate_size = 16, max_seq_len = 8)
+    lm := causal_lm_new(cfg)
+    mut tok_v := tiktoken_vocab_new(32)
+    tiktoken_add_token(mut tok_v, "a", 0)
+    gen_empty := pipeline_text_generation(lm, tok_v, "", 0, 0.7, 0.9)
+    tiktoken_vocab_free(move tok_v)
+    causal_lm_free(move lm)
+    if not str_eq(gen_empty, "") { return 5 }
+
+    // 5. IoT guards: div-by-zero checks
+    bad_pwm := pwm_new(0, 1, 0)
+    if bad_pwm.period_ticks != 0 { return 6 }
+    bad_adc := adc_new(0, 3300, 0)
+    if adc_read_millivolts(bad_adc, 0) != 0 { return 7 }
+    return 0
+}

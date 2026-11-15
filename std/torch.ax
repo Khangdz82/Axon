@@ -1,12 +1,10 @@
-// Axon PyTorch & Tinygrad Reimplementation (`std/torch.ax`)
-// 100% Pure Axon: Zero Python, Zero C++, Zero LibTorch, Zero-GC (@no_alloc).
+// Axon PyTorch-Style Tensor & Autograd Module (`std/torch.ax`)
+// 100% Pure Axon: Zero Python, Zero C++, Zero LibTorch.
 // Implements:
-//   - Autograd Dynamic Computational Graph Tape (`Tensor` + `backward()`)
-//   - Forward & Backward Kernels: Add, Mul, MatMul, ReLU, GELU, Sigmoid
-//   - Deep Learning Layers (`nn.Module`): Linear, LayerNorm, Conv1d
-//   - Loss Functions: MSELoss, CrossEntropyLoss, BCEWithLogitsLoss
-//   - Production Optimizers: AdamW (with decoupled weight decay), Lion, SGD+Momentum
-//   - Full Training Loop: zero_grad, backward, step
+//   - Tensor containers with gradient storage & explicit backward step kernels
+//   - Ops: Add, Mul, MatMul, ReLU, Linear layer forward/backward
+//   - Losses: MSELoss, CrossEntropyLoss
+//   - Optimizers: SGD+Momentum, AdamW (bias-corrected decoupled weight decay)
 
 use std::numpy
 use std::ai_math
@@ -250,23 +248,64 @@ fn torch_linear_new(in_features: i64, out_features: i64) -> TorchLinear {
     )
 }
 
+fn tensor_free(move t: Tensor) {
+    np_free(move t.data)
+    np_free(move t.grad)
+}
+
 fn torch_linear_forward(layer: TorchLinear, input: Tensor) -> Tensor {
-    // Y = X * W
-    mm := torch_matmul(input, layer.weight)
-    // Add bias
-    out := np_zeros(mm.data.rows, mm.data.cols)
+    // Y = X * W + b (fused without leaking intermediate mm Tensor)
+    mm := np_matmul(input.data, layer.weight.data)
     mut r := 0
-    while r < mm.data.rows {
+    while r < mm.rows {
         mut c := 0
-        while c < mm.data.cols {
-            v := np_get(mm.data, r, c)
+        while c < mm.cols {
+            v := np_get(mm, r, c)
             bias_val := np_get(layer.bias.data, 0, c)
-            np_set(out, r, c, v + bias_val)
+            np_set(mm, r, c, v + bias_val)
             c += 1
         }
         r += 1
     }
-    return tensor_from_array(out, input.requires_grad or layer.weight.requires_grad)
+    req := input.requires_grad or layer.weight.requires_grad or layer.bias.requires_grad
+    t := tensor_from_array(mm, req)
+    return Tensor(
+        data = t.data,
+        grad = t.grad,
+        requires_grad = req,
+        op_code = op_matmul(),
+        src_a_ptr = input.data.data_ptr,
+        src_b_ptr = layer.weight.data.data_ptr
+    )
+}
+
+@no_alloc
+fn torch_linear_backward(layer: TorchLinear, input: Tensor, out_grad: Tensor) {
+    m := input.data.rows
+    k := input.data.cols
+    n := layer.weight.data.cols
+    tensor_backward_step_matmul(
+        out_grad.grad.data_ptr,
+        input.data.data_ptr,
+        input.grad.data_ptr,
+        layer.weight.data.data_ptr,
+        layer.weight.grad.data_ptr,
+        m, k, n
+    )
+    if layer.bias.requires_grad {
+        mut c := 0
+        while c < n {
+            mut sb := 0.0
+            mut r := 0
+            while r < m {
+                sb = sb + ptr_read_f32(out_grad.grad.data_ptr, r * n + c)
+                r += 1
+            }
+            old_bg := ptr_read_f32(layer.bias.grad.data_ptr, c)
+            ptr_write_f32(layer.bias.grad.data_ptr, c, old_bg + sb)
+            c += 1
+        }
+    }
 }
 
 // --- 5. Loss Functions ---
@@ -300,6 +339,9 @@ fn nn_mse_loss(pred: Tensor, target: Tensor, mut loss_tensor: Tensor) -> f64 {
 @no_alloc
 fn nn_cross_entropy_loss(logits: Tensor, target_class: i64, mut loss_tensor: Tensor) -> f64 {
     n := logits.data.cols
+    if n <= 0 or target_class < 0 or target_class >= n {
+        return 0.0
+    }
     // 1. Find max for numerical stability
     mut max_val := ptr_read_f32(logits.data.data_ptr, 0)
     mut i := 1
@@ -410,12 +452,25 @@ fn optim_adamw_new(total_params: i64, lr: f64 = 0.001, beta1: f64 = 0.9, beta2: 
 }
 
 @no_alloc
+fn torch_pow_i64(base: f64, exp: i64) -> f64 {
+    mut res := 1.0
+    mut i := 0
+    while i < exp {
+        res = res * base
+        i += 1
+    }
+    return res
+}
+
+@no_alloc
 fn optim_adamw_step(mut opt: AdamWOptimizer, param: Tensor, param_offset: i64) {
     opt.step_count = opt.step_count + 1
-    t := opt.step_count as f64
-    bias_correction1 := 1.0 - pow2_i64_f64((t * -0.152) as i64) // approx 1 - beta1^t
-    bias_correction2 := 1.0 - pow2_i64_f64((t * -0.0014) as i64) // approx 1 - beta2^t
-    step_size := opt.lr * (sqrt_f64(bias_correction2) / (if bias_correction1 > 0.0001 { bias_correction1 } else { 0.0001 }))
+    b1_t := torch_pow_i64(opt.beta1, opt.step_count)
+    b2_t := torch_pow_i64(opt.beta2, opt.step_count)
+    bias_correction1 := 1.0 - b1_t
+    bias_correction2 := 1.0 - b2_t
+    bc1 := if bias_correction1 > 0.000000001 { bias_correction1 } else { 0.000000001 }
+    step_size := opt.lr * (sqrt_f64(bias_correction2) / bc1)
 
     mut i := 0
     while i < param.data.size {
@@ -433,8 +488,8 @@ fn optim_adamw_step(mut opt: AdamWOptimizer, param: Tensor, param_offset: i64) {
         ptr_write_f32(opt.v_ptr, idx, new_v)
 
         denom := sqrt_f64(new_v) + opt.eps
-        upd := (new_m / denom) + opt.weight_decay * w
-        ptr_write_f32(param.data.data_ptr, i, w - opt.lr * upd)
+        decoupled_wd := opt.lr * opt.weight_decay * w
+        ptr_write_f32(param.data.data_ptr, i, w - step_size * (new_m / denom) - decoupled_wd)
         i += 1
     }
 }

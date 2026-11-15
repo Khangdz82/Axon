@@ -78,7 +78,8 @@ fn vllm_share_block(bt: VllmBlockTable, blk_id: i64) {
 fn vllm_free_block(mut bt: VllmBlockTable, blk_id: i64) {
     if blk_id < 0 or blk_id >= bt.max_blocks { return }
     cur := ptr_read_i64(bt.ref_counts_ptr, blk_id)
-    if cur <= 1 {
+    if cur <= 0 { return } // Already free: prevent double-push corruption
+    if cur == 1 {
         ptr_write_i64(bt.ref_counts_ptr, blk_id, 0)
         if bt.free_count < ibuf_len(bt.free_list_buf) {
             ibuf_set(bt.free_list_buf, bt.free_count, blk_id)
@@ -120,6 +121,7 @@ struct VllmRequest {
     tokens_generated: i64
     is_finished: bool
     logical_to_physical: IntBuf // block table: logical block -> physical block ID
+    ltp_cap: i64
 }
 
 fn vllm_request_new(req_id: i64, prompt_len: i64, max_tokens: i64) -> VllmRequest {
@@ -129,7 +131,8 @@ fn vllm_request_new(req_id: i64, prompt_len: i64, max_tokens: i64) -> VllmReques
         max_tokens = max_tokens,
         tokens_generated = 0,
         is_finished = false,
-        logical_to_physical = ibuf_new(16)
+        logical_to_physical = ibuf_new(64),
+        ltp_cap = 64
     )
 }
 
@@ -148,25 +151,33 @@ fn vllm_engine_new(max_slots: i64 = 8, total_blocks: i64 = 256) -> VllmEngine {
     )
 }
 
-// Allocate next block for request if sequence token crosses block boundary
-@no_alloc
+// Allocate blocks as needed (handles both prompt_len > 0 prefill and incremental boundaries)
 fn vllm_request_append_token(mut engine: VllmEngine, mut req: VllmRequest, k_ptr: i64, v_ptr: i64) -> bool {
     total_tokens := req.prompt_len + req.tokens_generated
     token_in_block := total_tokens % engine.block_table.block_size_tokens
     logical_block := total_tokens / engine.block_table.block_size_tokens
 
-    mut phys_blk := 0
-    if token_in_block == 0 {
-        // Allocate a new physical block for this logical boundary
+    while ibuf_len(req.logical_to_physical) <= logical_block {
         new_blk := vllm_alloc_block(mut engine.block_table)
         if new_blk < 0 {
             return false // Out of memory
         }
+        if ibuf_len(req.logical_to_physical) >= req.ltp_cap {
+            ncap := req.ltp_cap * 2
+            nb := ibuf_new(ncap)
+            cur_n := ibuf_len(req.logical_to_physical)
+            mut bi := 0
+            while bi < cur_n {
+                ibuf_push(nb, ibuf_get(req.logical_to_physical, bi))
+                bi += 1
+            }
+            buf_free(move req.logical_to_physical)
+            req.logical_to_physical = nb
+            req.ltp_cap = ncap
+        }
         ibuf_push(req.logical_to_physical, new_blk)
-        phys_blk = new_blk
-    } else {
-        phys_blk = ibuf_get(req.logical_to_physical, logical_block)
     }
+    phys_blk := ibuf_get(req.logical_to_physical, logical_block)
 
     vllm_paged_kv_write(engine.block_table, phys_blk, token_in_block, k_ptr, v_ptr)
     req.tokens_generated = req.tokens_generated + 1

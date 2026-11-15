@@ -30,7 +30,7 @@ fn signal_val_bool() -> i64 { return 3 }
 //   6: version (mutation counter for O(1) change detection)
 //   7: binding_head (index of first binding in linked list, or -1)
 //
-// bindings: 10 slots per binding
+// bindings: 12 slots per binding
 //   0: signal_idx
 //   1: node_idx (exact index in DomTree.nodes)
 //   2: target_type (1: text, 2: class, 3: style, 4: attr)
@@ -39,13 +39,19 @@ fn signal_val_bool() -> i64 { return 3 }
 //   7: next_binding (next binding index in linked list, or -1)
 //   8: clear_bg (ARGB color for dirty-rect canvas erase, default 0xFF0F172A)
 //   9: dirty (1 if modified and needs canvas repaint, 0 if clean)
+//  10: full_tmpl_off in templates_buf, 11: full_tmpl_len (-1 for fast single-slot path)
 
 struct SignalGraph {
     signals: IntBuf
+    sig_cap: i64
     names_buf: ByteBuf
+    names_cap: i64
     values_buf: ByteBuf
+    vals_cap: i64
     bindings: IntBuf
+    bind_cap: i64
     templates_buf: ByteBuf
+    tmpl_cap: i64
     signal_count: i64
     binding_count: i64
 }
@@ -53,18 +59,171 @@ struct SignalGraph {
 fn signal_graph_new() -> SignalGraph {
     sb := ibuf_new(1024)
     nb := buf_new(16384)
-    vb := buf_new(262144)
-    bb := ibuf_new(2048)
+    vb := buf_new(65536)
+    bb := ibuf_new(2400)
     tb := buf_new(65536)
     return SignalGraph(
         signals = sb,
+        sig_cap = 1024,
         names_buf = nb,
+        names_cap = 16384,
         values_buf = vb,
+        vals_cap = 65536,
         bindings = bb,
+        bind_cap = 2400,
         templates_buf = tb,
+        tmpl_cap = 65536,
         signal_count = 0,
         binding_count = 0
     )
+}
+
+fn signal_graph_free(move g: SignalGraph) {
+    buf_free(move g.signals)
+    buf_free(move g.names_buf)
+    buf_free(move g.values_buf)
+    buf_free(move g.bindings)
+    buf_free(move g.templates_buf)
+}
+
+fn sig_grow_ibuf(src: IntBuf, min_cap: i64) -> IntBuf {
+    new_b := ibuf_new(min_cap)
+    n := ibuf_len(src)
+    mut i := 0
+    while i < n {
+        ibuf_push(new_b, ibuf_get(src, i))
+        i += 1
+    }
+    return new_b
+}
+
+fn sig_grow_bbuf(src: ByteBuf, min_cap: i64) -> ByteBuf {
+    new_b := buf_new(min_cap)
+    n := buf_len(src)
+    mut i := 0
+    while i < n {
+        buf_push(new_b, buf_get(src, i))
+        i += 1
+    }
+    return new_b
+}
+
+fn sig_ensure_names_space(mut g: SignalGraph, add_len: i64) {
+    if buf_len(g.names_buf) + add_len <= g.names_cap { return }
+    mut nc := g.names_cap * 2
+    while nc < buf_len(g.names_buf) + add_len { nc = nc * 2 }
+    nb := sig_grow_bbuf(g.names_buf, nc)
+    buf_free(move g.names_buf)
+    g.names_buf = nb
+    g.names_cap = nc
+}
+
+fn sig_ensure_tmpl_space(mut g: SignalGraph, add_len: i64) {
+    if buf_len(g.templates_buf) + add_len <= g.tmpl_cap { return }
+    mut nc := g.tmpl_cap * 2
+    while nc < buf_len(g.templates_buf) + add_len { nc = nc * 2 }
+    nb := sig_grow_bbuf(g.templates_buf, nc)
+    buf_free(move g.templates_buf)
+    g.templates_buf = nb
+    g.tmpl_cap = nc
+}
+
+fn sig_ensure_signals_space(mut g: SignalGraph, add_slots: i64) {
+    if ibuf_len(g.signals) + add_slots <= g.sig_cap { return }
+    nc := g.sig_cap * 2
+    nb := sig_grow_ibuf(g.signals, nc)
+    buf_free(move g.signals)
+    g.signals = nb
+    g.sig_cap = nc
+}
+
+fn sig_ensure_bindings_space(mut g: SignalGraph, add_slots: i64) {
+    if ibuf_len(g.bindings) + add_slots <= g.bind_cap { return }
+    nc := g.bind_cap * 2
+    nb := sig_grow_ibuf(g.bindings, nc)
+    buf_free(move g.bindings)
+    g.bindings = nb
+    g.bind_cap = nc
+}
+
+fn sig_compact_values_buf(mut g: SignalGraph, add_len: i64) {
+    mut live := 0
+    mut i := 0
+    while i < g.signal_count {
+        ln := ibuf_get(g.signals, i * 8 + 5)
+        if ln > 0 { live += ln }
+        i += 1
+    }
+    needed := live + add_len
+    mut nc := g.vals_cap
+    if nc < 65536 { nc = 65536 }
+    if needed * 2 > nc {
+        while nc < needed * 2 { nc = nc * 2 }
+    }
+    vb := buf_new(nc)
+    i = 0
+    while i < g.signal_count {
+        base := i * 8
+        off := ibuf_get(g.signals, base + 4)
+        ln := ibuf_get(g.signals, base + 5)
+        if ln > 0 {
+            new_off := buf_len(vb)
+            mut k := 0
+            while k < ln {
+                buf_push(vb, buf_get(g.values_buf, off + k))
+                k += 1
+            }
+            ibuf_set(g.signals, base + 4, new_off)
+        } else {
+            ibuf_set(g.signals, base + 4, 0)
+        }
+        i += 1
+    }
+    buf_free(move g.values_buf)
+    g.values_buf = vb
+    g.vals_cap = nc
+}
+
+fn sig_store_value_str(mut g: SignalGraph, sig_idx: i64, val: str) {
+    base := sig_idx * 8
+    cur_off := ibuf_get(g.signals, base + 4)
+    cur_len := ibuf_get(g.signals, base + 5)
+    v_len := str_len(val)
+
+    // In-place overwrite when fitting in existing live slot
+    if cur_off >= 0 and v_len <= cur_len and v_len > 0 {
+        mut vi := 0
+        while vi < v_len {
+            buf_set(g.values_buf, cur_off + vi, str_byte(val, vi))
+            vi += 1
+        }
+        ibuf_set(g.signals, base + 5, v_len)
+        return
+    }
+
+    mut src := val
+    if buf_len(g.values_buf) + v_len > g.vals_cap {
+        src = "" + val
+        ibuf_set(g.signals, base + 4, 0)
+        ibuf_set(g.signals, base + 5, 0)
+        if v_len == 0 { return }
+        sig_compact_values_buf(mut g, v_len)
+    } else {
+        if v_len == 0 {
+            ibuf_set(g.signals, base + 4, 0)
+            ibuf_set(g.signals, base + 5, 0)
+            return
+        }
+    }
+
+    v_off := buf_len(g.values_buf)
+    mut vi := 0
+    while vi < v_len {
+        buf_push(g.values_buf, str_byte(src, vi))
+        vi += 1
+    }
+    ibuf_set(g.signals, base + 4, v_off)
+    ibuf_set(g.signals, base + 5, v_len)
 }
 
 fn signal_get_name(g: SignalGraph, sig_idx: i64) -> str {
@@ -100,45 +259,32 @@ fn signal_register(mut g: SignalGraph, name: str, val_int: i64, val_str: str, va
         base := existing * 8
         ibuf_set(g.signals, base + 2, val_type)
         ibuf_set(g.signals, base + 3, val_int)
-        v_off := buf_len(g.values_buf)
-        v_len := str_len(val_str)
-        mut vi := 0
-        while vi < v_len {
-            buf_push(g.values_buf, str_byte(val_str, vi))
-            vi += 1
-        }
-        ibuf_set(g.signals, base + 4, v_off)
-        ibuf_set(g.signals, base + 5, v_len)
+        sig_store_value_str(mut g, existing, val_str)
         return existing
     }
 
-    sig_idx := g.signal_count
-    n_off := buf_len(g.names_buf)
     n_len := str_len(name)
+    sig_ensure_names_space(mut g, n_len)
+    n_off := buf_len(g.names_buf)
     mut ni := 0
     while ni < n_len {
         buf_push(g.names_buf, str_byte(name, ni))
         ni += 1
     }
 
-    v_off := buf_len(g.values_buf)
-    v_len := str_len(val_str)
-    mut vi := 0
-    while vi < v_len {
-        buf_push(g.values_buf, str_byte(val_str, vi))
-        vi += 1
-    }
-
+    sig_ensure_signals_space(mut g, 8)
+    sig_idx := g.signal_count
     ibuf_push(g.signals, n_off)
     ibuf_push(g.signals, n_len)
     ibuf_push(g.signals, val_type)
     ibuf_push(g.signals, val_int)
-    ibuf_push(g.signals, v_off)
-    ibuf_push(g.signals, v_len)
+    ibuf_push(g.signals, 0)  // val_str_off
+    ibuf_push(g.signals, 0)  // val_str_len
     ibuf_push(g.signals, 0)  // version = 0
     ibuf_push(g.signals, -1) // binding_head = -1
-
     g.signal_count = sig_idx + 1
+
+    sig_store_value_str(mut g, sig_idx, val_str)
     return sig_idx
 }
 
@@ -183,34 +329,38 @@ fn signal_get_version(g: SignalGraph, name: str) -> i64 {
     return ibuf_get(g.signals, idx * 8 + 6)
 }
 
-// Binds a specific DOM node directly to a signal (Static Direct Link)
-fn signal_bind_node(
+fn sig_append_template_str(mut g: SignalGraph, s: str) -> i64 {
+    slen := str_len(s)
+    if slen <= 0 { return 0 }
+    sig_ensure_tmpl_space(mut g, slen)
+    off := buf_len(g.templates_buf)
+    mut i := 0
+    while i < slen {
+        buf_push(g.templates_buf, str_byte(s, i))
+        i += 1
+    }
+    return off
+}
+
+fn signal_bind_node_full(
     mut g: SignalGraph,
     sig_idx: i64,
     node_idx: i64,
     target_type: i64,
     prefix: str,
     suffix: str,
-    clear_bg: i64 = 0xFF0F172A
+    clear_bg: i64,
+    full_tmpl_off: i64,
+    full_tmpl_len: i64
 ) -> i64 {
     if sig_idx < 0 or sig_idx >= g.signal_count { return -1 }
 
-    p_off := buf_len(g.templates_buf)
     p_len := str_len(prefix)
-    mut pi := 0
-    while pi < p_len {
-        buf_push(g.templates_buf, str_byte(prefix, pi))
-        pi += 1
-    }
-
-    s_off := buf_len(g.templates_buf)
+    p_off := sig_append_template_str(mut g, prefix)
     s_len := str_len(suffix)
-    mut si := 0
-    while si < s_len {
-        buf_push(g.templates_buf, str_byte(suffix, si))
-        si += 1
-    }
+    s_off := sig_append_template_str(mut g, suffix)
 
+    sig_ensure_bindings_space(mut g, 12)
     b_idx := g.binding_count
     base := sig_idx * 8
     old_head := ibuf_get(g.signals, base + 7)
@@ -225,10 +375,25 @@ fn signal_bind_node(
     ibuf_push(g.bindings, old_head) // next_binding
     ibuf_push(g.bindings, clear_bg)
     ibuf_push(g.bindings, 0)        // dirty = 0
+    ibuf_push(g.bindings, full_tmpl_off)
+    ibuf_push(g.bindings, full_tmpl_len)
 
     ibuf_set(g.signals, base + 7, b_idx)
     g.binding_count = b_idx + 1
     return b_idx
+}
+
+// Binds a specific DOM node directly to a signal (Static Direct Link)
+fn signal_bind_node(
+    mut g: SignalGraph,
+    sig_idx: i64,
+    node_idx: i64,
+    target_type: i64,
+    prefix: str,
+    suffix: str,
+    clear_bg: i64 = 0xFF0F172A
+) -> i64 {
+    return signal_bind_node_full(mut g, sig_idx, node_idx, target_type, prefix, suffix, clear_bg, 0, -1)
 }
 
 fn signal_bind_by_id(
@@ -251,146 +416,190 @@ fn signal_bind_by_id(
     return b_idx >= 0
 }
 
+// Scans a string for the next `@reactive(name)`, `{{name}}`, or `{name}` placeholder.
+// Writes [tok_start, tok_end, name_start, name_end] into `span_out` and returns true if found.
+fn signal_next_placeholder(src: str, pos: i64, span_out: IntBuf) -> bool {
+    n := str_len(src)
+    mut p := pos
+    while p < n {
+        if p + 10 < n and str_slice(src, p, p + 10) == "@reactive(" {
+            p_close := str_find_byte(src, 41, p + 10)
+            if p_close > p + 10 {
+                ibuf_set(span_out, 0, p)
+                ibuf_set(span_out, 1, p_close + 1)
+                ibuf_set(span_out, 2, p + 10)
+                ibuf_set(span_out, 3, p_close)
+                return true
+            }
+        }
+        if str_byte(src, p) == 123 { // '{'
+            mut ns := p + 1
+            is_double := ns < n and str_byte(src, ns) == 123
+            if is_double { ns += 1 }
+            p_end := str_find_byte(src, 125, ns)
+            if p_end > ns {
+                mut tok_end := p_end + 1
+                if is_double and tok_end < n and str_byte(src, tok_end) == 125 {
+                    tok_end += 1
+                }
+                ibuf_set(span_out, 0, p)
+                ibuf_set(span_out, 1, tok_end)
+                ibuf_set(span_out, 2, ns)
+                ibuf_set(span_out, 3, p_end)
+                return true
+            }
+        }
+        p += 1
+    }
+    return false
+}
+
+fn signal_bind_attr_template(mut g: SignalGraph, node_idx: i64, target_type: i64, raw: str, span_tmp: IntBuf) -> i64 {
+    rlen := str_len(raw)
+    if rlen == 0 { return 0 }
+
+    // Collect placeholders [sig_idx, tok_st, tok_en]
+    hits := ibuf_new(32)
+    mut pos := 0
+    while signal_next_placeholder(raw, pos, span_tmp) {
+        tok_st := ibuf_get(span_tmp, 0)
+        tok_en := ibuf_get(span_tmp, 1)
+        ns := ibuf_get(span_tmp, 2)
+        ne := ibuf_get(span_tmp, 3)
+        sig_name := str_trim(str_slice(raw, ns, ne))
+        if str_len(sig_name) > 0 {
+            mut s_idx := signal_find(g, sig_name)
+            if s_idx < 0 {
+                s_idx = signal_register_str(mut g, sig_name, "")
+            }
+            ibuf_push(hits, s_idx)
+            ibuf_push(hits, tok_st)
+            ibuf_push(hits, tok_en)
+        }
+        pos = tok_en
+    }
+
+    hit_count := ibuf_len(hits) / 3
+    if hit_count == 0 {
+        buf_free(move hits)
+        return 0
+    }
+
+    if hit_count == 1 {
+        s_idx := ibuf_get(hits, 0)
+        tok_st := ibuf_get(hits, 1)
+        tok_en := ibuf_get(hits, 2)
+        prefix := str_slice(raw, 0, tok_st)
+        suffix := str_slice(raw, tok_en, rlen)
+        signal_bind_node(mut g, s_idx, node_idx, target_type, prefix, suffix)
+        buf_free(move hits)
+        return 1
+    }
+
+    // Multiple placeholders on the same DOM target: store full template string once
+    full_off := sig_append_template_str(mut g, raw)
+    mut h := 0
+    mut bound := 0
+    while h < hit_count {
+        s_idx := ibuf_get(hits, h * 3)
+        // Avoid duplicate binding for identical signal appearing twice in the same template
+        mut dup := false
+        mut prev := 0
+        while prev < h {
+            if ibuf_get(hits, prev * 3) == s_idx {
+                dup = true
+                break
+            }
+            prev += 1
+        }
+        if not dup {
+            signal_bind_node_full(mut g, s_idx, node_idx, target_type, "", "", 0xFF0F172A, full_off, rlen)
+            bound += 1
+        }
+        h += 1
+    }
+    buf_free(move hits)
+    return bound
+}
+
 // Static Template Compiler: Parses HTML/Tailwind DOM tree at compile/load time,
 // detecting reactive annotations and connecting them directly to exact DOM nodes!
-// Recognizes:
-// 1. Text: `@reactive(name)`, `{name}`, `{{name}}`
-// 2. Class: `@reactive(name)`, `{name}`
-// 3. Style: `@reactive(name)`, `{name}`
+// Recognizes `@reactive(name)`, `{name}`, `{{name}}` in text, class, and style
+// including multiple placeholders per DOM node (e.g., `{first}-{last}`).
 fn signal_compile_template(mut g: SignalGraph, tree: DomTree) -> i64 {
     mut count_bound := 0
+    span_tmp := ibuf_new(4)
+    ibuf_push(span_tmp, 0)
+    ibuf_push(span_tmp, 0)
+    ibuf_push(span_tmp, 0)
+    ibuf_push(span_tmp, 0)
+
     mut i := 0
     while i < tree.count {
-        // 1. Text Content Analysis
-        txt := dom_get_text(tree, i)
-        tlen := str_len(txt)
-        if tlen > 0 {
-            // Check @reactive(name)
-            p_react := str_find(txt, "@reactive(", 0)
-            if p_react >= 0 {
-                p_close := str_find_byte(txt, 41, p_react + 10) // ')'
-                if p_close > p_react + 10 {
-                    sig_name := str_slice(txt, p_react + 10, p_close)
-                    prefix := str_slice(txt, 0, p_react)
-                    suffix := str_slice(txt, p_close + 1, tlen)
-                    mut s_idx := signal_find(g, sig_name)
-                    if s_idx < 0 {
-                        s_idx = signal_register_str(mut g, sig_name, "")
-                    }
-                    signal_bind_node(mut g, s_idx, i, signal_target_text(), prefix, suffix)
-                    count_bound += 1
-                }
-            } else {
-                // Check {name} or {{name}}
-                p_brace := str_find_byte(txt, 123, 0) // '{'
-                if p_brace >= 0 {
-                    mut name_start := p_brace + 1
-                    if name_start < tlen and str_byte(txt, name_start) == 123 {
-                        name_start += 1
-                    }
-                    p_end := str_find_byte(txt, 125, name_start) // '}'
-                    if p_end > name_start {
-                        mut actual_end := p_end
-                        mut next_pos := p_end + 1
-                        if next_pos < tlen and str_byte(txt, next_pos) == 125 {
-                            next_pos += 1
-                        }
-                        sig_name := str_trim(str_slice(txt, name_start, actual_end))
-                        prefix := str_slice(txt, 0, p_brace)
-                        suffix := str_slice(txt, next_pos, tlen)
-                        mut s_idx := signal_find(g, sig_name)
-                        if s_idx < 0 {
-                            s_idx = signal_register_str(mut g, sig_name, "")
-                        }
-                        signal_bind_node(mut g, s_idx, i, signal_target_text(), prefix, suffix)
-                        count_bound += 1
-                    }
-                }
-            }
-        }
-
-        // 2. Class Attribute Analysis
-        cls := dom_get_class(tree, i)
-        clen := str_len(cls)
-        if clen > 0 {
-            p_cr := str_find(cls, "@reactive(", 0)
-            if p_cr >= 0 {
-                p_close := str_find_byte(cls, 41, p_cr + 10)
-                if p_close > p_cr + 10 {
-                    sig_name := str_slice(cls, p_cr + 10, p_close)
-                    prefix := str_slice(cls, 0, p_cr)
-                    suffix := str_slice(cls, p_close + 1, clen)
-                    mut s_idx := signal_find(g, sig_name)
-                    if s_idx < 0 {
-                        s_idx = signal_register_str(mut g, sig_name, "")
-                    }
-                    signal_bind_node(mut g, s_idx, i, signal_target_class(), prefix, suffix)
-                    count_bound += 1
-                }
-            }
-        }
-
-        // 3. Style Attribute Analysis
-        sty := dom_get_style(tree, i)
-        slen := str_len(sty)
-        if slen > 0 {
-            p_sr := str_find(sty, "@reactive(", 0)
-            if p_sr >= 0 {
-                p_close := str_find_byte(sty, 41, p_sr + 10)
-                if p_close > p_sr + 10 {
-                    sig_name := str_slice(sty, p_sr + 10, p_close)
-                    prefix := str_slice(sty, 0, p_sr)
-                    suffix := str_slice(sty, p_close + 1, slen)
-                    mut s_idx := signal_find(g, sig_name)
-                    if s_idx < 0 {
-                        s_idx = signal_register_str(mut g, sig_name, "")
-                    }
-                    signal_bind_node(mut g, s_idx, i, signal_target_style(), prefix, suffix)
-                    count_bound += 1
-                }
-            }
-        }
-
+        count_bound += signal_bind_attr_template(mut g, i, signal_target_text(), dom_get_text(tree, i), span_tmp)
+        count_bound += signal_bind_attr_template(mut g, i, signal_target_class(), dom_get_class(tree, i), span_tmp)
+        count_bound += signal_bind_attr_template(mut g, i, signal_target_style(), dom_get_style(tree, i), span_tmp)
         i += 1
     }
+
+    buf_free(move span_tmp)
     return count_bound
 }
 
-// Zero-Virtual-DOM Signal Update Engine:
-// Directly writes into target DOM memory slots in nanoseconds without diffing!
-fn signal_set_int(mut g: SignalGraph, mut tree: DomTree, name: str, val: i64) -> bool {
-    sig_idx := signal_find(g, name)
-    if sig_idx < 0 { return false }
-    base := sig_idx * 8
+fn signal_eval_template(g: SignalGraph, tmpl: str) -> str {
+    tlen := str_len(tmpl)
+    out := buf_new(tlen + 64)
+    span_tmp := ibuf_new(4)
+    ibuf_push(span_tmp, 0)
+    ibuf_push(span_tmp, 0)
+    ibuf_push(span_tmp, 0)
+    ibuf_push(span_tmp, 0)
 
-    cur_type := ibuf_get(g.signals, base + 2)
-    cur_val := ibuf_get(g.signals, base + 3)
-    if cur_type == signal_val_int() and cur_val == val {
-        return false // Zero-cost bail: identical value
+    mut pos := 0
+    while signal_next_placeholder(tmpl, pos, span_tmp) {
+        tok_st := ibuf_get(span_tmp, 0)
+        tok_en := ibuf_get(span_tmp, 1)
+        ns := ibuf_get(span_tmp, 2)
+        ne := ibuf_get(span_tmp, 3)
+        if tok_st > pos {
+            buf_push_str(out, str_slice(tmpl, pos, tok_st))
+        }
+        sig_name := str_trim(str_slice(tmpl, ns, ne))
+        buf_push_str(out, signal_get_str(g, sig_name))
+        pos = tok_en
+    }
+    if pos < tlen {
+        buf_push_str(out, str_slice(tmpl, pos, tlen))
     }
 
-    ibuf_set(g.signals, base + 2, signal_val_int())
-    ibuf_set(g.signals, base + 3, val)
-    ibuf_set(g.signals, base + 6, ibuf_get(g.signals, base + 6) + 1) // version++
+    buf_free(move span_tmp)
+    return buf_to_owned_str(move out)
+}
 
-    val_str := f"{val}"
-
-    // Direct subscriber dispatch: NO Virtual DOM diffing!
+fn signal_dispatch_bindings(mut g: SignalGraph, mut tree: DomTree, base: i64, val_str: str) {
     mut b_idx := ibuf_get(g.signals, base + 7)
     while b_idx >= 0 {
-        b_base := b_idx * 10
+        b_base := b_idx * 12
         node_idx := ibuf_get(g.bindings, b_base + 1)
         target_type := ibuf_get(g.bindings, b_base + 2)
+        full_off := ibuf_get(g.bindings, b_base + 10)
+        full_len := ibuf_get(g.bindings, b_base + 11)
 
-        p_off := ibuf_get(g.bindings, b_base + 3)
-        p_len := ibuf_get(g.bindings, b_base + 4)
-        prefix := if p_len > 0 { buf_slice_str(g.templates_buf, p_off, p_off + p_len) } else { "" }
+        mut formatted := ""
+        if full_len >= 0 {
+            tmpl := buf_slice_str(g.templates_buf, full_off, full_off + full_len)
+            formatted = signal_eval_template(g, tmpl)
+        } else {
+            p_off := ibuf_get(g.bindings, b_base + 3)
+            p_len := ibuf_get(g.bindings, b_base + 4)
+            prefix := if p_len > 0 { buf_slice_str(g.templates_buf, p_off, p_off + p_len) } else { "" }
 
-        s_off := ibuf_get(g.bindings, b_base + 5)
-        s_len := ibuf_get(g.bindings, b_base + 6)
-        suffix := if s_len > 0 { buf_slice_str(g.templates_buf, s_off, s_off + s_len) } else { "" }
+            s_off := ibuf_get(g.bindings, b_base + 5)
+            s_len := ibuf_get(g.bindings, b_base + 6)
+            suffix := if s_len > 0 { buf_slice_str(g.templates_buf, s_off, s_off + s_len) } else { "" }
 
-        formatted := prefix + val_str + suffix
+            formatted = prefix + val_str + suffix
+        }
 
         if target_type == signal_target_text() {
             dom_set_text(mut tree, node_idx, formatted)
@@ -403,7 +612,28 @@ fn signal_set_int(mut g: SignalGraph, mut tree: DomTree, name: str, val: i64) ->
         ibuf_set(g.bindings, b_base + 9, 1) // mark dirty
         b_idx = ibuf_get(g.bindings, b_base + 7)
     }
+}
 
+// Zero-Virtual-DOM Signal Update Engine:
+// Directly writes into target DOM memory slots in nanoseconds without diffing!
+fn signal_set_int(mut g: SignalGraph, mut tree: DomTree, name: str, val: i64) -> bool {
+    sig_idx := signal_find(g, name)
+    if sig_idx < 0 { return false }
+    base := sig_idx * 8
+
+    cur_type := ibuf_get(g.signals, base + 2)
+    cur_val := ibuf_get(g.signals, base + 3)
+    if cur_type == signal_val_int() and cur_val == val {
+        return false
+    }
+
+    val_str := f"{val}"
+    ibuf_set(g.signals, base + 2, signal_val_int())
+    ibuf_set(g.signals, base + 3, val)
+    sig_store_value_str(mut g, sig_idx, val_str)
+    ibuf_set(g.signals, base + 6, ibuf_get(g.signals, base + 6) + 1)
+
+    signal_dispatch_bindings(mut g, mut tree, base, val_str)
     return true
 }
 
@@ -417,61 +647,17 @@ fn signal_set_str(mut g: SignalGraph, mut tree: DomTree, name: str, val: str) ->
     cur_len := ibuf_get(g.signals, base + 5)
     if cur_type == signal_val_str() and cur_len == str_len(val) {
         if buf_slice_str(g.values_buf, cur_off, cur_off + cur_len) == val {
-            return false // Zero-cost bail: identical string
+            return false
         }
     }
 
-    v_len := str_len(val)
-    if cur_type == signal_val_str() and v_len <= cur_len and cur_off >= 0 {
-        mut vi := 0
-        while vi < v_len {
-            buf_set(g.values_buf, cur_off + vi, str_byte(val, vi))
-            vi += 1
-        }
-        ibuf_set(g.signals, base + 5, v_len)
-        ibuf_set(g.signals, base + 6, ibuf_get(g.signals, base + 6) + 1)
-    } else {
-        v_off := buf_len(g.values_buf)
-        mut vi := 0
-        while vi < v_len {
-            buf_push(g.values_buf, str_byte(val, vi))
-            vi += 1
-        }
-        ibuf_set(g.signals, base + 2, signal_val_str())
-        ibuf_set(g.signals, base + 4, v_off)
-        ibuf_set(g.signals, base + 5, v_len)
-        ibuf_set(g.signals, base + 6, ibuf_get(g.signals, base + 6) + 1) // version++
-    }
+    ibuf_set(g.signals, base + 2, signal_val_str())
+    sig_store_value_str(mut g, sig_idx, val)
+    ibuf_set(g.signals, base + 6, ibuf_get(g.signals, base + 6) + 1)
 
-    // Direct subscriber dispatch: NO Virtual DOM diffing!
-    mut b_idx := ibuf_get(g.signals, base + 7)
-    while b_idx >= 0 {
-        b_base := b_idx * 10
-        node_idx := ibuf_get(g.bindings, b_base + 1)
-        target_type := ibuf_get(g.bindings, b_base + 2)
-
-        p_off := ibuf_get(g.bindings, b_base + 3)
-        p_len := ibuf_get(g.bindings, b_base + 4)
-        prefix := if p_len > 0 { buf_slice_str(g.templates_buf, p_off, p_off + p_len) } else { "" }
-
-        s_off := ibuf_get(g.bindings, b_base + 5)
-        s_len := ibuf_get(g.bindings, b_base + 6)
-        suffix := if s_len > 0 { buf_slice_str(g.templates_buf, s_off, s_off + s_len) } else { "" }
-
-        formatted := prefix + val + suffix
-
-        if target_type == signal_target_text() {
-            dom_set_text(mut tree, node_idx, formatted)
-        } else if target_type == signal_target_class() {
-            dom_set_class(mut tree, node_idx, formatted)
-        } else if target_type == signal_target_style() {
-            dom_set_style(mut tree, node_idx, formatted)
-        }
-
-        ibuf_set(g.bindings, b_base + 9, 1) // mark dirty
-        b_idx = ibuf_get(g.bindings, b_base + 7)
-    }
-
+    // Materialize a copy of val in case val slices g.values_buf across callbacks
+    safe_val := signal_get_str(g, name)
+    signal_dispatch_bindings(mut g, mut tree, base, safe_val)
     return true
 }
 
@@ -489,23 +675,10 @@ fn signal_set_bool(mut g: SignalGraph, mut tree: DomTree, name: str, val: bool) 
 
     ibuf_set(g.signals, base + 2, signal_val_bool())
     ibuf_set(g.signals, base + 3, b_int)
+    sig_store_value_str(mut g, sig_idx, b_str)
     ibuf_set(g.signals, base + 6, ibuf_get(g.signals, base + 6) + 1)
 
-    // Direct subscriber dispatch
-    mut b_idx := ibuf_get(g.signals, base + 7)
-    while b_idx >= 0 {
-        b_base := b_idx * 10
-        node_idx := ibuf_get(g.bindings, b_base + 1)
-        target_type := ibuf_get(g.bindings, b_base + 2)
-
-        if target_type == signal_target_text() {
-            dom_set_text(mut tree, node_idx, b_str)
-        }
-
-        ibuf_set(g.bindings, b_base + 9, 1)
-        b_idx = ibuf_get(g.bindings, b_base + 7)
-    }
-
+    signal_dispatch_bindings(mut g, mut tree, base, b_str)
     return true
 }
 
@@ -522,7 +695,7 @@ fn signal_patch_canvas(
     mut patched := 0
     mut b := 0
     while b < g.binding_count {
-        b_base := b * 10
+        b_base := b * 12
         if ibuf_get(g.bindings, b_base + 9) == 1 {
             node_idx := ibuf_get(g.bindings, b_base + 1)
             clear_bg := ibuf_get(g.bindings, b_base + 8)

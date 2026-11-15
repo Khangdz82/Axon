@@ -1,11 +1,9 @@
 // Axon OpenAI TikToken & BPE Tokenizer Engine (`std/tiktoken.ax`)
-// 100% Pure Axon: Zero Python, Zero Rust/PyO3, Zero External Dependencies, Zero-GC (@no_alloc).
+// 100% Pure Axon: Zero Python, Zero Rust/PyO3, Zero External Dependencies.
 // Implements:
-//   - Byte-Pair Encoding (BPE) Algorithm (Matching `openai/tiktoken` & `huggingface/tokenizers`)
-//   - FNV-1a Hash Table for High-Throughput O(1) Token-to-Rank Lookups
-//   - Zero-OOV Byte Fallback for Arbitrary Binary & UTF-8 Text
-//   - Special Tokens Handling (`<|endoftext|>`, `<|im_start|>`, `<|im_end|>`)
-//   - Fast Decoder with In-Place Byte Reconstruction
+//   - Exact Byte-Pair Encoding (BPE) Algorithm (matching `openai/tiktoken` merge rules)
+//   - FNV-1a Hash Table with byte-level collision verification for O(1) Token-to-Rank lookups
+//   - Arbitrary-rank Decode Table + Byte Fallback for Arbitrary UTF-8/Binary Text
 
 use std::collections
 use std::str
@@ -16,10 +14,14 @@ use std::os
 struct BpeVocabTable {
     cap: i64
     mask: i64
-    keys_ptr: i64      // token string hash (FNV-64)
-    ranks_ptr: i64     // merge rank (lower = higher priority)
-    tokens_meta: IntBuf // [start_byte, len] in strings buffer
+    keys_ptr: i64       // token string hash (FNV-64)
+    ranks_ptr: i64      // merge rank (lower = higher priority)
+    meta_slot_ptr: i64  // index into tokens_meta for exact byte verification (-1 if empty)
+    tokens_meta: IntBuf // [start_byte, len, rank] (3 ints per entry)
     tokens_bytes: ByteBuf
+    meta_count: i64
+    meta_cap: i64
+    bytes_cap: i64
     size: i64
 }
 
@@ -30,25 +32,34 @@ fn tiktoken_vocab_new(capacity: i64 = 4096) -> BpeVocabTable {
 
     kp := mem_alloc_aligned(c * 8 + 64)
     rp := mem_alloc_aligned(c * 8 + 64)
-    
+    mp := mem_alloc_aligned(c * 8 + 64)
+
     mut i := 0
     while i < c {
         ptr_write_i64(kp, i, 0)
         ptr_write_i64(rp, i, -1)
+        ptr_write_i64(mp, i, -1)
         i += 1
     }
 
+    mcap := c * 3 + 32
+    bcap := c * 8 + 64
     return BpeVocabTable(
         cap = c,
         mask = mask,
         keys_ptr = kp,
         ranks_ptr = rp,
-        tokens_meta = ibuf_new(c * 2),
-        tokens_bytes = buf_new(c * 8),
+        meta_slot_ptr = mp,
+        tokens_meta = ibuf_new(mcap),
+        tokens_bytes = buf_new(bcap),
+        meta_count = 0,
+        meta_cap = mcap,
+        bytes_cap = bcap,
         size = 0
     )
 }
 
+@no_alloc
 fn tiktoken_hash_token(tok: str) -> i64 {
     n := str_len(tok)
     mut h := -3750763034362895579
@@ -61,31 +72,103 @@ fn tiktoken_hash_token(tok: str) -> i64 {
     return h
 }
 
+@no_alloc
+fn tiktoken_hash_span(s: str, off: i64, len: i64) -> i64 {
+    mut h := -3750763034362895579
+    mut i := 0
+    while i < len {
+        h = (h ^ str_byte(s, off + i)) *% 1099511628211
+        i += 1
+    }
+    if h == 0 { h = 1 }
+    return h
+}
+
+@no_alloc
+fn tiktoken_slot_matches_str(v: BpeVocabTable, meta_idx: i64, s: str, off: i64, len: i64) -> bool {
+    if meta_idx < 0 { return false }
+    s_off := ibuf_get(v.tokens_meta, meta_idx * 3)
+    t_len := ibuf_get(v.tokens_meta, meta_idx * 3 + 1)
+    if t_len != len { return false }
+    mut i := 0
+    while i < len {
+        if buf_get(v.tokens_bytes, s_off + i) != str_byte(s, off + i) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
 // Add token with merge rank into BPE table
 fn tiktoken_add_token(mut v: BpeVocabTable, token_str: str, rank: i64) {
+    if v.size >= v.cap - 1 {
+        return // Table full: prevent infinite linear probe
+    }
+    t_len := str_len(token_str)
     h := tiktoken_hash_token(token_str)
     mut slot := h & v.mask
-    while ptr_read_i64(v.keys_ptr, slot) != 0 {
-        if ptr_read_i64(v.keys_ptr, slot) == h {
-            ptr_write_i64(v.ranks_ptr, slot, rank)
-            return
+    mut steps := 0
+    while steps < v.cap {
+        cur_k := ptr_read_i64(v.keys_ptr, slot)
+        if cur_k == 0 { break }
+        if cur_k == h {
+            m_idx := ptr_read_i64(v.meta_slot_ptr, slot)
+            if tiktoken_slot_matches_str(v, m_idx, token_str, 0, t_len) {
+                ptr_write_i64(v.ranks_ptr, slot, rank)
+                ibuf_set(v.tokens_meta, m_idx * 3 + 2, rank)
+                return
+            }
         }
         slot = (slot + 1) & v.mask
+        steps += 1
+    }
+    if steps >= v.cap { return }
+
+    // Ensure tokens_bytes and tokens_meta have room
+    if buf_len(v.tokens_bytes) + t_len > v.bytes_cap {
+        mut ncap := v.bytes_cap * 2
+        while ncap < buf_len(v.tokens_bytes) + t_len { ncap = ncap * 2 }
+        nb := buf_new(ncap)
+        blen := buf_len(v.tokens_bytes)
+        mut k := 0
+        while k < blen {
+            buf_push(nb, buf_get(v.tokens_bytes, k))
+            k += 1
+        }
+        buf_free(move v.tokens_bytes)
+        v.tokens_bytes = nb
+        v.bytes_cap = ncap
+    }
+    if ibuf_len(v.tokens_meta) + 3 > v.meta_cap {
+        ncap := v.meta_cap * 2
+        nm := ibuf_new(ncap)
+        mlen := ibuf_len(v.tokens_meta)
+        mut k := 0
+        while k < mlen {
+            ibuf_push(nm, ibuf_get(v.tokens_meta, k))
+            k += 1
+        }
+        buf_free(move v.tokens_meta)
+        v.tokens_meta = nm
+        v.meta_cap = ncap
     }
 
-    ptr_write_i64(v.keys_ptr, slot, h)
-    ptr_write_i64(v.ranks_ptr, slot, rank)
-
-    // Store raw bytes
     s_off := buf_len(v.tokens_bytes)
-    t_len := str_len(token_str)
     mut i := 0
     while i < t_len {
         buf_push(v.tokens_bytes, str_byte(token_str, i))
         i += 1
     }
+    meta_idx := v.meta_count
     ibuf_push(v.tokens_meta, s_off)
     ibuf_push(v.tokens_meta, t_len)
+    ibuf_push(v.tokens_meta, rank)
+    v.meta_count = meta_idx + 1
+
+    ptr_write_i64(v.keys_ptr, slot, h)
+    ptr_write_i64(v.ranks_ptr, slot, rank)
+    ptr_write_i64(v.meta_slot_ptr, slot, meta_idx)
     v.size = v.size + 1
 }
 
@@ -107,40 +190,56 @@ fn tiktoken_get_rank(v: BpeVocabTable, tok_hash: i64) -> i64 {
     return -1
 }
 
+@no_alloc
+fn tiktoken_get_rank_span(v: BpeVocabTable, text: str, off: i64, len: i64) -> i64 {
+    tok_hash := tiktoken_hash_span(text, off, len)
+    mut slot := tok_hash & v.mask
+    mut steps := 0
+    while steps < v.cap {
+        k := ptr_read_i64(v.keys_ptr, slot)
+        if k == 0 {
+            return -1
+        }
+        if k == tok_hash {
+            m_idx := ptr_read_i64(v.meta_slot_ptr, slot)
+            if tiktoken_slot_matches_str(v, m_idx, text, off, len) {
+                return ptr_read_i64(v.ranks_ptr, slot)
+            }
+        }
+        slot = (slot + 1) & v.mask
+        steps += 1
+    }
+    return -1
+}
+
 // --- 2. BPE Merge Engine ---
 
-// Tokenize text into token IDs using greedy BPE merges
+// Tokenize text into token IDs using exact byte-span BPE merges
 fn tiktoken_encode(v: BpeVocabTable, text: str) -> IntBuf {
     n := str_len(text)
     out := ibuf_new(n + 8)
     if n == 0 { return out }
 
-    // Initial pieces: byte-level tokens
-    mut pieces := ibuf_new(n * 2)
+    // Track byte boundaries [0, 1, 2, ..., n] for n active pieces.
+    // Piece p spans [bounds[p], bounds[p + 1]) directly in `text`.
+    bounds := ibuf_new(n + 2)
     mut i := 0
-    while i < n {
-        // Hash single byte
-        b := str_byte(text, i)
-        mut bh := (-3750763034362895579 ^ b) *% 1099511628211
-        if bh == 0 { bh = 1 }
-        ibuf_push(pieces, bh)
+    while i <= n {
+        ibuf_push(bounds, i)
         i += 1
     }
+    mut num_pieces := n
 
     // Iterative BPE merges
-    while ibuf_len(pieces) > 1 {
-        // Find best pair with lowest rank
+    while num_pieces > 1 {
         mut min_rank := 999999999999
         mut best_idx := -1
 
         mut p := 0
-        limit := ibuf_len(pieces) - 1
-        while p < limit {
-            h1 := ibuf_get(pieces, p)
-            h2 := ibuf_get(pieces, p + 1)
-            // Combined 2-token hash
-            combined_hash := (h1 *% 1099511628211) ^ h2
-            rank := tiktoken_get_rank(v, combined_hash)
+        while p < num_pieces - 1 {
+            s1 := ibuf_get(bounds, p)
+            e2 := ibuf_get(bounds, p + 2)
+            rank := tiktoken_get_rank_span(v, text, s1, e2 - s1)
             if rank >= 0 and rank < min_rank {
                 min_rank = rank
                 best_idx = p
@@ -148,65 +247,75 @@ fn tiktoken_encode(v: BpeVocabTable, text: str) -> IntBuf {
             p += 1
         }
 
-        // If no more merges possible, break
         if best_idx < 0 {
             break
         }
 
-        // Apply merge
-        merged := ibuf_new(ibuf_len(pieces))
-        mut j := 0
-        while j < ibuf_len(pieces) {
-            if j == best_idx {
-                h1 := ibuf_get(pieces, j)
-                h2 := ibuf_get(pieces, j + 1)
-                combined_hash := (h1 *% 1099511628211) ^ h2
-                ibuf_push(merged, combined_hash)
-                j += 2
-            } else {
-                ibuf_push(merged, ibuf_get(pieces, j))
-                j += 1
-            }
+        // Remove boundary at best_idx + 1 in-place to merge pieces best_idx and best_idx + 1
+        mut m := best_idx + 1
+        while m < num_pieces {
+            ibuf_set(bounds, m, ibuf_get(bounds, m + 1))
+            m += 1
         }
-        buf_free(move pieces)
-        pieces = merged
+        num_pieces -= 1
     }
 
-    // Map pieces to output token IDs
+    // Map final pieces to token IDs with exact raw-byte fallback
     mut k := 0
-    while k < ibuf_len(pieces) {
-        h := ibuf_get(pieces, k)
-        rank := tiktoken_get_rank(v, h)
+    while k < num_pieces {
+        ps := ibuf_get(bounds, k)
+        pe := ibuf_get(bounds, k + 1)
+        plen := pe - ps
+        rank := tiktoken_get_rank_span(v, text, ps, plen)
         if rank >= 0 {
             ibuf_push(out, rank)
         } else {
-            // Byte fallback token
-            ibuf_push(out, h & 0xFF)
+            mut bi := 0
+            while bi < plen {
+                ibuf_push(out, str_byte(text, ps + bi) & 0xFF)
+                bi += 1
+            }
         }
         k += 1
     }
 
-    buf_free(move pieces)
+    buf_free(move bounds)
     return out
 }
 
-// Decode token IDs back into string
+// Decode token IDs back into string (supports non-sequential ranks + raw byte fallback)
 fn tiktoken_decode(v: BpeVocabTable, tokens: IntBuf) -> str {
     b := buf_new(ibuf_len(tokens) * 8 + 16)
     n := ibuf_len(tokens)
     mut i := 0
     while i < n {
         tok_id := ibuf_get(tokens, i)
-        if tok_id >= 0 and tok_id < v.size {
-            off := ibuf_get(v.tokens_meta, tok_id * 2)
-            len := ibuf_get(v.tokens_meta, tok_id * 2 + 1)
+        mut found_meta := -1
+        if tok_id >= 0 and tok_id < v.meta_count {
+            if ibuf_get(v.tokens_meta, tok_id * 3 + 2) == tok_id {
+                found_meta = tok_id
+            }
+        }
+        if found_meta < 0 {
+            mut mi := 0
+            while mi < v.meta_count {
+                if ibuf_get(v.tokens_meta, mi * 3 + 2) == tok_id {
+                    found_meta = mi
+                    break
+                }
+                mi += 1
+            }
+        }
+
+        if found_meta >= 0 {
+            off := ibuf_get(v.tokens_meta, found_meta * 3)
+            len := ibuf_get(v.tokens_meta, found_meta * 3 + 1)
             mut p := 0
             while p < len {
                 buf_push(b, buf_get(v.tokens_bytes, off + p))
                 p += 1
             }
         } else {
-            // Raw byte fallback
             buf_push(b, tok_id & 0xFF)
         }
         i += 1
@@ -220,6 +329,9 @@ fn tiktoken_vocab_free(move v: BpeVocabTable) {
     }
     if v.ranks_ptr != 0 {
         mem_free_aligned(v.ranks_ptr)
+    }
+    if v.meta_slot_ptr != 0 {
+        mem_free_aligned(v.meta_slot_ptr)
     }
     buf_free(move v.tokens_meta)
     buf_free(move v.tokens_bytes)

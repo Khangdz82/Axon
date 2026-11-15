@@ -202,7 +202,6 @@ fn spi_transfer_byte(spi: SpiDevice, tx_byte: i64) -> i64 {
     return mmio_read32(spi.base_addr + 0x0C) & 0xFF
 }
 
-@no_alloc
 fn spi_transfer_buf(spi: SpiDevice, cs_port: GpioPort, cs_pin: i64, tx_buf: ByteBuf, rx_buf: ByteBuf, len: i64) {
     // Assert Chip Select (Active LOW)
     gpio_write(cs_port, cs_pin, false)
@@ -279,6 +278,14 @@ fn i2c_write_byte(i2c: I2cDevice, data_byte: i64) -> bool {
 }
 
 @no_alloc
+fn i2c_read_byte(i2c: I2cDevice) -> i64 {
+    if not mmio_poll_bits32(i2c.base_addr + 0x14, 1 << 6, 1 << 6, 10000) { // RxNE
+        return -1
+    }
+    return mmio_read32(i2c.base_addr + 0x10) & 0xFF
+}
+
+@no_alloc
 fn i2c_write_reg8(i2c: I2cDevice, dev_addr: i64, reg_addr: i64, val: i64) -> bool {
     if not i2c_send_start(i2c) { return false }
     if not i2c_send_addr(i2c, dev_addr, false) {
@@ -332,6 +339,9 @@ struct PwmChannel {
 }
 
 fn pwm_new(timer_base: i64, channel: i64, frequency_hz: i64, timer_clk_hz: i64 = 84000000) -> PwmChannel {
+    if frequency_hz <= 0 {
+        return PwmChannel(timer_base = timer_base, channel_idx = channel, period_ticks = 0)
+    }
     period := timer_clk_hz / frequency_hz
     mmio_write32(timer_base + 0x2C, period) // ARR (Auto-reload register)
     return PwmChannel(timer_base = timer_base, channel_idx = channel, period_ticks = period)
@@ -376,8 +386,14 @@ fn adc_read_raw(adc: AdcController, channel: i64) -> i64 {
 
 @no_alloc
 fn adc_read_millivolts(adc: AdcController, channel: i64) -> i64 {
+    if adc.resolution_bits <= 0 or adc.resolution_bits > 30 {
+        return 0
+    }
     raw := adc_read_raw(adc, channel)
     max_count := (1 << adc.resolution_bits) - 1
+    if max_count <= 0 {
+        return 0
+    }
     return (raw * adc.vref_millivolts) / max_count
 }
 
@@ -411,12 +427,16 @@ fn mpu6050_init(i2c: I2cDevice, dev_addr: i64 = 0x68) -> bool {
 
 @no_alloc
 fn mpu6050_read_sensors(i2c: I2cDevice, dev_addr: i64 = 0x68) -> Mpu6050Reading {
+    zero := Mpu6050Reading(accel_x = 0, accel_y = 0, accel_z = 0, temp_c_scaled = 0, gyro_x = 0, gyro_y = 0, gyro_z = 0)
     ax_hi := i2c_read_reg8(i2c, dev_addr, 0x3B)
     ax_lo := i2c_read_reg8(i2c, dev_addr, 0x3C)
     ay_hi := i2c_read_reg8(i2c, dev_addr, 0x3D)
     ay_lo := i2c_read_reg8(i2c, dev_addr, 0x3E)
     az_hi := i2c_read_reg8(i2c, dev_addr, 0x3F)
     az_lo := i2c_read_reg8(i2c, dev_addr, 0x40)
+    if ax_hi < 0 or ax_lo < 0 or ay_hi < 0 or ay_lo < 0 or az_hi < 0 or az_lo < 0 {
+        return zero
+    }
 
     raw_ax := mpu6050_sign_extend16((ax_hi << 8) | ax_lo)
     raw_ay := mpu6050_sign_extend16((ay_hi << 8) | ay_lo)
@@ -424,6 +444,9 @@ fn mpu6050_read_sensors(i2c: I2cDevice, dev_addr: i64 = 0x68) -> Mpu6050Reading 
 
     th_hi := i2c_read_reg8(i2c, dev_addr, 0x41)
     th_lo := i2c_read_reg8(i2c, dev_addr, 0x42)
+    if th_hi < 0 or th_lo < 0 {
+        return zero
+    }
     raw_t := mpu6050_sign_extend16((th_hi << 8) | th_lo)
     // Temp in C = (raw / 340.0) + 36.53 => scaled * 100
     temp_scaled := ((raw_t * 100) / 340) + 3653
@@ -434,6 +457,9 @@ fn mpu6050_read_sensors(i2c: I2cDevice, dev_addr: i64 = 0x68) -> Mpu6050Reading 
     gy_lo := i2c_read_reg8(i2c, dev_addr, 0x46)
     gz_hi := i2c_read_reg8(i2c, dev_addr, 0x47)
     gz_lo := i2c_read_reg8(i2c, dev_addr, 0x48)
+    if gx_hi < 0 or gx_lo < 0 or gy_hi < 0 or gy_lo < 0 or gz_hi < 0 or gz_lo < 0 {
+        return zero
+    }
 
     raw_gx := mpu6050_sign_extend16((gx_hi << 8) | gx_lo)
     raw_gy := mpu6050_sign_extend16((gy_hi << 8) | gy_lo)
@@ -468,6 +494,9 @@ fn sht3x_read(i2c: I2cDevice, dev_addr: i64 = 0x44) -> Sht3xReading {
     cmd_ok1 := i2c_write_byte(i2c, 0x2C)
     cmd_ok2 := i2c_write_byte(i2c, 0x06)
     i2c_send_stop(i2c)
+    if not cmd_ok1 or not cmd_ok2 {
+        return Sht3xReading(temp_c_scaled = 0, humidity_scaled = 0, valid = false)
+    }
 
     // Wait 15ms for measurement conversion
     delay_ms(15)
@@ -478,14 +507,17 @@ fn sht3x_read(i2c: I2cDevice, dev_addr: i64 = 0x44) -> Sht3xReading {
         i2c_send_stop(i2c)
         return Sht3xReading(temp_c_scaled = 0, humidity_scaled = 0, valid = false)
     }
-    
-    t_hi := mmio_read32(i2c.base_addr + 0x10) & 0xFF
-    t_lo := mmio_read32(i2c.base_addr + 0x10) & 0xFF
-    discard_crc1 := mmio_read32(i2c.base_addr + 0x10)
-    h_hi := mmio_read32(i2c.base_addr + 0x10) & 0xFF
-    h_lo := mmio_read32(i2c.base_addr + 0x10) & 0xFF
-    discard_crc2 := mmio_read32(i2c.base_addr + 0x10)
+
+    t_hi := i2c_read_byte(i2c)
+    t_lo := i2c_read_byte(i2c)
+    discard_crc1 := i2c_read_byte(i2c)
+    h_hi := i2c_read_byte(i2c)
+    h_lo := i2c_read_byte(i2c)
+    discard_crc2 := i2c_read_byte(i2c)
     i2c_send_stop(i2c)
+    if t_hi < 0 or t_lo < 0 or discard_crc1 < 0 or h_hi < 0 or h_lo < 0 or discard_crc2 < 0 {
+        return Sht3xReading(temp_c_scaled = 0, humidity_scaled = 0, valid = false)
+    }
 
     raw_t := (t_hi << 8) | t_lo
     raw_h := (h_hi << 8) | h_lo

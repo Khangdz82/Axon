@@ -84,8 +84,16 @@ fn f32_to_fp16(scratch_ptr: i64, val: f64) -> i64 {
         return (sign << 15) | sub_frac
     }
 
-    new_frac := (frac + 0x1000) >> 13
-    return (sign << 15) | (new_exp << 10) | (new_frac & 0x3FF)
+    mut new_frac := (frac + 0x1000) >> 13
+    mut out_exp := new_exp
+    if (new_frac & 0x400) != 0 {
+        new_frac = 0
+        out_exp = out_exp + 1
+        if out_exp >= 31 {
+            return (sign << 15) | (31 << 10)
+        }
+    }
+    return (sign << 15) | (out_exp << 10) | (new_frac & 0x3FF)
 }
 
 // Convert IEEE-754 FP16 to FP32
@@ -148,11 +156,12 @@ fn quantize_q8_0_block(src_f32_ptr: i64, dst_block_ptr: i64, scratch_ptr: i64) {
     // Store scale at offset 0
     ptr_write_f32(dst_block_ptr, 0, scale)
 
-    // Quantize 32 elements into 8-bit signed
+    // Quantize 32 elements into 8-bit signed with symmetric rounding away from zero
     i = 0
     while i < 32 {
         v := ptr_read_f32(src_f32_ptr, i)
-        q := (v * inv_scale + 0.5) as i64
+        scaled := v * inv_scale
+        q := if scaled >= 0.0 { (scaled + 0.5) as i64 } else { (scaled - 0.5) as i64 }
         mut clamped := q
         if clamped > 127 { clamped = 127 }
         if clamped < -127 { clamped = -127 }
@@ -273,6 +282,48 @@ fn nf4_lut_level(idx: i64) -> f64 {
     if i == 13 { return 0.562617 }
     if i == 14 { return 0.722957 }
     return 1.0
+}
+
+@no_alloc
+fn nf4_nearest_idx(val_norm: f64) -> i64 {
+    mut best_idx := 0
+    mut best_diff := 999.0
+    mut k := 0
+    while k < 16 {
+        lvl := nf4_lut_level(k)
+        diff := if val_norm >= lvl { val_norm - lvl } else { lvl - val_norm }
+        if diff < best_diff {
+            best_diff = diff
+            best_idx = k
+        }
+        k += 1
+    }
+    return best_idx
+}
+
+// Quantize 32 FP32 weights into a 20-byte NF4 block (matching gemv_nf4 layout)
+@no_alloc
+fn quantize_nf4_block(src_f32_ptr: i64, dst_block_ptr: i64) {
+    mut max_abs := 0.0
+    mut i := 0
+    while i < 32 {
+        v := ptr_read_f32(src_f32_ptr, i)
+        av := if v < 0.0 { 0.0 - v } else { v }
+        if av > max_abs { max_abs = av }
+        i += 1
+    }
+    inv_scale := if max_abs > 0.000000001 { 1.0 / max_abs } else { 0.0 }
+    ptr_write_f32(dst_block_ptr, 0, max_abs)
+
+    i = 0
+    while i < 16 {
+        v0 := ptr_read_f32(src_f32_ptr, i * 2) * inv_scale
+        v1 := ptr_read_f32(src_f32_ptr, i * 2 + 1) * inv_scale
+        q0 := nf4_nearest_idx(v0)
+        q1 := nf4_nearest_idx(v1)
+        ptr_write_u8(dst_block_ptr, 4 + i, (q0 & 0x0F) | ((q1 & 0x0F) << 4))
+        i += 1
+    }
 }
 
 @no_alloc
