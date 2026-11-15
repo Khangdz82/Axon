@@ -716,7 +716,11 @@ fn coff_merge_single_obj(pool: ByteBuf, raw: ByteBuf, obj_off: i64, obj_end: i64
         s += 1
     }
 
-    // Parse COFF Symbol Table (`18` bytes per symbol) + String Table
+    // Parse COFF Symbol Table (`18` bytes per symbol) + String Table (strictly bounds-checked!)
+    if nsyms > 1000000 or sym_ptr > obj_end - obj_off or nsyms * 18 > (obj_end - obj_off) - sym_ptr {
+        buf_free(move sec_map)
+        return false
+    }
     str_tbl_base := obj_off + sym_ptr + nsyms * 18
     // `local_syms`: 4 words per COFF symbol index `[skind, merged_off, name_soff, name_slen]`
     local_syms := ibuf_new(nsyms * 4 + 8)
@@ -742,7 +746,7 @@ fn coff_merge_single_obj(pool: ByteBuf, raw: ByteBuf, obj_off: i64, obj_end: i64
         if coff_read_u32(raw, sb) == 0 {
             stroff := coff_read_u32(raw, sb + 4)
             mut p := str_tbl_base + stroff
-            while p < obj_end and buf_get(raw, p) != 0 {
+            while p >= str_tbl_base and p < obj_end and buf_get(raw, p) != 0 {
                 buf_push(pool, buf_get(raw, p))
                 nslen += 1
                 p += 1
@@ -797,38 +801,43 @@ fn coff_merge_single_obj(pool: ByteBuf, raw: ByteBuf, obj_off: i64, obj_end: i64
                     sym_i := coff_read_u32(raw, rb + 4)
                     rtype := coff_read_u16(raw, rb + 8)
                     if rtype >= 4 and rtype <= 9 and sym_i < nsyms {
-                        extra_disp := rtype - 4
-                        disp_pos := cbase + vaddr
-                        next_rip := disp_pos + 4 + extra_disp
-                        existing_addend := coff_read_u32(raw, obj_off + coff_read_u32(raw, sh + 20) + vaddr)
-                        mut addend := existing_addend
-                        if addend >= 0x80000000 { addend = addend - 0x100000000 }
+                        s_raw_ptr := coff_read_u32(raw, sh + 20)
+                        s_raw_sz := coff_read_u32(raw, sh + 16)
+                        add_off := obj_off + s_raw_ptr + vaddr
+                        if vaddr + 4 <= s_raw_sz and add_off >= obj_off and add_off + 4 <= obj_end {
+                            extra_disp := rtype - 4
+                            disp_pos := cbase + vaddr
+                            next_rip := disp_pos + 4 + extra_disp
+                            existing_addend := coff_read_u32(raw, add_off)
+                            mut addend := existing_addend
+                            if addend >= 0x80000000 { addend = addend - 0x100000000 }
 
-                        mut t_sk := ibuf_get(local_syms, sym_i * 4)
-                        mut t_off := ibuf_get(local_syms, sym_i * 4 + 1)
-                        if t_sk == 0 {
-                            // Cross-object symbol lookup in `coff_syms`
-                            un_soff := ibuf_get(local_syms, sym_i * 4 + 2)
-                            un_slen := ibuf_get(local_syms, sym_i * 4 + 3)
-                            mut ci := 0
-                            while ci < ibuf_len(coff_syms) / 4 {
-                                cb := ci * 4
-                                if ibuf_get(coff_syms, cb + 1) == un_slen and pool_str_eq2(pool, ibuf_get(coff_syms, cb), un_slen, un_soff) {
-                                    t_sk = ibuf_get(coff_syms, cb + 2)
-                                    t_off = ibuf_get(coff_syms, cb + 3)
-                                    break
+                            mut t_sk := ibuf_get(local_syms, sym_i * 4)
+                            mut t_off := ibuf_get(local_syms, sym_i * 4 + 1)
+                            if t_sk == 0 {
+                                // Cross-object symbol lookup in `coff_syms`
+                                un_soff := ibuf_get(local_syms, sym_i * 4 + 2)
+                                un_slen := ibuf_get(local_syms, sym_i * 4 + 3)
+                                mut ci := 0
+                                while ci < ibuf_len(coff_syms) / 4 {
+                                    cb := ci * 4
+                                    if ibuf_get(coff_syms, cb + 1) == un_slen and pool_str_eq2(pool, ibuf_get(coff_syms, cb), un_slen, un_soff) {
+                                        t_sk = ibuf_get(coff_syms, cb + 2)
+                                        t_off = ibuf_get(coff_syms, cb + 3)
+                                        break
+                                    }
+                                    ci += 1
                                 }
-                                ci += 1
                             }
-                        }
-                        if t_sk == 1 {
-                            buf_put_u32(code, disp_pos, (t_off + addend) - next_rip)
-                        } else if t_sk == 2 {
-                            // Record `fx_rdata()` (`2`) fixup!
-                            ibuf_push(fixups, disp_pos)
-                            ibuf_push(fixups, next_rip)
-                            ibuf_push(fixups, 2)
-                            ibuf_push(fixups, t_off + addend)
+                            if t_sk == 1 and disp_pos >= 0 and disp_pos + 4 <= buf_len(code) {
+                                buf_put_u32(code, disp_pos, (t_off + addend) - next_rip)
+                            } else if t_sk == 2 {
+                                // Record `fx_rdata()` (`2`) fixup!
+                                ibuf_push(fixups, disp_pos)
+                                ibuf_push(fixups, next_rip)
+                                ibuf_push(fixups, 2)
+                                ibuf_push(fixups, t_off + addend)
+                            }
                         }
                     }
                 }
@@ -872,7 +881,7 @@ fn coff_link_archive_or_obj(pool: ByteBuf, raw: ByteBuf, code: ByteBuf, rdata: B
             }
             body_off := pos + 60
             body_end := body_off + msize
-            if body_end > n {
+            if msize < 0 or body_end < body_off or body_end > n {
                 break
             }
             if msize >= 20 and coff_read_u16(raw, body_off) == 0x8664 and coff_read_u16(raw, body_off + 2) != 0xFFFF {

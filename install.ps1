@@ -1,7 +1,7 @@
-# Axon v7.0 Self-Hosted Multi-OS Native Toolchain Installer (Windows x64)
+# Axon v0.9.0 Self-Hosted Multi-OS Native Toolchain Installer (Windows x64)
 $ErrorActionPreference = "Stop"
 
-$AxonVersion = "7.0.0"
+$AxonVersion = "0.9.0"
 $AxonRoot = Join-Path $env:USERPROFILE ".axon"
 $InstallBin = Join-Path $AxonRoot "bin"
 $InstallStd = Join-Path $AxonRoot "std"

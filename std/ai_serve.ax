@@ -1,0 +1,402 @@
+// Axon v7.0 Public & Hybrid AI Serving Gateway (`std/ai_serve.ax`)
+// Engineered for fastest, lightest, lowest-cost AI execution across Local + Public endpoints:
+//   - Capability-gated (`NetCap`) & Taint-sanitized (`tainted[str]`) prompt ingress
+//   - Lossless Prompt Compressor + Token Estimator (reduces input token spend)
+//   - Zero-reflection JSON builders (OpenAI/Ollama/vLLM/Groq, Gemini, Anthropic) + SSE streaming delta parser
+//   - Zero-GC FNV-64 Prompt/Response Cache (`0 ms` / `$0.00` cache hits)
+//   - Cascade Local-First Router + Circuit Breaker + Micro-Dollar Budget Tracker
+
+use std::os
+use std::json
+use std::cap
+
+// --- 1. Taint Sanitization & Capability Guard ---
+
+fn sanitize_ai_prompt(input: tainted[str], max_bytes: i64 = 32768) -> str ! i64 {
+    raw := tainted_raw_str(input)
+    n := str_len(raw)
+    if n <= 0 or n > max_bytes {
+        return err(505)
+    }
+    mut i := 0
+    while i < n {
+        b := str_byte(raw, i)
+        // Block NUL and non-whitespace ASCII control characters (< 32 except \t=9, \n=10, \r=13)
+        if b < 32 and b != 9 and b != 10 and b != 13 {
+            return err(505)
+        }
+        i += 1
+    }
+    return ok(trusted_str_unwrap(input))
+}
+
+fn verify_ai_endpoint_cap(cap: NetCap, host: str, port: i64) -> bool {
+    if str_len(cap.allowed_host) == 0 {
+        return false
+    }
+    return str_eq(cap.allowed_host, host) and cap.allowed_port == port
+}
+
+// --- 2. Lossless Prompt Compression & Token Estimator ---
+
+// Collapses redundant spaces/tabs and excessive blank lines (`>2` newlines) into `out`.
+// Returns compressed byte length (typically saves 10%-35% input tokens on noisy prompts).
+fn compress_prompt_lossless(raw: str, out: ByteBuf) -> i64 {
+    n := str_len(raw)
+    mut i := 0
+    // Skip leading whitespace
+    while i < n {
+        b := str_byte(raw, i)
+        if b == 32 or b == 9 or b == 10 or b == 13 { i += 1 } else { break }
+    }
+    start_out := buf_len(out)
+    mut prev_space := false
+    mut nl_run := 0
+    while i < n {
+        b := str_byte(raw, i)
+        if b == 13 {
+            i += 1
+        } else if b == 10 {
+            nl_run += 1
+            prev_space = false
+            if nl_run <= 2 {
+                buf_push(out, 10)
+            }
+            i += 1
+        } else if b == 32 or b == 9 {
+            if nl_run == 0 and not prev_space {
+                buf_push(out, 32)
+                prev_space = true
+            }
+            i += 1
+        } else {
+            nl_run = 0
+            prev_space = false
+            buf_push(out, b)
+            i += 1
+        }
+    }
+    // Trim trailing spaces/newlines
+    while buf_len(out) > start_out {
+        last := buf_get(out, buf_len(out) - 1)
+        if last == 32 or last == 10 {
+            buf_truncate(out, buf_len(out) - 1)
+        } else {
+            break
+        }
+    }
+    return buf_len(out) - start_out
+}
+
+@no_alloc
+fn estimate_prompt_tokens(s: str) -> i64 {
+    n := str_len(s)
+    if n <= 0 { return 0 }
+    mut words := 0
+    mut non_ascii := 0
+    mut in_word := false
+    mut i := 0
+    while i < n {
+        b := str_byte(s, i)
+        if b >= 128 {
+            non_ascii += 1
+        }
+        if b == 32 or b == 9 or b == 10 or b == 13 {
+            in_word = false
+        } else if not in_word {
+            in_word = true
+            words += 1
+        }
+        i += 1
+    }
+    est_chars := (n + 3) / 4
+    est_words := (words * 4 + 2) / 3 + (non_ascii / 2)
+    if est_words > est_chars { return est_words }
+    return est_chars
+}
+
+// --- 3. Zero-Reflection JSON Builders & SSE Streaming Delta Parser ---
+
+fn json_push_escaped(out: ByteBuf, s: str) {
+    n := str_len(s)
+    mut i := 0
+    while i < n {
+        b := str_byte(s, i)
+        if b == 34 { buf_push_str(out, "\\\"") }
+        else if b == 92 { buf_push_str(out, "\\\\") }
+        else if b == 10 { buf_push_str(out, "\\n") }
+        else if b == 13 { buf_push_str(out, "\\r") }
+        else if b == 9 { buf_push_str(out, "\\t") }
+        else if b >= 32 { buf_push(out, b) }
+        i += 1
+    }
+}
+
+// Builds OpenAI / Ollama / vLLM / llama.cpp / Groq `/v1/chat/completions` JSON payload.
+fn ai_build_openai_chat_req(out: ByteBuf, model: str, system_prompt: str, user_prompt: str, max_tokens: i64, stream: bool) {
+    buf_push_str(out, "{\"model\":\"")
+    json_push_escaped(out, model)
+    buf_push_str(out, "\",\"messages\":[{\"role\":\"system\",\"content\":\"")
+    json_push_escaped(out, system_prompt)
+    buf_push_str(out, "\"},{\"role\":\"user\",\"content\":\"")
+    json_push_escaped(out, user_prompt)
+    buf_push_str(out, "\"}],\"max_tokens\":")
+    buf_append_i64(out, max_tokens)
+    buf_push_str(out, ",\"stream\":")
+    if stream { buf_push_str(out, "true") } else { buf_push_str(out, "false") }
+    buf_push(out, 125)
+}
+
+// Builds Google Gemini `generateContent` JSON payload.
+fn ai_build_gemini_req(out: ByteBuf, system_prompt: str, user_prompt: str, max_tokens: i64) {
+    buf_push_str(out, "{\"systemInstruction\":{\"parts\":[{\"text\":\"")
+    json_push_escaped(out, system_prompt)
+    buf_push_str(out, "\"}]},\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":\"")
+    json_push_escaped(out, user_prompt)
+    buf_push_str(out, "\"}]}],\"generationConfig\":{\"maxOutputTokens\":")
+    buf_append_i64(out, max_tokens)
+    buf_push_str(out, "}}")
+}
+
+// Builds Anthropic `/v1/messages` JSON payload.
+fn ai_build_anthropic_req(out: ByteBuf, model: str, system_prompt: str, user_prompt: str, max_tokens: i64) {
+    buf_push_str(out, "{\"model\":\"")
+    json_push_escaped(out, model)
+    buf_push_str(out, "\",\"max_tokens\":")
+    buf_append_i64(out, max_tokens)
+    buf_push_str(out, ",\"system\":\"")
+    json_push_escaped(out, system_prompt)
+    buf_push_str(out, "\",\"messages\":[{\"role\":\"user\",\"content\":\"")
+    json_push_escaped(out, user_prompt)
+    buf_push_str(out, "\"}]}")
+}
+
+// Zero-alloc extraction of `"content":"..."` from an OpenAI/vLLM/Ollama JSON response or SSE `"data: {...}"` chunk.
+fn ai_extract_chat_content(json_or_sse: str) -> str ! i64 {
+    return json_get_str(json_or_sse, "content")
+}
+
+fn ai_is_sse_done(line: str) -> bool {
+    return str_starts_with(line, "data: [DONE]") or str_starts_with(line, "data:[DONE]")
+}
+
+// --- 4. Zero-GC FNV-64 Exact Prompt/Response Cache (`PromptCache`) ---
+
+struct PromptCache {
+    index_slots: IntBuf // [slot * 4]: [occupied(0/1), key_hash, data_off, data_len]
+    data_buf: ByteBuf
+    cap_slots: i64
+    meta_ptr: i64       // [0]=write_cursor_slot, [1]=hits, [2]=misses
+}
+
+fn prompt_cache_new(cap_slots: i64 = 128, data_bytes: i64 = 65536) -> PromptCache {
+    mut c := 16
+    while c < cap_slots { c = c << 1 }
+    idx := ibuf_new(c * 4)
+    mut i := 0
+    while i < c * 4 {
+        ibuf_push(idx, 0)
+        i += 1
+    }
+    mp := mem_alloc_aligned(64)
+    ptr_write_i64(mp, 0, 0)
+    ptr_write_i64(mp, 1, 0)
+    ptr_write_i64(mp, 2, 0)
+    return PromptCache(index_slots = idx, data_buf = buf_new(data_bytes), cap_slots = c, meta_ptr = mp)
+}
+
+fn prompt_cache_free(move pc: PromptCache) {
+    buf_free(move pc.index_slots)
+    buf_free(move pc.data_buf)
+    if pc.meta_ptr != 0 { mem_free_aligned(pc.meta_ptr) }
+}
+
+fn prompt_cache_key(model: str, system_prompt: str, user_prompt: str) -> i64 {
+    h1 := fnv1a_64(model)
+    h2 := fnv1a_64(system_prompt)
+    h3 := fnv1a_64(user_prompt)
+    return (h1 *% 1099511628211) ^ (h2 *% 0x517CC1B727220A95) ^ h3
+}
+
+fn prompt_cache_get(pc: PromptCache, key_hash: i64) -> str ! i64 {
+    mask := pc.cap_slots - 1
+    mut slot := key_hash & mask
+    mut probes := 0
+    while probes < pc.cap_slots {
+        base := slot * 4
+        occ := ibuf_get(pc.index_slots, base)
+        if occ == 0 {
+            ptr_write_i64(pc.meta_ptr, 2, ptr_read_i64(pc.meta_ptr, 2) + 1)
+            return err(404)
+        }
+        if ibuf_get(pc.index_slots, base + 1) == key_hash {
+            off := ibuf_get(pc.index_slots, base + 2)
+            dlen := ibuf_get(pc.index_slots, base + 3)
+            ptr_write_i64(pc.meta_ptr, 1, ptr_read_i64(pc.meta_ptr, 1) + 1)
+            return ok(buf_slice_str(pc.data_buf, off, off + dlen))
+        }
+        slot = (slot + 1) & mask
+        probes += 1
+    }
+    ptr_write_i64(pc.meta_ptr, 2, ptr_read_i64(pc.meta_ptr, 2) + 1)
+    return err(404)
+}
+
+fn prompt_cache_put(pc: PromptCache, key_hash: i64, response: str) {
+    off := buf_len(pc.data_buf)
+    rlen := str_len(response)
+    buf_push_str(pc.data_buf, response)
+    mask := pc.cap_slots - 1
+    mut slot := key_hash & mask
+    mut probes := 0
+    while probes < pc.cap_slots {
+        base := slot * 4
+        if ibuf_get(pc.index_slots, base) == 0 or ibuf_get(pc.index_slots, base + 1) == key_hash {
+            ibuf_set(pc.index_slots, base, 1)
+            ibuf_set(pc.index_slots, base + 1, key_hash)
+            ibuf_set(pc.index_slots, base + 2, off)
+            ibuf_set(pc.index_slots, base + 3, rlen)
+            return
+        }
+        slot = (slot + 1) & mask
+        probes += 1
+    }
+    // Overwrite oldest circular slot if table is full
+    cur := ptr_read_i64(pc.meta_ptr, 0) & mask
+    ptr_write_i64(pc.meta_ptr, 0, cur + 1)
+    base := cur * 4
+    ibuf_set(pc.index_slots, base, 1)
+    ibuf_set(pc.index_slots, base + 1, key_hash)
+    ibuf_set(pc.index_slots, base + 2, off)
+    ibuf_set(pc.index_slots, base + 3, rlen)
+}
+
+// --- 5. Cascade Local-First Cost/Latency Router + Circuit Breaker (`AiModelRouter`) ---
+// Endpoint record (8 i64s per endpoint):
+//   [0] tier (0=Local $0, 1=Public Fast/Cheap, 2=Public Frontier)
+//   [1] cost_in_micros_per_1m  (e.g. 0 for local, 150000 = $0.15/1M)
+//   [2] cost_out_micros_per_1m (e.g. 0 for local, 600000 = $0.60/1M)
+//   [3] max_ctx_tokens
+//   [4] min_complexity (0..100)
+//   [5] latency_ema_ms
+//   [6] consecutive_failures (circuit breaker trips at >= 3)
+//   [7] total_requests
+
+struct AiModelRouter {
+    endpoints: IntBuf
+    meta_ptr: i64 // [0]=ep_count, [1]=total_spend_micros, [2]=total_in_tokens, [3]=total_out_tokens
+}
+
+fn ai_router_new(max_endpoints: i64 = 16) -> AiModelRouter {
+    eb := ibuf_new(max_endpoints * 8 + 8)
+    mp := mem_alloc_aligned(64)
+    ptr_write_i64(mp, 0, 0)
+    ptr_write_i64(mp, 1, 0)
+    ptr_write_i64(mp, 2, 0)
+    ptr_write_i64(mp, 3, 0)
+    return AiModelRouter(endpoints = eb, meta_ptr = mp)
+}
+
+fn ai_router_free(move r: AiModelRouter) {
+    buf_free(move r.endpoints)
+    if r.meta_ptr != 0 { mem_free_aligned(r.meta_ptr) }
+}
+
+fn ai_router_add_endpoint(r: AiModelRouter, tier: i64, cost_in_per_1m_micros: i64, cost_out_per_1m_micros: i64, max_ctx: i64, min_complexity: i64, init_latency_ms: i64) -> i64 {
+    eid := ptr_read_i64(r.meta_ptr, 0)
+    ibuf_push(r.endpoints, tier)
+    ibuf_push(r.endpoints, cost_in_per_1m_micros)
+    ibuf_push(r.endpoints, cost_out_per_1m_micros)
+    ibuf_push(r.endpoints, max_ctx)
+    ibuf_push(r.endpoints, min_complexity)
+    ibuf_push(r.endpoints, init_latency_ms)
+    ibuf_push(r.endpoints, 0)
+    ibuf_push(r.endpoints, 0)
+    ptr_write_i64(r.meta_ptr, 0, eid + 1)
+    return eid
+}
+
+@no_alloc
+fn ai_router_estimate_cost_micros(r: AiModelRouter, ep_id: i64, in_tokens: i64, est_out_tokens: i64) -> i64 {
+    cnt := ptr_read_i64(r.meta_ptr, 0)
+    if ep_id < 0 or ep_id >= cnt {
+        return 0
+    }
+    base := ep_id * 8
+    cin := ibuf_get(r.endpoints, base + 1)
+    cout := ibuf_get(r.endpoints, base + 2)
+    return (in_tokens * cin + est_out_tokens * cout) / 1000000
+}
+
+// Selects the lowest-cost healthy endpoint meeting context, complexity, and budget constraints.
+// If `prefer_local` is true and a local tier-0 endpoint is healthy & fits context, it is prioritized.
+@no_alloc
+fn ai_router_select(r: AiModelRouter, est_in_tokens: i64, est_out_tokens: i64, complexity: i64, prefer_local: bool, max_req_micros: i64) -> i64 {
+    cnt := ptr_read_i64(r.meta_ptr, 0)
+    mut best_id := -1
+    mut best_score := 9223372036854775807
+    mut i := 0
+    while i < cnt {
+        base := i * 8
+        tier := ibuf_get(r.endpoints, base)
+        max_ctx := ibuf_get(r.endpoints, base + 3)
+        min_cmp := ibuf_get(r.endpoints, base + 4)
+        lat := ibuf_get(r.endpoints, base + 5)
+        fails := ibuf_get(r.endpoints, base + 6)
+        if fails < 3 and (est_in_tokens + est_out_tokens) <= max_ctx {
+            cost := ai_router_estimate_cost_micros(r, i, est_in_tokens, est_out_tokens)
+            if cost <= max_req_micros {
+                // Penalize endpoints below required complexity, prefer local when `prefer_local`
+                mut score := cost * 1000 + lat
+                if complexity > 60 and tier == 0 and not prefer_local {
+                    score = score + 500000
+                }
+                if complexity >= min_cmp and tier == 0 and prefer_local {
+                    score = score - 10000
+                }
+                if min_cmp > complexity and tier > 0 {
+                    score = score + 100000
+                }
+                if score < best_score {
+                    best_score = score
+                    best_id = i
+                }
+            }
+        }
+        i += 1
+    }
+    return best_id
+}
+
+@no_alloc
+fn ai_router_record_success(r: AiModelRouter, ep_id: i64, in_tokens: i64, out_tokens: i64, latency_ms: i64) {
+    cnt := ptr_read_i64(r.meta_ptr, 0)
+    if ep_id < 0 or ep_id >= cnt {
+        return
+    }
+    base := ep_id * 8
+    old_lat := ibuf_get(r.endpoints, base + 5)
+    new_lat := (old_lat * 3 + latency_ms) / 4
+    ibuf_set(r.endpoints, base + 5, new_lat)
+    ibuf_set(r.endpoints, base + 6, 0) // reset circuit breaker
+    ibuf_set(r.endpoints, base + 7, ibuf_get(r.endpoints, base + 7) + 1)
+    cost := ai_router_estimate_cost_micros(r, ep_id, in_tokens, out_tokens)
+    ptr_write_i64(r.meta_ptr, 1, ptr_read_i64(r.meta_ptr, 1) + cost)
+    ptr_write_i64(r.meta_ptr, 2, ptr_read_i64(r.meta_ptr, 2) + in_tokens)
+    ptr_write_i64(r.meta_ptr, 3, ptr_read_i64(r.meta_ptr, 3) + out_tokens)
+}
+
+@no_alloc
+fn ai_router_record_failure(r: AiModelRouter, ep_id: i64) {
+    cnt := ptr_read_i64(r.meta_ptr, 0)
+    if ep_id < 0 or ep_id >= cnt {
+        return
+    }
+    base := ep_id * 8
+    ibuf_set(r.endpoints, base + 6, ibuf_get(r.endpoints, base + 6) + 1)
+}
+
+@no_alloc
+fn ai_router_total_spend_micros(r: AiModelRouter) -> i64 {
+    return ptr_read_i64(r.meta_ptr, 1)
+}

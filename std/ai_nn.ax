@@ -1,0 +1,670 @@
+// Axon v7.0 Deep Learning Layers, Transformer (GQA + SwiGLU + RoPE + FlashAttention), MoE, Sampling & Classical ML (`std/ai_nn.ax`)
+// Zero-GC, `@no_alloc` hot paths backed by `VramArena` and `PagedKvCache`.
+
+use std::ai_engine
+use std::ai_math
+use std::ai_autograd
+
+// --- 1. `LinearLayer` & `EmbeddingTable` ---
+
+struct LinearLayer {
+    in_dim: i64
+    out_dim: i64
+    has_bias: bool
+    w: ParamTensor // [out_dim, in_dim]
+    b: ParamTensor // [out_dim] (or 1-elem dummy)
+}
+
+fn linear_layer_new(in_dim: i64, out_dim: i64, has_bias: bool, rng: AiRng, opt_kind: i64 = 2) -> LinearLayer {
+    w := param_new(out_dim * in_dim, opt_kind)
+    init_kaiming_normal_f32(w.data_ptr, out_dim * in_dim, in_dim, rng)
+    mut bsz := 1
+    if has_bias { bsz = out_dim }
+    b := param_new(bsz, opt_kind)
+    return LinearLayer(in_dim = in_dim, out_dim = out_dim, has_bias = has_bias, w = w, b = b)
+}
+
+fn linear_layer_free(move l: LinearLayer) {
+    param_free(move l.w)
+    param_free(move l.b)
+}
+
+@no_alloc
+fn linear_layer_zero_grad(l: LinearLayer) {
+    param_zero_grad(l.w)
+    if l.has_bias { param_zero_grad(l.b) }
+}
+
+@no_alloc
+@nan_guard
+fn linear_layer_fwd(l: LinearLayer, x_ptr: i64, out_ptr: i64, batch: i64) {
+    gemm_f32(x_ptr, l.w.data_ptr, out_ptr, batch, l.in_dim, l.out_dim, false, true, 1.0, 0.0)
+    if l.has_bias {
+        mut r := 0
+        while r < batch {
+            row := r * l.out_dim
+            mut j := 0
+            while j < l.out_dim {
+                ptr_write_f32(out_ptr, row + j, ptr_read_f32(out_ptr, row + j) + ptr_read_f32(l.b.data_ptr, j))
+                j += 1
+            }
+            r += 1
+        }
+    }
+}
+
+@no_alloc
+@nan_guard
+fn linear_layer_bwd(l: LinearLayer, x_ptr: i64, dout_ptr: i64, dx_ptr: i64, batch: i64, propagate_dx: bool) {
+    gemm_f32(dout_ptr, x_ptr, l.w.grad_ptr, l.out_dim, batch, l.in_dim, true, false, 1.0, 1.0)
+    if l.has_bias {
+        mut r := 0
+        while r < batch {
+            row := r * l.out_dim
+            mut j := 0
+            while j < l.out_dim {
+                ptr_write_f32(l.b.grad_ptr, j, ptr_read_f32(l.b.grad_ptr, j) + ptr_read_f32(dout_ptr, row + j))
+                j += 1
+            }
+            r += 1
+        }
+    }
+    if propagate_dx and dx_ptr != 0 {
+        gemm_f32(dout_ptr, l.w.data_ptr, dx_ptr, batch, l.out_dim, l.in_dim, false, false, 1.0, 1.0)
+    }
+}
+
+@no_alloc
+@nan_guard
+fn linear_layer_step_adamw(l: LinearLayer, step_num: i64, lr: f64, weight_decay: f64 = 0.01) {
+    adamw_step(l.w, step_num, lr, 0.9, 0.999, 0.00000001, weight_decay)
+    if l.has_bias {
+        adamw_step(l.b, step_num, lr, 0.9, 0.999, 0.00000001, 0.0)
+    }
+}
+
+@no_alloc
+@nan_guard
+fn linear_layer_step_lion(l: LinearLayer, lr: f64, weight_decay: f64 = 0.01) {
+    lion_step(l.w, lr, 0.9, 0.99, weight_decay)
+    if l.has_bias {
+        lion_step(l.b, lr, 0.9, 0.99, 0.0)
+    }
+}
+
+struct EmbeddingTable {
+    vocab_size: i64
+    dim: i64
+    weight: ParamTensor // [vocab_size, dim]
+}
+
+fn embedding_new(vocab_size: i64, dim: i64, rng: AiRng, opt_kind: i64 = 2) -> EmbeddingTable {
+    w := param_new(vocab_size * dim, opt_kind)
+    mut i := 0
+    total := vocab_size * dim
+    while i < total {
+        ptr_write_f32(w.data_ptr, i, ai_rng_normal(rng, 0.02))
+        i += 1
+    }
+    return EmbeddingTable(vocab_size = vocab_size, dim = dim, weight = w)
+}
+
+fn embedding_free(move e: EmbeddingTable) {
+    param_free(move e.weight)
+}
+
+@no_alloc
+fn embedding_fwd(e: EmbeddingTable, token_ids_ptr: i64, out_ptr: i64, seq_len: i64) {
+    mut t := 0
+    while t < seq_len {
+        mut tid := ptr_read_i64(token_ids_ptr, t)
+        if tid < 0 { tid = 0 }
+        if tid >= e.vocab_size { tid = e.vocab_size - 1 }
+        src_off := tid * e.dim
+        dst_off := t * e.dim
+        mut d := 0
+        while d < e.dim {
+            ptr_write_f32(out_ptr, dst_off + d, ptr_read_f32(e.weight.data_ptr, src_off + d))
+            d += 1
+        }
+        t += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn embedding_bwd(e: EmbeddingTable, token_ids_ptr: i64, dout_ptr: i64, seq_len: i64) {
+    mut t := 0
+    while t < seq_len {
+        mut tid := ptr_read_i64(token_ids_ptr, t)
+        if tid >= 0 and tid < e.vocab_size {
+            g_off := tid * e.dim
+            do_off := t * e.dim
+            mut d := 0
+            while d < e.dim {
+                ptr_write_f32(e.weight.grad_ptr, g_off + d, ptr_read_f32(e.weight.grad_ptr, g_off + d) + ptr_read_f32(dout_ptr, do_off + d))
+                d += 1
+            }
+        }
+        t += 1
+    }
+}
+
+// --- 2. Transformer Block (Pre-RMSNorm + RoPE + GQA + PagedKvCache + SwiGLU) ---
+
+struct TransformerBlock {
+    dim: i64
+    n_heads: i64
+    n_kv_heads: i64
+    head_dim: i64
+    hidden_dim: i64
+    eps: f64
+    rope_theta: f64
+    attn_norm: ParamTensor // [dim]
+    ffn_norm: ParamTensor  // [dim]
+    wq: LinearLayer        // [n_heads * head_dim, dim]
+    wk: LinearLayer        // [n_kv_heads * head_dim, dim]
+    wv: LinearLayer        // [n_kv_heads * head_dim, dim]
+    wo: LinearLayer        // [dim, n_heads * head_dim]
+    w_gate: LinearLayer    // [hidden_dim, dim]
+    w_up: LinearLayer      // [hidden_dim, dim]
+    w_down: LinearLayer    // [dim, hidden_dim]
+}
+
+fn transformer_block_new(dim: i64, n_heads: i64, n_kv_heads: i64, hidden_dim: i64, rng: AiRng, opt_kind: i64 = 1) -> TransformerBlock {
+    head_dim := dim / n_heads
+    kv_dim := n_kv_heads * head_dim
+    an := param_new(dim, opt_kind)
+    fnm := param_new(dim, opt_kind)
+    mut i := 0
+    while i < dim {
+        ptr_write_f32(an.data_ptr, i, 1.0)
+        ptr_write_f32(fnm.data_ptr, i, 1.0)
+        i += 1
+    }
+    return TransformerBlock(
+        dim = dim,
+        n_heads = n_heads,
+        n_kv_heads = n_kv_heads,
+        head_dim = head_dim,
+        hidden_dim = hidden_dim,
+        eps = 0.00001,
+        rope_theta = 10000.0,
+        attn_norm = an,
+        ffn_norm = fnm,
+        wq = linear_layer_new(dim, n_heads * head_dim, false, rng, opt_kind),
+        wk = linear_layer_new(dim, kv_dim, false, rng, opt_kind),
+        wv = linear_layer_new(dim, kv_dim, false, rng, opt_kind),
+        wo = linear_layer_new(n_heads * head_dim, dim, false, rng, opt_kind),
+        w_gate = linear_layer_new(dim, hidden_dim, false, rng, opt_kind),
+        w_up = linear_layer_new(dim, hidden_dim, false, rng, opt_kind),
+        w_down = linear_layer_new(hidden_dim, dim, false, rng, opt_kind)
+    )
+}
+
+fn transformer_block_free(move tb: TransformerBlock) {
+    param_free(move tb.attn_norm)
+    param_free(move tb.ffn_norm)
+    linear_layer_free(move tb.wq)
+    linear_layer_free(move tb.wk)
+    linear_layer_free(move tb.wv)
+    linear_layer_free(move tb.wo)
+    linear_layer_free(move tb.w_gate)
+    linear_layer_free(move tb.w_up)
+    linear_layer_free(move tb.w_down)
+}
+
+// Appends a `[kv_dim]` key/value vector into `PagedKvCache` at current token slot (0 memcpy of prior tokens!).
+@no_alloc
+fn paged_kv_append_vec(kv: PagedKvCache, vec_ptr: i64) -> i64 {
+    tok_idx := ptr_read_i64(kv.meta_ptr, 1)
+    logical_blk := tok_idx / kv.block_tokens
+    slot_in_blk := tok_idx % kv.block_tokens
+    if logical_blk >= kv.max_blocks { return -1 }
+    mut phys_blk := 0
+    if slot_in_blk == 0 {
+        phys_blk = ptr_read_i64(kv.meta_ptr, 0)
+        ptr_write_i64(kv.block_table_ptr, logical_blk, phys_blk)
+        ptr_write_i64(kv.meta_ptr, 0, phys_blk + 1)
+    } else {
+        phys_blk = ptr_read_i64(kv.block_table_ptr, logical_blk)
+    }
+    base_float := (phys_blk * kv.block_tokens + slot_in_blk) * kv.head_dim
+    mut d := 0
+    while d < kv.head_dim {
+        ptr_write_f32(kv.pool_ptr, base_float + d, ptr_read_f32(vec_ptr, d))
+        d += 1
+    }
+    ptr_write_i64(kv.meta_ptr, 1, tok_idx + 1)
+    return phys_blk
+}
+
+// Single-token autoregressive decode step using `VramArena` scratch (`0` heap allocs) + `PagedKvCache` (GQA + RoPE + SwiGLU).
+// `x_ptr` is updated in-place (`[dim]`). `scratch` arena is reset at end of step if caller desires.
+@no_alloc
+@nan_guard
+fn transformer_block_decode_step(tb: TransformerBlock, x_ptr: i64, pos: i64, k_cache: PagedKvCache, v_cache: PagedKvCache, scratch: VramArena) -> bool {
+    kv_dim := tb.n_kv_heads * tb.head_dim
+    q_dim := tb.n_heads * tb.head_dim
+    mark := vram_arena_used_bytes(scratch)
+
+    xb := vram_arena_alloc_f32(scratch, tb.dim)
+    q := vram_arena_alloc_f32(scratch, q_dim)
+    k := vram_arena_alloc_f32(scratch, kv_dim)
+    v := vram_arena_alloc_f32(scratch, kv_dim)
+    attn_out := vram_arena_alloc_f32(scratch, q_dim)
+    proj := vram_arena_alloc_f32(scratch, tb.dim)
+    gate := vram_arena_alloc_f32(scratch, tb.hidden_dim)
+    up := vram_arena_alloc_f32(scratch, tb.hidden_dim)
+    if xb == 0 or up == 0 {
+        ptr_write_i64(scratch.state_ptr, 0, mark)
+        return false
+    }
+
+    // 1. Pre-RMSNorm + Q/K/V GEMV projections
+    rmsnorm_fwd_f32(xb, x_ptr, tb.attn_norm.data_ptr, 1, tb.dim, tb.eps)
+    gemv_f32(tb.wq.w.data_ptr, xb, q, q_dim, tb.dim)
+    gemv_f32(tb.wk.w.data_ptr, xb, k, kv_dim, tb.dim)
+    gemv_f32(tb.wv.w.data_ptr, xb, v, kv_dim, tb.dim)
+
+    // 2. RoPE + append K, V into non-contiguous PagedKvCache
+    rope_apply_f32(q, pos, tb.n_heads, tb.head_dim, tb.rope_theta)
+    rope_apply_f32(k, pos, tb.n_kv_heads, tb.head_dim, tb.rope_theta)
+    _kb := paged_kv_append_vec(k_cache, k)
+    _vb := paged_kv_append_vec(v_cache, v)
+    seq_len := paged_kv_num_tokens(k_cache)
+
+    // 3. Online-Softmax Grouped-Query Attention across PagedKvCache blocks (O(1) score memory!)
+    gqa_ratio := tb.n_heads / tb.n_kv_heads
+    inv_sqrt_hd := 1.0 / sqrt_f64(tb.head_dim as f64)
+    mut h := 0
+    while h < tb.n_heads {
+        kv_h := h / gqa_ratio
+        q_off := h * tb.head_dim
+        kv_off := kv_h * tb.head_dim
+        mut d := 0
+        while d < tb.head_dim {
+            ptr_write_f32(attn_out, q_off + d, 0.0)
+            d += 1
+        }
+        mut m_prev := -1000000.0
+        mut l_prev := 0.0
+        mut t := 0
+        while t < seq_len {
+            lblk := t / k_cache.block_tokens
+            slot := t % k_cache.block_tokens
+            k_pblk := ptr_read_i64(k_cache.block_table_ptr, lblk)
+            v_pblk := ptr_read_i64(v_cache.block_table_ptr, lblk)
+            k_base := (k_pblk * k_cache.block_tokens + slot) * k_cache.head_dim + kv_off
+            v_base := (v_pblk * v_cache.block_tokens + slot) * v_cache.head_dim + kv_off
+            mut dot := 0.0
+            d = 0
+            while d < tb.head_dim {
+                dot = dot + ptr_read_f32(q, q_off + d) * ptr_read_f32(k_cache.pool_ptr, k_base + d)
+                d += 1
+            }
+            score := dot * inv_sqrt_hd
+            mut m_new := m_prev
+            if score > m_new { m_new = score }
+            alpha := exp_f64(m_prev - m_new)
+            beta := exp_f64(score - m_new)
+            l_new := l_prev * alpha + beta
+            d = 0
+            while d < tb.head_dim {
+                vv := ptr_read_f32(v_cache.pool_ptr, v_base + d)
+                ptr_write_f32(attn_out, q_off + d, ptr_read_f32(attn_out, q_off + d) * alpha + beta * vv)
+                d += 1
+            }
+            m_prev = m_new
+            l_prev = l_new
+            t += 1
+        }
+        inv_l := 1.0 / (l_prev + 0.000000000001)
+        d = 0
+        while d < tb.head_dim {
+            ptr_write_f32(attn_out, q_off + d, ptr_read_f32(attn_out, q_off + d) * inv_l)
+            d += 1
+        }
+        h += 1
+    }
+
+    // 4. Output projection + Residual
+    gemv_f32(tb.wo.w.data_ptr, attn_out, proj, tb.dim, q_dim)
+    vec_add_f32(x_ptr, x_ptr, proj, tb.dim)
+
+    // 5. Pre-RMSNorm + SwiGLU FFN + Residual
+    rmsnorm_fwd_f32(xb, x_ptr, tb.ffn_norm.data_ptr, 1, tb.dim, tb.eps)
+    gemv_f32(tb.w_gate.w.data_ptr, xb, gate, tb.hidden_dim, tb.dim)
+    gemv_f32(tb.w_up.w.data_ptr, xb, up, tb.hidden_dim, tb.dim)
+    swiglu_fwd_f32(gate, gate, up, tb.hidden_dim)
+    gemv_f32(tb.w_down.w.data_ptr, gate, proj, tb.dim, tb.hidden_dim)
+    vec_add_f32(x_ptr, x_ptr, proj, tb.dim)
+
+    ptr_write_i64(scratch.state_ptr, 0, mark)
+    return true
+}
+
+// --- 3. Mixture-of-Experts (`MoERouter`) Top-K Sparse Gating ---
+
+// Routes a single token hidden vector `x_ptr[dim]` through `n_experts` gate matrix `gate_w[n_experts, dim]`.
+// Selects `top_k` experts, writes expert indices to `out_ids_ptr` (`i64`) and softmax-normalized weights to `out_weights_ptr` (`f32`).
+@no_alloc
+@nan_guard
+fn moe_route_topk(gate_w_ptr: i64, x_ptr: i64, logits_scratch_ptr: i64, n_experts: i64, dim: i64, top_k: i64, out_ids_ptr: i64, out_weights_ptr: i64) {
+    gemv_f32(gate_w_ptr, x_ptr, logits_scratch_ptr, n_experts, dim)
+    softmax_inplace_f32(logits_scratch_ptr, n_experts)
+    mut k := 0
+    mut sum_w := 0.0
+    while k < top_k and k < n_experts {
+        mut best_idx := -1
+        mut best_val := -1.0
+        mut e := 0
+        while e < n_experts {
+            p := ptr_read_f32(logits_scratch_ptr, e)
+            if p > best_val {
+                best_val = p
+                best_idx = e
+            }
+            e += 1
+        }
+        ptr_write_i64(out_ids_ptr, k, best_idx)
+        ptr_write_f32(out_weights_ptr, k, best_val)
+        sum_w = sum_w + best_val
+        if best_idx >= 0 {
+            ptr_write_f32(logits_scratch_ptr, best_idx, -2.0)
+        }
+        k += 1
+    }
+    inv_w := 1.0 / max_f64(sum_w, 0.000000000001)
+    k = 0
+    while k < top_k and k < n_experts {
+        ptr_write_f32(out_weights_ptr, k, ptr_read_f32(out_weights_ptr, k) * inv_w)
+        k += 1
+    }
+}
+
+// --- 4. Allocation-Free Token Sampling (Greedy, Repetition Penalty, Temperature, Min-P, Top-K/Top-P) ---
+
+@no_alloc
+@nan_guard
+fn sample_greedy(logits_ptr: i64, vocab_size: i64) -> i64 {
+    mut best_id := 0
+    mut best_val := ptr_read_f32(logits_ptr, 0)
+    mut i := 1
+    while i < vocab_size {
+        v := ptr_read_f32(logits_ptr, i)
+        if v > best_val {
+            best_val = v
+            best_id = i
+        }
+        i += 1
+    }
+    return best_id
+}
+
+@no_alloc
+@nan_guard
+fn apply_repetition_penalty(logits_ptr: i64, vocab_size: i64, recent_ptr: i64, n_recent: i64, penalty: f64) {
+    if penalty == 1.0 or n_recent <= 0 { return }
+    mut i := 0
+    while i < n_recent {
+        tid := ptr_read_i64(recent_ptr, i)
+        if tid >= 0 and tid < vocab_size {
+            v := ptr_read_f32(logits_ptr, tid)
+            if v > 0.0 {
+                ptr_write_f32(logits_ptr, tid, v / penalty)
+            } else {
+                ptr_write_f32(logits_ptr, tid, v * penalty)
+            }
+        }
+        i += 1
+    }
+}
+
+// In-place Temperature + Min-P + Top-K/Top-P sampling (`0` allocations!).
+// Uses `cand_ids_ptr` (`i64[top_k]`) and `cand_probs_ptr` (`f32[top_k]`) in caller's `VramArena`.
+@no_alloc
+@nan_guard
+fn sample_top_k_min_p(logits_ptr: i64, vocab_size: i64, temperature: f64, top_k: i64, top_p: f64, min_p: f64, cand_ids_ptr: i64, cand_probs_ptr: i64, rng: AiRng) -> i64 {
+    if temperature <= 0.0001 or top_k <= 1 {
+        return sample_greedy(logits_ptr, vocab_size)
+    }
+    inv_temp := 1.0 / temperature
+    mut i := 0
+    while i < vocab_size {
+        ptr_write_f32(logits_ptr, i, ptr_read_f32(logits_ptr, i) * inv_temp)
+        i += 1
+    }
+    softmax_inplace_f32(logits_ptr, vocab_size)
+
+    // Extract top-k candidates via partial selection (O(vocab * top_k), 0 allocs!)
+    mut max_prob := 0.0
+    mut cnt := 0
+    while cnt < top_k and cnt < vocab_size {
+        mut best_id := 0
+        mut best_p := -1.0
+        i = 0
+        while i < vocab_size {
+            p := ptr_read_f32(logits_ptr, i)
+            if p > best_p {
+                best_p = p
+                best_id = i
+            }
+            i += 1
+        }
+        if cnt == 0 { max_prob = best_p }
+        if best_p < min_p * max_prob {
+            break
+        }
+        ptr_write_i64(cand_ids_ptr, cnt, best_id)
+        ptr_write_f32(cand_probs_ptr, cnt, best_p)
+        ptr_write_f32(logits_ptr, best_id, -1.0)
+        cnt += 1
+    }
+    if cnt <= 0 { return 0 }
+
+    // Apply nucleus top-p cutoff & renormalize
+    mut cum := 0.0
+    mut keep := 0
+    while keep < cnt {
+        p := ptr_read_f32(cand_probs_ptr, keep)
+        cum = cum + p
+        keep += 1
+        if cum >= top_p { break }
+    }
+    r := ai_rng_uniform_01(rng) * cum
+    mut acc := 0.0
+    mut k := 0
+    while k < keep {
+        acc = acc + ptr_read_f32(cand_probs_ptr, k)
+        if acc >= r {
+            return ptr_read_i64(cand_ids_ptr, k)
+        }
+        k += 1
+    }
+    return ptr_read_i64(cand_ids_ptr, keep - 1)
+}
+
+// --- 5. Classical / Tabular ML & Local RAG Vector Search (`@no_alloc`) ---
+
+// Fits Ridge/Linear Regression `y = X @ w` (L2 regularized GD), returns final MSE.
+@no_alloc
+@nan_guard
+fn linear_regression_fit_gd(x_ptr: i64, y_ptr: i64, w_ptr: i64, grad_scratch: i64, n_samples: i64, n_features: i64, lr: f64, l2_reg: f64, epochs: i64) -> f64 {
+    inv_n := 1.0 / max_f64(n_samples as f64, 1.0)
+    mut last_mse := 0.0
+    mut ep := 0
+    while ep < epochs {
+        vec_zero_f32(grad_scratch, n_features)
+        mut mse := 0.0
+        mut i := 0
+        while i < n_samples {
+            row_ptr := x_ptr + i * n_features * 4
+            pred := dlpack_dot_f32(row_ptr, w_ptr, n_features)
+            err_v := pred - ptr_read_f32(y_ptr, i)
+            mse = mse + err_v * err_v
+            _rc := dlpack_scale_add_f32(grad_scratch, row_ptr, 2.0 * err_v * inv_n, n_features)
+            i += 1
+        }
+        last_mse = mse * inv_n
+        mut j := 0
+        while j < n_features {
+            wj := ptr_read_f32(w_ptr, j)
+            gj := ptr_read_f32(grad_scratch, j) + 2.0 * l2_reg * wj
+            ptr_write_f32(w_ptr, j, wj - lr * gj)
+            j += 1
+        }
+        ep += 1
+    }
+    return last_mse
+}
+
+// Fits Binary Logistic Regression `p = sigmoid(X @ w)` with BCE + L2 loss, returns final BCE loss.
+@no_alloc
+@nan_guard
+fn logistic_regression_fit_gd(x_ptr: i64, y_ptr: i64, w_ptr: i64, grad_scratch: i64, n_samples: i64, n_features: i64, lr: f64, l2_reg: f64, epochs: i64) -> f64 {
+    inv_n := 1.0 / max_f64(n_samples as f64, 1.0)
+    mut last_loss := 0.0
+    mut ep := 0
+    while ep < epochs {
+        vec_zero_f32(grad_scratch, n_features)
+        mut bce := 0.0
+        mut i := 0
+        while i < n_samples {
+            row_ptr := x_ptr + i * n_features * 4
+            z := dlpack_dot_f32(row_ptr, w_ptr, n_features)
+            y := ptr_read_f32(y_ptr, i)
+            p := sigmoid_f64(z)
+            bce = bce - (y * ln_f64(max_f64(p, 0.000000001)) + (1.0 - y) * ln_f64(max_f64(1.0 - p, 0.000000001)))
+            _rc := dlpack_scale_add_f32(grad_scratch, row_ptr, (p - y) * inv_n, n_features)
+            i += 1
+        }
+        last_loss = bce * inv_n
+        mut j := 0
+        while j < n_features {
+            wj := ptr_read_f32(w_ptr, j)
+            gj := ptr_read_f32(grad_scratch, j) + l2_reg * wj
+            ptr_write_f32(w_ptr, j, wj - lr * gj)
+            j += 1
+        }
+        ep += 1
+    }
+    return last_loss
+}
+
+// K-Means clustering (`counts_ptr` holds `k` i64s; `centroids_ptr` holds `k * dim` f32s; `assign_ptr` holds `n_samples` i64s).
+@no_alloc
+@nan_guard
+fn kmeans_fit(data_ptr: i64, centroids_ptr: i64, assign_ptr: i64, counts_ptr: i64, n_samples: i64, dim: i64, k: i64, max_iters: i64) -> f64 {
+    // Deterministic spaced initialization from samples
+    mut c := 0
+    while c < k {
+        src_idx := (c * n_samples) / k
+        src_off := src_idx * dim
+        dst_off := c * dim
+        mut d := 0
+        while d < dim {
+            ptr_write_f32(centroids_ptr, dst_off + d, ptr_read_f32(data_ptr, src_off + d))
+            d += 1
+        }
+        c += 1
+    }
+    mut inertia := 0.0
+    mut it := 0
+    while it < max_iters {
+        inertia = 0.0
+        mut i := 0
+        while i < n_samples {
+            x_off := i * dim
+            mut best_c := 0
+            mut best_dist := 1000000000000.0
+            c = 0
+            while c < k {
+                c_off := c * dim
+                mut dist := 0.0
+                mut d := 0
+                while d < dim {
+                    diff := ptr_read_f32(data_ptr, x_off + d) - ptr_read_f32(centroids_ptr, c_off + d)
+                    dist = dist + diff * diff
+                    d += 1
+                }
+                if dist < best_dist {
+                    best_dist = dist
+                    best_c = c
+                }
+                c += 1
+            }
+            ptr_write_i64(assign_ptr, i, best_c)
+            inertia = inertia + best_dist
+            i += 1
+        }
+        vec_zero_f32(centroids_ptr, k * dim)
+        c = 0
+        while c < k {
+            ptr_write_i64(counts_ptr, c, 0)
+            c += 1
+        }
+        i = 0
+        while i < n_samples {
+            cid := ptr_read_i64(assign_ptr, i)
+            ptr_write_i64(counts_ptr, cid, ptr_read_i64(counts_ptr, cid) + 1)
+            x_off := i * dim
+            c_off := cid * dim
+            mut d := 0
+            while d < dim {
+                ptr_write_f32(centroids_ptr, c_off + d, ptr_read_f32(centroids_ptr, c_off + d) + ptr_read_f32(data_ptr, x_off + d))
+                d += 1
+            }
+            i += 1
+        }
+        c = 0
+        while c < k {
+            cnt := ptr_read_i64(counts_ptr, c)
+            if cnt > 0 {
+                inv := 1.0 / (cnt as f64)
+                c_off := c * dim
+                mut d := 0
+                while d < dim {
+                    ptr_write_f32(centroids_ptr, c_off + d, ptr_read_f32(centroids_ptr, c_off + d) * inv)
+                    d += 1
+                }
+            }
+            c += 1
+        }
+        it += 1
+    }
+    return inertia
+}
+
+// Local RAG Top-K Cosine Similarity Search over `db_ptr[n_docs, dim]` (`0` heap allocs!).
+@no_alloc
+@nan_guard
+fn top_k_cosine_search(query_ptr: i64, db_ptr: i64, n_docs: i64, dim: i64, top_k: i64, out_ids_ptr: i64, out_scores_ptr: i64) {
+    q_norm := sqrt_f64(dlpack_dot_f32(query_ptr, query_ptr, dim) + 0.000000000001)
+    mut r := 0
+    while r < top_k {
+        ptr_write_i64(out_ids_ptr, r, -1)
+        ptr_write_f32(out_scores_ptr, r, -2.0)
+        r += 1
+    }
+    mut i := 0
+    stride_b := dim * 4
+    while i < n_docs {
+        doc_ptr := db_ptr + i * stride_b
+        dot := dlpack_dot_f32(query_ptr, doc_ptr, dim)
+        d_norm := sqrt_f64(dlpack_dot_f32(doc_ptr, doc_ptr, dim) + 0.000000000001)
+        sim := dot / (q_norm * d_norm)
+        // Insert into sorted top-k list
+        mut pos := top_k - 1
+        if sim > ptr_read_f32(out_scores_ptr, pos) {
+            while pos > 0 and sim > ptr_read_f32(out_scores_ptr, pos - 1) {
+                ptr_write_i64(out_ids_ptr, pos, ptr_read_i64(out_ids_ptr, pos - 1))
+                ptr_write_f32(out_scores_ptr, pos, ptr_read_f32(out_scores_ptr, pos - 1))
+                pos -= 1
+            }
+            ptr_write_i64(out_ids_ptr, pos, i)
+            ptr_write_f32(out_scores_ptr, pos, sim)
+        }
+        i += 1
+    }
+}

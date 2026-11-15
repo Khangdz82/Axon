@@ -1,0 +1,541 @@
+// Axon v7.0 Local AI Model Runtime (`std/ai_local.ax`)
+// Features:
+//   - `.axm` Compact Zero-Fragmentation Model Weight Archive (loads straight into `VramArena`)
+//   - Native `.gguf` Header Inspector (magic `"GGUF"`, version, tensor_count, kv_count)
+//   - Fast FNV-1a Hash-Indexed Subword Tokenizer (`0%` OOV via byte fallback)
+//   - Prefix-Shared `LocalLlmSession` (skips redundant system-prompt prefill via `PagedKvCache`)
+//   - Bounded-RAM `ContinuousBatcher` for concurrent local inference slots
+
+use std::os
+use std::ai_engine
+use std::ai_math
+use std::ai_quant
+
+fn axm_read_u32_le(b: ByteBuf, off: i64) -> i64 {
+    return buf_get(b, off) | (buf_get(b, off + 1) << 8) | (buf_get(b, off + 2) << 16) | (buf_get(b, off + 3) << 24)
+}
+
+fn axm_read_u64_le(b: ByteBuf, off: i64) -> i64 {
+    lo := axm_read_u32_le(b, off)
+    hi := axm_read_u32_le(b, off + 4)
+    return lo | (hi << 32)
+}
+
+fn axm_fnv1a_bytes(b: ByteBuf, start: i64, len: i64) -> i64 {
+    mut h := -3750763034362895579
+    mut i := 0
+    while i < len {
+        h = (h ^ buf_get(b, start + i)) *% 1099511628211
+        i += 1
+    }
+    return h
+}
+
+// --- 1. Native `.gguf` Header Inspector ---
+
+struct GgufHeader {
+    valid: bool
+    version: i64
+    tensor_count: i64
+    metadata_kv_count: i64
+}
+
+fn gguf_parse_header(raw: ByteBuf) -> GgufHeader {
+    if buf_len(raw) < 24 {
+        return GgufHeader(valid = false, version = 0, tensor_count = 0, metadata_kv_count = 0)
+    }
+    // "GGUF" little-endian = 0x46554747
+    magic := axm_read_u32_le(raw, 0)
+    if magic != 0x46554747 {
+        return GgufHeader(valid = false, version = 0, tensor_count = 0, metadata_kv_count = 0)
+    }
+    ver := axm_read_u32_le(raw, 4)
+    tc := axm_read_u64_le(raw, 8)
+    kvc := axm_read_u64_le(raw, 16)
+    if ver < 1 or ver > 3 or tc < 0 or kvc < 0 {
+        return GgufHeader(valid = false, version = ver, tensor_count = 0, metadata_kv_count = 0)
+    }
+    return GgufHeader(valid = true, version = ver, tensor_count = tc, metadata_kv_count = kvc)
+}
+
+// --- 2. Compact `.axm` Zero-Fragmentation Model Weight Archive ---
+// Binary layout:
+//   [0..4]   magic = "AXM1" (0x314D5841)
+//   [4..8]   version = 1
+//   [8..16]  tensor_count
+//   [16..24] data_checksum (FNV-64 over payload)
+//   [24..24 + N*40] Directory entries (5 x i64 per tensor): [name_hash, dtype, rows, cols, data_byte_len]
+//   [payload...] Contiguous 64-byte-padded tensor bytes (ready for direct `VramArena` load!)
+
+struct AxmArchiveBuilder {
+    dir_buf: IntBuf   // 5 i64s per tensor
+    payload: ByteBuf
+    tensor_count_ptr: i64
+}
+
+fn axm_builder_new(init_payload_bytes: i64 = 65536) -> AxmArchiveBuilder {
+    cp := mem_alloc_aligned(64)
+    ptr_write_i64(cp, 0, 0)
+    return AxmArchiveBuilder(
+        dir_buf = ibuf_new(512),
+        payload = buf_new(init_payload_bytes),
+        tensor_count_ptr = cp
+    )
+}
+
+fn axm_builder_free(move b: AxmArchiveBuilder) {
+    if b.tensor_count_ptr != 0 { mem_free_aligned(b.tensor_count_ptr) }
+    buf_free(move b.dir_buf)
+    buf_free(move b.payload)
+}
+
+fn axm_builder_add_raw(b: AxmArchiveBuilder, name: str, dtype: i64, rows: i64, cols: i64, raw_ptr: i64, byte_len: i64) {
+    // Pad payload to 16-byte alignment for SIMD reads
+    while (buf_len(b.payload) & 15) != 0 {
+        buf_push(b.payload, 0)
+    }
+    nh := fnv1a_64(name)
+    ibuf_push(b.dir_buf, nh)
+    ibuf_push(b.dir_buf, dtype)
+    ibuf_push(b.dir_buf, rows)
+    ibuf_push(b.dir_buf, cols)
+    ibuf_push(b.dir_buf, byte_len)
+    mut i := 0
+    while i < byte_len {
+        buf_push(b.payload, ptr_read_u8(raw_ptr, i))
+        i += 1
+    }
+    ptr_write_i64(b.tensor_count_ptr, 0, ptr_read_i64(b.tensor_count_ptr, 0) + 1)
+}
+
+fn axm_builder_save(b: AxmArchiveBuilder, path: str) -> i64 ! i64 {
+    cnt := ptr_read_i64(b.tensor_count_ptr, 0)
+    plen := buf_len(b.payload)
+    out := buf_new(32 + cnt * 40 + plen)
+    buf_push_u32(out, 0x314D5841) // "AXM1"
+    buf_push_u32(out, 1)
+    buf_push_u64(out, cnt)
+    csum := axm_fnv1a_bytes(b.payload, 0, plen)
+    buf_push_u64(out, csum)
+    mut i := 0
+    while i < cnt {
+        base := i * 5
+        buf_push_u64(out, ibuf_get(b.dir_buf, base))
+        buf_push_u64(out, ibuf_get(b.dir_buf, base + 1))
+        buf_push_u64(out, ibuf_get(b.dir_buf, base + 2))
+        buf_push_u64(out, ibuf_get(b.dir_buf, base + 3))
+        buf_push_u64(out, ibuf_get(b.dir_buf, base + 4))
+        i += 1
+    }
+    i = 0
+    while i < plen {
+        buf_push(out, buf_get(b.payload, i))
+        i += 1
+    }
+    return fs_write_file(path, out)
+}
+
+struct AxmLoadedModel {
+    arena: VramArena
+    tensor_count: i64
+    table: IntBuf // 6 i64s per tensor: [name_hash, dtype, rows, cols, ptr, byte_len]
+}
+
+fn axm_load_into_arena(path: str) -> AxmLoadedModel ! i64 {
+    raw := fs_read_file(path) or return err(404)
+    total := buf_len(raw)
+    if total < 24 or axm_read_u32_le(raw, 0) != 0x314D5841 {
+        buf_free(move raw)
+        return err(422)
+    }
+    cnt := axm_read_u64_le(raw, 8)
+    expected_csum := axm_read_u64_le(raw, 16)
+    if cnt < 0 or cnt > 1000000 {
+        buf_free(move raw)
+        return err(422)
+    }
+    dir_bytes := cnt * 40
+    payload_start := 24 + dir_bytes
+    if payload_start < 24 or total < payload_start {
+        buf_free(move raw)
+        return err(422)
+    }
+    plen := total - payload_start
+    actual_csum := axm_fnv1a_bytes(raw, payload_start, plen)
+    if actual_csum != expected_csum {
+        buf_free(move raw)
+        return err(422)
+    }
+    arena := vram_arena_new(plen + cnt * 64 + 65536)
+    tbl := ibuf_new(cnt * 6 + 8)
+    mut off := payload_start
+    mut i := 0
+    while i < cnt {
+        d_off := 24 + i * 40
+        nh := axm_read_u64_le(raw, d_off)
+        dtype := axm_read_u64_le(raw, d_off + 8)
+        rows := axm_read_u64_le(raw, d_off + 16)
+        cols := axm_read_u64_le(raw, d_off + 24)
+        blen := axm_read_u64_le(raw, d_off + 32)
+        while ((off - payload_start) & 15) != 0 and off < total {
+            off += 1
+        }
+        if blen < 0 or rows <= 0 or cols <= 0 or blen > total - off {
+            buf_free(move raw)
+            vram_arena_free(move arena)
+            buf_free(move tbl)
+            return err(422)
+        }
+        n_floats := (blen + 3) / 4
+        dst_ptr := vram_arena_alloc_f32(arena, n_floats)
+        mut k := 0
+        while k < blen {
+            ptr_write_u8(dst_ptr, k, buf_get(raw, off + k))
+            k += 1
+        }
+        off += blen
+        ibuf_push(tbl, nh)
+        ibuf_push(tbl, dtype)
+        ibuf_push(tbl, rows)
+        ibuf_push(tbl, cols)
+        ibuf_push(tbl, dst_ptr)
+        ibuf_push(tbl, blen)
+        i += 1
+    }
+    buf_free(move raw)
+    return ok(AxmLoadedModel(arena = arena, tensor_count = cnt, table = tbl))
+}
+
+fn axm_loaded_free(move m: AxmLoadedModel) {
+    vram_arena_free(move m.arena)
+    buf_free(move m.table)
+}
+
+@no_alloc
+fn axm_find_tensor_ptr(m: AxmLoadedModel, name_hash: i64) -> i64 {
+    mut i := 0
+    while i < m.tensor_count {
+        base := i * 6
+        if ibuf_get(m.table, base) == name_hash {
+            return ibuf_get(m.table, base + 4)
+        }
+        i += 1
+    }
+    return 0
+}
+
+// --- 3. Fast FNV-1a Hash-Indexed Subword Tokenizer (`0%` OOV via Byte Fallback) ---
+
+struct AiTokenizer {
+    vocab_bytes: ByteBuf
+    tok_offs: IntBuf  // [token_id] -> byte offset in vocab_bytes
+    tok_lens: IntBuf  // [token_id] -> byte length
+    hash_map: IntBuf  // open addressing [cap * 2]: [hash, token_id + 1] (0 = empty)
+    mask: i64
+    max_tok_len: i64
+    vocab_size_ptr: i64
+}
+
+fn ai_tokenizer_new(vocab_cap: i64 = 1024) -> AiTokenizer {
+    mut hm_cap := 256
+    while hm_cap < vocab_cap * 2 {
+        hm_cap = hm_cap << 1
+    }
+    hm := ibuf_new(hm_cap * 2)
+    mut i := 0
+    while i < hm_cap * 2 {
+        ibuf_push(hm, 0)
+        i += 1
+    }
+    vp := mem_alloc_aligned(64)
+    ptr_write_i64(vp, 0, 0)
+    ptr_write_i64(vp, 1, 1) // [1] = max_tok_len
+    return AiTokenizer(
+        vocab_bytes = buf_new(vocab_cap * 8),
+        tok_offs = ibuf_new(vocab_cap),
+        tok_lens = ibuf_new(vocab_cap),
+        hash_map = hm,
+        mask = hm_cap - 1,
+        max_tok_len = 32,
+        vocab_size_ptr = vp
+    )
+}
+
+fn ai_tokenizer_free(move tk: AiTokenizer) {
+    if tk.vocab_size_ptr != 0 { mem_free_aligned(tk.vocab_size_ptr) }
+    buf_free(move tk.vocab_bytes)
+    buf_free(move tk.tok_offs)
+    buf_free(move tk.tok_lens)
+    buf_free(move tk.hash_map)
+}
+
+fn ai_tokenizer_add_token(tk: AiTokenizer, piece: str) -> i64 {
+    tid := ptr_read_i64(tk.vocab_size_ptr, 0)
+    off := buf_len(tk.vocab_bytes)
+    plen := str_len(piece)
+    buf_push_str(tk.vocab_bytes, piece)
+    ibuf_push(tk.tok_offs, off)
+    ibuf_push(tk.tok_lens, plen)
+    if plen > ptr_read_i64(tk.vocab_size_ptr, 1) {
+        ptr_write_i64(tk.vocab_size_ptr, 1, plen)
+    }
+    h := fnv1a_64(piece)
+    mut slot := h & tk.mask
+    mut probes := 0
+    cap := tk.mask + 1
+    while probes < cap {
+        base := slot * 2
+        if ibuf_get(tk.hash_map, base + 1) == 0 {
+            ibuf_set(tk.hash_map, base, h)
+            ibuf_set(tk.hash_map, base + 1, tid + 1)
+            break
+        }
+        slot = (slot + 1) & tk.mask
+        probes += 1
+    }
+    ptr_write_i64(tk.vocab_size_ptr, 0, tid + 1)
+    return tid
+}
+
+// Seeds IDs `0..255` as raw byte tokens so any UTF-8 text encodes with `0%` OOV loss.
+fn ai_tokenizer_seed_bytes(tk: AiTokenizer) {
+    tmp := buf_new(4)
+    mut b := 0
+    while b < 256 {
+        buf_truncate(tmp, 0)
+        buf_push(tmp, b)
+        _id := ai_tokenizer_add_token(tk, buf_slice_str(tmp, 0, 1))
+        b += 1
+    }
+    buf_free(move tmp)
+}
+
+fn tok_lookup_slice(tk: AiTokenizer, text: str, start: i64, end_pos: i64) -> i64 {
+    slen := end_pos - start
+    mut h := -3750763034362895579
+    mut i := start
+    while i < end_pos {
+        h = (h ^ str_byte(text, i)) *% 1099511628211
+        i += 1
+    }
+    mut slot := h & tk.mask
+    cap := tk.mask + 1
+    mut probes := 0
+    while probes < cap {
+        base := slot * 2
+        v := ibuf_get(tk.hash_map, base + 1)
+        if v == 0 { return -1 }
+        if ibuf_get(tk.hash_map, base) == h {
+            tid := v - 1
+            if ibuf_get(tk.tok_lens, tid) == slen {
+                toff := ibuf_get(tk.tok_offs, tid)
+                mut eq := true
+                mut k := 0
+                while k < slen {
+                    if buf_get(tk.vocab_bytes, toff + k) != str_byte(text, start + k) {
+                        eq = false
+                        break
+                    }
+                    k += 1
+                }
+                if eq { return tid }
+            }
+        }
+        slot = (slot + 1) & tk.mask
+        probes += 1
+    }
+    return -1
+}
+
+// Greedy longest-match subword encoder with O(1) hash lookup and guaranteed byte-level fallback.
+fn ai_tokenizer_encode(tk: AiTokenizer, text: str, out_ids: IntBuf) -> i64 {
+    n := str_len(text)
+    max_len := ptr_read_i64(tk.vocab_size_ptr, 1)
+    mut i := 0
+    mut count := 0
+    while i < n {
+        mut try_len := max_len
+        if i + try_len > n { try_len = n - i }
+        mut matched_id := -1
+        mut matched_len := 1
+        while try_len >= 1 {
+            tid := tok_lookup_slice(tk, text, i, i + try_len)
+            if tid >= 0 {
+                matched_id = tid
+                matched_len = try_len
+                break
+            }
+            try_len -= 1
+        }
+        if matched_id < 0 {
+            matched_id = str_byte(text, i)
+            matched_len = 1
+        }
+        ibuf_push(out_ids, matched_id)
+        i += matched_len
+        count += 1
+    }
+    return count
+}
+
+fn ai_tokenizer_decode(tk: AiTokenizer, ids: IntBuf, out: ByteBuf) {
+    n := ibuf_len(ids)
+    vsz := ptr_read_i64(tk.vocab_size_ptr, 0)
+    mut i := 0
+    while i < n {
+        tid := ibuf_get(ids, i)
+        if tid >= 0 and tid < vsz {
+            off := ibuf_get(tk.tok_offs, tid)
+            tlen := ibuf_get(tk.tok_lens, tid)
+            mut k := 0
+            while k < tlen {
+                buf_push(out, buf_get(tk.vocab_bytes, off + k))
+                k += 1
+            }
+        }
+        i += 1
+    }
+}
+
+// --- 4. Prefix-Shared Local Inference Session (`LocalLlmSession`) ---
+// Reuses `PagedKvCache` prefix tokens across multi-turn prompts to eliminate redundant prefill FLOPs!
+
+struct LocalLlmSession {
+    scratch: VramArena
+    k_cache: PagedKvCache
+    v_cache: PagedKvCache
+    cached_tokens: IntBuf
+    state_ptr: i64 // [0]=active_tokens, [1]=prefix_hits, [2]=tokens_generated, [3]=saved_prefill_tokens
+}
+
+fn local_session_new(scratch_bytes: i64, max_kv_blocks: i64, block_tokens: i64, kv_dim: i64) -> LocalLlmSession {
+    st := mem_alloc_aligned(64)
+    ptr_write_i64(st, 0, 0)
+    ptr_write_i64(st, 1, 0)
+    ptr_write_i64(st, 2, 0)
+    ptr_write_i64(st, 3, 0)
+    return LocalLlmSession(
+        scratch = vram_arena_new(scratch_bytes),
+        k_cache = paged_kv_new(max_kv_blocks, block_tokens, kv_dim),
+        v_cache = paged_kv_new(max_kv_blocks, block_tokens, kv_dim),
+        cached_tokens = ibuf_new(max_kv_blocks * block_tokens),
+        state_ptr = st
+    )
+}
+
+fn local_session_free(move s: LocalLlmSession) {
+    vram_arena_free(move s.scratch)
+    paged_kv_free(move s.k_cache)
+    paged_kv_free(move s.v_cache)
+    buf_free(move s.cached_tokens)
+    if s.state_ptr != 0 { mem_free_aligned(s.state_ptr) }
+}
+
+// Computes longest shared prefix with previous KV cache and rewinds KV logical cursor to `shared_len`!
+// Returns the number of tokens skipped from prefill (`shared_len`).
+@no_alloc
+fn local_session_reuse_prefix(s: LocalLlmSession, prompt_ids: IntBuf) -> i64 {
+    old_len := ibuf_len(s.cached_tokens)
+    new_len := ibuf_len(prompt_ids)
+    kv_len := paged_kv_num_tokens(s.k_cache)
+    mut lim := old_len
+    if new_len < lim { lim = new_len }
+    if kv_len < lim { lim = kv_len }
+    mut shared := 0
+    while shared < lim {
+        if ibuf_get(s.cached_tokens, shared) != ibuf_get(prompt_ids, shared) {
+            break
+        }
+        shared += 1
+    }
+    // Rewind KV cache token cursors to `shared` without zeroing/freeing physical blocks
+    ptr_write_i64(s.k_cache.meta_ptr, 1, shared)
+    ptr_write_i64(s.v_cache.meta_ptr, 1, shared)
+    used_blocks := (shared + s.k_cache.block_tokens - 1) / s.k_cache.block_tokens
+    ptr_write_i64(s.k_cache.meta_ptr, 0, used_blocks)
+    ptr_write_i64(s.v_cache.meta_ptr, 0, used_blocks)
+    ibuf_truncate(s.cached_tokens, shared)
+    mut i := shared
+    while i < new_len {
+        ibuf_push(s.cached_tokens, ibuf_get(prompt_ids, i))
+        i += 1
+    }
+    if shared > 0 {
+        ptr_write_i64(s.state_ptr, 1, ptr_read_i64(s.state_ptr, 1) + 1)
+        ptr_write_i64(s.state_ptr, 3, ptr_read_i64(s.state_ptr, 3) + shared)
+    }
+    ptr_write_i64(s.state_ptr, 0, new_len)
+    return shared
+}
+
+// --- 5. Bounded-RAM Continuous Batcher (`ContinuousBatcher`) ---
+// Slot layout (5 i64s per slot): [0]=status (0=FREE,1=PREFILL,2=DECODE), [1]=req_id, [2]=prompt_len, [3]=gen_len, [4]=max_gen
+
+struct ContinuousBatcher {
+    slots: IntBuf
+    max_slots: i64
+    meta_ptr: i64 // [0]=active_count, [1]=completed_count
+}
+
+fn batcher_new(max_slots: i64) -> ContinuousBatcher {
+    sb := ibuf_new(max_slots * 5)
+    mut i := 0
+    while i < max_slots * 5 {
+        ibuf_push(sb, 0)
+        i += 1
+    }
+    mp := mem_alloc_aligned(64)
+    ptr_write_i64(mp, 0, 0)
+    ptr_write_i64(mp, 1, 0)
+    return ContinuousBatcher(slots = sb, max_slots = max_slots, meta_ptr = mp)
+}
+
+fn batcher_free(move b: ContinuousBatcher) {
+    buf_free(move b.slots)
+    if b.meta_ptr != 0 { mem_free_aligned(b.meta_ptr) }
+}
+
+@no_alloc
+fn batcher_enqueue(b: ContinuousBatcher, req_id: i64, prompt_len: i64, max_gen: i64) -> i64 {
+    mut i := 0
+    while i < b.max_slots {
+        base := i * 5
+        if ibuf_get(b.slots, base) == 0 {
+            ibuf_set(b.slots, base, 1) // PREFILL
+            ibuf_set(b.slots, base + 1, req_id)
+            ibuf_set(b.slots, base + 2, prompt_len)
+            ibuf_set(b.slots, base + 3, 0)
+            ibuf_set(b.slots, base + 4, max_gen)
+            ptr_write_i64(b.meta_ptr, 0, ptr_read_i64(b.meta_ptr, 0) + 1)
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// Advances all active slots by 1 decode step; frees slots reaching `max_gen` and returns number of stepped requests.
+@no_alloc
+fn batcher_step_all(b: ContinuousBatcher) -> i64 {
+    mut stepped := 0
+    mut i := 0
+    while i < b.max_slots {
+        base := i * 5
+        st := ibuf_get(b.slots, base)
+        if st == 1 {
+            ibuf_set(b.slots, base, 2) // transition PREFILL -> DECODE
+            stepped += 1
+        } else if st == 2 {
+            gen := ibuf_get(b.slots, base + 3) + 1
+            ibuf_set(b.slots, base + 3, gen)
+            stepped += 1
+            if gen >= ibuf_get(b.slots, base + 4) {
+                ibuf_set(b.slots, base, 0) // FREE slot immediately for next request
+                ptr_write_i64(b.meta_ptr, 0, ptr_read_i64(b.meta_ptr, 0) - 1)
+                ptr_write_i64(b.meta_ptr, 1, ptr_read_i64(b.meta_ptr, 1) + 1)
+            }
+        }
+        i += 1
+    }
+    return stepped
+}

@@ -1,0 +1,117 @@
+// Test 21 (v7.0): Security Hardening + Unified AI & Game Module Interop Suite
+use std::ai
+use std::game
+
+fn try_load_axm_ok(path: str) -> bool {
+    m := axm_load_into_arena(path) or return false
+    axm_loaded_free(move m)
+    return true
+}
+
+fn try_load_lora_ok(path: str) -> bool {
+    ad := lora_load_file(path) or return false
+    lora_free(move ad)
+    return true
+}
+
+fn sec_put_u32_le(b: ByteBuf, v: i64) {
+    buf_push(b, v & 255)
+    buf_push(b, (v >> 8) & 255)
+    buf_push(b, (v >> 16) & 255)
+    buf_push(b, (v >> 24) & 255)
+}
+
+fn sec_put_u64_le(b: ByteBuf, v: i64) {
+    sec_put_u32_le(b, v)
+    sec_put_u32_le(b, v >> 32)
+}
+
+@test
+fn test_sec_gguf_axm_lora_overflow_rejection() {
+    // 1. GGUF invalid version rejected
+    bad_gguf := buf_new(64)
+    sec_put_u32_le(bad_gguf, 0x46554747)
+    sec_put_u32_le(bad_gguf, 999) // bogus GGUF version
+    sec_put_u64_le(bad_gguf, 1)
+    sec_put_u64_le(bad_gguf, 1)
+    gh := gguf_parse_header(bad_gguf)
+    assert(not gh.valid)
+    buf_free(move bad_gguf)
+
+    // 2. Crafted .axm with huge tensor_count (dir_bytes overflow) must cleanly err(422)
+    bad_axm := buf_new(128)
+    sec_put_u32_le(bad_axm, 0x314D5841)
+    sec_put_u32_le(bad_axm, 1)
+    sec_put_u64_le(bad_axm, 0x100000000000000) // triggers cnt cap!
+    sec_put_u64_le(bad_axm, 0)
+    _w := fs_write_file(".axon_sec_bad_axm.tmp", bad_axm) or -1
+    buf_free(move bad_axm)
+    assert(not try_load_axm_ok(".axon_sec_bad_axm.tmp"))
+
+    // 3. Crafted .axlora with huge dims / integer overflow in expected_len must err(422)
+    bad_lora := buf_new(128)
+    sec_put_u32_le(bad_lora, 0x524C5841)
+    sec_put_u32_le(bad_lora, 1)
+    sec_put_u64_le(bad_lora, 1000000) // huge in_dim
+    sec_put_u64_le(bad_lora, 1000000) // huge out_dim
+    sec_put_u64_le(bad_lora, 8)
+    sec_put_u64_le(bad_lora, 0x41000000)
+    sec_put_u64_le(bad_lora, 0)
+    sec_put_u64_le(bad_lora, 0)
+    _wl := fs_write_file(".axon_sec_bad_lora.tmp", bad_lora) or -1
+    buf_free(move bad_lora)
+    assert(not try_load_lora_ok(".axon_sec_bad_lora.tmp"))
+}
+
+@test
+fn test_sec_arena_bounds_and_fs_path_limit() {
+    // FrameArena negative/zero/huge allocation returns 0 cleanly without corrupting state
+    arena := frame_arena_new(4096)
+    assert(frame_arena_alloc(arena, -64) == 0)
+    assert(frame_arena_alloc(arena, 0) == 0)
+    assert(frame_arena_alloc(arena, 999999999) == 0)
+    assert(frame_arena_used(arena) == 0)
+    p := frame_arena_alloc(arena, 128)
+    assert(p != 0 and frame_arena_used(arena) == 128)
+    frame_arena_free(move arena)
+
+    // Router OOB ep_id does not trap or corrupt
+    rt := ai_router_new(4)
+    _ep := ai_router_add_endpoint(rt, 0, 10, 10, 4096, 10, 5)
+    assert(ai_router_estimate_cost_micros(rt, -1, 100, 100) == 0)
+    assert(ai_router_estimate_cost_micros(rt, 99, 100, 100) == 0)
+    ai_router_record_failure(rt, -1)
+    ai_router_record_failure(rt, 99)
+    ai_router_free(move rt)
+
+    // Over-long path (>= 500 bytes) must be rejected instead of silently truncated!
+    long_pb := buf_new(600)
+    mut i := 0
+    while i < 520 {
+        buf_push(long_pb, 97) // 'a'
+        i += 1
+    }
+    long_path := buf_slice_str(long_pb, 0, 520)
+    empty_r := fs_read_file(long_path) or buf_new(0)
+    rd_len := buf_len(empty_r)
+    buf_free(move empty_r)
+    buf_free(move long_pb)
+    assert(rd_len == 0)
+}
+
+@test
+fn test_sec_ai_and_game_unified_namespace() {
+    // Verify AI + 2D/3D Game compile & run side-by-side cleanly
+    v := v2_norm(v2(3.0, 4.0))
+    assert(g2_abs(v.x - 0.6) < 0.001)
+    s := silu_f64(2.0)
+    assert(s > 1.7 and s < 1.8)
+}
+
+fn main() -> i32 {
+    test_sec_gguf_axm_lora_overflow_rejection()
+    test_sec_arena_bounds_and_fs_path_limit()
+    test_sec_ai_and_game_unified_namespace()
+    println("  [21] Security hardening & AI+Game unified namespace passed")
+    return 0
+}

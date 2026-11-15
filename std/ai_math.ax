@@ -1,0 +1,869 @@
+// Axon v7.0 AI High-Precision Zero-Alloc Math, Activations, Losses, GEMM & FlashAttention (`std/ai_math.ax`)
+// All hot-path kernels are `@no_alloc` and `@nan_guard`-safe, requiring zero CRT `libm` dependencies.
+
+use std::ai_engine
+
+@no_alloc
+@nan_guard
+fn clamp_f64(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+@no_alloc
+@nan_guard
+fn max_f64(a: f64, b: f64) -> f64 {
+    if a > b { return a }
+    return b
+}
+
+@no_alloc
+@nan_guard
+fn min_f64(a: f64, b: f64) -> f64 {
+    if a < b { return a }
+    return b
+}
+
+@no_alloc
+@nan_guard
+fn pow2_i64_f64(exp_i: i64) -> f64 {
+    mut e := exp_i
+    mut base := 2.0
+    if e < 0 {
+        e = 0 - e
+        base = 0.5
+    }
+    mut res := 1.0
+    while e > 0 {
+        if (e & 1) != 0 {
+            res = res * base
+        }
+        e = e >> 1
+        if e > 0 {
+            base = base * base
+        }
+    }
+    return res
+}
+
+// High-precision Cody-Waite range-reduced `exp(x)` (~1e-11 accuracy, clamped safely against Inf/NaN).
+@no_alloc
+@nan_guard
+fn exp_f64(x_in: f64) -> f64 {
+    if x_in <= -80.0 { return 0.0 }
+    x := clamp_f64(x_in, -80.0, 80.0)
+    inv_ln2 := 1.4426950408889634
+    ln2_hi := 0.6931471803691238
+    ln2_lo := 0.00000000019082149292705877
+    scaled := x * inv_ln2
+    mut k := 0
+    if scaled >= 0.0 {
+        k = (scaled + 0.5) as i64
+    } else {
+        k = (scaled - 0.5) as i64
+    }
+    kf := k as f64
+    r := (x - kf * ln2_hi) - kf * ln2_lo
+    // Degree-9 Horner polynomial on `|r| <= 0.347`
+    mut p := 1.0 + r * 0.1111111111111111
+    p = 1.0 + r * 0.125 * p
+    p = 1.0 + r * 0.14285714285714285 * p
+    p = 1.0 + r * 0.16666666666666666 * p
+    p = 1.0 + r * 0.2 * p
+    p = 1.0 + r * 0.25 * p
+    p = 1.0 + r * 0.3333333333333333 * p
+    p = 1.0 + r * 0.5 * p
+    er := 1.0 + r * p
+    return er * pow2_i64_f64(k)
+}
+
+@no_alloc
+@nan_guard
+fn exp2_f64(x: f64) -> f64 {
+    return exp_f64(x * 0.6931471805599453)
+}
+
+// High-precision range-reduced `ln(x)` using `artanh` series (~1e-11 accuracy).
+@no_alloc
+@nan_guard
+fn ln_f64(x: f64) -> f64 {
+    if x <= 0.000000000000000000000000000001 {
+        return -69.07755278982137
+    }
+    mut m := x
+    mut k := 0
+    sqrt2 := 1.4142135623730951
+    inv_sqrt2 := 0.7071067811865475
+    while m >= sqrt2 {
+        m = m * 0.5
+        k += 1
+    }
+    while m < inv_sqrt2 {
+        m = m * 2.0
+        k -= 1
+    }
+    u := (m - 1.0) / (m + 1.0)
+    u2 := u * u
+    // 2 * u * (1 + u^2/3 + u^4/5 + u^6/7 + u^8/9 + u^10/11)
+    poly := 1.0 + u2 * (0.3333333333333333 + u2 * (0.2 + u2 * (0.14285714285714285 + u2 * (0.1111111111111111 + u2 * 0.09090909090909091))))
+    ln2 := 0.6931471805599453
+    return (k as f64) * ln2 + 2.0 * u * poly
+}
+
+@no_alloc
+@nan_guard
+fn log2_f64(x: f64) -> f64 {
+    return ln_f64(x) * 1.4426950408889634
+}
+
+@no_alloc
+@nan_guard
+fn pow_f64(base: f64, exponent: f64) -> f64 {
+    if base <= 0.0 {
+        if exponent == 0.0 { return 1.0 }
+        return 0.0
+    }
+    return exp_f64(exponent * ln_f64(base))
+}
+
+@no_alloc
+@nan_guard
+fn sin_f64(x_in: f64) -> f64 {
+    pi := 3.141592653589793
+    two_pi := 6.283185307179586
+    half_pi := 1.5707963267948966
+    // Reduce modulo 2*pi
+    mut q := 0
+    r_raw := x_in / two_pi
+    if r_raw >= 0.0 {
+        q = (r_raw + 0.5) as i64
+    } else {
+        q = (r_raw - 0.5) as i64
+    }
+    mut x := x_in - (q as f64) * two_pi
+    if x > half_pi {
+        x = pi - x
+    } else if x < (0.0 - half_pi) {
+        x = (0.0 - pi) - x
+    }
+    x2 := x * x
+    // Taylor degree 11 on [-pi/2, pi/2]
+    poly := 1.0 - x2 * (0.16666666666666666 - x2 * (0.008333333333333333 - x2 * (0.0001984126984126984 - x2 * (0.0000027557319223985893 - x2 * 0.00000002505210838544172))))
+    return x * poly
+}
+
+@no_alloc
+@nan_guard
+fn cos_f64(x: f64) -> f64 {
+    return sin_f64(x + 1.5707963267948966)
+}
+
+@no_alloc
+@nan_guard
+fn sigmoid_f64(x: f64) -> f64 {
+    if x >= 0.0 {
+        e := exp_f64(0.0 - x)
+        return 1.0 / (1.0 + e)
+    }
+    e := exp_f64(x)
+    return e / (1.0 + e)
+}
+
+@no_alloc
+@nan_guard
+fn tanh_f64(x: f64) -> f64 {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return -1.0 }
+    if x >= 0.0 {
+        e := exp_f64(-2.0 * x)
+        return (1.0 - e) / (1.0 + e)
+    }
+    e := exp_f64(2.0 * x)
+    return (e - 1.0) / (e + 1.0)
+}
+
+@no_alloc
+@nan_guard
+fn silu_f64(x: f64) -> f64 {
+    return x * sigmoid_f64(x)
+}
+
+@no_alloc
+@nan_guard
+fn gelu_f64(x: f64) -> f64 {
+    // Hendrycks & Gimpel tanh approximation used in GPT/LLaMA/ViT
+    c := 0.7978845608028654
+    inner := c * (x + 0.044715 * x * x * x)
+    return 0.5 * x * (1.0 + tanh_f64(inner))
+}
+
+// --- Zero-Alloc Vector & Tensor Primitives ---
+
+@no_alloc
+fn vec_zero_f32(dst_ptr: i64, n: i64) {
+    mut i := 0
+    while i < n {
+        ptr_write_f32(dst_ptr, i, 0.0)
+        i += 1
+    }
+}
+
+@no_alloc
+fn vec_copy_f32(dst_ptr: i64, src_ptr: i64, n: i64) {
+    mut i := 0
+    while i < n {
+        ptr_write_f32(dst_ptr, i, ptr_read_f32(src_ptr, i))
+        i += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn vec_add_f32(dst_ptr: i64, a_ptr: i64, b_ptr: i64, n: i64) {
+    mut i := 0
+    while i < n {
+        ptr_write_f32(dst_ptr, i, ptr_read_f32(a_ptr, i) + ptr_read_f32(b_ptr, i))
+        i += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn vec_axpy_f32(y_ptr: i64, x_ptr: i64, alpha: f64, n: i64) {
+    _rc := dlpack_scale_add_f32(y_ptr, x_ptr, alpha, n)
+}
+
+@no_alloc
+@nan_guard
+fn vec_scale_f32(dst_ptr: i64, src_ptr: i64, scale: f64, n: i64) {
+    mut i := 0
+    while i < n {
+        ptr_write_f32(dst_ptr, i, ptr_read_f32(src_ptr, i) * scale)
+        i += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn vec_dot_f32(a_ptr: i64, b_ptr: i64, n: i64) -> f64 {
+    return dlpack_dot_f32(a_ptr, b_ptr, n)
+}
+
+@no_alloc
+@nan_guard
+fn vec_l2_norm_sq_f32(ptr: i64, n: i64) -> f64 {
+    return dlpack_dot_f32(ptr, ptr, n)
+}
+
+// --- Activations: Forward & Exact Analytic Backward ---
+
+@no_alloc
+@nan_guard
+fn relu_fwd_f32(dst_ptr: i64, src_ptr: i64, n: i64) {
+    mut i := 0
+    while i < n {
+        v := ptr_read_f32(src_ptr, i)
+        if v > 0.0 {
+            ptr_write_f32(dst_ptr, i, v)
+        } else {
+            ptr_write_f32(dst_ptr, i, 0.0)
+        }
+        i += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn relu_bwd_f32(dx_ptr: i64, dout_ptr: i64, x_ptr: i64, n: i64) {
+    mut i := 0
+    while i < n {
+        if ptr_read_f32(x_ptr, i) > 0.0 {
+            ptr_write_f32(dx_ptr, i, ptr_read_f32(dout_ptr, i))
+        } else {
+            ptr_write_f32(dx_ptr, i, 0.0)
+        }
+        i += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn leaky_relu_fwd_f32(dst_ptr: i64, src_ptr: i64, n: i64, slope: f64) {
+    mut i := 0
+    while i < n {
+        v := ptr_read_f32(src_ptr, i)
+        if v > 0.0 {
+            ptr_write_f32(dst_ptr, i, v)
+        } else {
+            ptr_write_f32(dst_ptr, i, v * slope)
+        }
+        i += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn leaky_relu_bwd_f32(dx_ptr: i64, dout_ptr: i64, x_ptr: i64, n: i64, slope: f64) {
+    mut i := 0
+    while i < n {
+        g := ptr_read_f32(dout_ptr, i)
+        if ptr_read_f32(x_ptr, i) > 0.0 {
+            ptr_write_f32(dx_ptr, i, g)
+        } else {
+            ptr_write_f32(dx_ptr, i, g * slope)
+        }
+        i += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn silu_fwd_f32(dst_ptr: i64, src_ptr: i64, n: i64) {
+    mut i := 0
+    while i < n {
+        v := ptr_read_f32(src_ptr, i)
+        ptr_write_f32(dst_ptr, i, silu_f64(v))
+        i += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn silu_bwd_f32(dx_ptr: i64, dout_ptr: i64, x_ptr: i64, n: i64) {
+    mut i := 0
+    while i < n {
+        x := ptr_read_f32(x_ptr, i)
+        s := sigmoid_f64(x)
+        ds := s * (1.0 + x * (1.0 - s))
+        ptr_write_f32(dx_ptr, i, ptr_read_f32(dout_ptr, i) * ds)
+        i += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn swiglu_fwd_f32(dst_ptr: i64, gate_ptr: i64, up_ptr: i64, n: i64) {
+    mut i := 0
+    while i < n {
+        g := ptr_read_f32(gate_ptr, i)
+        u := ptr_read_f32(up_ptr, i)
+        ptr_write_f32(dst_ptr, i, silu_f64(g) * u)
+        i += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn swiglu_bwd_f32(dgate_ptr: i64, dup_ptr: i64, dout_ptr: i64, gate_ptr: i64, up_ptr: i64, n: i64) {
+    mut i := 0
+    while i < n {
+        g := ptr_read_f32(gate_ptr, i)
+        u := ptr_read_f32(up_ptr, i)
+        dy := ptr_read_f32(dout_ptr, i)
+        s := sigmoid_f64(g)
+        silu_g := g * s
+        dsilu := s * (1.0 + g * (1.0 - s))
+        ptr_write_f32(dup_ptr, i, dy * silu_g)
+        ptr_write_f32(dgate_ptr, i, dy * u * dsilu)
+        i += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn gelu_fwd_f32(dst_ptr: i64, src_ptr: i64, n: i64) {
+    mut i := 0
+    while i < n {
+        ptr_write_f32(dst_ptr, i, gelu_f64(ptr_read_f32(src_ptr, i)))
+        i += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn gelu_bwd_f32(dx_ptr: i64, dout_ptr: i64, x_ptr: i64, n: i64) {
+    c := 0.7978845608028654
+    mut i := 0
+    while i < n {
+        x := ptr_read_f32(x_ptr, i)
+        x2 := x * x
+        u := c * (x + 0.044715 * x * x2)
+        t := tanh_f64(u)
+        sech2 := 1.0 - t * t
+        du := c * (1.0 + 0.134145 * x2)
+        dgelu := 0.5 * (1.0 + t) + 0.5 * x * sech2 * du
+        ptr_write_f32(dx_ptr, i, ptr_read_f32(dout_ptr, i) * dgelu)
+        i += 1
+    }
+}
+
+// --- Normalizations (Softmax, RMSNorm, LayerNorm) ---
+
+@no_alloc
+@nan_guard
+fn softmax_inplace_f32(x_ptr: i64, n: i64) {
+    if n <= 0 { return }
+    mut mx := ptr_read_f32(x_ptr, 0)
+    mut i := 1
+    while i < n {
+        v := ptr_read_f32(x_ptr, i)
+        if v > mx { mx = v }
+        i += 1
+    }
+    mut sum := 0.0
+    i = 0
+    while i < n {
+        e := exp_f64(ptr_read_f32(x_ptr, i) - mx)
+        ptr_write_f32(x_ptr, i, e)
+        sum = sum + e
+        i += 1
+    }
+    inv := 1.0 / (sum + 0.000000000001)
+    i = 0
+    while i < n {
+        ptr_write_f32(x_ptr, i, ptr_read_f32(x_ptr, i) * inv)
+        i += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn rmsnorm_fwd_f32(out_ptr: i64, x_ptr: i64, weight_ptr: i64, rows: i64, dim: i64, eps: f64) {
+    mut r := 0
+    while r < rows {
+        base := r * dim
+        mut sq := 0.0
+        mut c := 0
+        while c < dim {
+            v := ptr_read_f32(x_ptr, base + c)
+            sq = sq + v * v
+            c += 1
+        }
+        inv_rms := 1.0 / sqrt_f64((sq / (dim as f64)) + eps)
+        c = 0
+        while c < dim {
+            xv := ptr_read_f32(x_ptr, base + c)
+            wv := ptr_read_f32(weight_ptr, c)
+            ptr_write_f32(out_ptr, base + c, xv * inv_rms * wv)
+            c += 1
+        }
+        r += 1
+    }
+}
+
+// Exact RMSNorm backward: accumulates `dw_ptr` across `rows` and writes `dx_ptr`.
+@no_alloc
+@nan_guard
+fn rmsnorm_bwd_f32(dx_ptr: i64, dw_ptr: i64, dout_ptr: i64, x_ptr: i64, weight_ptr: i64, rows: i64, dim: i64, eps: f64) {
+    mut r := 0
+    inv_d := 1.0 / (dim as f64)
+    while r < rows {
+        base := r * dim
+        mut sq := 0.0
+        mut c := 0
+        while c < dim {
+            v := ptr_read_f32(x_ptr, base + c)
+            sq = sq + v * v
+            c += 1
+        }
+        inv_rms := 1.0 / sqrt_f64((sq * inv_d) + eps)
+        inv_rms3 := inv_rms * inv_rms * inv_rms
+        mut dot_dywx := 0.0
+        c = 0
+        while c < dim {
+            dy := ptr_read_f32(dout_ptr, base + c)
+            xv := ptr_read_f32(x_ptr, base + c)
+            wv := ptr_read_f32(weight_ptr, c)
+            dot_dywx = dot_dywx + dy * wv * xv
+            ptr_write_f32(dw_ptr, c, ptr_read_f32(dw_ptr, c) + dy * xv * inv_rms)
+            c += 1
+        }
+        scale_corr := dot_dywx * inv_d * inv_rms3
+        c = 0
+        while c < dim {
+            dy := ptr_read_f32(dout_ptr, base + c)
+            xv := ptr_read_f32(x_ptr, base + c)
+            wv := ptr_read_f32(weight_ptr, c)
+            dx := dy * wv * inv_rms - xv * scale_corr
+            ptr_write_f32(dx_ptr, base + c, ptr_read_f32(dx_ptr, base + c) + dx)
+            c += 1
+        }
+        r += 1
+    }
+}
+
+@no_alloc
+@nan_guard
+fn layernorm_fwd_f32(out_ptr: i64, x_ptr: i64, gamma_ptr: i64, beta_ptr: i64, rows: i64, dim: i64, eps: f64) {
+    inv_d := 1.0 / (dim as f64)
+    mut r := 0
+    while r < rows {
+        base := r * dim
+        mut mean := 0.0
+        mut c := 0
+        while c < dim {
+            mean = mean + ptr_read_f32(x_ptr, base + c)
+            c += 1
+        }
+        mean = mean * inv_d
+        mut var := 0.0
+        c = 0
+        while c < dim {
+            d := ptr_read_f32(x_ptr, base + c) - mean
+            var = var + d * d
+            c += 1
+        }
+        inv_std := 1.0 / sqrt_f64((var * inv_d) + eps)
+        c = 0
+        while c < dim {
+            normed := (ptr_read_f32(x_ptr, base + c) - mean) * inv_std
+            g := ptr_read_f32(gamma_ptr, c)
+            b := ptr_read_f32(beta_ptr, c)
+            ptr_write_f32(out_ptr, base + c, normed * g + b)
+            c += 1
+        }
+        r += 1
+    }
+}
+
+// --- Fused Numerically-Stable Losses + Exact Gradients ---
+
+// Fused Cross-Entropy Loss & Logit Gradient (`targets_ptr` holds `i64` token IDs; `-1` is ignored).
+@no_alloc
+@nan_guard
+fn cross_entropy_loss_grad_f32(logits_ptr: i64, dlogits_ptr: i64, targets_ptr: i64, batch: i64, vocab: i64) -> f64 {
+    mut total_loss := 0.0
+    mut valid_cnt := 0
+    mut b := 0
+    while b < batch {
+        tgt := ptr_read_i64(targets_ptr, b)
+        row := b * vocab
+        if tgt < 0 or tgt >= vocab {
+            mut j := 0
+            while j < vocab {
+                ptr_write_f32(dlogits_ptr, row + j, 0.0)
+                j += 1
+            }
+        } else {
+            valid_cnt += 1
+            mut mx := ptr_read_f32(logits_ptr, row)
+            mut j := 1
+            while j < vocab {
+                v := ptr_read_f32(logits_ptr, row + j)
+                if v > mx { mx = v }
+                j += 1
+            }
+            mut sum_exp := 0.0
+            j = 0
+            while j < vocab {
+                e := exp_f64(ptr_read_f32(logits_ptr, row + j) - mx)
+                ptr_write_f32(dlogits_ptr, row + j, e)
+                sum_exp = sum_exp + e
+                j += 1
+            }
+            inv_sum := 1.0 / (sum_exp + 0.000000000001)
+            tgt_prob := ptr_read_f32(dlogits_ptr, row + tgt) * inv_sum
+            total_loss = total_loss - ln_f64(max_f64(tgt_prob, 0.000000000001))
+            j = 0
+            while j < vocab {
+                p := ptr_read_f32(dlogits_ptr, row + j) * inv_sum
+                if j == tgt {
+                    ptr_write_f32(dlogits_ptr, row + j, p - 1.0)
+                } else {
+                    ptr_write_f32(dlogits_ptr, row + j, p)
+                }
+                j += 1
+            }
+        }
+        b += 1
+    }
+    if valid_cnt == 0 {
+        return 0.0
+    }
+    inv_cnt := 1.0 / (valid_cnt as f64)
+    total_elems := batch * vocab
+    mut k := 0
+    while k < total_elems {
+        ptr_write_f32(dlogits_ptr, k, ptr_read_f32(dlogits_ptr, k) * inv_cnt)
+        k += 1
+    }
+    return total_loss * inv_cnt
+}
+
+// Knowledge Distillation KL-Divergence Loss & Gradient: `T^2 * KL(softmax(t/T) || softmax(s/T))`.
+@no_alloc
+@nan_guard
+fn kl_div_loss_grad_f32(student_ptr: i64, teacher_ptr: i64, dstudent_ptr: i64, batch: i64, vocab: i64, temp: f64) -> f64 {
+    inv_t := 1.0 / max_f64(temp, 0.0001)
+    t2 := temp * temp
+    inv_b := 1.0 / (max_f64(batch as f64, 1.0))
+    mut total_kl := 0.0
+    mut b := 0
+    while b < batch {
+        row := b * vocab
+        mut max_s := ptr_read_f32(student_ptr, row) * inv_t
+        mut max_t := ptr_read_f32(teacher_ptr, row) * inv_t
+        mut j := 1
+        while j < vocab {
+            vs := ptr_read_f32(student_ptr, row + j) * inv_t
+            vt := ptr_read_f32(teacher_ptr, row + j) * inv_t
+            if vs > max_s { max_s = vs }
+            if vt > max_t { max_t = vt }
+            j += 1
+        }
+        mut sum_s := 0.0
+        mut sum_t := 0.0
+        j = 0
+        while j < vocab {
+            sum_s = sum_s + exp_f64(ptr_read_f32(student_ptr, row + j) * inv_t - max_s)
+            sum_t = sum_t + exp_f64(ptr_read_f32(teacher_ptr, row + j) * inv_t - max_t)
+            j += 1
+        }
+        inv_ss := 1.0 / (sum_s + 0.000000000001)
+        inv_st := 1.0 / (sum_t + 0.000000000001)
+        j = 0
+        while j < vocab {
+            ps := exp_f64(ptr_read_f32(student_ptr, row + j) * inv_t - max_s) * inv_ss
+            pt := exp_f64(ptr_read_f32(teacher_ptr, row + j) * inv_t - max_t) * inv_st
+            if pt > 0.000000000001 {
+                total_kl = total_kl + pt * (ln_f64(pt) - ln_f64(max_f64(ps, 0.000000000001)))
+            }
+            // dL/dz_s = (ps - pt) * T * (1/batch)
+            ptr_write_f32(dstudent_ptr, row + j, (ps - pt) * temp * inv_b)
+            j += 1
+        }
+        b += 1
+    }
+    return total_kl * t2 * inv_b
+}
+
+@no_alloc
+@nan_guard
+fn mse_loss_grad_f32(pred_ptr: i64, target_ptr: i64, dpred_ptr: i64, n: i64) -> f64 {
+    if n <= 0 { return 0.0 }
+    inv_n := 1.0 / (n as f64)
+    scale_g := 2.0 * inv_n
+    mut loss := 0.0
+    mut i := 0
+    while i < n {
+        diff := ptr_read_f32(pred_ptr, i) - ptr_read_f32(target_ptr, i)
+        loss = loss + diff * diff
+        ptr_write_f32(dpred_ptr, i, diff * scale_g)
+        i += 1
+    }
+    return loss * inv_n
+}
+
+@no_alloc
+@nan_guard
+fn huber_loss_grad_f32(pred_ptr: i64, target_ptr: i64, dpred_ptr: i64, n: i64, delta: f64) -> f64 {
+    if n <= 0 { return 0.0 }
+    inv_n := 1.0 / (n as f64)
+    mut loss := 0.0
+    mut i := 0
+    while i < n {
+        diff := ptr_read_f32(pred_ptr, i) - ptr_read_f32(target_ptr, i)
+        ad := abs_f64(diff)
+        if ad <= delta {
+            loss = loss + 0.5 * diff * diff
+            ptr_write_f32(dpred_ptr, i, diff * inv_n)
+        } else {
+            loss = loss + delta * (ad - 0.5 * delta)
+            if diff >= 0.0 {
+                ptr_write_f32(dpred_ptr, i, delta * inv_n)
+            } else {
+                ptr_write_f32(dpred_ptr, i, (0.0 - delta) * inv_n)
+            }
+        }
+        i += 1
+    }
+    return loss * inv_n
+}
+
+@no_alloc
+@nan_guard
+fn bce_logits_loss_grad_f32(logits_ptr: i64, target_ptr: i64, dlogits_ptr: i64, n: i64) -> f64 {
+    if n <= 0 { return 0.0 }
+    inv_n := 1.0 / (n as f64)
+    mut loss := 0.0
+    mut i := 0
+    while i < n {
+        z := ptr_read_f32(logits_ptr, i)
+        y := ptr_read_f32(target_ptr, i)
+        // max(z, 0) - z*y + ln(1 + exp(-|z|))
+        abs_z := abs_f64(z)
+        mx := max_f64(z, 0.0)
+        loss = loss + (mx - z * y + ln_f64(1.0 + exp_f64(0.0 - abs_z)))
+        p := sigmoid_f64(z)
+        ptr_write_f32(dlogits_ptr, i, (p - y) * inv_n)
+        i += 1
+    }
+    return loss * inv_n
+}
+
+// --- Zero-Alloc BLAS-Style GEMM, GEMV, RoPE & Online-Softmax FlashAttention ---
+
+// `C[m, n] = alpha * op(A) @ op(B) + beta * C[m, n]`
+// Zero heap allocations! Supports `trans_a` (`A` stored as `[k, m]`) and `trans_b` (`B` stored as `[n, k]`).
+@no_alloc
+@nan_guard
+fn gemm_f32(a_ptr: i64, b_ptr: i64, c_ptr: i64, m: i64, k: i64, n: i64, trans_a: bool, trans_b: bool, alpha: f64, beta: f64) {
+    mut i := 0
+    while i < m {
+        c_row := i * n
+        mut j := 0
+        while j < n {
+            mut acc0 := 0.0
+            mut acc1 := 0.0
+            mut acc2 := 0.0
+            mut acc3 := 0.0
+            mut p := 0
+            // 4x unrolled reduction for ILP + reduced loop overhead
+            while p + 3 < k {
+                mut a0 := 0.0
+                mut a1 := 0.0
+                mut a2 := 0.0
+                mut a3 := 0.0
+                if trans_a {
+                    a0 = ptr_read_f32(a_ptr, p * m + i)
+                    a1 = ptr_read_f32(a_ptr, (p + 1) * m + i)
+                    a2 = ptr_read_f32(a_ptr, (p + 2) * m + i)
+                    a3 = ptr_read_f32(a_ptr, (p + 3) * m + i)
+                } else {
+                    ab := i * k + p
+                    a0 = ptr_read_f32(a_ptr, ab)
+                    a1 = ptr_read_f32(a_ptr, ab + 1)
+                    a2 = ptr_read_f32(a_ptr, ab + 2)
+                    a3 = ptr_read_f32(a_ptr, ab + 3)
+                }
+                mut b0 := 0.0
+                mut b1 := 0.0
+                mut b2 := 0.0
+                mut b3 := 0.0
+                if trans_b {
+                    bb := j * k + p
+                    b0 = ptr_read_f32(b_ptr, bb)
+                    b1 = ptr_read_f32(b_ptr, bb + 1)
+                    b2 = ptr_read_f32(b_ptr, bb + 2)
+                    b3 = ptr_read_f32(b_ptr, bb + 3)
+                } else {
+                    b0 = ptr_read_f32(b_ptr, p * n + j)
+                    b1 = ptr_read_f32(b_ptr, (p + 1) * n + j)
+                    b2 = ptr_read_f32(b_ptr, (p + 2) * n + j)
+                    b3 = ptr_read_f32(b_ptr, (p + 3) * n + j)
+                }
+                acc0 = acc0 + a0 * b0
+                acc1 = acc1 + a1 * b1
+                acc2 = acc2 + a2 * b2
+                acc3 = acc3 + a3 * b3
+                p += 4
+            }
+            mut acc := (acc0 + acc1) + (acc2 + acc3)
+            while p < k {
+                mut av := 0.0
+                mut bv := 0.0
+                if trans_a { av = ptr_read_f32(a_ptr, p * m + i) } else { av = ptr_read_f32(a_ptr, i * k + p) }
+                if trans_b { bv = ptr_read_f32(b_ptr, j * k + p) } else { bv = ptr_read_f32(b_ptr, p * n + j) }
+                acc = acc + av * bv
+                p += 1
+            }
+            c_idx := c_row + j
+            if beta == 0.0 {
+                ptr_write_f32(c_ptr, c_idx, alpha * acc)
+            } else {
+                ptr_write_f32(c_ptr, c_idx, alpha * acc + beta * ptr_read_f32(c_ptr, c_idx))
+            }
+            j += 1
+        }
+        i += 1
+    }
+}
+
+// Fast `y = W[rows, cols] @ x[cols]` using hardware SSE `dlpack_dot_f32` per row.
+@no_alloc
+@nan_guard
+fn gemv_f32(w_ptr: i64, x_ptr: i64, y_ptr: i64, rows: i64, cols: i64) {
+    mut r := 0
+    stride_bytes := cols * 4
+    while r < rows {
+        row_ptr := w_ptr + r * stride_bytes
+        ptr_write_f32(y_ptr, r, dlpack_dot_f32(row_ptr, x_ptr, cols))
+        r += 1
+    }
+}
+
+// Applies Rotary Position Embedding (RoPE) in-place across `n_heads * head_dim`.
+@no_alloc
+@nan_guard
+fn rope_apply_f32(vec_ptr: i64, pos: i64, n_heads: i64, head_dim: i64, theta_base: f64) {
+    half := head_dim / 2
+    ln_theta := ln_f64(theta_base)
+    inv_d := 1.0 / (head_dim as f64)
+    pos_f := pos as f64
+    mut h := 0
+    while h < n_heads {
+        base := h * head_dim
+        mut i := 0
+        while i < half {
+            freq := exp_f64(0.0 - ((2 * i) as f64) * inv_d * ln_theta)
+            angle := pos_f * freq
+            c := cos_f64(angle)
+            s := sin_f64(angle)
+            x0 := ptr_read_f32(vec_ptr, base + i)
+            x1 := ptr_read_f32(vec_ptr, base + half + i)
+            ptr_write_f32(vec_ptr, base + i, x0 * c - x1 * s)
+            ptr_write_f32(vec_ptr, base + half + i, x0 * s + x1 * c)
+            i += 1
+        }
+        h += 1
+    }
+}
+
+// Single-pass Online-Softmax Causal FlashAttention (`O(1)` extra memory, zero `[S, S]` score matrix!).
+// `q_ptr, k_ptr, v_ptr, out_ptr`: `[seq_len, head_dim]` contiguous f32 buffers.
+@no_alloc
+@nan_guard
+fn flash_attention_causal_f32(q_ptr: i64, k_ptr: i64, v_ptr: i64, out_ptr: i64, seq_len: i64, head_dim: i64, scale: f64) {
+    stride_b := head_dim * 4
+    mut t := 0
+    while t < seq_len {
+        q_row_ptr := q_ptr + t * stride_b
+        out_off := t * head_dim
+        mut d := 0
+        while d < head_dim {
+            ptr_write_f32(out_ptr, out_off + d, 0.0)
+            d += 1
+        }
+        mut m_prev := -1000000.0
+        mut l_prev := 0.0
+        mut s := 0
+        while s <= t {
+            k_row_ptr := k_ptr + s * stride_b
+            v_off := s * head_dim
+            score := dlpack_dot_f32(q_row_ptr, k_row_ptr, head_dim) * scale
+            mut m_new := m_prev
+            if score > m_new { m_new = score }
+            alpha := exp_f64(m_prev - m_new)
+            beta := exp_f64(score - m_new)
+            l_new := l_prev * alpha + beta
+            d = 0
+            while d < head_dim {
+                acc_prev := ptr_read_f32(out_ptr, out_off + d)
+                vv := ptr_read_f32(v_ptr, v_off + d)
+                ptr_write_f32(out_ptr, out_off + d, acc_prev * alpha + beta * vv)
+                d += 1
+            }
+            m_prev = m_new
+            l_prev = l_new
+            s += 1
+        }
+        inv_l := 1.0 / (l_prev + 0.000000000001)
+        d = 0
+        while d < head_dim {
+            ptr_write_f32(out_ptr, out_off + d, ptr_read_f32(out_ptr, out_off + d) * inv_l)
+            d += 1
+        }
+        t += 1
+    }
+}

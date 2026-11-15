@@ -1,0 +1,568 @@
+// Axon v7.0 AI Quantization & Memory Compression Engine (`std/ai_quant.ax`)
+// Supports:
+//   - IEEE-754 `BF16` (2x compression) & `FP16` (2x compression)
+//   - `Q8_0` Symmetric Block-32 INT8 (~3.55x compression, high precision)
+//   - `Q4_0` Symmetric Block-32 Packed INT4 (~6.4x compression)
+//   - `NF4` QLoRA NormalFloat-4 with `comptime` `.rdata` quantile LUT & fused nibble GEMV (~6.4x-8x compression)
+
+use std::ai_math
+
+fn quant_dtype_fp32() -> i64 { return 0 }
+fn quant_dtype_bf16() -> i64 { return 1 }
+fn quant_dtype_fp16() -> i64 { return 2 }
+fn quant_dtype_q8() -> i64   { return 3 }
+fn quant_dtype_q4() -> i64   { return 4 }
+fn quant_dtype_nf4() -> i64  { return 5 }
+
+// Optimal 4-bit NormalFloat (NF4, Dettmers et al. 2023) quantile levels scaled by 1_000_000 in `.rdata`.
+comptime fn build_nf4_lut_scaled() -> IntBuf {
+    t := ibuf_new(16)
+    ibuf_push(t, -1000000)
+    ibuf_push(t, -696193)
+    ibuf_push(t, -525073)
+    ibuf_push(t, -394917)
+    ibuf_push(t, -284441)
+    ibuf_push(t, -184773)
+    ibuf_push(t, -91050)
+    ibuf_push(t, 0)
+    ibuf_push(t, 79580)
+    ibuf_push(t, 160930)
+    ibuf_push(t, 246112)
+    ibuf_push(t, 337915)
+    ibuf_push(t, 440710)
+    ibuf_push(t, 562617)
+    ibuf_push(t, 722957)
+    ibuf_push(t, 1000000)
+    return t
+}
+
+comptime NF4_Q_LUT := build_nf4_lut_scaled()
+
+comptime {
+    comptime_assert(ibuf_len(NF4_Q_LUT) == 16, "NF4 LUT must contain 16 quantile levels")
+}
+
+@no_alloc
+@nan_guard
+fn nf4_level_f64(q: i64) -> f64 {
+    idx := q & 15
+    return (NF4_Q_LUT[idx] as f64) * 0.000001
+}
+
+@no_alloc
+@nan_guard
+fn nf4_quantize_scalar(norm_val: f64) -> i64 {
+    // Binary/threshold search over midpoints of the 16 NF4 quantiles
+    if norm_val < -0.848096 { return 0 }
+    if norm_val < -0.610633 { return 1 }
+    if norm_val < -0.459995 { return 2 }
+    if norm_val < -0.339679 { return 3 }
+    if norm_val < -0.234607 { return 4 }
+    if norm_val < -0.137912 { return 5 }
+    if norm_val < -0.045525 { return 6 }
+    if norm_val < 0.039790  { return 7 }
+    if norm_val < 0.120255  { return 8 }
+    if norm_val < 0.203521  { return 9 }
+    if norm_val < 0.292014  { return 10 }
+    if norm_val < 0.389312  { return 11 }
+    if norm_val < 0.501663  { return 12 }
+    if norm_val < 0.642787  { return 13 }
+    if norm_val < 0.861478  { return 14 }
+    return 15
+}
+
+// --- Zero-Alloc IEEE-754 `f32` <-> `u32` Bit Helpers & `BF16` / `FP16` Converters ---
+
+@no_alloc
+fn f64_to_f32_bits(scratch_ptr: i64, v: f64) -> i64 {
+    ptr_write_i64(scratch_ptr, 0, 0)
+    ptr_write_f32(scratch_ptr, 0, v)
+    return ptr_read_i64(scratch_ptr, 0) & 0xFFFFFFFF
+}
+
+@no_alloc
+fn f32_bits_to_f64(scratch_ptr: i64, bits: i64) -> f64 {
+    ptr_write_i64(scratch_ptr, 0, bits & 0xFFFFFFFF)
+    return ptr_read_f32(scratch_ptr, 0)
+}
+
+@no_alloc
+fn f32_bits_to_bf16_rne(bits: i64) -> i64 {
+    // IEEE-754 round-to-nearest-even (handle NaN preservation cleanly)
+    abs_bits := bits & 0x7FFFFFFF
+    if abs_bits > 0x7F800000 {
+        return ((bits >> 16) & 0xFFFF) | 0x0040
+    }
+    rounding_bias := 0x7FFF + ((bits >> 16) & 1)
+    return ((bits + rounding_bias) >> 16) & 0xFFFF
+}
+
+@no_alloc
+fn bf16_to_f32_bits(bf: i64) -> i64 {
+    return (bf & 0xFFFF) << 16
+}
+
+@no_alloc
+fn f32_bits_to_fp16(bits: i64) -> i64 {
+    sign := (bits >> 16) & 0x8000
+    exp32 := (bits >> 23) & 0xFF
+    mant32 := bits & 0x7FFFFF
+    if exp32 == 255 {
+        if mant32 == 0 { return sign | 0x7C00 }
+        return sign | 0x7E00
+    }
+    exp16 := exp32 - 112
+    if exp16 >= 31 {
+        return sign | 0x7C00
+    }
+    if exp16 <= 0 {
+        if exp16 < -10 { return sign }
+        m := (mant32 | 0x800000) >> (14 - exp16)
+        return sign | (m & 0x3FF)
+    }
+    // Round-to-nearest on 13 truncated mantissa bits
+    rounded_mant := (mant32 + 0x1000) >> 13
+    if rounded_mant >= 0x400 {
+        return sign | (((exp16 + 1) & 0x1F) << 10)
+    }
+    return sign | (exp16 << 10) | (rounded_mant & 0x3FF)
+}
+
+@no_alloc
+fn fp16_to_f32_bits(h: i64) -> i64 {
+    sign := (h & 0x8000) << 16
+    exp16 := (h >> 10) & 0x1F
+    mant16 := h & 0x3FF
+    if exp16 == 0 {
+        if mant16 == 0 { return sign }
+        mut m := mant16
+        mut e := 113
+        while (m & 0x400) == 0 {
+            m = m << 1
+            e -= 1
+        }
+        m = m & 0x3FF
+        return sign | (e << 23) | (m << 13)
+    }
+    if exp16 == 31 {
+        if mant16 == 0 { return sign | 0x7F800000 }
+        return sign | 0x7FC00000
+    }
+    return sign | ((exp16 + 112) << 23) | (mant16 << 13)
+}
+
+@no_alloc
+fn read_u16_le(ptr: i64, idx: i64) -> i64 {
+    b := idx * 2
+    return ptr_read_u8(ptr, b) | (ptr_read_u8(ptr, b + 1) << 8)
+}
+
+@no_alloc
+fn write_u16_le(ptr: i64, idx: i64, val: i64) {
+    b := idx * 2
+    ptr_write_u8(ptr, b, val & 255)
+    ptr_write_u8(ptr, b + 1, (val >> 8) & 255)
+}
+
+// --- Quantized Tensor Descriptor ---
+
+struct QuantTensor {
+    dtype: i64
+    rows: i64
+    cols: i64
+    block_size: i64
+    blocks_per_row: i64
+    data_ptr: i64
+    scales_ptr: i64
+    scratch_ptr: i64
+    data_bytes: i64
+    scale_bytes: i64
+}
+
+fn quant_tensor_alloc(rows: i64, cols: i64, dtype: i64, block_size: i64 = 32) -> QuantTensor {
+    mut bs := block_size
+    if bs < 8 { bs = 8 }
+    bpr := (cols + bs - 1) / bs
+    mut dbytes := rows * cols * 4
+    mut sbytes := 0
+    if dtype == quant_dtype_bf16() or dtype == quant_dtype_fp16() {
+        dbytes = rows * cols * 2
+    } else if dtype == quant_dtype_q8() {
+        dbytes = rows * cols
+        sbytes = rows * bpr * 4
+    } else if dtype == quant_dtype_q4() or dtype == quant_dtype_nf4() {
+        packed_row_bytes := (cols + 1) / 2
+        dbytes = rows * packed_row_bytes
+        sbytes = rows * bpr * 4
+    }
+    dptr := mem_alloc_aligned(dbytes + 64)
+    mut sptr := 0
+    if sbytes > 0 {
+        sptr = mem_alloc_aligned(sbytes + 64)
+    }
+    scr := mem_alloc_aligned(64)
+    ptr_write_i64(scr, 0, 0)
+    return QuantTensor(
+        dtype = dtype,
+        rows = rows,
+        cols = cols,
+        block_size = bs,
+        blocks_per_row = bpr,
+        data_ptr = dptr,
+        scales_ptr = sptr,
+        scratch_ptr = scr,
+        data_bytes = dbytes,
+        scale_bytes = sbytes
+    )
+}
+
+fn quant_tensor_free(move q: QuantTensor) {
+    if q.data_ptr != 0 { mem_free_aligned(q.data_ptr) }
+    if q.scales_ptr != 0 { mem_free_aligned(q.scales_ptr) }
+    if q.scratch_ptr != 0 { mem_free_aligned(q.scratch_ptr) }
+}
+
+@no_alloc
+fn quant_bytes_used(q: QuantTensor) -> i64 {
+    return q.data_bytes + q.scale_bytes
+}
+
+@no_alloc
+@nan_guard
+fn quant_compression_ratio(q: QuantTensor) -> f64 {
+    fp32_bytes := (q.rows * q.cols * 4) as f64
+    used := quant_bytes_used(q) as f64
+    if used <= 0.0 { return 1.0 }
+    return fp32_bytes / used
+}
+
+// --- Zero-Alloc Row Quantizers & Fused Dequant-GEMV Kernels ---
+
+@no_alloc
+@nan_guard
+fn quantize_f32_into(q: QuantTensor, src_f32_ptr: i64) {
+    total := q.rows * q.cols
+    if q.dtype == quant_dtype_fp32() {
+        vec_copy_f32(q.data_ptr, src_f32_ptr, total)
+        return
+    }
+    if q.dtype == quant_dtype_bf16() {
+        mut i := 0
+        while i < total {
+            bits := f64_to_f32_bits(q.scratch_ptr, ptr_read_f32(src_f32_ptr, i))
+            write_u16_le(q.data_ptr, i, f32_bits_to_bf16_rne(bits))
+            i += 1
+        }
+        return
+    }
+    if q.dtype == quant_dtype_fp16() {
+        mut i := 0
+        while i < total {
+            bits := f64_to_f32_bits(q.scratch_ptr, ptr_read_f32(src_f32_ptr, i))
+            write_u16_le(q.data_ptr, i, f32_bits_to_fp16(bits))
+            i += 1
+        }
+        return
+    }
+    if q.dtype == quant_dtype_q8() {
+        mut r := 0
+        while r < q.rows {
+            row_off := r * q.cols
+            mut b := 0
+            while b < q.blocks_per_row {
+                c_start := b * q.block_size
+                mut c_end := c_start + q.block_size
+                if c_end > q.cols { c_end = q.cols }
+                mut amax := 0.0
+                mut c := c_start
+                while c < c_end {
+                    av := abs_f64(ptr_read_f32(src_f32_ptr, row_off + c))
+                    if av > amax { amax = av }
+                    c += 1
+                }
+                mut scale := amax / 127.0
+                if scale <= 0.0000000001 { scale = 0.0000000001 }
+                inv_scale := 1.0 / scale
+                ptr_write_f32(q.scales_ptr, r * q.blocks_per_row + b, scale)
+                c = c_start
+                while c < c_end {
+                    v := ptr_read_f32(src_f32_ptr, row_off + c) * inv_scale
+                    mut qi := 0
+                    if v >= 0.0 { qi = (v + 0.5) as i64 } else { qi = (v - 0.5) as i64 }
+                    if qi > 127 { qi = 127 }
+                    if qi < -127 { qi = -127 }
+                    ptr_write_u8(q.data_ptr, row_off + c, qi & 255)
+                    c += 1
+                }
+                b += 1
+            }
+            r += 1
+        }
+        return
+    }
+    // `Q4_0` (symmetric signed [-7..7] shifted +8) or `NF4` (16 Gaussian quantiles)
+    packed_row_bytes := (q.cols + 1) / 2
+    is_nf4 := q.dtype == quant_dtype_nf4()
+    mut r := 0
+    while r < q.rows {
+        row_src := r * q.cols
+        row_dst := r * packed_row_bytes
+        mut b := 0
+        while b < q.blocks_per_row {
+            c_start := b * q.block_size
+            mut c_end := c_start + q.block_size
+            if c_end > q.cols { c_end = q.cols }
+            mut amax := 0.0
+            mut c := c_start
+            while c < c_end {
+                av := abs_f64(ptr_read_f32(src_f32_ptr, row_src + c))
+                if av > amax { amax = av }
+                c += 1
+            }
+            mut scale := amax
+            if not is_nf4 { scale = amax / 7.0 }
+            if scale <= 0.0000000001 { scale = 0.0000000001 }
+            inv_scale := 1.0 / scale
+            ptr_write_f32(q.scales_ptr, r * q.blocks_per_row + b, scale)
+            c = c_start
+            while c < c_end {
+                v0 := ptr_read_f32(src_f32_ptr, row_src + c) * inv_scale
+                mut q0 := 0
+                if is_nf4 {
+                    q0 = nf4_quantize_scalar(v0)
+                } else {
+                    mut iq0 := 0
+                    if v0 >= 0.0 { iq0 = (v0 + 0.5) as i64 } else { iq0 = (v0 - 0.5) as i64 }
+                    if iq0 > 7 { iq0 = 7 }
+                    if iq0 < -7 { iq0 = -7 }
+                    q0 = iq0 + 8
+                }
+                mut q1 := 7
+                if not is_nf4 { q1 = 8 }
+                if c + 1 < c_end {
+                    v1 := ptr_read_f32(src_f32_ptr, row_src + c + 1) * inv_scale
+                    if is_nf4 {
+                        q1 = nf4_quantize_scalar(v1)
+                    } else {
+                        mut iq1 := 0
+                        if v1 >= 0.0 { iq1 = (v1 + 0.5) as i64 } else { iq1 = (v1 - 0.5) as i64 }
+                        if iq1 > 7 { iq1 = 7 }
+                        if iq1 < -7 { iq1 = -7 }
+                        q1 = iq1 + 8
+                    }
+                }
+                byte_idx := row_dst + (c >> 1)
+                ptr_write_u8(q.data_ptr, byte_idx, (q0 & 15) | ((q1 & 15) << 4))
+                c += 2
+            }
+            b += 1
+        }
+        r += 1
+    }
+}
+
+fn quant_tensor_from_f32(src_f32_ptr: i64, rows: i64, cols: i64, dtype: i64, block_size: i64 = 32) -> QuantTensor {
+    q := quant_tensor_alloc(rows, cols, dtype, block_size)
+    quantize_f32_into(q, src_f32_ptr)
+    return q
+}
+
+@no_alloc
+@nan_guard
+fn dequantize_to_f32(q: QuantTensor, dst_f32_ptr: i64) {
+    total := q.rows * q.cols
+    if q.dtype == quant_dtype_fp32() {
+        vec_copy_f32(dst_f32_ptr, q.data_ptr, total)
+        return
+    }
+    if q.dtype == quant_dtype_bf16() {
+        mut i := 0
+        while i < total {
+            bits := bf16_to_f32_bits(read_u16_le(q.data_ptr, i))
+            ptr_write_f32(dst_f32_ptr, i, f32_bits_to_f64(q.scratch_ptr, bits))
+            i += 1
+        }
+        return
+    }
+    if q.dtype == quant_dtype_fp16() {
+        mut i := 0
+        while i < total {
+            bits := fp16_to_f32_bits(read_u16_le(q.data_ptr, i))
+            ptr_write_f32(dst_f32_ptr, i, f32_bits_to_f64(q.scratch_ptr, bits))
+            i += 1
+        }
+        return
+    }
+    if q.dtype == quant_dtype_q8() {
+        mut r := 0
+        while r < q.rows {
+            row_off := r * q.cols
+            mut b := 0
+            while b < q.blocks_per_row {
+                scale := ptr_read_f32(q.scales_ptr, r * q.blocks_per_row + b)
+                c_start := b * q.block_size
+                mut c_end := c_start + q.block_size
+                if c_end > q.cols { c_end = q.cols }
+                mut c := c_start
+                while c < c_end {
+                    u := ptr_read_u8(q.data_ptr, row_off + c)
+                    mut sv := u
+                    if u >= 128 { sv = u - 256 }
+                    ptr_write_f32(dst_f32_ptr, row_off + c, (sv as f64) * scale)
+                    c += 1
+                }
+                b += 1
+            }
+            r += 1
+        }
+        return
+    }
+    packed_row_bytes := (q.cols + 1) / 2
+    is_nf4 := q.dtype == quant_dtype_nf4()
+    mut r := 0
+    while r < q.rows {
+        row_dst := r * q.cols
+        row_src := r * packed_row_bytes
+        mut b := 0
+        while b < q.blocks_per_row {
+            scale := ptr_read_f32(q.scales_ptr, r * q.blocks_per_row + b)
+            c_start := b * q.block_size
+            mut c_end := c_start + q.block_size
+            if c_end > q.cols { c_end = q.cols }
+            mut c := c_start
+            while c < c_end {
+                pk := ptr_read_u8(q.data_ptr, row_src + (c >> 1))
+                q0 := pk & 15
+                if is_nf4 {
+                    ptr_write_f32(dst_f32_ptr, row_dst + c, nf4_level_f64(q0) * scale)
+                } else {
+                    ptr_write_f32(dst_f32_ptr, row_dst + c, ((q0 - 8) as f64) * scale)
+                }
+                if c + 1 < c_end {
+                    q1 := (pk >> 4) & 15
+                    if is_nf4 {
+                        ptr_write_f32(dst_f32_ptr, row_dst + c + 1, nf4_level_f64(q1) * scale)
+                    } else {
+                        ptr_write_f32(dst_f32_ptr, row_dst + c + 1, ((q1 - 8) as f64) * scale)
+                    }
+                }
+                c += 2
+            }
+            b += 1
+        }
+        r += 1
+    }
+}
+
+// Fused Dequant-on-the-Fly Matrix-Vector Multiply `y[rows] = W_quant[rows, cols] @ x[cols]`.
+// Zero intermediate FP32 weight buffer allocated! Dequantizes directly in registers.
+@no_alloc
+@nan_guard
+fn quant_gemv_f32(q: QuantTensor, x_ptr: i64, y_ptr: i64) {
+    if q.dtype == quant_dtype_fp32() {
+        gemv_f32(q.data_ptr, x_ptr, y_ptr, q.rows, q.cols)
+        return
+    }
+    if q.dtype == quant_dtype_bf16() or q.dtype == quant_dtype_fp16() {
+        is_bf := q.dtype == quant_dtype_bf16()
+        mut r := 0
+        while r < q.rows {
+            row_off := r * q.cols
+            mut acc := 0.0
+            mut c := 0
+            while c < q.cols {
+                raw16 := read_u16_le(q.data_ptr, row_off + c)
+                mut bits := 0
+                if is_bf { bits = bf16_to_f32_bits(raw16) } else { bits = fp16_to_f32_bits(raw16) }
+                w := f32_bits_to_f64(q.scratch_ptr, bits)
+                acc = acc + w * ptr_read_f32(x_ptr, c)
+                c += 1
+            }
+            ptr_write_f32(y_ptr, r, acc)
+            r += 1
+        }
+        return
+    }
+    if q.dtype == quant_dtype_q8() {
+        mut r := 0
+        while r < q.rows {
+            row_off := r * q.cols
+            mut acc := 0.0
+            mut b := 0
+            while b < q.blocks_per_row {
+                scale := ptr_read_f32(q.scales_ptr, r * q.blocks_per_row + b)
+                c_start := b * q.block_size
+                mut c_end := c_start + q.block_size
+                if c_end > q.cols { c_end = q.cols }
+                mut blk_dot := 0.0
+                mut c := c_start
+                while c < c_end {
+                    u := ptr_read_u8(q.data_ptr, row_off + c)
+                    mut sv := u
+                    if u >= 128 { sv = u - 256 }
+                    blk_dot = blk_dot + (sv as f64) * ptr_read_f32(x_ptr, c)
+                    c += 1
+                }
+                acc = acc + blk_dot * scale
+                b += 1
+            }
+            ptr_write_f32(y_ptr, r, acc)
+            r += 1
+        }
+        return
+    }
+    // Fused `Q4_0` or `NF4` QLoRA nibble GEMV
+    packed_row_bytes := (q.cols + 1) / 2
+    is_nf4 := q.dtype == quant_dtype_nf4()
+    mut r := 0
+    while r < q.rows {
+        row_src := r * packed_row_bytes
+        mut acc := 0.0
+        mut b := 0
+        while b < q.blocks_per_row {
+            scale := ptr_read_f32(q.scales_ptr, r * q.blocks_per_row + b)
+            c_start := b * q.block_size
+            mut c_end := c_start + q.block_size
+            if c_end > q.cols { c_end = q.cols }
+            mut blk_dot := 0.0
+            mut c := c_start
+            while c < c_end {
+                pk := ptr_read_u8(q.data_ptr, row_src + (c >> 1))
+                q0 := pk & 15
+                x0 := ptr_read_f32(x_ptr, c)
+                if is_nf4 {
+                    blk_dot = blk_dot + nf4_level_f64(q0) * x0
+                } else {
+                    blk_dot = blk_dot + ((q0 - 8) as f64) * x0
+                }
+                if c + 1 < c_end {
+                    q1 := (pk >> 4) & 15
+                    x1 := ptr_read_f32(x_ptr, c + 1)
+                    if is_nf4 {
+                        blk_dot = blk_dot + nf4_level_f64(q1) * x1
+                    } else {
+                        blk_dot = blk_dot + ((q1 - 8) as f64) * x1
+                    }
+                }
+                c += 2
+            }
+            acc = acc + blk_dot * scale
+            b += 1
+        }
+        ptr_write_f32(y_ptr, r, acc)
+        r += 1
+    }
+}
+
+// Batched Quantized MatMul: `out[batch_rows, rows] = X[batch_rows, cols] @ W_quant[rows, cols]^T`
+@no_alloc
+@nan_guard
+fn quant_matmul_f32(q: QuantTensor, x_ptr: i64, out_ptr: i64, batch_rows: i64) {
+    mut b := 0
+    x_stride_b := q.cols * 4
+    o_stride_b := q.rows * 4
+    while b < batch_rows {
+        quant_gemv_f32(q, x_ptr + b * x_stride_b, out_ptr + b * o_stride_b)
+        b += 1
+    }
+}

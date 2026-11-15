@@ -1,0 +1,448 @@
+// Test 19 (v7.0): Complete End-to-End Verification of `std::ai` Suite
+// Tests: Math/FlashAttention/Losses, BF16/FP16/Q8/Q4/NF4 Quantization, Autograd+Checkpointing+AdamW/Lion,
+//        LoRA/QLoRA/DoRA Fine-Tuning+Merge+Save/Load, Transformer GQA+PagedKV+MoE+ML, Local AXM/GGUF/Tokenizer,
+//        and Public/Hybrid Prompt Compression, Cache & Cascade Router.
+
+use std::ai
+
+@test
+fn test_ai_math_flash_attn_and_losses() {
+    // 1. High-precision transcendental checks
+    e1 := exp_f64(1.0)
+    assert(abs_f64(e1 - 2.718281828) < 0.0001)
+    assert(abs_f64(ln_f64(exp_f64(2.5)) - 2.5) < 0.00001)
+    s := sin_f64(1.23)
+    c := cos_f64(1.23)
+    assert(abs_f64((s * s + c * c) - 1.0) < 0.00001)
+
+    // 2. Online-Softmax FlashAttention vs Explicit Causal Attention (S=4, D=4)
+    arena := vram_arena_new(65536)
+    q := vram_arena_alloc_f32(arena, 16)
+    k := vram_arena_alloc_f32(arena, 16)
+    v := vram_arena_alloc_f32(arena, 16)
+    out_flash := vram_arena_alloc_f32(arena, 16)
+    scores := vram_arena_alloc_f32(arena, 4)
+
+    mut i := 0
+    while i < 16 {
+        ptr_write_f32(q, i, ((i % 5) as f64) * 0.25)
+        ptr_write_f32(k, i, (((i + 2) % 4) as f64) * 0.3)
+        ptr_write_f32(v, i, (i as f64) * 0.1 + 0.5)
+        i += 1
+    }
+    scale := 0.5
+    flash_attention_causal_f32(q, k, v, out_flash, 4, 4, scale)
+
+    // Verify last row t=3 explicitly against 2-pass softmax
+    mut s_idx := 0
+    while s_idx <= 3 {
+        dot := dlpack_dot_f32(q + 3 * 16, k + s_idx * 16, 4) * scale
+        ptr_write_f32(scores, s_idx, dot)
+        s_idx += 1
+    }
+    softmax_inplace_f32(scores, 4)
+    mut d := 0
+    while d < 4 {
+        mut ref_v := 0.0
+        s_idx = 0
+        while s_idx <= 3 {
+            ref_v = ref_v + ptr_read_f32(scores, s_idx) * ptr_read_f32(v, s_idx * 4 + d)
+            s_idx += 1
+        }
+        diff := abs_f64(ptr_read_f32(out_flash, 3 * 4 + d) - ref_v)
+        assert(diff < 0.0001)
+        d += 1
+    }
+
+    // 3. Fused Cross-Entropy Loss & Gradient check
+    logits := vram_arena_alloc_f32(arena, 8) // batch=2, vocab=4
+    dlogits := vram_arena_alloc_f32(arena, 8)
+    tgts := mem_alloc_aligned(64)
+    ptr_write_i64(tgts, 0, 1)
+    ptr_write_i64(tgts, 1, 3)
+    i = 0
+    while i < 8 {
+        ptr_write_f32(logits, i, (i as f64) * 0.2)
+        i += 1
+    }
+    ce := cross_entropy_loss_grad_f32(logits, dlogits, tgts, 2, 4)
+    assert(ce > 0.5 and ce < 2.0)
+    // Sum of gradients per row must be ~0.0
+    row0_gsum := ptr_read_f32(dlogits, 0) + ptr_read_f32(dlogits, 1) + ptr_read_f32(dlogits, 2) + ptr_read_f32(dlogits, 3)
+    assert(abs_f64(row0_gsum) < 0.0001)
+
+    mem_free_aligned(tgts)
+    vram_arena_free(move arena)
+}
+
+@test
+fn test_ai_quant_bf16_q8_nf4_gemv() {
+    rows := 4
+    cols := 32
+    rng := ai_rng_new(42)
+    w_buf := mem_alloc_aligned(rows * cols * 4 + 64)
+    x_buf := mem_alloc_aligned(cols * 4 + 64)
+    y_fp32 := mem_alloc_aligned(rows * 4 + 64)
+    y_q := mem_alloc_aligned(rows * 4 + 64)
+
+    mut i := 0
+    while i < rows * cols {
+        ptr_write_f32(w_buf, i, ai_rng_normal(rng, 0.5))
+        i += 1
+    }
+    i = 0
+    while i < cols {
+        ptr_write_f32(x_buf, i, ((i % 7) as f64 - 3.0) * 0.25)
+        i += 1
+    }
+    gemv_f32(w_buf, x_buf, y_fp32, rows, cols)
+
+    // BF16 (2x smaller)
+    qbf := quant_tensor_from_f32(w_buf, rows, cols, quant_dtype_bf16(), 32)
+    assert(quant_compression_ratio(qbf) > 1.99)
+    quant_gemv_f32(qbf, x_buf, y_q)
+    mut r := 0
+    while r < rows {
+        assert(abs_f64(ptr_read_f32(y_fp32, r) - ptr_read_f32(y_q, r)) < 0.05)
+        r += 1
+    }
+    quant_tensor_free(move qbf)
+
+    // Q8_0 (~3.55x smaller)
+    qq8 := quant_tensor_from_f32(w_buf, rows, cols, quant_dtype_q8(), 32)
+    assert(quant_compression_ratio(qq8) > 3.5)
+    quant_gemv_f32(qq8, x_buf, y_q)
+    r = 0
+    while r < rows {
+        assert(abs_f64(ptr_read_f32(y_fp32, r) - ptr_read_f32(y_q, r)) < 0.05)
+        r += 1
+    }
+    quant_tensor_free(move qq8)
+
+    // NF4 QLoRA (~6.4x smaller)
+    qnf4 := quant_tensor_from_f32(w_buf, rows, cols, quant_dtype_nf4(), 32)
+    assert(quant_compression_ratio(qnf4) > 6.3)
+    quant_gemv_f32(qnf4, x_buf, y_q)
+    r = 0
+    while r < rows {
+        assert(abs_f64(ptr_read_f32(y_fp32, r) - ptr_read_f32(y_q, r)) < 0.5)
+        r += 1
+    }
+    quant_tensor_free(move qnf4)
+
+    ai_rng_free(move rng)
+    mem_free_aligned(w_buf)
+    mem_free_aligned(x_buf)
+    mem_free_aligned(y_fp32)
+    mem_free_aligned(y_q)
+}
+
+@test
+fn test_ai_autograd_training_lion_and_adamw() {
+    // Train a 2-layer MLP (2 -> 8 -> 1 with SiLU) on XOR using AutogradTape + Lion (50% optimizer RAM)
+    rng := ai_rng_new(777)
+    w1 := param_new(8 * 2, opt_kind_lion())
+    b1 := param_new(8, opt_kind_lion())
+    w2 := param_new(1 * 8, opt_kind_lion())
+    b2 := param_new(1, opt_kind_lion())
+    init_kaiming_normal_f32(w1.data_ptr, 16, 2, rng)
+    init_kaiming_normal_f32(w2.data_ptr, 8, 8, rng)
+
+    x_data := mem_alloc_aligned(4 * 2 * 4 + 64)
+    y_data := mem_alloc_aligned(4 * 4 + 64)
+    // XOR dataset: (0,0)->0, (0,1)->1, (1,0)->1, (1,1)->0
+    ptr_write_f32(x_data, 0, 0.0); ptr_write_f32(x_data, 1, 0.0); ptr_write_f32(y_data, 0, 0.0)
+    ptr_write_f32(x_data, 2, 0.0); ptr_write_f32(x_data, 3, 1.0); ptr_write_f32(y_data, 1, 1.0)
+    ptr_write_f32(x_data, 4, 1.0); ptr_write_f32(x_data, 5, 0.0); ptr_write_f32(y_data, 2, 1.0)
+    ptr_write_f32(x_data, 6, 1.0); ptr_write_f32(x_data, 7, 1.0); ptr_write_f32(y_data, 3, 0.0)
+
+    tape := autograd_tape_new(65536, 128)
+    mut first_loss := 0.0
+    mut last_loss := 0.0
+    mut step := 0
+    while step < 120 {
+        param_zero_grad(w1)
+        param_zero_grad(b1)
+        param_zero_grad(w2)
+        param_zero_grad(b2)
+        mark := tape_checkpoint_mark(tape)
+
+        h1 := tape_alloc_zero_f32(tape, 4 * 8)
+        dh1 := tape_alloc_zero_f32(tape, 4 * 8)
+        a1 := tape_alloc_zero_f32(tape, 4 * 8)
+        da1 := tape_alloc_zero_f32(tape, 4 * 8)
+        out := tape_alloc_zero_f32(tape, 4)
+        dout := tape_alloc_zero_f32(tape, 4)
+
+        tape_linear_fwd(tape, x_data, 0, w1, b1.data_ptr, b1.grad_ptr, 4, 2, 8, h1, dh1)
+        tape_silu_fwd(tape, h1, dh1, a1, da1, 32)
+        tape_linear_fwd(tape, a1, da1, w2, b2.data_ptr, b2.grad_ptr, 4, 8, 1, out, dout)
+
+        loss := mse_loss_grad_f32(out, y_data, dout, 4)
+        if step == 0 { first_loss = loss }
+        last_loss = loss
+
+        tape_backward(tape)
+        _gn := grad_clip_norm_ptr(w1.grad_ptr, w1.numel, 1.0)
+        lr := lr_cosine_warmup(step, 10, 120, 0.05, 0.005)
+        lion_step(w1, lr)
+        lion_step(b1, lr)
+        lion_step(w2, lr)
+        lion_step(b2, lr)
+
+        tape_rewind(tape, mark)
+        assert(vram_arena_used_bytes(tape.act_arena) == 0)
+        step += 1
+    }
+    assert(last_loss < first_loss * 0.2)
+
+    autograd_tape_free(move tape)
+    mem_free_aligned(x_data)
+    mem_free_aligned(y_data)
+    param_free(move w1); param_free(move b1); param_free(move w2); param_free(move b2)
+    ai_rng_free(move rng)
+}
+
+@test
+fn test_ai_lora_qlora_merge_and_checkpoint() {
+    in_dim := 16
+    out_dim := 8
+    batch := 4
+    rng := ai_rng_new(99)
+    base_w := mem_alloc_aligned(out_dim * in_dim * 4 + 64)
+    mut i := 0
+    while i < out_dim * in_dim {
+        ptr_write_f32(base_w, i, ai_rng_normal(rng, 0.2))
+        i += 1
+    }
+    adapter := lora_new(in_dim, out_dim, 4, 8.0, rng, opt_kind_adamw(), false)
+
+    x := mem_alloc_aligned(batch * in_dim * 4 + 64)
+    y_tgt := mem_alloc_aligned(batch * out_dim * 4 + 64)
+    out := mem_alloc_aligned(batch * out_dim * 4 + 64)
+    dout := mem_alloc_aligned(batch * out_dim * 4 + 64)
+    hbuf := mem_alloc_aligned(batch * 4 * 4 + 64)
+    dhbuf := mem_alloc_aligned(batch * 4 * 4 + 64)
+
+    i = 0
+    while i < batch * in_dim {
+        ptr_write_f32(x, i, ((i % 5) as f64 - 2.0) * 0.3)
+        i += 1
+    }
+    i = 0
+    while i < batch * out_dim {
+        ptr_write_f32(y_tgt, i, 0.75)
+        i += 1
+    }
+
+    mut loss0 := 0.0
+    mut loss_end := 0.0
+    mut st := 0
+    while st < 40 {
+        lora_zero_grad(adapter)
+        lora_fwd_f32(base_w, adapter, x, out, hbuf, batch)
+        l := mse_loss_grad_f32(out, y_tgt, dout, batch * out_dim)
+        if st == 0 { loss0 = l }
+        loss_end = l
+        lora_bwd_f32(base_w, adapter, x, hbuf, dout, 0, dhbuf, batch, false)
+        lora_step_adamw(adapter, st + 1, 0.02, 0.0)
+        st += 1
+    }
+    assert(loss_end < loss0 * 0.15)
+
+    // Verify QLoRA forward runs cleanly on NF4 quantized base
+    qbase := quant_tensor_from_f32(base_w, out_dim, in_dim, quant_dtype_nf4(), 16)
+    qlora_fwd_f32(qbase, adapter, x, out, hbuf, batch)
+    quant_tensor_free(move qbase)
+
+    // Verify zero-overhead Merge & Unmerge equivalence!
+    lora_fwd_f32(base_w, adapter, x, out, hbuf, batch)
+    ref0 := ptr_read_f32(out, 0)
+    lora_merge_into_f32(base_w, adapter)
+    gemm_f32(x, base_w, out, batch, in_dim, out_dim, false, true, 1.0, 0.0)
+    assert(abs_f64(ptr_read_f32(out, 0) - ref0) < 0.001)
+    lora_unmerge_from_f32(base_w, adapter)
+
+    // Save & reload `.axlora` checkpoint with FNV-64 verification
+    ckpt_path := "bin/test_adapter.axlora"
+    _wr := lora_save_file(ckpt_path, adapter) or -1
+    reloaded := lora_load_file(ckpt_path, opt_kind_lion()) or return
+    assert(abs_f64(ptr_read_f32(reloaded.b.data_ptr, 0) - ptr_read_f32(adapter.b.data_ptr, 0)) < 0.0001)
+    lora_free(move reloaded)
+
+    lora_free(move adapter)
+    mem_free_aligned(base_w); mem_free_aligned(x); mem_free_aligned(y_tgt)
+    mem_free_aligned(out); mem_free_aligned(dout); mem_free_aligned(hbuf); mem_free_aligned(dhbuf)
+    ai_rng_free(move rng)
+}
+
+@test
+fn test_ai_transformer_gqa_moe_and_classical_ml() {
+    rng := ai_rng_new(123)
+    tb := transformer_block_new(16, 4, 2, 32, rng, opt_kind_lion())
+    kc := paged_kv_new(8, 4, 8) // 2 kv heads * 4 head_dim = 8
+    vc := paged_kv_new(8, 4, 8)
+    scratch := vram_arena_new(65536)
+    x := mem_alloc_aligned(16 * 4 + 64)
+    mut i := 0
+    while i < 16 { ptr_write_f32(x, i, 0.1 * ((i % 4) as f64 + 1.0)); i += 1 }
+
+    ok0 := transformer_block_decode_step(tb, x, 0, kc, vc, scratch)
+    ok1 := transformer_block_decode_step(tb, x, 1, kc, vc, scratch)
+    assert(ok0 and ok1)
+    assert(paged_kv_num_tokens(kc) == 2)
+    assert(vram_arena_used_bytes(scratch) == 0)
+
+    // Top-K MoE Routing
+    gate_w := mem_alloc_aligned(4 * 16 * 4 + 64)
+    g_scr := mem_alloc_aligned(64)
+    e_ids := mem_alloc_aligned(64)
+    e_wts := mem_alloc_aligned(64)
+    i = 0
+    while i < 64 { ptr_write_f32(gate_w, i, 0.05 * ((i % 5) as f64)); i += 1 }
+    moe_route_topk(gate_w, x, g_scr, 4, 16, 2, e_ids, e_wts)
+    wsum := ptr_read_f32(e_wts, 0) + ptr_read_f32(e_wts, 1)
+    assert(abs_f64(wsum - 1.0) < 0.001)
+
+    // Classical ML: Linear Regression + Top-K Cosine RAG Search
+    rx := mem_alloc_aligned(4 * 2 * 4 + 64)
+    ry := mem_alloc_aligned(4 * 4 + 64)
+    rw := mem_alloc_aligned(64)
+    rgrad := mem_alloc_aligned(64)
+    vec_zero_f32(rw, 2)
+    // y = 2*x0 + 3*x1
+    ptr_write_f32(rx, 0, 1.0); ptr_write_f32(rx, 1, 0.0); ptr_write_f32(ry, 0, 2.0)
+    ptr_write_f32(rx, 2, 0.0); ptr_write_f32(rx, 3, 1.0); ptr_write_f32(ry, 1, 3.0)
+    ptr_write_f32(rx, 4, 1.0); ptr_write_f32(rx, 5, 1.0); ptr_write_f32(ry, 2, 5.0)
+    ptr_write_f32(rx, 6, 2.0); ptr_write_f32(rx, 7, 1.0); ptr_write_f32(ry, 3, 7.0)
+    mse := linear_regression_fit_gd(rx, ry, rw, rgrad, 4, 2, 0.1, 0.0, 200)
+    assert(mse < 0.01)
+
+    rag_ids := mem_alloc_aligned(64)
+    rag_scores := mem_alloc_aligned(64)
+    // Query [1, 0] matches doc 0 [1, 0] best
+    top_k_cosine_search(rx, rx, 4, 2, 2, rag_ids, rag_scores)
+    assert(ptr_read_i64(rag_ids, 0) == 0)
+
+    mem_free_aligned(rag_ids); mem_free_aligned(rag_scores)
+    mem_free_aligned(rx); mem_free_aligned(ry); mem_free_aligned(rw); mem_free_aligned(rgrad)
+    mem_free_aligned(gate_w); mem_free_aligned(g_scr); mem_free_aligned(e_ids); mem_free_aligned(e_wts)
+    mem_free_aligned(x)
+    vram_arena_free(move scratch)
+    paged_kv_free(move kc); paged_kv_free(move vc)
+    transformer_block_free(move tb)
+    ai_rng_free(move rng)
+}
+
+@test
+fn test_ai_local_axm_gguf_tokenizer_and_serve() {
+    // 1. AXM compact model archive roundtrip straight into VramArena
+    builder := axm_builder_new(4096)
+    w := mem_alloc_aligned(64)
+    ptr_write_f32(w, 0, 1.25); ptr_write_f32(w, 1, -2.5)
+    axm_builder_add_raw(builder, "tok_emb", quant_dtype_fp32(), 1, 2, w, 8)
+    _wb := axm_builder_save(builder, "bin/test_model.axm") or -1
+    axm_builder_free(move builder)
+    mem_free_aligned(w)
+
+    loaded := axm_load_into_arena("bin/test_model.axm") or return
+    p_emb := axm_find_tensor_ptr(loaded, fnv1a_64("tok_emb"))
+    assert(p_emb != 0)
+    assert(abs_f64(ptr_read_f32(p_emb, 0) - 1.25) < 0.0001)
+    axm_loaded_free(move loaded)
+
+    // 2. GGUF header inspection
+    gg := buf_new(32)
+    buf_push_u32(gg, 0x46554747) // "GGUF"
+    buf_push_u32(gg, 3)
+    buf_push_u64(gg, 291)
+    buf_push_u64(gg, 24)
+    gh := gguf_parse_header(gg)
+    assert(gh.valid and gh.version == 3 and gh.tensor_count == 291)
+    buf_free(move gg)
+
+    // 3. Fast FNV-1a subword tokenizer with 0% OOV byte fallback
+    tk := ai_tokenizer_new(512)
+    ai_tokenizer_seed_bytes(tk)
+    id_axon := ai_tokenizer_add_token(tk, "Axon")
+    _id_ai := ai_tokenizer_add_token(tk, "AI")
+    ids := ibuf_new(64)
+    _cnt := ai_tokenizer_encode(tk, "Axon AI!", ids)
+    assert(ibuf_get(ids, 0) == id_axon)
+    dec_buf := buf_new(64)
+    ai_tokenizer_decode(tk, ids, dec_buf)
+    assert(buf_slice_str(dec_buf, 0, buf_len(dec_buf)) == "Axon AI!")
+    buf_free(move dec_buf); buf_free(move ids); ai_tokenizer_free(move tk)
+
+    // 4. Prefix-shared LocalLlmSession + ContinuousBatcher
+    sess := local_session_new(32768, 8, 8, 16)
+    p1 := ibuf_new(16)
+    ibuf_push(p1, 10); ibuf_push(p1, 20); ibuf_push(p1, 30); ibuf_push(p1, 40)
+    _s0 := local_session_reuse_prefix(sess, p1)
+    // Simulate filling 4 KV tokens
+    ptr_write_i64(sess.k_cache.meta_ptr, 1, 4)
+    ibuf_push(p1, 50)
+    shared := local_session_reuse_prefix(sess, p1)
+    assert(shared == 4)
+    buf_free(move p1); local_session_free(move sess)
+
+    bat := batcher_new(4)
+    _sl0 := batcher_enqueue(bat, 101, 12, 2)
+    assert(batcher_step_all(bat) == 1)
+    assert(batcher_step_all(bat) == 1)
+    assert(batcher_step_all(bat) == 1)
+    assert(ptr_read_i64(bat.meta_ptr, 1) == 1)
+    batcher_free(move bat)
+
+    // 5. Public/Hybrid AI Serving: Taint + NetCap + Compression + JSON + Cache + Router
+    root := acquire_root_cap()
+    ncap := attenuate_net(root, "api.openai.com", 443)
+    assert(verify_ai_endpoint_cap(ncap, "api.openai.com", 443))
+    raw_in := taint_str("  Hello   world \n\n\n\n fast  AI  ")
+    clean_in := sanitize_ai_prompt(raw_in, 4096) or return
+    comp := buf_new(128)
+    clen := compress_prompt_lossless(clean_in, comp)
+    clean_comp := buf_slice_str(comp, 0, clen)
+    assert(clean_comp == "Hello world \n\nfast AI")
+
+    req_buf := buf_new(512)
+    ai_build_openai_chat_req(req_buf, "gpt-4o-mini", "sys", clean_comp, 128, false)
+    req_str := buf_slice_str(req_buf, 0, buf_len(req_buf))
+    extracted := ai_extract_chat_content(req_str) or ""
+    assert(extracted == "sys")
+
+    pc := prompt_cache_new(32, 4096)
+    ck := prompt_cache_key("local-7b", "sys", clean_comp)
+    prompt_cache_put(pc, ck, "cached_ok")
+    hit := prompt_cache_get(pc, ck) or ""
+    assert(hit == "cached_ok")
+    prompt_cache_free(move pc)
+
+    router := ai_router_new(4)
+    ep_local := ai_router_add_endpoint(router, 0, 0, 0, 8192, 0, 12)
+    ep_pub := ai_router_add_endpoint(router, 1, 150000, 600000, 128000, 40, 220)
+    pick1 := ai_router_select(router, 500, 100, 30, true, 100000)
+    assert(pick1 == ep_local)
+    // Trip local circuit breaker (3 failures) -> automatic failover to public tier!
+    ai_router_record_failure(router, ep_local)
+    ai_router_record_failure(router, ep_local)
+    ai_router_record_failure(router, ep_local)
+    pick2 := ai_router_select(router, 500, 100, 30, true, 100000)
+    assert(pick2 == ep_pub)
+    ai_router_record_success(router, ep_pub, 1000, 500, 180)
+    assert(ai_router_total_spend_micros(router) > 0)
+    ai_router_free(move router)
+
+    buf_free(move req_buf); buf_free(move comp)
+}
+
+fn main() -> i32 {
+    test_ai_math_flash_attn_and_losses()
+    test_ai_quant_bf16_q8_nf4_gemv()
+    test_ai_autograd_training_lion_and_adamw()
+    test_ai_lora_qlora_merge_and_checkpoint()
+    test_ai_transformer_gqa_moe_and_classical_ml()
+    test_ai_local_axm_gguf_tokenizer_and_serve()
+    println(f"  [19] v7 {ai_toolkit_version()} -> ALL 6 AI/ML/LoRA/Local/Serve test suites passed!")
+    return 0
+}

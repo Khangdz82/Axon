@@ -1,0 +1,894 @@
+// Axon 2D Game Engine Standard Library (`std/game2d.ax`)
+// Zero-GC (`@no_alloc` hot paths), Spatial Hash Broadphase, Impulse Physics,
+// OBB SAT Collision, Sprite Batcher, Atlas UVs, Animation State Machine,
+// Tilemap + A* Pathfinding, and Preallocated Particle Pool.
+
+@no_alloc
+fn g2_abs(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@no_alloc
+fn g2_min(a: f64, b: f64) -> f64 {
+    if a < b { return a }
+    return b
+}
+
+@no_alloc
+fn g2_max(a: f64, b: f64) -> f64 {
+    if a > b { return a }
+    return b
+}
+
+@no_alloc
+fn g2_clamp(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+@no_alloc
+fn g2_wrap_angle(a: f64) -> f64 {
+    pi := 3.141592653589793
+    two_pi := 6.283185307179586
+    mut x := a
+    while x > pi { x = x - two_pi }
+    while x < (0.0 - pi) { x = x + two_pi }
+    return x
+}
+
+@no_alloc
+fn g2_sin(rad: f64) -> f64 {
+    pi := 3.141592653589793
+    half_pi := 1.5707963267948966
+    mut x := g2_wrap_angle(rad)
+    if x > half_pi { x = pi - x }
+    else if x < (0.0 - half_pi) { x = (0.0 - pi) - x }
+    x2 := x * x
+    // 9th-order minimax/Taylor polynomial on [-pi/2, pi/2]
+    mut term := x
+    mut sum := x
+    term = term * (0.0 - x2) / 6.0
+    sum = sum + term
+    term = term * (0.0 - x2) / 20.0
+    sum = sum + term
+    term = term * (0.0 - x2) / 42.0
+    sum = sum + term
+    term = term * (0.0 - x2) / 72.0
+    sum = sum + term
+    return sum
+}
+
+@no_alloc
+fn g2_cos(rad: f64) -> f64 {
+    return g2_sin(rad + 1.5707963267948966)
+}
+
+// --- 1. 2D Vector & Transform Primitives ---
+
+struct Vec2 {
+    x: f64
+    y: f64
+}
+
+@no_alloc fn v2(x: f64, y: f64) -> Vec2 { return Vec2(x = x, y = y) }
+@no_alloc fn v2_zero() -> Vec2 { return Vec2(x = 0.0, y = 0.0) }
+@no_alloc fn v2_add(a: Vec2, b: Vec2) -> Vec2 { return Vec2(x = a.x + b.x, y = a.y + b.y) }
+@no_alloc fn v2_sub(a: Vec2, b: Vec2) -> Vec2 { return Vec2(x = a.x - b.x, y = a.y - b.y) }
+@no_alloc fn v2_scale(a: Vec2, s: f64) -> Vec2 { return Vec2(x = a.x * s, y = a.y * s) }
+@no_alloc fn v2_dot(a: Vec2, b: Vec2) -> f64 { return a.x * b.x + a.y * b.y }
+@no_alloc fn v2_cross(a: Vec2, b: Vec2) -> f64 { return a.x * b.y - a.y * b.x }
+@no_alloc fn v2_len_sq(a: Vec2) -> f64 { return a.x * a.x + a.y * a.y }
+@no_alloc fn v2_len(a: Vec2) -> f64 { return sqrt_f64(a.x * a.x + a.y * a.y) }
+@no_alloc fn v2_perp(a: Vec2) -> Vec2 { return Vec2(x = 0.0 - a.y, y = a.x) }
+
+@no_alloc
+fn v2_norm(a: Vec2) -> Vec2 {
+    l2 := a.x * a.x + a.y * a.y
+    if l2 <= 0.000000000001 {
+        return Vec2(x = 0.0, y = 0.0)
+    }
+    inv := 1.0 / sqrt_f64(l2)
+    return Vec2(x = a.x * inv, y = a.y * inv)
+}
+
+@no_alloc
+fn v2_rot(a: Vec2, rad: f64) -> Vec2 {
+    s := g2_sin(rad)
+    c := g2_cos(rad)
+    return Vec2(x = a.x * c - a.y * s, y = a.x * s + a.y * c)
+}
+
+@no_alloc
+fn v2_lerp(a: Vec2, b: Vec2, t: f64) -> Vec2 {
+    return Vec2(x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t)
+}
+
+@no_alloc
+fn v2_reflect(v: Vec2, n: Vec2) -> Vec2 {
+    d := 2.0 * v2_dot(v, n)
+    return Vec2(x = v.x - n.x * d, y = v.y - n.y * d)
+}
+
+struct Aabb2 {
+    min_x: f64
+    min_y: f64
+    max_x: f64
+    max_y: f64
+}
+
+struct Circle2 {
+    cx: f64
+    cy: f64
+    r: f64
+}
+
+struct Hit2D {
+    hit: bool
+    nx: f64
+    ny: f64
+    depth: f64
+    t: f64
+}
+
+@no_alloc
+fn g2_aabb_overlap(a: Aabb2, b: Aabb2) -> bool {
+    if a.max_x < b.min_x or a.min_x > b.max_x { return false }
+    if a.max_y < b.min_y or a.min_y > b.max_y { return false }
+    return true
+}
+
+@no_alloc
+fn g2_circle_overlap(a: Circle2, b: Circle2) -> Hit2D {
+    dx := b.cx - a.cx
+    dy := b.cy - a.cy
+    rsum := a.r + b.r
+    d2 := dx * dx + dy * dy
+    if d2 >= rsum * rsum {
+        return Hit2D(hit = false, nx = 0.0, ny = 0.0, depth = 0.0, t = 0.0)
+    }
+    d := sqrt_f64(d2)
+    if d <= 0.0000001 {
+        return Hit2D(hit = true, nx = 0.0, ny = 1.0, depth = rsum, t = 0.0)
+    }
+    inv := 1.0 / d
+    return Hit2D(hit = true, nx = dx * inv, ny = dy * inv, depth = rsum - d, t = 0.0)
+}
+
+@no_alloc
+fn g2_circle_vs_aabb(c: Circle2, b: Aabb2) -> Hit2D {
+    qx := g2_clamp(c.cx, b.min_x, b.max_x)
+    qy := g2_clamp(c.cy, b.min_y, b.max_y)
+    dx := c.cx - qx
+    dy := c.cy - qy
+    d2 := dx * dx + dy * dy
+    if d2 > c.r * c.r {
+        return Hit2D(hit = false, nx = 0.0, ny = 0.0, depth = 0.0, t = 0.0)
+    }
+    d := sqrt_f64(d2)
+    if d > 0.0000001 {
+        inv := 1.0 / d
+        return Hit2D(hit = true, nx = dx * inv, ny = dy * inv, depth = c.r - d, t = 0.0)
+    }
+    // Center is inside AABB: push out along nearest edge
+    dl := c.cx - b.min_x
+    dr := b.max_x - c.cx
+    db := c.cy - b.min_y
+    dt := b.max_y - c.cy
+    mut m := dl
+    mut nx := -1.0
+    mut ny := 0.0
+    if dr < m { m = dr; nx = 1.0; ny = 0.0 }
+    if db < m { m = db; nx = 0.0; ny = -1.0 }
+    if dt < m { m = dt; nx = 0.0; ny = 1.0 }
+    return Hit2D(hit = true, nx = nx, ny = ny, depth = c.r + m, t = 0.0)
+}
+
+@no_alloc
+fn g2_ray_vs_aabb(ox: f64, oy: f64, dx: f64, dy: f64, b: Aabb2, max_t: f64) -> Hit2D {
+    mut tmin := 0.0
+    mut tmax := max_t
+    mut hit_nx := 0.0
+    mut hit_ny := 0.0
+    if g2_abs(dx) < 0.000000001 {
+        if ox < b.min_x or ox > b.max_x {
+            return Hit2D(hit = false, nx = 0.0, ny = 0.0, depth = 0.0, t = 0.0)
+        }
+    } else {
+        inv_x := 1.0 / dx
+        mut t1 := (b.min_x - ox) * inv_x
+        mut t2 := (b.max_x - ox) * inv_x
+        mut nx_cand := -1.0
+        if inv_x < 0.0 {
+            tmp := t1; t1 = t2; t2 = tmp; nx_cand = 1.0
+        }
+        if t1 > tmin { tmin = t1; hit_nx = nx_cand; hit_ny = 0.0 }
+        if t2 < tmax { tmax = t2 }
+        if tmin > tmax { return Hit2D(hit = false, nx = 0.0, ny = 0.0, depth = 0.0, t = 0.0) }
+    }
+    if g2_abs(dy) < 0.000000001 {
+        if oy < b.min_y or oy > b.max_y {
+            return Hit2D(hit = false, nx = 0.0, ny = 0.0, depth = 0.0, t = 0.0)
+        }
+    } else {
+        inv_y := 1.0 / dy
+        mut t1 := (b.min_y - oy) * inv_y
+        mut t2 := (b.max_y - oy) * inv_y
+        mut ny_cand := -1.0
+        if inv_y < 0.0 {
+            tmp := t1; t1 = t2; t2 = tmp; ny_cand = 1.0
+        }
+        if t1 > tmin { tmin = t1; hit_nx = 0.0; hit_ny = ny_cand }
+        if t2 < tmax { tmax = t2 }
+        if tmin > tmax { return Hit2D(hit = false, nx = 0.0, ny = 0.0, depth = 0.0, t = 0.0) }
+    }
+    return Hit2D(hit = true, nx = hit_nx, ny = hit_ny, depth = 0.0, t = tmin)
+}
+
+// 2D Oriented Bounding Box Separating Axis Theorem (OBB vs OBB)
+@no_alloc
+fn g2_sat_obb_overlap(cx1: f64, cy1: f64, hx1: f64, hy1: f64, rot1: f64, cx2: f64, cy2: f64, hx2: f64, hy2: f64, rot2: f64) -> Hit2D {
+    c1 := g2_cos(rot1); s1 := g2_sin(rot1)
+    c2 := g2_cos(rot2); s2 := g2_sin(rot2)
+    // Local axes of box1: u1=(c1,s1), v1=(-s1,c1); box2: u2=(c2,s2), v2=(-s2,c2)
+    dx := cx2 - cx1
+    dy := cy2 - cy1
+    mut best_depth := 1000000000.0
+    mut best_nx := 0.0
+    mut best_ny := 1.0
+
+    mut k := 0
+    while k < 4 {
+        mut ax := c1; mut ay := s1
+        if k == 1 { ax = 0.0 - s1; ay = c1 }
+        else if k == 2 { ax = c2; ay = s2 }
+        else if k == 3 { ax = 0.0 - s2; ay = c2 }
+
+        r1 := hx1 * g2_abs(ax * c1 + ay * s1) + hy1 * g2_abs(ay * c1 - ax * s1)
+        r2 := hx2 * g2_abs(ax * c2 + ay * s2) + hy2 * g2_abs(ay * c2 - ax * s2)
+        dist := dx * ax + dy * ay
+        pen := (r1 + r2) - g2_abs(dist)
+        if pen <= 0.0 {
+            return Hit2D(hit = false, nx = 0.0, ny = 0.0, depth = 0.0, t = 0.0)
+        }
+        if pen < best_depth {
+            best_depth = pen
+            if dist < 0.0 { best_nx = 0.0 - ax; best_ny = 0.0 - ay }
+            else { best_nx = ax; best_ny = ay }
+        }
+        k += 1
+    }
+    return Hit2D(hit = true, nx = best_nx, ny = best_ny, depth = best_depth, t = 0.0)
+}
+
+// --- 2. Fixed-Timestep Accumulator & Spatial Hash Broadphase ---
+
+struct FixedClock2D {
+    dt: f64
+    acc: f64
+    steps: i64
+}
+
+@no_alloc
+fn g2_fixed_step_advance(clock_step: f64, prev_acc: f64, frame_dt: f64, max_substeps: i64) -> FixedClock2D {
+    clamped := g2_clamp(frame_dt, 0.0, 0.25)
+    mut acc := prev_acc + clamped
+    mut steps := 0
+    while acc >= clock_step and steps < max_substeps {
+        acc = acc - clock_step
+        steps += 1
+    }
+    return FixedClock2D(dt = clock_step, acc = acc, steps = steps)
+}
+
+struct SpatialHash2D {
+    cell_size: f64
+    num_buckets: i64
+    max_entities: i64
+    heads_ptr: i64   // i64[num_buckets]
+    next_ptr: i64    // i64[max_entities]
+    out_ptr: i64     // scratch results i64[max_entities]
+}
+
+fn g2_spatial_new(cell_size: f64, num_buckets: i64, max_entities: i64) -> SpatialHash2D {
+    mut nb := num_buckets
+    if nb < 64 { nb = 64 }
+    mut me := max_entities
+    if me < 64 { me = 64 }
+    mut cs := cell_size
+    if cs < 0.001 { cs = 1.0 }
+    hp := mem_alloc_aligned(nb * 8)
+    np := mem_alloc_aligned(me * 8)
+    op := mem_alloc_aligned(me * 8)
+    mut i := 0
+    while i < nb { ptr_write_i64(hp, i, -1); i += 1 }
+    i = 0
+    while i < me { ptr_write_i64(np, i, -1); i += 1 }
+    return SpatialHash2D(cell_size = cs, num_buckets = nb, max_entities = me, heads_ptr = hp, next_ptr = np, out_ptr = op)
+}
+
+fn g2_spatial_free(move sh: SpatialHash2D) {
+    if sh.heads_ptr != 0 { mem_free_aligned(sh.heads_ptr) }
+    if sh.next_ptr != 0 { mem_free_aligned(sh.next_ptr) }
+    if sh.out_ptr != 0 { mem_free_aligned(sh.out_ptr) }
+}
+
+@no_alloc
+fn g2_spatial_hash_cell(cx: i64, cy: i64, num_buckets: i64) -> i64 {
+    h := ((cx *% 73856093) ^ (cy *% 19349663)) & 0x7FFFFFFFFFFFFFFF
+    return h % num_buckets
+}
+
+@no_alloc
+fn g2_spatial_clear(sh: SpatialHash2D) {
+    mut i := 0
+    while i < sh.num_buckets {
+        ptr_write_i64(sh.heads_ptr, i, -1)
+        i += 1
+    }
+}
+
+@no_alloc
+fn g2_spatial_insert(sh: SpatialHash2D, entity_id: i64, x: f64, y: f64) {
+    if entity_id < 0 or entity_id >= sh.max_entities { return }
+    mut cx := (x / sh.cell_size) as i64
+    mut cy := (y / sh.cell_size) as i64
+    if x < 0.0 { cx = cx - 1 }
+    if y < 0.0 { cy = cy - 1 }
+    b := g2_spatial_hash_cell(cx, cy, sh.num_buckets)
+    old_h := ptr_read_i64(sh.heads_ptr, b)
+    ptr_write_i64(sh.next_ptr, entity_id, old_h)
+    ptr_write_i64(sh.heads_ptr, b, entity_id)
+}
+
+@no_alloc
+fn g2_spatial_query_cell_3x3(sh: SpatialHash2D, x: f64, y: f64, max_out: i64) -> i64 {
+    mut cx := (x / sh.cell_size) as i64
+    mut cy := (y / sh.cell_size) as i64
+    if x < 0.0 { cx = cx - 1 }
+    if y < 0.0 { cy = cy - 1 }
+    mut cnt := 0
+    mut limit := max_out
+    if limit > sh.max_entities { limit = sh.max_entities }
+    mut dy := -1
+    while dy <= 1 {
+        mut dx := -1
+        while dx <= 1 {
+            b := g2_spatial_hash_cell(cx + dx, cy + dy, sh.num_buckets)
+            mut cur := ptr_read_i64(sh.heads_ptr, b)
+            mut guard := 0
+            while cur >= 0 and cnt < limit and guard < sh.max_entities {
+                ptr_write_i64(sh.out_ptr, cnt, cur)
+                cnt += 1
+                cur = ptr_read_i64(sh.next_ptr, cur)
+                guard += 1
+            }
+            dx += 1
+        }
+        dy += 1
+    }
+    return cnt
+}
+
+// --- 3. 2D Impulse Physics World (Preallocated SoA f32 arrays, @no_alloc step!) ---
+// Layout per body (8 floats stride in `data_ptr`):
+//   [0]=x, [1]=y, [2]=vx, [3]=vy, [4]=inv_mass, [5]=radius, [6]=restitution, [7]=drag
+struct PhysicsWorld2D {
+    max_bodies: i64
+    count_ptr: i64
+    data_ptr: i64    // max_bodies * 8 f32s
+    grid: SpatialHash2D
+}
+
+fn g2_world_new(max_bodies: i64, cell_size: f64) -> PhysicsWorld2D {
+    mut mb := max_bodies
+    if mb < 32 { mb = 32 }
+    cp := mem_alloc_aligned(64)
+    ptr_write_i64(cp, 0, 0)
+    dp := mem_alloc_aligned(mb * 32 + 64)
+    return PhysicsWorld2D(
+        max_bodies = mb,
+        count_ptr = cp,
+        data_ptr = dp,
+        grid = g2_spatial_new(cell_size, mb * 2, mb)
+    )
+}
+
+fn g2_world_free(move w: PhysicsWorld2D) {
+    if w.count_ptr != 0 { mem_free_aligned(w.count_ptr) }
+    if w.data_ptr != 0 { mem_free_aligned(w.data_ptr) }
+    g2_spatial_free(move w.grid)
+}
+
+@no_alloc
+fn g2_world_add_body(w: PhysicsWorld2D, x: f64, y: f64, vx: f64, vy: f64, mass: f64, radius: f64, restitution: f64, drag: f64) -> i64 {
+    idx := ptr_read_i64(w.count_ptr, 0)
+    if idx >= w.max_bodies { return -1 }
+    b := idx * 8
+    mut inv_m := 0.0
+    if mass > 0.000001 { inv_m = 1.0 / mass }
+    ptr_write_f32(w.data_ptr, b, x)
+    ptr_write_f32(w.data_ptr, b + 1, y)
+    ptr_write_f32(w.data_ptr, b + 2, vx)
+    ptr_write_f32(w.data_ptr, b + 3, vy)
+    ptr_write_f32(w.data_ptr, b + 4, inv_m)
+    ptr_write_f32(w.data_ptr, b + 5, radius)
+    ptr_write_f32(w.data_ptr, b + 6, restitution)
+    ptr_write_f32(w.data_ptr, b + 7, drag)
+    ptr_write_i64(w.count_ptr, 0, idx + 1)
+    return idx
+}
+
+@no_alloc
+fn g2_world_body_pos(w: PhysicsWorld2D, body_id: i64) -> Vec2 {
+    if body_id < 0 or body_id >= ptr_read_i64(w.count_ptr, 0) {
+        return v2_zero()
+    }
+    b := body_id * 8
+    return v2(ptr_read_f32(w.data_ptr, b), ptr_read_f32(w.data_ptr, b + 1))
+}
+
+@no_alloc
+fn g2_world_step(w: PhysicsWorld2D, gx: f64, gy: f64, dt: f64) {
+    cnt := ptr_read_i64(w.count_ptr, 0)
+    g2_spatial_clear(w.grid)
+    mut i := 0
+    while i < cnt {
+        b := i * 8
+        inv_m := ptr_read_f32(w.data_ptr, b + 4)
+        mut x := ptr_read_f32(w.data_ptr, b)
+        mut y := ptr_read_f32(w.data_ptr, b + 1)
+        if inv_m > 0.0 {
+            drag := ptr_read_f32(w.data_ptr, b + 7)
+            damp := g2_max(0.0, 1.0 - drag * dt)
+            vx := (ptr_read_f32(w.data_ptr, b + 2) + gx * dt) * damp
+            vy := (ptr_read_f32(w.data_ptr, b + 3) + gy * dt) * damp
+            x = x + vx * dt
+            y = y + vy * dt
+            ptr_write_f32(w.data_ptr, b, x)
+            ptr_write_f32(w.data_ptr, b + 1, y)
+            ptr_write_f32(w.data_ptr, b + 2, vx)
+            ptr_write_f32(w.data_ptr, b + 3, vy)
+        }
+        g2_spatial_insert(w.grid, i, x, y)
+        i += 1
+    }
+
+    // Spatial broadphase + circle-circle impulse resolution
+    i = 0
+    while i < cnt {
+        ba := i * 8
+        xa := ptr_read_f32(w.data_ptr, ba)
+        ya := ptr_read_f32(w.data_ptr, ba + 1)
+        ra := ptr_read_f32(w.data_ptr, ba + 5)
+        inv_ma := ptr_read_f32(w.data_ptr, ba + 4)
+        ncand := g2_spatial_query_cell_3x3(w.grid, xa, ya, 64)
+        mut ci := 0
+        while ci < ncand {
+            j := ptr_read_i64(w.grid.out_ptr, ci)
+            if j > i {
+                bb := j * 8
+                inv_mb := ptr_read_f32(w.data_ptr, bb + 4)
+                inv_sum := inv_ma + inv_mb
+                if inv_sum > 0.0 {
+                    xb := ptr_read_f32(w.data_ptr, bb)
+                    yb := ptr_read_f32(w.data_ptr, bb + 1)
+                    rb := ptr_read_f32(w.data_ptr, bb + 5)
+                    dx := xb - xa
+                    dy := yb - ya
+                    rsum := ra + rb
+                    d2 := dx * dx + dy * dy
+                    if d2 < rsum * rsum {
+                        d := sqrt_f64(d2)
+                        mut nx := 0.0
+                        mut ny := 1.0
+                        if d > 0.000001 { nx = dx / d; ny = dy / d }
+                        pen := rsum - d
+                        // Positional correction (80% Baumgarte)
+                        corr := (pen * 0.8) / inv_sum
+                        ptr_write_f32(w.data_ptr, ba, ptr_read_f32(w.data_ptr, ba) - nx * corr * inv_ma)
+                        ptr_write_f32(w.data_ptr, ba + 1, ptr_read_f32(w.data_ptr, ba + 1) - ny * corr * inv_ma)
+                        ptr_write_f32(w.data_ptr, bb, xb + nx * corr * inv_mb)
+                        ptr_write_f32(w.data_ptr, bb + 1, yb + ny * corr * inv_mb)
+
+                        // Relative normal velocity
+                        vxa := ptr_read_f32(w.data_ptr, ba + 2)
+                        vya := ptr_read_f32(w.data_ptr, ba + 3)
+                        vxb := ptr_read_f32(w.data_ptr, bb + 2)
+                        vyb := ptr_read_f32(w.data_ptr, bb + 3)
+                        rvn := (vxb - vxa) * nx + (vyb - vya) * ny
+                        if rvn < 0.0 {
+                            e := g2_min(ptr_read_f32(w.data_ptr, ba + 6), ptr_read_f32(w.data_ptr, bb + 6))
+                            j_imp := ((0.0 - (1.0 + e)) * rvn) / inv_sum
+                            ptr_write_f32(w.data_ptr, ba + 2, vxa - nx * j_imp * inv_ma)
+                            ptr_write_f32(w.data_ptr, ba + 3, vya - ny * j_imp * inv_ma)
+                            ptr_write_f32(w.data_ptr, bb + 2, vxb + nx * j_imp * inv_mb)
+                            ptr_write_f32(w.data_ptr, bb + 3, vyb + ny * j_imp * inv_mb)
+                        }
+                    }
+                }
+            }
+            ci += 1
+        }
+        i += 1
+    }
+}
+
+// --- 4. Camera2D, Texture Atlas UV, Sprite Batch & Animation State Machine ---
+
+struct Camera2D {
+    x: f64
+    y: f64
+    zoom: f64
+    rot: f64
+    view_w: f64
+    view_h: f64
+    shake: f64
+}
+
+@no_alloc
+fn g2_cam_world_to_screen(c: Camera2D, wx: f64, wy: f64) -> Vec2 {
+    dx := (wx - c.x) * c.zoom
+    dy := (wy - c.y) * c.zoom
+    r := v2_rot(v2(dx, dy), c.rot)
+    return v2(r.x + c.view_w * 0.5, r.y + c.view_h * 0.5)
+}
+
+@no_alloc
+fn g2_cam_screen_to_world(c: Camera2D, sx: f64, sy: f64) -> Vec2 {
+    mut z := c.zoom
+    if z < 0.0001 { z = 0.0001 }
+    dx := sx - c.view_w * 0.5
+    dy := sy - c.view_h * 0.5
+    r := v2_rot(v2(dx, dy), 0.0 - c.rot)
+    return v2(c.x + r.x / z, c.y + r.y / z)
+}
+
+struct UvRect {
+    u0: f64
+    v0: f64
+    u1: f64
+    v1: f64
+}
+
+@no_alloc
+fn g2_atlas_uv(tile_id: i64, cols: i64, rows: i64, inset: f64 = 0.001) -> UvRect {
+    if cols <= 0 or rows <= 0 or tile_id < 0 {
+        return UvRect(u0 = 0.0, v0 = 0.0, u1 = 1.0, v1 = 1.0)
+    }
+    tx := tile_id % cols
+    ty := (tile_id / cols) % rows
+    cw := 1.0 / (cols as f64)
+    ch := 1.0 / (rows as f64)
+    return UvRect(
+        u0 = (tx as f64) * cw + inset,
+        v0 = (ty as f64) * ch + inset,
+        u1 = ((tx + 1) as f64) * cw - inset,
+        v1 = ((ty + 1) as f64) * ch - inset
+    )
+}
+
+// GPU-ready interleaved 2D sprite batch (`[x, y, u, v, color_packed_f32]` per vertex, 4 vertices per quad)
+struct SpriteBatch {
+    max_quads: i64
+    quad_count_ptr: i64
+    vtx_ptr: i64     // max_quads * 20 f32s
+}
+
+fn g2_batch_new(max_quads: i64) -> SpriteBatch {
+    mut mq := max_quads
+    if mq < 64 { mq = 64 }
+    qp := mem_alloc_aligned(64)
+    ptr_write_i64(qp, 0, 0)
+    vp := mem_alloc_aligned(mq * 80 + 64)
+    return SpriteBatch(max_quads = mq, quad_count_ptr = qp, vtx_ptr = vp)
+}
+
+fn g2_batch_free(move sb: SpriteBatch) {
+    if sb.quad_count_ptr != 0 { mem_free_aligned(sb.quad_count_ptr) }
+    if sb.vtx_ptr != 0 { mem_free_aligned(sb.vtx_ptr) }
+}
+
+@no_alloc
+fn g2_batch_clear(sb: SpriteBatch) {
+    ptr_write_i64(sb.quad_count_ptr, 0, 0)
+}
+
+@no_alloc
+fn g2_batch_count(sb: SpriteBatch) -> i64 {
+    return ptr_read_i64(sb.quad_count_ptr, 0)
+}
+
+@no_alloc
+fn g2_batch_push_quad(sb: SpriteBatch, cx: f64, cy: f64, w: f64, h: f64, rot: f64, uv: UvRect, tint_f: f64) -> bool {
+    q := ptr_read_i64(sb.quad_count_ptr, 0)
+    if q >= sb.max_quads { return false }
+    hw := w * 0.5
+    hh := h * 0.5
+    c := g2_cos(rot)
+    s := g2_sin(rot)
+    b := q * 20
+    // v0 = (-hw, -hh), v1 = (hw, -hh), v2 = (hw, hh), v3 = (-hw, hh)
+    x0 := cx + (-hw) * c - (-hh) * s; y0 := cy + (-hw) * s + (-hh) * c
+    x1 := cx + hw * c - (-hh) * s;    y1 := cy + hw * s + (-hh) * c
+    x2 := cx + hw * c - hh * s;       y2 := cy + hw * s + hh * c
+    x3 := cx + (-hw) * c - hh * s;    y3 := cy + (-hw) * s + hh * c
+
+    ptr_write_f32(sb.vtx_ptr, b, x0);      ptr_write_f32(sb.vtx_ptr, b + 1, y0);  ptr_write_f32(sb.vtx_ptr, b + 2, uv.u0);  ptr_write_f32(sb.vtx_ptr, b + 3, uv.v0);  ptr_write_f32(sb.vtx_ptr, b + 4, tint_f)
+    ptr_write_f32(sb.vtx_ptr, b + 5, x1);  ptr_write_f32(sb.vtx_ptr, b + 6, y1);  ptr_write_f32(sb.vtx_ptr, b + 7, uv.u1);  ptr_write_f32(sb.vtx_ptr, b + 8, uv.v0);  ptr_write_f32(sb.vtx_ptr, b + 9, tint_f)
+    ptr_write_f32(sb.vtx_ptr, b + 10, x2); ptr_write_f32(sb.vtx_ptr, b + 11, y2); ptr_write_f32(sb.vtx_ptr, b + 12, uv.u1); ptr_write_f32(sb.vtx_ptr, b + 13, uv.v1); ptr_write_f32(sb.vtx_ptr, b + 14, tint_f)
+    ptr_write_f32(sb.vtx_ptr, b + 15, x3); ptr_write_f32(sb.vtx_ptr, b + 16, y3); ptr_write_f32(sb.vtx_ptr, b + 17, uv.u0); ptr_write_f32(sb.vtx_ptr, b + 18, uv.v1); ptr_write_f32(sb.vtx_ptr, b + 19, tint_f)
+    ptr_write_i64(sb.quad_count_ptr, 0, q + 1)
+    return true
+}
+
+struct AnimState2D {
+    frame: i64
+    elapsed: f64
+    finished: bool
+}
+
+@no_alloc
+fn g2_anim_step(cur_frame: i64, cur_elapsed: f64, frame_count: i64, fps: f64, looped: bool, dt: f64) -> AnimState2D {
+    if frame_count <= 0 or fps <= 0.0 {
+        return AnimState2D(frame = 0, elapsed = 0.0, finished = true)
+    }
+    step_t := 1.0 / fps
+    mut el := cur_elapsed + g2_max(0.0, dt)
+    mut fr := cur_frame
+    mut done := false
+    while el >= step_t {
+        el = el - step_t
+        if fr + 1 < frame_count {
+            fr += 1
+        } else if looped {
+            fr = 0
+        } else {
+            fr = frame_count - 1
+            done = true
+            break
+        }
+    }
+    return AnimState2D(frame = fr, elapsed = el, finished = done)
+}
+
+// --- 5. TileMap2D + Zero-Allocation A* Pathfinding ---
+
+struct TileMap2D {
+    width: i64
+    height: i64
+    tiles_ptr: i64    // i64[w*h]: 0=open, <0=blocked, >0=extra traversal cost
+    g_ptr: i64        // scratch A* g_score
+    f_ptr: i64        // scratch A* f_score
+    parent_ptr: i64   // scratch A* came_from
+    state_ptr: i64    // scratch 0=unvisited, 1=open, 2=closed
+    path_ptr: i64     // output flattened cell indices (reversed then unreversed)
+}
+
+fn g2_tilemap_new(width: i64, height: i64) -> TileMap2D {
+    mut w := width
+    mut h := height
+    if w < 1 { w = 1 }
+    if h < 1 { h = 1 }
+    n := w * h
+    tp := mem_alloc_aligned(n * 8 + 64)
+    gp := mem_alloc_aligned(n * 8 + 64)
+    fp := mem_alloc_aligned(n * 8 + 64)
+    pp := mem_alloc_aligned(n * 8 + 64)
+    sp := mem_alloc_aligned(n * 8 + 64)
+    op := mem_alloc_aligned(n * 8 + 64)
+    mut i := 0
+    while i < n { ptr_write_i64(tp, i, 0); i += 1 }
+    return TileMap2D(width = w, height = h, tiles_ptr = tp, g_ptr = gp, f_ptr = fp, parent_ptr = pp, state_ptr = sp, path_ptr = op)
+}
+
+fn g2_tilemap_free(move tm: TileMap2D) {
+    if tm.tiles_ptr != 0 { mem_free_aligned(tm.tiles_ptr) }
+    if tm.g_ptr != 0 { mem_free_aligned(tm.g_ptr) }
+    if tm.f_ptr != 0 { mem_free_aligned(tm.f_ptr) }
+    if tm.parent_ptr != 0 { mem_free_aligned(tm.parent_ptr) }
+    if tm.state_ptr != 0 { mem_free_aligned(tm.state_ptr) }
+    if tm.path_ptr != 0 { mem_free_aligned(tm.path_ptr) }
+}
+
+@no_alloc
+fn g2_tilemap_set(tm: TileMap2D, x: i64, y: i64, val: i64) {
+    if x >= 0 and x < tm.width and y >= 0 and y < tm.height {
+        ptr_write_i64(tm.tiles_ptr, y * tm.width + x, val)
+    }
+}
+
+@no_alloc
+fn g2_tilemap_get(tm: TileMap2D, x: i64, y: i64) -> i64 {
+    if x < 0 or x >= tm.width or y < 0 or y >= tm.height { return -1 }
+    return ptr_read_i64(tm.tiles_ptr, y * tm.width + x)
+}
+
+// 4-bit cardinal autotile bitmask (1=N, 2=E, 4=S, 8=W matching tile `target_val`)
+@no_alloc
+fn g2_tilemap_autotile_mask(tm: TileMap2D, x: i64, y: i64, target_val: i64) -> i64 {
+    mut m := 0
+    if g2_tilemap_get(tm, x, y - 1) == target_val { m = m | 1 }
+    if g2_tilemap_get(tm, x + 1, y) == target_val { m = m | 2 }
+    if g2_tilemap_get(tm, x, y + 1) == target_val { m = m | 4 }
+    if g2_tilemap_get(tm, x - 1, y) == target_val { m = m | 8 }
+    return m
+}
+
+// 100% `@no_alloc` A* shortest-path solver storing cell indices `[start..goal]` in `tm.path_ptr[0..path_len)`.
+// Returns `path_len` (`0` if unreachable).
+@no_alloc
+fn g2_astar_find_path(tm: TileMap2D, sx: i64, sy: i64, gx: i64, gy: i64) -> i64 {
+    if g2_tilemap_get(tm, sx, sy) < 0 or g2_tilemap_get(tm, gx, gy) < 0 {
+        return 0
+    }
+    n := tm.width * tm.height
+    start := sy * tm.width + sx
+    goal := gy * tm.width + gx
+    inf := 1000000000
+    mut i := 0
+    while i < n {
+        ptr_write_i64(tm.g_ptr, i, inf)
+        ptr_write_i64(tm.f_ptr, i, inf)
+        ptr_write_i64(tm.parent_ptr, i, -1)
+        ptr_write_i64(tm.state_ptr, i, 0)
+        i += 1
+    }
+    mut mdx := gx - sx
+    if mdx < 0 { mdx = 0 - mdx }
+    mut mdy := gy - sy
+    if mdy < 0 { mdy = 0 - mdy }
+    ptr_write_i64(tm.g_ptr, start, 0)
+    ptr_write_i64(tm.f_ptr, start, (mdx + mdy) * 10)
+    ptr_write_i64(tm.state_ptr, start, 1)
+
+    mut found := false
+    mut iter := 0
+    while iter < n {
+        // Pick lowest f in open set
+        mut best := -1
+        mut best_f := inf
+        mut j := 0
+        while j < n {
+            if ptr_read_i64(tm.state_ptr, j) == 1 {
+                fval := ptr_read_i64(tm.f_ptr, j)
+                if fval < best_f {
+                    best_f = fval
+                    best = j
+                }
+            }
+            j += 1
+        }
+        if best < 0 { break }
+        if best == goal {
+            found = true
+            break
+        }
+        ptr_write_i64(tm.state_ptr, best, 2)
+        bx := best % tm.width
+        by := best / tm.width
+        bg := ptr_read_i64(tm.g_ptr, best)
+
+        mut dir := 0
+        while dir < 4 {
+            mut nx := bx
+            mut ny := by
+            if dir == 0 { ny = by - 1 }
+            else if dir == 1 { nx = bx + 1 }
+            else if dir == 2 { ny = by + 1 }
+            else { nx = bx - 1 }
+            if nx >= 0 and nx < tm.width and ny >= 0 and ny < tm.height {
+                nid := ny * tm.width + nx
+                tval := ptr_read_i64(tm.tiles_ptr, nid)
+                if tval >= 0 and ptr_read_i64(tm.state_ptr, nid) != 2 {
+                    step_cost := 10 + tval * 5
+                    cand_g := bg + step_cost
+                    if cand_g < ptr_read_i64(tm.g_ptr, nid) {
+                        mut hdx := gx - nx
+                        if hdx < 0 { hdx = 0 - hdx }
+                        mut hdy := gy - ny
+                        if hdy < 0 { hdy = 0 - hdy }
+                        ptr_write_i64(tm.parent_ptr, nid, best)
+                        ptr_write_i64(tm.g_ptr, nid, cand_g)
+                        ptr_write_i64(tm.f_ptr, nid, cand_g + (hdx + hdy) * 10)
+                        ptr_write_i64(tm.state_ptr, nid, 1)
+                    }
+                }
+            }
+            dir += 1
+        }
+        iter += 1
+    }
+
+    if not found { return 0 }
+    mut plen := 0
+    mut cur := goal
+    while cur >= 0 and plen < n {
+        ptr_write_i64(tm.path_ptr, plen, cur)
+        plen += 1
+        if cur == start { break }
+        cur = ptr_read_i64(tm.parent_ptr, cur)
+    }
+    // Reverse in-place so `path_ptr[0] == start` and `path_ptr[plen - 1] == goal`
+    mut lo := 0
+    mut hi := plen - 1
+    while lo < hi {
+        a := ptr_read_i64(tm.path_ptr, lo)
+        b := ptr_read_i64(tm.path_ptr, hi)
+        ptr_write_i64(tm.path_ptr, lo, b)
+        ptr_write_i64(tm.path_ptr, hi, a)
+        lo += 1
+        hi -= 1
+    }
+    return plen
+}
+
+// --- 6. Zero-GC SoA Particle Pool (2D) ---
+
+struct ParticlePool2D {
+    cap: i64
+    active_ptr: i64  // i64[1]
+    data_ptr: i64    // 6 f32s per particle: x, y, vx, vy, life, max_life
+}
+
+fn g2_particles_new(cap: i64) -> ParticlePool2D {
+    mut c := cap
+    if c < 32 { c = 32 }
+    ap := mem_alloc_aligned(64)
+    ptr_write_i64(ap, 0, 0)
+    dp := mem_alloc_aligned(c * 24 + 64)
+    return ParticlePool2D(cap = c, active_ptr = ap, data_ptr = dp)
+}
+
+fn g2_particles_free(move p: ParticlePool2D) {
+    if p.active_ptr != 0 { mem_free_aligned(p.active_ptr) }
+    if p.data_ptr != 0 { mem_free_aligned(p.data_ptr) }
+}
+
+@no_alloc
+fn g2_particles_spawn(p: ParticlePool2D, x: f64, y: f64, vx: f64, vy: f64, life: f64) -> bool {
+    cnt := ptr_read_i64(p.active_ptr, 0)
+    if cnt >= p.cap or life <= 0.0 { return false }
+    b := cnt * 6
+    ptr_write_f32(p.data_ptr, b, x)
+    ptr_write_f32(p.data_ptr, b + 1, y)
+    ptr_write_f32(p.data_ptr, b + 2, vx)
+    ptr_write_f32(p.data_ptr, b + 3, vy)
+    ptr_write_f32(p.data_ptr, b + 4, life)
+    ptr_write_f32(p.data_ptr, b + 5, life)
+    ptr_write_i64(p.active_ptr, 0, cnt + 1)
+    return true
+}
+
+@no_alloc
+fn g2_particles_step(p: ParticlePool2D, gy: f64, dt: f64) -> i64 {
+    mut cnt := ptr_read_i64(p.active_ptr, 0)
+    mut i := 0
+    while i < cnt {
+        b := i * 6
+        life := ptr_read_f32(p.data_ptr, b + 4) - dt
+        if life <= 0.0 {
+            last := cnt - 1
+            if i != last {
+                lb := last * 6
+                mut k := 0
+                while k < 6 {
+                    ptr_write_f32(p.data_ptr, b + k, ptr_read_f32(p.data_ptr, lb + k))
+                    k += 1
+                }
+            }
+            cnt -= 1
+        } else {
+            vx := ptr_read_f32(p.data_ptr, b + 2)
+            vy := ptr_read_f32(p.data_ptr, b + 3) + gy * dt
+            ptr_write_f32(p.data_ptr, b, ptr_read_f32(p.data_ptr, b) + vx * dt)
+            ptr_write_f32(p.data_ptr, b + 1, ptr_read_f32(p.data_ptr, b + 1) + vy * dt)
+            ptr_write_f32(p.data_ptr, b + 3, vy)
+            ptr_write_f32(p.data_ptr, b + 4, life)
+            i += 1
+        }
+    }
+    ptr_write_i64(p.active_ptr, 0, cnt)
+    return cnt
+}
