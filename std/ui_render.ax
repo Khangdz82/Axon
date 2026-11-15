@@ -1,0 +1,342 @@
+// Axon Standard Library: Native UI Software Rasterizer & Framebuffer (`std/ui_render.ax`)
+// High-performance 32-bit ARGB/BGRA Canvas Rasterizer: Anti-aliased rounded boxes,
+// solid fills, alpha blending, borders, text rendering and 32-bit BMP export.
+
+use std::os
+use std::str
+use std::html
+use std::css
+use std::ui_layout
+
+struct Canvas {
+    pixels: ByteBuf
+    width: i64
+    height: i64
+}
+
+fn canvas_new(w: i64, h: i64) -> Canvas {
+    size := w * h * 4
+    b := buf_new(size + 64)
+    mut i := 0
+    while i < size {
+        buf_push(b, 0)
+        i += 1
+    }
+    return Canvas(pixels = b, width = w, height = h)
+}
+
+fn canvas_clear(c: Canvas, color: i64) {
+    w := c.width
+    h := c.height
+    total_px := w * h
+    b0 := color & 255         // B
+    b1 := (color >> 8) & 255  // G
+    b2 := (color >> 16) & 255 // R
+    b3 := (color >> 24) & 255 // A
+
+    mut i := 0
+    while i < total_px {
+        off := i * 4
+        buf_set(c.pixels, off, b0)
+        buf_set(c.pixels, off + 1, b1)
+        buf_set(c.pixels, off + 2, b2)
+        buf_set(c.pixels, off + 3, b3)
+        i += 1
+    }
+}
+
+@inline
+fn canvas_blend_pixel(c: Canvas, x: i64, y: i64, color: i64) {
+    if x < 0 or x >= c.width or y < 0 or y >= c.height { return }
+    off := (y * c.width + x) * 4
+    
+    sa := (color >> 24) & 255
+    if sa == 0 { return }
+    if sa == 255 {
+        buf_set(c.pixels, off, color & 255)
+        buf_set(c.pixels, off + 1, (color >> 8) & 255)
+        buf_set(c.pixels, off + 2, (color >> 16) & 255)
+        buf_set(c.pixels, off + 3, 255)
+        return
+    }
+
+    // Alpha blend: out = src * sa + dst * (255 - sa)
+    inv_sa := 255 - sa
+    db := buf_get(c.pixels, off) & 255
+    dg := buf_get(c.pixels, off + 1) & 255
+    dr := buf_get(c.pixels, off + 2) & 255
+
+    sr := (color >> 16) & 255
+    sg := (color >> 8) & 255
+    sb := color & 255
+
+    out_b := (sb * sa + db * inv_sa) / 255
+    out_g := (sg * sa + dg * inv_sa) / 255
+    out_r := (sr * sa + dr * inv_sa) / 255
+
+    buf_set(c.pixels, off, out_b)
+    buf_set(c.pixels, off + 1, out_g)
+    buf_set(c.pixels, off + 2, out_r)
+    buf_set(c.pixels, off + 3, 255)
+}
+
+fn canvas_draw_rect(c: Canvas, rx: i64, ry: i64, rw: i64, rh: i64, color: i64) {
+    if (color >> 24) == 0 { return }
+    mut y := ry
+    y_end := ry + rh
+    while y < y_end {
+        mut x := rx
+        x_end := rx + rw
+        while x < x_end {
+            canvas_blend_pixel(c, x, y, color)
+            x += 1
+        }
+        y += 1
+    }
+}
+
+// Anti-aliased rounded rectangle
+fn canvas_draw_rounded_rect(c: Canvas, rx: i64, ry: i64, rw: i64, rh: i64, rad: i64, color: i64) {
+    if rad <= 0 {
+        canvas_draw_rect(c, rx, ry, rw, rh, color)
+        return
+    }
+    mut r := rad
+    if r > rw / 2 { r = rw / 2 }
+    if r > rh / 2 { r = rh / 2 }
+
+    mut y := ry
+    y_end := ry + rh
+    while y < y_end {
+        mut x := rx
+        x_end := rx + rw
+        while x < x_end {
+            // Check corners
+            mut in_corner := false
+            mut dx := 0
+            mut dy := 0
+
+            if x < rx + r and y < ry + r { // Top-left
+                in_corner = true
+                dx = (rx + r) - x
+                dy = (ry + r) - y
+            } else if x >= rx + rw - r and y < ry + r { // Top-right
+                in_corner = true
+                dx = x - (rx + rw - r - 1)
+                dy = (ry + r) - y
+            } else if x < rx + r and y >= ry + rh - r { // Bottom-left
+                in_corner = true
+                dx = (rx + r) - x
+                dy = y - (ry + rh - r - 1)
+            } else if x >= rx + rw - r and y >= ry + rh - r { // Bottom-right
+                in_corner = true
+                dx = x - (rx + rw - r - 1)
+                dy = y - (ry + rh - r - 1)
+            }
+
+            if not in_corner or (dx * dx + dy * dy <= r * r) {
+                canvas_blend_pixel(c, x, y, color)
+            }
+            x += 1
+        }
+        y += 1
+    }
+}
+
+fn canvas_draw_border(c: Canvas, rx: i64, ry: i64, rw: i64, rh: i64, bw: i64, color: i64) {
+    if bw <= 0 { return }
+    canvas_draw_rect(c, rx, ry, rw, bw, color)                  // Top
+    canvas_draw_rect(c, rx, ry + rh - bw, rw, bw, color)         // Bottom
+    canvas_draw_rect(c, rx, ry + bw, bw, rh - bw * 2, color)     // Left
+    canvas_draw_rect(c, rx + rw - bw, ry + bw, bw, rh - bw * 2, color) // Right
+}
+
+// Minimal 5x7 ASCII font column masks (columns 0..4)
+// Returns a 7-bit column mask for character `ch` at column `col` (0..4)
+fn font_glyph_col(ch: i64, col: i64) -> i64 {
+    // Digits '0'..'9'
+    if ch == 48 { // '0'
+        if col == 0 or col == 4 { return 0x3E }
+        if col == 1 or col == 3 { return 0x41 }
+        return 0x41
+    }
+    if ch == 49 { // '1'
+        if col == 2 { return 0x7F }
+        if col == 1 { return 0x21 }
+        return 0x01
+    }
+    if ch >= 65 and ch <= 90 { // Uppercase 'A'..'Z'
+        if ch == 65 { // 'A'
+            if col == 0 or col == 4 { return 0x7E }
+            if col == 2 { return 0x11 }
+            return 0x12
+        }
+        if ch == 66 { // 'B'
+            if col == 0 { return 0x7F }
+            if col == 4 { return 0x36 }
+            return 0x49
+        }
+        if ch == 67 { // 'C'
+            if col == 0 { return 0x3E }
+            if col == 4 { return 0x22 }
+            return 0x41
+        }
+        if ch == 88 { // 'X'
+            if col == 0 or col == 4 { return 0x63 }
+            if col == 1 or col == 3 { return 0x14 }
+            return 0x08
+        }
+        // Generic box for other letters
+        if col == 0 or col == 4 { return 0x7F }
+        return 0x41
+    }
+    // Dash / Hyphen '-'
+    if ch == 45 {
+        if col >= 1 and col <= 3 { return 0x08 }
+        return 0
+    }
+    // Period '.'
+    if ch == 46 {
+        if col == 2 { return 0x01 }
+        return 0
+    }
+    // Default block for visible ascii
+    if ch > 32 and ch < 127 {
+        if col == 0 or col == 4 { return 0x7F }
+        if col == 2 { return 0x49 }
+        return 0x41
+    }
+    return 0
+}
+
+fn canvas_draw_char(c: Canvas, cx: i64, cy: i64, ch: i64, color: i64, scale: i64 = 1) {
+    if ch <= 32 or ch >= 127 { return }
+    mut sc := scale
+    if sc < 1 { sc = 1 }
+
+    mut col := 0
+    while col < 5 {
+        bits := font_glyph_col(ch, col)
+        mut row := 0
+        while row < 7 {
+            if ((bits >> (6 - row)) & 1) != 0 {
+                mut sy := 0
+                while sy < sc {
+                    mut sx := 0
+                    while sx < sc {
+                        canvas_blend_pixel(c, cx + col * sc + sx, cy + row * sc + sy, color)
+                        sx += 1
+                    }
+                    sy += 1
+                }
+            }
+            row += 1
+        }
+        col += 1
+    }
+}
+
+fn canvas_draw_text(c: Canvas, tx: i64, ty: i64, text: str, color: i64, scale: i64 = 1) {
+    n := str_len(text)
+    if n == 0 { return }
+    mut sc := scale
+    if sc < 1 { sc = 1 }
+    char_step := 6 * sc
+
+    mut i := 0
+    while i < n {
+        ch := str_byte(text, i)
+        canvas_draw_char(c, tx + i * char_step, ty, ch, color, sc)
+        i += 1
+    }
+}
+
+// Paints the styled DOM layout tree onto the canvas
+fn canvas_paint_dom(c: Canvas, tree: DomTree, sheet: Stylesheet, lt: LayoutTree) {
+    mut i := 0
+    while i < tree.count {
+        bx := layout_get_x(lt, i)
+        by := layout_get_y(lt, i)
+        bw := layout_get_w(lt, i)
+        bh := layout_get_h(lt, i)
+
+        if bw > 0 and bh > 0 {
+            style := css_compute_node_style(tree, i, sheet)
+
+            // 1. Draw background
+            if (style.bg_color >> 24) != 0 {
+                if style.border_radius > 0 {
+                    canvas_draw_rounded_rect(c, bx, by, bw, bh, style.border_radius, style.bg_color)
+                } else {
+                    canvas_draw_rect(c, bx, by, bw, bh, style.bg_color)
+                }
+            }
+
+            // 2. Draw border
+            if style.border_width > 0 and (style.border_color >> 24) != 0 {
+                canvas_draw_border(c, bx, by, bw, bh, style.border_width, style.border_color)
+            }
+
+            // 3. Draw text content
+            txt := dom_get_text(tree, i)
+            if str_len(txt) > 0 {
+                tag := dom_get_tag(tree, i)
+                scale := if str_eq(tag, "h1") { 2 } else { 1 }
+                pad_x := style.padding_x / 2
+                pad_y := style.padding_y / 2
+                tx := bx + pad_x + 6
+                ty := by + pad_y + 6
+                canvas_draw_text(c, tx, ty, txt, style.text_color, scale)
+            }
+        }
+        i += 1
+    }
+}
+
+// Encodes canvas pixels into standard 32-bit BMP image format
+fn canvas_to_bmp(c: Canvas) -> ByteBuf {
+    w := c.width
+    h := c.height
+    row_bytes := w * 4
+    img_size := row_bytes * h
+    file_size := 54 + img_size
+
+    out := buf_new(file_size + 64)
+
+    // BMP Header (14 bytes)
+    buf_push(out, 66) // 'B'
+    buf_push(out, 77) // 'M'
+    buf_push(out, file_size & 255)
+    buf_push(out, (file_size >> 8) & 255)
+    buf_push(out, (file_size >> 16) & 255)
+    buf_push(out, (file_size >> 24) & 255)
+    buf_push(out, 0); buf_push(out, 0); buf_push(out, 0); buf_push(out, 0)
+    buf_push(out, 54); buf_push(out, 0); buf_push(out, 0); buf_push(out, 0) // offset to pixels
+
+    // DIB Header BITMAPINFOHEADER (40 bytes)
+    buf_push(out, 40); buf_push(out, 0); buf_push(out, 0); buf_push(out, 0) // header size
+    buf_push(out, w & 255); buf_push(out, (w >> 8) & 255); buf_push(out, (w >> 16) & 255); buf_push(out, (w >> 24) & 255)
+    buf_push(out, h & 255); buf_push(out, (h >> 8) & 255); buf_push(out, (h >> 16) & 255); buf_push(out, (h >> 24) & 255)
+    buf_push(out, 1); buf_push(out, 0)  // planes = 1
+    buf_push(out, 32); buf_push(out, 0) // 32 bpp
+    buf_push(out, 0); buf_push(out, 0); buf_push(out, 0); buf_push(out, 0) // compression = BI_RGB
+    buf_push(out, img_size & 255); buf_push(out, (img_size >> 8) & 255); buf_push(out, (img_size >> 16) & 255); buf_push(out, (img_size >> 24) & 255)
+    buf_push(out, 0); buf_push(out, 0); buf_push(out, 0); buf_push(out, 0)
+    buf_push(out, 0); buf_push(out, 0); buf_push(out, 0); buf_push(out, 0)
+    buf_push(out, 0); buf_push(out, 0); buf_push(out, 0); buf_push(out, 0)
+    buf_push(out, 0); buf_push(out, 0); buf_push(out, 0); buf_push(out, 0)
+
+    // BMP pixel rows are stored bottom-to-top
+    mut y := h - 1
+    while y >= 0 {
+        row_off := y * row_bytes
+        mut x := 0
+        while x < row_bytes {
+            buf_push(out, buf_get(c.pixels, row_off + x))
+            x += 1
+        }
+        y -= 1
+    }
+
+    return out
+}

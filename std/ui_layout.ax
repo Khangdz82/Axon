@@ -1,0 +1,175 @@
+// Axon Standard Library: Native Flexbox & Box Layout Engine (`std/ui_layout.ax`)
+// Pure native zero-CEF layout solver: Computes exact bounding boxes (x, y, w, h)
+// for DOM elements according to CSS flex-direction, gap, padding, margin & alignments.
+
+use std::os
+use std::str
+use std::html
+use std::css
+
+// Layout box per node: [x, y, w, h] (4 integers per node)
+struct LayoutTree {
+    boxes: IntBuf // node_idx * 4 -> [x, y, w, h]
+    count: i64
+}
+
+fn layout_tree_new(cap_nodes: i64) -> LayoutTree {
+    mut b := ibuf_new(cap_nodes * 4 + 16)
+    mut i := 0
+    total_slots := cap_nodes * 4
+    while i < total_slots {
+        ibuf_push(b, 0)
+        i += 1
+    }
+    return LayoutTree(boxes = b, count = cap_nodes)
+}
+
+fn layout_get_x(lt: LayoutTree, node_idx: i64) -> i64 {
+    if node_idx < 0 or node_idx >= lt.count { return 0 }
+    return ibuf_get(lt.boxes, node_idx * 4)
+}
+
+fn layout_get_y(lt: LayoutTree, node_idx: i64) -> i64 {
+    if node_idx < 0 or node_idx >= lt.count { return 0 }
+    return ibuf_get(lt.boxes, node_idx * 4 + 1)
+}
+
+fn layout_get_w(lt: LayoutTree, node_idx: i64) -> i64 {
+    if node_idx < 0 or node_idx >= lt.count { return 0 }
+    return ibuf_get(lt.boxes, node_idx * 4 + 2)
+}
+
+fn layout_get_h(lt: LayoutTree, node_idx: i64) -> i64 {
+    if node_idx < 0 or node_idx >= lt.count { return 0 }
+    return ibuf_get(lt.boxes, node_idx * 4 + 3)
+}
+
+fn layout_set_box(lt: LayoutTree, node_idx: i64, x: i64, y: i64, w: i64, h: i64) {
+    if node_idx < 0 or node_idx >= lt.count { return }
+    base := node_idx * 4
+    ibuf_set(lt.boxes, base, x)
+    ibuf_set(lt.boxes, base + 1, y)
+    ibuf_set(lt.boxes, base + 2, w)
+    ibuf_set(lt.boxes, base + 3, h)
+}
+
+// Estimates text content width based on character count and font size
+fn layout_estimate_text_width(text: str, font_size: i64 = 14) -> i64 {
+    n := str_len(text)
+    if n == 0 { return 0 }
+    char_w := (font_size * 6) / 10 // ~0.6 aspect ratio
+    return n * char_w
+}
+
+// Solves layout recursively starting from root
+fn layout_solve_node(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, node_idx: i64, avail_x: i64, avail_y: i64, avail_w: i64, avail_h: i64) {
+    if node_idx < 0 or node_idx >= tree.count { return }
+
+    style := css_compute_node_style(tree, node_idx, sheet)
+    if style.display == 3 { // display: none
+        layout_set_box(lt, node_idx, 0, 0, 0, 0)
+        return
+    }
+
+    // Determine intrinsic width and height
+    mut box_w := style.width
+    mut box_h := style.height
+
+    pad_w := style.padding_x
+    pad_h := style.padding_y
+    margin_x := style.margin_x / 2
+    margin_y := style.margin_y / 2
+
+    mut pos_x := avail_x + margin_x
+    mut pos_y := avail_y + margin_y
+
+    // If width is auto, expand to available width (minus margins)
+    if box_w < 0 {
+        box_w = avail_w - style.margin_x
+        if box_w < 0 { box_w = 0 }
+    }
+
+    // If height is auto for elements with text, estimate height
+    txt := dom_get_text(tree, node_idx)
+    if box_h < 0 and str_len(txt) > 0 {
+        box_h = 24 + pad_h
+    }
+
+    // Layout children
+    fc := dom_first_child(tree, node_idx)
+    if fc >= 0 {
+        content_x := pos_x + pad_w / 2
+        content_y := pos_y + pad_h / 2
+        mut content_w := box_w - pad_w
+        if content_w < 0 { content_w = 0 }
+
+        is_col := (style.flex_direction == 1) // column
+        gap := style.gap
+
+        mut cur_child := fc
+        mut cursor_x := content_x
+        mut cursor_y := content_y
+        mut total_child_h := 0
+        mut total_child_w := 0
+
+        while cur_child >= 0 {
+            c_style := css_compute_node_style(tree, cur_child, sheet)
+            mut cw := c_style.width
+            mut ch := c_style.height
+
+            // Default button / input sizing
+            c_tag := dom_get_tag(tree, cur_child)
+            if ch < 0 {
+                if str_eq(c_tag, "button") or str_eq(c_tag, "input") { ch = 36 }
+                else if str_eq(c_tag, "h1") { ch = 36 }
+                else if str_eq(c_tag, "h2") { ch = 28 }
+                else { ch = 30 }
+            }
+            if cw < 0 {
+                c_txt := dom_get_text(tree, cur_child)
+                if str_len(c_txt) > 0 {
+                    cw = layout_estimate_text_width(c_txt) + c_style.padding_x + 16
+                } else if is_col {
+                    cw = content_w
+                } else {
+                    cw = 100
+                }
+            }
+
+            layout_solve_node(tree, sheet, lt, cur_child, cursor_x, cursor_y, cw, ch)
+
+            if is_col {
+                child_advance := ch + c_style.margin_y + gap
+                cursor_y += child_advance
+                total_child_h += child_advance
+            } else {
+                child_advance := cw + c_style.margin_x + gap
+                cursor_x += child_advance
+                total_child_w += child_advance
+            }
+
+            cur_child = dom_next_sibling(tree, cur_child)
+        }
+
+        // If height was auto, wrap children content
+        if box_h < 0 {
+            if is_col {
+                box_h = total_child_h + pad_h
+            } else {
+                box_h = 40 + pad_h
+            }
+        }
+    } else {
+        if box_h < 0 { box_h = 32 }
+    }
+
+    layout_set_box(lt, node_idx, pos_x, pos_y, box_w, box_h)
+}
+
+fn layout_compute(tree: DomTree, sheet: Stylesheet, window_w: i64, window_h: i64) -> LayoutTree {
+    lt := layout_tree_new(tree.count)
+    if tree.root_idx >= 0 {
+        layout_solve_node(tree, sheet, lt, tree.root_idx, 0, 0, window_w, window_h)
+    }
+    return lt
+}

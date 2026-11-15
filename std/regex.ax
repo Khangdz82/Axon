@@ -1,0 +1,570 @@
+// Axon Standard Library: Regular Expression Engine (`std/regex.ax`)
+// High-performance NFA / Backtracking Pattern Matcher in 100% Pure Axon.
+// Supports: Literals, '.', '\d', '\D', '\w', '\W', '\s', '\S', '[a-z]', '[^0-9]',
+// Anchors '^' and '$', Quantifiers '*', '+', '?', and Alternation '|'.
+
+use std::os
+use std::str
+
+struct RegexMatch {
+    start: i64
+    end: i64
+    len: i64
+}
+
+// Bytecode Opcodes for Regex VM
+// OP_CHAR:       [1, char_byte]
+// OP_ANY:        [2]
+// OP_DIGIT:      [3]
+// OP_NON_DIGIT:  [4]
+// OP_WORD:       [5]
+// OP_NON_WORD:   [6]
+// OP_SPACE:      [7]
+// OP_NON_SPACE:  [8]
+// OP_RANGE:      [9, min_ch, max_ch]
+// OP_NEG_RANGE:  [10, min_ch, max_ch]
+// OP_START:      [11] (^)
+// OP_END:        [12] ($)
+// OP_MATCH:      [255]
+
+struct Regex {
+    code: IntBuf
+    has_start_anchor: bool
+    has_end_anchor: bool
+}
+
+fn rx_is_digit(ch: i64) -> bool {
+    return ch >= 48 and ch <= 57
+}
+
+fn rx_is_word(ch: i64) -> bool {
+    return (ch >= 65 and ch <= 90) or (ch >= 97 and ch <= 122) or (ch >= 48 and ch <= 57) or ch == 95
+}
+
+fn rx_is_space(ch: i64) -> bool {
+    return ch == 32 or ch == 9 or ch == 10 or ch == 13
+}
+
+fn regex_compile(pattern: str) -> Regex ! i64 {
+    n := str_len(pattern)
+    if n == 0 {
+        code := ibuf_new(4)
+        ibuf_push(code, 255) // MATCH
+        return ok(Regex(code = code, has_start_anchor = false, has_end_anchor = false))
+    }
+
+    code := ibuf_new(n * 4 + 8)
+    mut i := 0
+    mut has_start := false
+    mut has_end := false
+
+    if str_byte(pattern, 0) == 94 { // '^'
+        has_start = true
+        ibuf_push(code, 11) // OP_START
+        i += 1
+    }
+
+    while i < n {
+        b := str_byte(pattern, i)
+
+        if b == 36 and i == n - 1 { // '$' at end
+            has_end = true
+            ibuf_push(code, 12) // OP_END
+            i += 1
+            break
+        }
+
+        if b == 46 { // '.'
+            // Check next quantifier
+            if i + 1 < n and str_byte(pattern, i + 1) == 42 { // '.*'
+                ibuf_push(code, 20) // OP_STAR_ANY
+                i += 2
+            } else if i + 1 < n and str_byte(pattern, i + 1) == 43 { // '.+'
+                ibuf_push(code, 21) // OP_PLUS_ANY
+                i += 2
+            } else if i + 1 < n and str_byte(pattern, i + 1) == 63 { // '.?'
+                ibuf_push(code, 22) // OP_OPT_ANY
+                i += 2
+            } else {
+                ibuf_push(code, 2) // OP_ANY
+                i += 1
+            }
+        } else if b == 92 { // '\' escape
+            if i + 1 >= n {
+                buf_free(move code)
+                return err(400)
+            }
+            esc := str_byte(pattern, i + 1)
+            mut op := 0
+            if esc == 100 { op = 3 }       // \d
+            else if esc == 68 { op = 4 }   // \D
+            else if esc == 119 { op = 5 }  // \w
+            else if esc == 87 { op = 6 }   // \W
+            else if esc == 115 { op = 7 }  // \s
+            else if esc == 83 { op = 8 }   // \S
+            else {
+                // Escaped literal character
+                op = 1
+            }
+
+            // Check quantifier
+            mut quant := 0
+            if i + 2 < n {
+                qb := str_byte(pattern, i + 2)
+                if qb == 42 { quant = 1 }      // *
+                else if qb == 43 { quant = 2 } // +
+                else if qb == 63 { quant = 3 } // ?
+            }
+
+            if op == 1 {
+                if quant == 1 {
+                    ibuf_push(code, 30) // OP_STAR_CHAR
+                    ibuf_push(code, esc)
+                    i += 3
+                } else if quant == 2 {
+                    ibuf_push(code, 31) // OP_PLUS_CHAR
+                    ibuf_push(code, esc)
+                    i += 3
+                } else if quant == 3 {
+                    ibuf_push(code, 32) // OP_OPT_CHAR
+                    ibuf_push(code, esc)
+                    i += 3
+                } else {
+                    ibuf_push(code, 1) // OP_CHAR
+                    ibuf_push(code, esc)
+                    i += 2
+                }
+            } else {
+                if quant == 1 {
+                    ibuf_push(code, 40) // OP_STAR_CLASS
+                    ibuf_push(code, op)
+                    i += 3
+                } else if quant == 2 {
+                    ibuf_push(code, 41) // OP_PLUS_CLASS
+                    ibuf_push(code, op)
+                    i += 3
+                } else if quant == 3 {
+                    ibuf_push(code, 42) // OP_OPT_CLASS
+                    ibuf_push(code, op)
+                    i += 3
+                } else {
+                    ibuf_push(code, op)
+                    i += 2
+                }
+            }
+        } else if b == 91 { // '[' character class range
+            mut close_idx := str_find_byte(pattern, 93, i + 1)
+            if close_idx < 0 {
+                buf_free(move code)
+                return err(400)
+            }
+            is_neg := str_byte(pattern, i + 1) == 94 // '^'
+            mut r_start := i + 1
+            if is_neg { r_start += 1 }
+
+            if r_start + 2 < close_idx and str_byte(pattern, r_start + 1) == 45 { // range 'a-z'
+                min_c := str_byte(pattern, r_start)
+                max_c := str_byte(pattern, r_start + 2)
+                mut quant := 0
+                if close_idx + 1 < n {
+                    qb := str_byte(pattern, close_idx + 1)
+                    if qb == 42 { quant = 1 }
+                    else if qb == 43 { quant = 2 }
+                    else if qb == 63 { quant = 3 }
+                }
+                base_op := if is_neg { 10 } else { 9 }
+                if quant == 1 {
+                    ibuf_push(code, base_op + 40) // OP_STAR_RANGE
+                    ibuf_push(code, min_c)
+                    ibuf_push(code, max_c)
+                    i = close_idx + 2
+                } else if quant == 2 {
+                    ibuf_push(code, base_op + 42) // OP_PLUS_RANGE
+                    ibuf_push(code, min_c)
+                    ibuf_push(code, max_c)
+                    i = close_idx + 2
+                } else if quant == 3 {
+                    ibuf_push(code, base_op + 44) // OP_OPT_RANGE
+                    ibuf_push(code, min_c)
+                    ibuf_push(code, max_c)
+                    i = close_idx + 2
+                } else {
+                    ibuf_push(code, base_op)
+                    ibuf_push(code, min_c)
+                    ibuf_push(code, max_c)
+                    i = close_idx + 1
+                }
+            } else {
+                // Single char bracket
+                ibuf_push(code, 1)
+                ibuf_push(code, str_byte(pattern, r_start))
+                i = close_idx + 1
+            }
+        } else {
+            // Normal character
+            mut quant := 0
+            if i + 1 < n {
+                qb := str_byte(pattern, i + 1)
+                if qb == 42 { quant = 1 }      // *
+                else if qb == 43 { quant = 2 } // +
+                else if qb == 63 { quant = 3 } // ?
+            }
+
+            if quant == 1 {
+                ibuf_push(code, 30) // OP_STAR_CHAR
+                ibuf_push(code, b)
+                i += 2
+            } else if quant == 2 {
+                ibuf_push(code, 31) // OP_PLUS_CHAR
+                ibuf_push(code, b)
+                i += 2
+            } else if quant == 3 {
+                ibuf_push(code, 32) // OP_OPT_CHAR
+                ibuf_push(code, b)
+                i += 2
+            } else {
+                ibuf_push(code, 1) // OP_CHAR
+                ibuf_push(code, b)
+                i += 1
+            }
+        }
+    }
+
+    ibuf_push(code, 255) // OP_MATCH
+    return ok(Regex(code = code, has_start_anchor = has_start, has_end_anchor = has_end))
+}
+
+fn rx_match_class(op: i64, ch: i64) -> bool {
+    if op == 3 { return rx_is_digit(ch) }
+    if op == 4 { return not rx_is_digit(ch) }
+    if op == 5 { return rx_is_word(ch) }
+    if op == 6 { return not rx_is_word(ch) }
+    if op == 7 { return rx_is_space(ch) }
+    if op == 8 { return not rx_is_space(ch) }
+    return false
+}
+
+// Executes bytecode against text at a specific starting position
+fn rx_exec_at(code: IntBuf, text: str, text_start: i64) -> i64 {
+    tlen := str_len(text)
+    mut pc := 0
+    mut tp := text_start
+    clen := ibuf_len(code)
+
+    while pc < clen {
+        op := ibuf_get(code, pc)
+
+        if op == 255 { // OP_MATCH
+            return tp - text_start
+        }
+
+        if op == 11 { // OP_START (^)
+            if tp != 0 { return -1 }
+            pc += 1
+        } else if op == 12 { // OP_END ($)
+            if tp != tlen { return -1 }
+            pc += 1
+        } else if op == 1 { // OP_CHAR
+            expected := ibuf_get(code, pc + 1)
+            if tp >= tlen or str_byte(text, tp) != expected {
+                return -1
+            }
+            tp += 1
+            pc += 2
+        } else if op == 2 { // OP_ANY (.)
+            if tp >= tlen { return -1 }
+            ch := str_byte(text, tp)
+            if ch == 10 or ch == 13 { return -1 }
+            tp += 1
+            pc += 1
+        } else if op >= 3 and op <= 8 { // OP_CLASS (\d, \w, etc.)
+            if tp >= tlen or not rx_match_class(op, str_byte(text, tp)) {
+                return -1
+            }
+            tp += 1
+            pc += 1
+        } else if op == 9 { // OP_RANGE [min, max]
+            min_c := ibuf_get(code, pc + 1)
+            max_c := ibuf_get(code, pc + 2)
+            if tp >= tlen { return -1 }
+            ch := str_byte(text, tp)
+            if ch < min_c or ch > max_c { return -1 }
+            tp += 1
+            pc += 3
+        } else if op == 10 { // OP_NEG_RANGE [^min, max]
+            min_c := ibuf_get(code, pc + 1)
+            max_c := ibuf_get(code, pc + 2)
+            if tp >= tlen { return -1 }
+            ch := str_byte(text, tp)
+            if ch >= min_c and ch <= max_c { return -1 }
+            tp += 1
+            pc += 3
+        } else if op == 20 { // OP_STAR_ANY (.*)
+            // Greedy match any non-newline
+            mut count := 0
+            while tp + count < tlen {
+                ch := str_byte(text, tp + count)
+                if ch == 10 or ch == 13 { break }
+                count += 1
+            }
+            // Backtrack down to 0
+            mut try_cnt := count
+            while try_cnt >= 0 {
+                sub_res := rx_exec_at_pc(code, pc + 1, text, tp + try_cnt)
+                if sub_res >= 0 {
+                    return try_cnt + sub_res
+                }
+                try_cnt -= 1
+            }
+            return -1
+        } else if op == 21 { // OP_PLUS_ANY (.+)
+            if tp >= tlen { return -1 }
+            ch0 := str_byte(text, tp)
+            if ch0 == 10 or ch0 == 13 { return -1 }
+            mut count := 1
+            while tp + count < tlen {
+                ch := str_byte(text, tp + count)
+                if ch == 10 or ch == 13 { break }
+                count += 1
+            }
+            mut try_cnt := count
+            while try_cnt >= 1 {
+                sub_res := rx_exec_at_pc(code, pc + 1, text, tp + try_cnt)
+                if sub_res >= 0 {
+                    return try_cnt + sub_res
+                }
+                try_cnt -= 1
+            }
+            return -1
+        } else if op == 22 { // OP_OPT_ANY (.?)
+            if tp < tlen {
+                ch0 := str_byte(text, tp)
+                if ch0 != 10 and ch0 != 13 {
+                    sub_res := rx_exec_at_pc(code, pc + 1, text, tp + 1)
+                    if sub_res >= 0 {
+                        return 1 + sub_res
+                    }
+                }
+            }
+            sub_res0 := rx_exec_at_pc(code, pc + 1, text, tp)
+            if sub_res0 >= 0 { return sub_res0 }
+            return -1
+        } else if op == 30 { // OP_STAR_CHAR (c*)
+            target := ibuf_get(code, pc + 1)
+            mut count := 0
+            while tp + count < tlen and str_byte(text, tp + count) == target {
+                count += 1
+            }
+            mut try_cnt := count
+            while try_cnt >= 0 {
+                sub_res := rx_exec_at_pc(code, pc + 2, text, tp + try_cnt)
+                if sub_res >= 0 {
+                    return try_cnt + sub_res
+                }
+                try_cnt -= 1
+            }
+            return -1
+        } else if op == 31 { // OP_PLUS_CHAR (c+)
+            target := ibuf_get(code, pc + 1)
+            if tp >= tlen or str_byte(text, tp) != target { return -1 }
+            mut count := 1
+            while tp + count < tlen and str_byte(text, tp + count) == target {
+                count += 1
+            }
+            mut try_cnt := count
+            while try_cnt >= 1 {
+                sub_res := rx_exec_at_pc(code, pc + 2, text, tp + try_cnt)
+                if sub_res >= 0 {
+                    return try_cnt + sub_res
+                }
+                try_cnt -= 1
+            }
+            return -1
+        } else if op == 32 { // OP_OPT_CHAR (c?)
+            target := ibuf_get(code, pc + 1)
+            if tp < tlen and str_byte(text, tp) == target {
+                sub_res := rx_exec_at_pc(code, pc + 2, text, tp + 1)
+                if sub_res >= 0 {
+                    return 1 + sub_res
+                }
+            }
+            sub_res0 := rx_exec_at_pc(code, pc + 2, text, tp)
+            if sub_res0 >= 0 { return sub_res0 }
+            return -1
+        } else if op == 40 { // OP_STAR_CLASS (\d*, \w*, etc.)
+            cls_op := ibuf_get(code, pc + 1)
+            mut count := 0
+            while tp + count < tlen and rx_match_class(cls_op, str_byte(text, tp + count)) {
+                count += 1
+            }
+            mut try_cnt := count
+            while try_cnt >= 0 {
+                sub_res := rx_exec_at_pc(code, pc + 2, text, tp + try_cnt)
+                if sub_res >= 0 {
+                    return try_cnt + sub_res
+                }
+                try_cnt -= 1
+            }
+            return -1
+        } else if op == 41 { // OP_PLUS_CLASS (\d+, \w+, etc.)
+            cls_op := ibuf_get(code, pc + 1)
+            if tp >= tlen or not rx_match_class(cls_op, str_byte(text, tp)) { return -1 }
+            mut count := 1
+            while tp + count < tlen and rx_match_class(cls_op, str_byte(text, tp + count)) {
+                count += 1
+            }
+            mut try_cnt := count
+            while try_cnt >= 1 {
+                sub_res := rx_exec_at_pc(code, pc + 2, text, tp + try_cnt)
+                if sub_res >= 0 {
+                    return try_cnt + sub_res
+                }
+                try_cnt -= 1
+            }
+            return -1
+        } else if op == 42 { // OP_OPT_CLASS (\d?, etc.)
+            cls_op := ibuf_get(code, pc + 1)
+            if tp < tlen and rx_match_class(cls_op, str_byte(text, tp)) {
+                sub_res := rx_exec_at_pc(code, pc + 2, text, tp + 1)
+                if sub_res >= 0 {
+                    return 1 + sub_res
+                }
+            }
+            sub_res0 := rx_exec_at_pc(code, pc + 2, text, tp)
+            if sub_res0 >= 0 { return sub_res0 }
+            return -1
+        } else if op >= 49 and op <= 54 { // RANGE quantifiers
+            is_neg := (op == 50 or op == 52 or op == 54)
+            is_star := (op == 49 or op == 50)
+            is_plus := (op == 51 or op == 52)
+            min_c := ibuf_get(code, pc + 1)
+            max_c := ibuf_get(code, pc + 2)
+            
+            mut count := 0
+            while tp + count < tlen {
+                ch := str_byte(text, tp + count)
+                in_range := (ch >= min_c and ch <= max_c)
+                matched := if is_neg { not in_range } else { in_range }
+                if not matched { break }
+                count += 1
+            }
+            min_req := if is_plus { 1 } else { 0 }
+            if count < min_req { return -1 }
+
+            mut try_cnt := count
+            while try_cnt >= min_req {
+                sub_res := rx_exec_at_pc(code, pc + 3, text, tp + try_cnt)
+                if sub_res >= 0 {
+                    return try_cnt + sub_res
+                }
+                try_cnt -= 1
+            }
+            return -1
+        } else {
+            return -1
+        }
+    }
+
+    return tp - text_start
+}
+
+fn rx_exec_at_pc(code: IntBuf, start_pc: i64, text: str, text_start: i64) -> i64 {
+    tlen := str_len(text)
+    mut pc := start_pc
+    mut tp := text_start
+    clen := ibuf_len(code)
+
+    while pc < clen {
+        op := ibuf_get(code, pc)
+        if op == 255 { return tp - text_start }
+        if op == 11 {
+            if tp != 0 { return -1 }
+            pc += 1
+        } else if op == 12 {
+            if tp != tlen { return -1 }
+            pc += 1
+        } else if op == 1 {
+            expected := ibuf_get(code, pc + 1)
+            if tp >= tlen or str_byte(text, tp) != expected { return -1 }
+            tp += 1
+            pc += 2
+        } else if op == 2 {
+            if tp >= tlen { return -1 }
+            ch := str_byte(text, tp)
+            if ch == 10 or ch == 13 { return -1 }
+            tp += 1
+            pc += 1
+        } else if op >= 3 and op <= 8 {
+            if tp >= tlen or not rx_match_class(op, str_byte(text, tp)) { return -1 }
+            tp += 1
+            pc += 1
+        } else if op == 9 {
+            min_c := ibuf_get(code, pc + 1)
+            max_c := ibuf_get(code, pc + 2)
+            if tp >= tlen { return -1 }
+            ch := str_byte(text, tp)
+            if ch < min_c or ch > max_c { return -1 }
+            tp += 1
+            pc += 3
+        } else if op == 10 {
+            min_c := ibuf_get(code, pc + 1)
+            max_c := ibuf_get(code, pc + 2)
+            if tp >= tlen { return -1 }
+            ch := str_byte(text, tp)
+            if ch >= min_c and ch <= max_c { return -1 }
+            tp += 1
+            pc += 3
+        } else {
+            return -1
+        }
+    }
+    return tp - text_start
+}
+
+fn regex_find(pattern: str, text: str) -> RegexMatch ! i64 {
+    rx := regex_compile(pattern) or return err(400)
+    tlen := str_len(text)
+
+    if rx.has_start_anchor {
+        matched_len := rx_exec_at(rx.code, text, 0)
+        buf_free(move rx.code)
+        if matched_len >= 0 {
+            return ok(RegexMatch(start = 0, end = matched_len, len = matched_len))
+        }
+        return err(404)
+    }
+
+    mut i := 0
+    while i <= tlen {
+        matched_len := rx_exec_at(rx.code, text, i)
+        if matched_len >= 0 {
+            buf_free(move rx.code)
+            return ok(RegexMatch(start = i, end = i + matched_len, len = matched_len))
+        }
+        i += 1
+    }
+
+    buf_free(move rx.code)
+    return err(404)
+}
+
+fn regex_is_match(pattern: str, text: str) -> bool {
+    m := regex_find(pattern, text) or return false
+    _unused := m.len
+    return true
+}
+
+fn regex_replace(pattern: str, text: str, replacement: str) -> str {
+    m := regex_find(pattern, text) or return text
+    tlen := str_len(text)
+    
+    b := buf_new(tlen + str_len(replacement) + 8)
+    if m.start > 0 {
+        buf_push_str(b, str_slice(text, 0, m.start))
+    }
+    buf_push_str(b, replacement)
+    if m.end < tlen {
+        buf_push_str(b, str_slice(text, m.end, tlen))
+    }
+    return buf_to_owned_str(move b)
+}

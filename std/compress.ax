@@ -1,0 +1,250 @@
+// Axon Standard Library: High-Speed Lossless Byte Compression (`std/compress.ax`)
+// Pure native LZ4-style streaming block compression & decompression.
+// Zero third-party dependencies, AV-clean, sub-millisecond roundtrip for RAM buffers & network payloads.
+
+use std::os
+use std::str
+
+struct CompressResult {
+    data: ByteBuf
+    orig_len: i64
+    comp_len: i64
+}
+
+fn lz_hash4(b: ByteBuf, pos: i64) -> i64 {
+    v := (buf_get(b, pos) & 255) |
+         ((buf_get(b, pos + 1) & 255) << 8) |
+         ((buf_get(b, pos + 2) & 255) << 16) |
+         ((buf_get(b, pos + 3) & 255) << 24)
+    h := (v *% 2654435761) & 0xFFFFFFFF
+    return ushr64(h, 18) & 4095 // 4096 hash slots
+}
+
+fn compress_bytes(src: ByteBuf) -> ByteBuf {
+    n := buf_len(src)
+    if n <= 0 {
+        return buf_new(4)
+    }
+
+    // Hash table with 4096 entries, initialized to -1
+    ht := ibuf_new(4096)
+    mut h_idx := 0
+    while h_idx < 4096 {
+        ibuf_push(ht, -1)
+        h_idx += 1
+    }
+
+    out := buf_new(n + n / 4 + 16)
+    
+    // Store original 32-bit length in little endian
+    buf_push(out, n & 255)
+    buf_push(out, (n >> 8) & 255)
+    buf_push(out, (n >> 16) & 255)
+    buf_push(out, (n >> 24) & 255)
+
+    mut ip := 0
+    mut anchor := 0
+
+    while ip + 4 < n {
+        slot := lz_hash4(src, ip)
+        ref_pos := ibuf_get(ht, slot)
+        ibuf_set(ht, slot, ip)
+
+        if ref_pos >= 0 and ip - ref_pos < 65535 and ip - ref_pos > 0 {
+            // Check 4-byte match
+            m0 := buf_get(src, ref_pos) == buf_get(src, ip)
+            m1 := buf_get(src, ref_pos + 1) == buf_get(src, ip + 1)
+            m2 := buf_get(src, ref_pos + 2) == buf_get(src, ip + 2)
+            m3 := buf_get(src, ref_pos + 3) == buf_get(src, ip + 3)
+
+            if m0 and m1 and m2 and m3 {
+                // Find full match length
+                mut match_len := 4
+                while ip + match_len < n and buf_get(src, ref_pos + match_len) == buf_get(src, ip + match_len) {
+                    if match_len >= 255 + 15 { break }
+                    match_len += 1
+                }
+
+                // Emit literals from anchor to ip
+                lit_len := ip - anchor
+                offset := ip - ref_pos
+
+                mut token_lit := lit_len
+                if token_lit > 15 { token_lit = 15 }
+                mut token_mat := match_len - 4
+                if token_mat > 15 { token_mat = 15 }
+
+                buf_push(out, (token_lit << 4) | token_mat)
+
+                if lit_len >= 15 {
+                    mut rem_lit := lit_len - 15
+                    while rem_lit >= 255 {
+                        buf_push(out, 255)
+                        rem_lit -= 255
+                    }
+                    buf_push(out, rem_lit)
+                }
+
+                // Copy literals
+                mut l := 0
+                while l < lit_len {
+                    buf_push(out, buf_get(src, anchor + l))
+                    l += 1
+                }
+
+                // Emit offset (16-bit LE)
+                buf_push(out, offset & 255)
+                buf_push(out, (offset >> 8) & 255)
+
+                // Emit extra match length if >= 15
+                if match_len - 4 >= 15 {
+                    mut rem_mat := (match_len - 4) - 15
+                    while rem_mat >= 255 {
+                        buf_push(out, 255)
+                        rem_mat -= 255
+                    }
+                    buf_push(out, rem_mat)
+                }
+
+                ip += match_len
+                anchor = ip
+                continue
+            }
+        }
+        ip += 1
+    }
+
+    // Emit remaining literals
+    last_lit := n - anchor
+    if last_lit > 0 {
+        mut tok_lit := last_lit
+        if tok_lit > 15 { tok_lit = 15 }
+        buf_push(out, tok_lit << 4)
+        if last_lit >= 15 {
+            mut rem := last_lit - 15
+            while rem >= 255 {
+                buf_push(out, 255)
+                rem -= 255
+            }
+            buf_push(out, rem)
+        }
+        mut k := 0
+        while k < last_lit {
+            buf_push(out, buf_get(src, anchor + k))
+            k += 1
+        }
+    }
+
+    buf_free(move ht)
+    return out
+}
+
+fn decompress_bytes(comp: ByteBuf) -> ByteBuf ! i64 {
+    cn := buf_len(comp)
+    if cn < 4 {
+        return err(400)
+    }
+
+    // Read original size
+    orig_len := (buf_get(comp, 0) & 255) |
+                ((buf_get(comp, 1) & 255) << 8) |
+                ((buf_get(comp, 2) & 255) << 16) |
+                ((buf_get(comp, 3) & 255) << 24)
+
+    if orig_len < 0 or orig_len > 1000000000 {
+        return err(400)
+    }
+
+    out := buf_new(orig_len + 8)
+    mut ip := 4
+
+    while ip < cn {
+        token := buf_get(comp, ip) & 255
+        ip += 1
+
+        mut lit_len := (token >> 4) & 15
+        if lit_len == 15 {
+            while ip < cn {
+                extra := buf_get(comp, ip) & 255
+                ip += 1
+                lit_len += extra
+                if extra < 255 { break }
+            }
+        }
+
+        // Copy literals
+        mut l := 0
+        while l < lit_len {
+            if ip >= cn {
+                buf_free(move out)
+                return err(400)
+            }
+            buf_push(out, buf_get(comp, ip))
+            ip += 1
+            l += 1
+        }
+
+        if ip >= cn {
+            break
+        }
+
+        // Read offset
+        if ip + 1 >= cn {
+            buf_free(move out)
+            return err(400)
+        }
+        offset := (buf_get(comp, ip) & 255) | ((buf_get(comp, ip + 1) & 255) << 8)
+        ip += 2
+
+        if offset <= 0 {
+            buf_free(move out)
+            return err(400)
+        }
+
+        mut mat_len := (token & 15) + 4
+        if (token & 15) == 15 {
+            while ip < cn {
+                extra := buf_get(comp, ip) & 255
+                ip += 1
+                mat_len += extra
+                if extra < 255 { break }
+            }
+        }
+
+        // Copy matched slice
+        out_pos := buf_len(out)
+        mut m := 0
+        while m < mat_len {
+            ref_idx := out_pos - offset + m
+            if ref_idx < 0 or ref_idx >= buf_len(out) {
+                buf_free(move out)
+                return err(400)
+            }
+            buf_push(out, buf_get(out, ref_idx))
+            m += 1
+        }
+    }
+
+    return ok(out)
+}
+
+fn compress_str(text: str) -> ByteBuf {
+    n := str_len(text)
+    src := buf_new(n + 1)
+    mut i := 0
+    while i < n {
+        buf_push(src, str_byte(text, i))
+        i += 1
+    }
+    out := compress_bytes(src)
+    buf_free(move src)
+    return out
+}
+
+fn decompress_to_str(comp: ByteBuf) -> str ! i64 {
+    decomp := decompress_bytes(comp) or return err(400)
+    n := buf_len(decomp)
+    out := "" + buf_slice_str(decomp, 0, n)
+    buf_free(move decomp)
+    return ok(out)
+}

@@ -1,0 +1,320 @@
+// Axon Standard Library: High-Performance Native HTML DOM Parser (`std/html.ax`)
+// Pure native zero-CEF HTML5/XML tokenizer and First-Child Next-Sibling (FCNS) DOM tree.
+// Zero string copying: Node descriptors point directly into the source HTML slice.
+
+use std::os
+use std::str
+
+// Node integer layout (14 slots per node):
+// 0: tag_start,    1: tag_len
+// 2: id_start,     3: id_len
+// 4: class_start,  5: class_len
+// 6: style_start,  7: style_len
+// 8: text_start,   9: text_len
+// 10: parent_idx,  11: first_child,  12: next_sibling,  13: node_type (1: Element, 2: Text)
+
+struct DomTree {
+    raw_html: str
+    nodes: IntBuf
+    root_idx: i64
+    count: i64
+}
+
+fn dom_tree_new(html: str) -> DomTree {
+    nb := ibuf_new(1024)
+    return DomTree(raw_html = html, nodes = nb, root_idx = -1, count = 0)
+}
+
+fn dom_node_count(tree: DomTree) -> i64 {
+    return tree.count
+}
+
+fn dom_get_tag(tree: DomTree, node_idx: i64) -> str {
+    if node_idx < 0 or node_idx >= tree.count { return "" }
+    base := node_idx * 14
+    start := ibuf_get(tree.nodes, base)
+    len := ibuf_get(tree.nodes, base + 1)
+    if len <= 0 { return "" }
+    return str_slice(tree.raw_html, start, start + len)
+}
+
+fn dom_get_id(tree: DomTree, node_idx: i64) -> str {
+    if node_idx < 0 or node_idx >= tree.count { return "" }
+    base := node_idx * 14
+    start := ibuf_get(tree.nodes, base + 2)
+    len := ibuf_get(tree.nodes, base + 3)
+    if len <= 0 { return "" }
+    return str_slice(tree.raw_html, start, start + len)
+}
+
+fn dom_get_class(tree: DomTree, node_idx: i64) -> str {
+    if node_idx < 0 or node_idx >= tree.count { return "" }
+    base := node_idx * 14
+    start := ibuf_get(tree.nodes, base + 4)
+    len := ibuf_get(tree.nodes, base + 5)
+    if len <= 0 { return "" }
+    return str_slice(tree.raw_html, start, start + len)
+}
+
+fn dom_get_style(tree: DomTree, node_idx: i64) -> str {
+    if node_idx < 0 or node_idx >= tree.count { return "" }
+    base := node_idx * 14
+    start := ibuf_get(tree.nodes, base + 6)
+    len := ibuf_get(tree.nodes, base + 7)
+    if len <= 0 { return "" }
+    return str_slice(tree.raw_html, start, start + len)
+}
+
+fn dom_get_text(tree: DomTree, node_idx: i64) -> str {
+    if node_idx < 0 or node_idx >= tree.count { return "" }
+    base := node_idx * 14
+    start := ibuf_get(tree.nodes, base + 8)
+    len := ibuf_get(tree.nodes, base + 9)
+    if len <= 0 { return "" }
+    return str_slice(tree.raw_html, start, start + len)
+}
+
+fn dom_parent(tree: DomTree, node_idx: i64) -> i64 {
+    if node_idx < 0 or node_idx >= tree.count { return -1 }
+    return ibuf_get(tree.nodes, node_idx * 14 + 10)
+}
+
+fn dom_first_child(tree: DomTree, node_idx: i64) -> i64 {
+    if node_idx < 0 or node_idx >= tree.count { return -1 }
+    return ibuf_get(tree.nodes, node_idx * 14 + 11)
+}
+
+fn dom_next_sibling(tree: DomTree, node_idx: i64) -> i64 {
+    if node_idx < 0 or node_idx >= tree.count { return -1 }
+    return ibuf_get(tree.nodes, node_idx * 14 + 12)
+}
+
+fn dom_node_type(tree: DomTree, node_idx: i64) -> i64 {
+    if node_idx < 0 or node_idx >= tree.count { return 0 }
+    return ibuf_get(tree.nodes, node_idx * 14 + 13)
+}
+
+fn html_skip_ws(s: str, pos: i64) -> i64 {
+    n := str_len(s)
+    mut p := pos
+    while p < n {
+        b := str_byte(s, p)
+        if b == 32 or b == 9 or b == 10 or b == 13 {
+            p += 1
+        } else {
+            break
+        }
+    }
+    return p
+}
+
+fn html_find_attr_range(html: str, tag_start: i64, tag_end: i64, attr_name: str) -> i64 {
+    mut p := tag_start
+    needle := attr_name + "="
+    idx := str_find(html, needle, p)
+    if idx < 0 or idx >= tag_end {
+        return -1
+    }
+    val_start := idx + str_len(needle)
+    if val_start >= tag_end { return -1 }
+
+    q := str_byte(html, val_start)
+    if q == 34 or q == 39 { // '"' or '''
+        mut eq := str_find_byte(html, q, val_start + 1)
+        if eq < 0 or eq > tag_end { eq = tag_end }
+        len := eq - (val_start + 1)
+        return ((val_start + 1) << 32) | (len & 0xFFFFFFFF)
+    }
+
+    // Unquoted attribute
+    mut e := val_start
+    while e < tag_end {
+        b := str_byte(html, e)
+        if b == 32 or b == 9 or b == 10 or b == 13 or b == 62 or b == 47 { break }
+        e += 1
+    }
+    return (val_start << 32) | ((e - val_start) & 0xFFFFFFFF)
+}
+
+fn html_alloc_node(tree: DomTree, t_st: i64, t_len: i64, id_st: i64, id_len: i64, cls_st: i64, cls_len: i64, st_st: i64, st_len: i64, txt_st: i64, txt_len: i64, parent: i64, n_type: i64) -> i64 {
+    idx := tree.count
+    ibuf_push(tree.nodes, t_st)
+    ibuf_push(tree.nodes, t_len)
+    ibuf_push(tree.nodes, id_st)
+    ibuf_push(tree.nodes, id_len)
+    ibuf_push(tree.nodes, cls_st)
+    ibuf_push(tree.nodes, cls_len)
+    ibuf_push(tree.nodes, st_st)
+    ibuf_push(tree.nodes, st_len)
+    ibuf_push(tree.nodes, txt_st)
+    ibuf_push(tree.nodes, txt_len)
+    ibuf_push(tree.nodes, parent)
+    ibuf_push(tree.nodes, -1) // first_child
+    ibuf_push(tree.nodes, -1) // next_sibling
+    ibuf_push(tree.nodes, n_type)
+    return idx
+}
+
+fn html_append_child(tree: DomTree, parent_idx: i64, child_idx: i64) {
+    if parent_idx < 0 { return }
+    p_fc := ibuf_get(tree.nodes, parent_idx * 14 + 11)
+    if p_fc < 0 {
+        ibuf_set(tree.nodes, parent_idx * 14 + 11, child_idx)
+    } else {
+        mut cur := p_fc
+        while true {
+            next_sib := ibuf_get(tree.nodes, cur * 14 + 12)
+            if next_sib < 0 {
+                ibuf_set(tree.nodes, cur * 14 + 12, child_idx)
+                break
+            }
+            cur = next_sib
+        }
+    }
+}
+
+fn html_parse(raw_html: str) -> DomTree ! i64 {
+    n := str_len(raw_html)
+    mut tree := dom_tree_new(raw_html)
+    if n == 0 { return ok(tree) }
+
+    mut stack := ibuf_new(64)
+    mut cur_parent := -1
+    mut p := 0
+
+    while p < n {
+        p = html_skip_ws(raw_html, p)
+        if p >= n { break }
+
+        if str_byte(raw_html, p) == 60 { // '<'
+            // Check comment <!-- ... -->
+            if p + 3 < n and str_byte(raw_html, p + 1) == 33 and str_byte(raw_html, p + 2) == 45 and str_byte(raw_html, p + 3) == 45 {
+                end_c := str_find(raw_html, "-->", p + 4)
+                if end_c >= 0 { p = end_c + 3 } else { p = n }
+                continue
+            }
+
+            // Closing tag: </tag>
+            if p + 1 < n and str_byte(raw_html, p + 1) == 47 {
+                mut tag_close_end := str_find_byte(raw_html, 62, p + 2)
+                if tag_close_end < 0 { tag_close_end = n }
+                p = tag_close_end + 1
+
+                stack_len := ibuf_len(stack)
+                if stack_len > 0 {
+                    cur_parent = ibuf_get(stack, stack_len - 1)
+                    mut new_stack := ibuf_new(stack_len)
+                    mut s_idx := 0
+                    while s_idx < stack_len - 1 {
+                        ibuf_push(new_stack, ibuf_get(stack, s_idx))
+                        s_idx += 1
+                    }
+                    buf_free(move stack)
+                    stack = new_stack
+                } else {
+                    cur_parent = -1
+                }
+                continue
+            }
+
+            // Opening tag: <tag ...>
+            mut tag_end := str_find_byte(raw_html, 62, p + 1)
+            if tag_end < 0 { tag_end = n }
+
+            is_self_closing := tag_end > 0 and str_byte(raw_html, tag_end - 1) == 47
+            content_end := if is_self_closing { tag_end - 1 } else { tag_end }
+
+            // Extract tag name range
+            mut sp := str_find_byte(raw_html, 32, p + 1)
+            if sp < 0 or sp > content_end { sp = content_end }
+            tag_st := p + 1
+            tag_l := sp - tag_st
+
+            // Extract id
+            id_rng := html_find_attr_range(raw_html, sp, content_end, "id")
+            id_st := if id_rng >= 0 { ushr64(id_rng, 32) } else { 0 }
+            id_l := if id_rng >= 0 { id_rng & 0xFFFFFFFF } else { 0 }
+
+            // Extract class
+            cls_rng := html_find_attr_range(raw_html, sp, content_end, "class")
+            cls_st := if cls_rng >= 0 { ushr64(cls_rng, 32) } else { 0 }
+            cls_l := if cls_rng >= 0 { cls_rng & 0xFFFFFFFF } else { 0 }
+
+            // Extract style
+            st_rng := html_find_attr_range(raw_html, sp, content_end, "style")
+            st_st := if st_rng >= 0 { ushr64(st_rng, 32) } else { 0 }
+            st_l := if st_rng >= 0 { st_rng & 0xFFFFFFFF } else { 0 }
+
+            node_idx := html_alloc_node(tree, tag_st, tag_l, id_st, id_l, cls_st, cls_l, st_st, st_l, 0, 0, cur_parent, 1)
+            tree.count += 1
+
+            if tree.root_idx < 0 { tree.root_idx = node_idx }
+            if cur_parent >= 0 { html_append_child(tree, cur_parent, node_idx) }
+
+            // Void tags
+            tag_name_lower := str_to_lower(str_slice(raw_html, tag_st, tag_st + tag_l))
+            is_void := str_eq(tag_name_lower, "img") or str_eq(tag_name_lower, "input") or str_eq(tag_name_lower, "br") or str_eq(tag_name_lower, "hr") or str_eq(tag_name_lower, "meta") or str_eq(tag_name_lower, "link")
+
+            if not is_self_closing and not is_void {
+                ibuf_push(stack, cur_parent)
+                cur_parent = node_idx
+            }
+
+            p = tag_end + 1
+        } else {
+            // Text node
+            mut next_lt := str_find_byte(raw_html, 60, p)
+            if next_lt < 0 { next_lt = n }
+            txt_st := p
+            txt_l := next_lt - p
+
+            // Check if text is not just whitespace
+            mut has_content := false
+            mut k := 0
+            while k < txt_l {
+                b := str_byte(raw_html, txt_st + k)
+                if b != 32 and b != 9 and b != 10 and b != 13 {
+                    has_content = true
+                    break
+                }
+                k += 1
+            }
+
+            if has_content and cur_parent >= 0 {
+                // Attach text to current parent if it doesn't have text yet
+                cur_txt_len := ibuf_get(tree.nodes, cur_parent * 14 + 9)
+                if cur_txt_len <= 0 {
+                    ibuf_set(tree.nodes, cur_parent * 14 + 8, txt_st)
+                    ibuf_set(tree.nodes, cur_parent * 14 + 9, txt_l)
+                }
+            }
+            p = next_lt
+        }
+    }
+
+    buf_free(move stack)
+    return ok(tree)
+}
+
+fn dom_find_by_id(tree: DomTree, id: str) -> i64 {
+    mut i := 0
+    while i < tree.count {
+        if str_eq(dom_get_id(tree, i), id) {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn dom_find_by_tag(tree: DomTree, tag: str) -> IntBuf {
+    out := ibuf_new(16)
+    mut i := 0
+    while i < tree.count {
+        if str_eq_ignore_case(dom_get_tag(tree, i), tag) {
+            ibuf_push(out, i)
+        }
+        i += 1
+    }
+    return out
+}
