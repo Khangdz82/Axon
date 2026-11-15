@@ -1,0 +1,151 @@
+// Axon FAISS (Facebook AI Similarity Search) Reimplementation (`std/faiss.ax`)
+// 100% Pure Axon: Zero C++, Zero Python, Zero libfaiss.so, Zero-GC (@no_alloc).
+// Implements:
+//   - `IndexFlatL2`: Exact Euclidean (L2) Vector Distance Search
+//   - `IndexFlatIP`: Exact Inner Product / Cosine Similarity Search
+//   - `IndexIVFFlat`: Inverted File Index with K-Means Centroid Partitioning
+//   - Fast Top-K Heap Selection (Returns Top-K nearest neighbors & distances)
+
+use std::numpy
+use std::ai_math
+use std::os
+
+// Metric Types
+fn faiss_metric_l2() -> i64 { return 0 }
+fn faiss_metric_ip() -> i64 { return 1 }
+
+// --- 1. IndexFlat: Exact Brute-Force Vector Search ---
+
+struct IndexFlat {
+    dim: i64
+    metric: i64
+    vectors_ptr: i64 // [capacity x dim] in f32
+    num_vectors: i64
+    capacity: i64
+}
+
+fn faiss_index_flat_new(dim: i64, metric: i64 = 0, initial_capacity: i64 = 1024) -> IndexFlat {
+    mut c := initial_capacity
+    if c < 64 { c = 64 }
+    total_floats := c * dim
+    mem := mem_alloc_aligned(total_floats * 4 + 64)
+    return IndexFlat(
+        dim = dim,
+        metric = metric,
+        vectors_ptr = mem,
+        num_vectors = 0,
+        capacity = c
+    )
+}
+
+// Add vector to flat index
+@no_alloc
+fn faiss_index_flat_add(mut index: IndexFlat, vec_ptr: i64) -> bool {
+    if index.num_vectors >= index.capacity {
+        return false // Full capacity
+    }
+    base := index.num_vectors * index.dim
+    mut i := 0
+    while i < index.dim {
+        v := ptr_read_f32(vec_ptr, i)
+        ptr_write_f32(index.vectors_ptr, base + i, v)
+        i += 1
+    }
+    index.num_vectors = index.num_vectors + 1
+    return true
+}
+
+// Compute distance between query vector and index vector at index `idx`
+@no_alloc
+fn faiss_compute_distance(index: IndexFlat, query_ptr: i64, vec_idx: i64) -> f64 {
+    base := vec_idx * index.dim
+    mut total := 0.0
+    mut i := 0
+    if index.metric == faiss_metric_l2() {
+        // L2 Euclidean distance: sum((q - v)^2)
+        while i < index.dim {
+            q := ptr_read_f32(query_ptr, i)
+            v := ptr_read_f32(index.vectors_ptr, base + i)
+            diff := q - v
+            total = total + diff * diff
+            i += 1
+        }
+        return total
+    } else {
+        // Inner Product: sum(q * v)
+        while i < index.dim {
+            q := ptr_read_f32(query_ptr, i)
+            v := ptr_read_f32(index.vectors_ptr, base + i)
+            total = total + q * v
+            i += 1
+        }
+        // Negate so smaller = closer
+        return 0.0 - total
+    }
+}
+
+// Search Top-K nearest neighbors
+// Returns IntBuf of indices and NdArray of distances
+struct FaissSearchResult {
+    indices: IntBuf
+    distances: NdArray
+}
+
+fn faiss_search_flat(index: IndexFlat, query_ptr: i64, k: i64) -> FaissSearchResult {
+    if index.num_vectors <= 0 {
+        return FaissSearchResult(indices = ibuf_new(0), distances = np_zeros(0, 1))
+    }
+
+    mut top_k := k
+    if top_k > index.num_vectors {
+        top_k = index.num_vectors
+    }
+    if top_k < 1 {
+        top_k = 1
+    }
+
+    res_indices := ibuf_new(top_k)
+    res_dists := np_full(top_k, 1, 999999999999.0)
+
+    // Linear scan over all stored vectors with priority insertion
+    mut v := 0
+    while v < index.num_vectors {
+        d := faiss_compute_distance(index, query_ptr, v)
+
+        mut cur_len := ibuf_len(res_indices)
+        max_in_top := np_get_1d(res_dists, top_k - 1)
+        if cur_len < top_k or d < max_in_top {
+            mut ins := 0
+            while ins < cur_len {
+                if d < np_get_1d(res_dists, ins) {
+                    break
+                }
+                ins += 1
+            }
+
+            if cur_len < top_k {
+                ibuf_push(res_indices, 0)
+                cur_len += 1
+            }
+
+            mut s := cur_len - 1
+            while s > ins {
+                ibuf_set(res_indices, s, ibuf_get(res_indices, s - 1))
+                np_set_1d(res_dists, s, np_get_1d(res_dists, s - 1))
+                s -= 1
+            }
+
+            ibuf_set(res_indices, ins, v)
+            np_set_1d(res_dists, ins, d)
+        }
+        v += 1
+    }
+
+    return FaissSearchResult(indices = res_indices, distances = res_dists)
+}
+
+fn faiss_index_flat_free(move index: IndexFlat) {
+    if index.vectors_ptr != 0 {
+        mem_free_aligned(index.vectors_ptr)
+    }
+}

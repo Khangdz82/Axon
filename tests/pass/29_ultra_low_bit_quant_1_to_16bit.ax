@@ -1,0 +1,173 @@
+// Axon Ultra-Low-Bit Quantization Test Suite (`tests/pass/29_ultra_low_bit_quant_1_to_16bit.ax`)
+// Tests: 16-bit (FP16, BF16), 8-bit (Q8_0), 4-bit (Q4_0, NF4), 2-bit (Q2_0), 1.58-bit (BitNet b1.58), 1-bit (BNN XNOR)
+
+use std::quant
+use std::os
+
+@test
+fn test_16bit_fp16_and_bf16() {
+    scratch := mem_alloc_aligned(64)
+    
+    // 1. BF16
+    bf := f32_to_bf16(scratch, 3.14159)
+    f_back_bf := bf16_to_f32(scratch, bf)
+    assert(f_back_bf >= 3.12 and f_back_bf <= 3.16, "bf16 roundtrip failed")
+
+    // 2. FP16
+    h := f32_to_fp16(scratch, 42.5)
+    f_back_fp16 := fp16_to_f32(scratch, h)
+    assert(f_back_fp16 >= 42.49 and f_back_fp16 <= 42.51, "fp16 roundtrip failed")
+
+    mem_free_aligned(scratch)
+}
+
+@test
+fn test_8bit_q8_0() {
+    scratch := mem_alloc_aligned(64)
+    src := mem_alloc_aligned(128 * 4 + 64)
+    dst_block := mem_alloc_aligned(128 + 64)
+    act := mem_alloc_aligned(128 * 4 + 64)
+
+    // Fill 32 weights with constant 1.5
+    mut i := 0
+    while i < 32 {
+        ptr_write_f32(src, i, 1.5)
+        ptr_write_f32(act, i, 1.0)
+        i += 1
+    }
+
+    quantize_q8_0_block(src, dst_block, scratch)
+    
+    // Compute GEMV: 32 * 1.5 = 48.0
+    gemv_res := gemv_q8_0(act, dst_block, 1)
+    assert(gemv_res >= 47.5 and gemv_res <= 48.5, "q8_0 gemv sum failed")
+
+    mem_free_aligned(scratch)
+    mem_free_aligned(src)
+    mem_free_aligned(dst_block)
+    mem_free_aligned(act)
+}
+
+@test
+fn test_4bit_q4_0_and_nf4() {
+    src := mem_alloc_aligned(128 * 4 + 64)
+    dst_q4 := mem_alloc_aligned(64)
+    dst_nf4 := mem_alloc_aligned(64)
+    act := mem_alloc_aligned(128 * 4 + 64)
+
+    mut i := 0
+    while i < 32 {
+        ptr_write_f32(src, i, 0.5) // constant 0.5
+        ptr_write_f32(act, i, 2.0) // act = 2.0
+        i += 1
+    }
+
+    // 1. Q4_0
+    quantize_q4_0_block(src, dst_q4)
+    res_q4 := gemv_q4_0(act, dst_q4, 1)
+    // 32 * 0.5 * 2.0 = 32.0
+    assert(res_q4 >= 30.0 and res_q4 <= 34.0, "q4_0 gemv failed")
+
+    // 2. NF4
+    mut k := 0
+    while k < 16 {
+        // Mock NF4 block: byte 4..19 holding quantile indices 14 (level ~0.72)
+        ptr_write_u8(dst_nf4, 4 + k, 0xEE)
+        k += 1
+    }
+    ptr_write_f32(dst_nf4, 0, 1.0) // scale = 1.0
+    res_nf4 := gemv_nf4(act, dst_nf4, 1)
+    assert(res_nf4 > 40.0 and res_nf4 < 50.0, "nf4 gemv failed")
+
+    mem_free_aligned(src)
+    mem_free_aligned(dst_q4)
+    mem_free_aligned(dst_nf4)
+    mem_free_aligned(act)
+}
+
+@test
+fn test_2bit_q2_0() {
+    src := mem_alloc_aligned(128 * 4 + 64)
+    dst_q2 := mem_alloc_aligned(64)
+    act := mem_alloc_aligned(128 * 4 + 64)
+
+    // Fill with values that map cleanly into quaternary levels {-1.5, -0.5, +0.5, +1.5}
+    mut i := 0
+    while i < 32 {
+        ptr_write_f32(src, i, 1.5) // mapped to +1.5
+        ptr_write_f32(act, i, 1.0)
+        i += 1
+    }
+
+    quantize_q2_0_block(src, dst_q2)
+    res_q2 := gemv_q2_0(act, dst_q2, 1)
+    // 32 * 1.5 = 48.0
+    assert(res_q2 >= 47.0 and res_q2 <= 49.0, "q2_0 gemv failed")
+
+    mem_free_aligned(src)
+    mem_free_aligned(dst_q2)
+    mem_free_aligned(act)
+}
+
+@test
+fn test_bitnet_158_ternary() {
+    src := mem_alloc_aligned(128 * 4 + 64)
+    dst_bn := mem_alloc_aligned(64)
+    act := mem_alloc_aligned(128 * 4 + 64)
+
+    // 16 elements +1.0, 8 elements -1.0, 8 elements 0.0
+    mut i := 0
+    while i < 16 {
+        ptr_write_f32(src, i, 1.0)
+        ptr_write_f32(act, i, 2.0)
+        i += 1
+    }
+    while i < 24 {
+        ptr_write_f32(src, i, -1.0)
+        ptr_write_f32(act, i, 2.0)
+        i += 1
+    }
+    while i < 32 {
+        ptr_write_f32(src, i, 0.0)
+        ptr_write_f32(act, i, 2.0)
+        i += 1
+    }
+
+    quantize_bitnet_158_block(src, dst_bn)
+    res_bn := gemv_bitnet_158(act, dst_bn, 1)
+
+    // Expected: 16 * (+1) * 2.0 + 8 * (-1) * 2.0 = 32 - 16 = 16 * scale
+    // Scale = (16*1 + 8*1 + 0) / 32 = 24 / 32 = 0.75
+    // Dot = 8 * 2.0 = 16.0 => total = 16.0 * 0.75 = 12.0
+    assert(res_bn >= 11.5 and res_bn <= 12.5, "bitnet 1.58 gemv failed")
+
+    mem_free_aligned(src)
+    mem_free_aligned(dst_bn)
+    mem_free_aligned(act)
+}
+
+@test
+fn test_1bit_bnn_xnor() {
+    src := mem_alloc_aligned(128 * 4 + 64)
+    dst_bnn := mem_alloc_aligned(64)
+    act := mem_alloc_aligned(128 * 4 + 64)
+
+    // All positive activations and all positive weights
+    mut i := 0
+    while i < 32 {
+        ptr_write_f32(src, i, 2.0)
+        ptr_write_f32(act, i, 1.5)
+        i += 1
+    }
+
+    quantize_bnn_1bit_block(src, dst_bnn)
+    res_bnn := gemv_bnn_1bit(act, dst_bnn, 1)
+    
+    // Scale = 2.0. Matching = 32 => Dot = 2 * 32 - 32 = 32.
+    // Total = scale * 32 = 2.0 * 32 = 64.0
+    assert(res_bnn >= 63.9 and res_bnn <= 64.1, "1-bit bnn gemv failed")
+
+    mem_free_aligned(src)
+    mem_free_aligned(dst_bnn)
+    mem_free_aligned(act)
+}

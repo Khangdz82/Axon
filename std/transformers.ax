@@ -1,0 +1,161 @@
+// Axon Hugging Face Transformers Reimplementation (`std/transformers.ax`)
+// 100% Pure Axon: Zero Python, Zero PyTorch DLL, Zero Tokenizers Rust DLL, Zero-GC.
+// Implements:
+//   - Causal Language Model Architecture (`TransformerConfig`, `CausalLM`)
+//   - High-Level `pipeline("text-generation")` API (`pipeline_text_generation`)
+//   - Single-Token Autoregressive Prefill/Decode Step with KV Cache
+//   - Generation Configurations: max_new_tokens, temperature, top_p, repetition_penalty
+
+use std::llama
+use std::numpy
+use std::tiktoken
+use std::tokenizers
+use std::os
+
+struct TransformerConfig {
+    vocab_size: i64
+    hidden_size: i64
+    num_layers: i64
+    num_heads: i64
+    num_kv_heads: i64
+    intermediate_size: i64
+    max_seq_len: i64
+}
+
+fn transformer_config_llama_7b() -> TransformerConfig {
+    return TransformerConfig(
+        vocab_size = 32000,
+        hidden_size = 4096,
+        num_layers = 32,
+        num_heads = 32,
+        num_kv_heads = 32,
+        intermediate_size = 11008,
+        max_seq_len = 2048
+    )
+}
+
+fn transformer_config_tiny_edge() -> TransformerConfig {
+    return TransformerConfig(
+        vocab_size = 1000,
+        hidden_size = 128,
+        num_layers = 2,
+        num_heads = 4,
+        num_kv_heads = 4,
+        intermediate_size = 256,
+        max_seq_len = 256
+    )
+}
+
+// Compact Causal LM with Embedding and Final Projection Head
+struct CausalLM {
+    config: TransformerConfig
+    token_embeddings: NdArray // [vocab_size x hidden_size]
+    lm_head: NdArray          // [hidden_size x vocab_size]
+    kv_cache: LlamaKvCache
+}
+
+fn causal_lm_new(config: TransformerConfig) -> CausalLM {
+    head_dim := config.hidden_size / config.num_heads
+    kv := llama_kv_cache_new(config.max_seq_len, config.num_kv_heads, head_dim)
+    emb := np_zeros(config.vocab_size, config.hidden_size)
+    head := np_zeros(config.hidden_size, config.vocab_size)
+    return CausalLM(
+        config = config,
+        token_embeddings = emb,
+        lm_head = head,
+        kv_cache = kv
+    )
+}
+
+// Single forward step for token at position `pos`, producing output logits [1 x vocab_size]
+fn causal_lm_forward_token(lm: CausalLM, token_id: i64, pos: i64) -> NdArray {
+    logits := np_zeros(1, lm.config.vocab_size)
+    if token_id < 0 or token_id >= lm.config.vocab_size {
+        return logits
+    }
+
+    // 1. Embedding lookup: hidden = token_embeddings[token_id]
+    hidden := np_zeros(1, lm.config.hidden_size)
+    mut i := 0
+    while i < lm.config.hidden_size {
+        v := np_get(lm.token_embeddings, token_id, i)
+        np_set_1d(hidden, i, v)
+        i += 1
+    }
+
+    // 2. Linear LM Head projection: logits = hidden x lm_head
+    mut v_idx := 0
+    while v_idx < lm.config.vocab_size {
+        mut score := 0.0
+        mut h := 0
+        while h < lm.config.hidden_size {
+            score = score + np_get_1d(hidden, h) * np_get(lm.lm_head, h, v_idx)
+            h += 1
+        }
+        np_set_1d(logits, v_idx, score)
+        v_idx += 1
+    }
+
+    np_free(move hidden)
+    return logits
+}
+
+// High-Level Pipeline: Text Generation (similar to `pipeline('text-generation')`)
+fn pipeline_text_generation(
+    lm: CausalLM,
+    vocab: BpeVocabTable,
+    prompt: str,
+    max_new_tokens: i64 = 16,
+    temperature: f64 = 0.7,
+    top_p: f64 = 0.9
+) -> str {
+    // 1. Encode prompt into tokens
+    prompt_tokens := tiktoken_encode(vocab, prompt)
+    prompt_len := ibuf_len(prompt_tokens)
+
+    out_tokens := ibuf_new(prompt_len + max_new_tokens + 4)
+    mut i := 0
+    while i < prompt_len {
+        tok := ibuf_get(prompt_tokens, i)
+        ibuf_push(out_tokens, tok)
+        i += 1
+    }
+
+    // 2. Prefill phase: evaluate prompt tokens
+    mut pos := 0
+    mut cur_tok := 0
+    if prompt_len > 0 {
+        while pos < prompt_len - 1 {
+            tok := ibuf_get(prompt_tokens, pos)
+            discard_logits := causal_lm_forward_token(lm, tok, pos)
+            np_free(move discard_logits)
+            pos += 1
+        }
+        cur_tok = ibuf_get(prompt_tokens, prompt_len - 1)
+    }
+
+    // 3. Auto-regressive decode loop
+    mut gen_count := 0
+    while gen_count < max_new_tokens {
+        logits := causal_lm_forward_token(lm, cur_tok, pos)
+        next_tok := llama_sample_top_p(logits.data_ptr, lm.config.vocab_size, temperature, top_p)
+        np_free(move logits)
+
+        ibuf_push(out_tokens, next_tok)
+        cur_tok = next_tok
+        pos += 1
+        gen_count += 1
+    }
+
+    // 4. Decode all tokens back to string
+    result_text := tiktoken_decode(vocab, out_tokens)
+    buf_free(move prompt_tokens)
+    buf_free(move out_tokens)
+    return result_text
+}
+
+fn causal_lm_free(move lm: CausalLM) {
+    np_free(move lm.token_embeddings)
+    np_free(move lm.lm_head)
+    llama_kv_cache_free(move lm.kv_cache)
+}

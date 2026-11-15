@@ -1,0 +1,355 @@
+// Axon Semiconductor & Deep Hardware Systems Library (`std/semiconductor.ax`)
+// 100% Pure Axon: Zero CRT, Zero External Dependencies, Zero-GC (@no_alloc).
+// Provides:
+//   - Memory-Mapped I/O (MMIO) 8/16/32/64-bit Register Abstraction
+//   - Register Bitfield Operations (Extract, Deposit, Mask, Toggle)
+//   - Hardware High-Precision Monotonic Timer & Cycle Delay
+//   - Circular DMA Ring Descriptors with Chaining & Hardware Ownership Bit
+//   - Interrupt Controller (NVIC / PLIC) Vector Table & Priority Management
+//   - Low-Power Power Management & Clock Gating (WFI / Sleep Modes)
+
+use std::os
+
+// --- 1. Memory-Mapped I/O (MMIO) Hardware Register Access ---
+
+@no_alloc
+fn mmio_read8(reg_addr: i64) -> i64 {
+    return ptr_read_u8(reg_addr, 0)
+}
+
+@no_alloc
+fn mmio_write8(reg_addr: i64, val: i64) {
+    ptr_write_u8(reg_addr, 0, val & 0xFF)
+}
+
+@no_alloc
+fn mmio_read16(reg_addr: i64) -> i64 {
+    lo := ptr_read_u8(reg_addr, 0)
+    hi := ptr_read_u8(reg_addr, 1)
+    return lo | (hi << 8)
+}
+
+@no_alloc
+fn mmio_write16(reg_addr: i64, val: i64) {
+    ptr_write_u8(reg_addr, 0, val & 0xFF)
+    ptr_write_u8(reg_addr, 1, (val >> 8) & 0xFF)
+}
+
+@no_alloc
+fn mmio_read32(reg_addr: i64) -> i64 {
+    b0 := ptr_read_u8(reg_addr, 0)
+    b1 := ptr_read_u8(reg_addr, 1)
+    b2 := ptr_read_u8(reg_addr, 2)
+    b3 := ptr_read_u8(reg_addr, 3)
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+@no_alloc
+fn mmio_write32(reg_addr: i64, val: i64) {
+    ptr_write_u8(reg_addr, 0, val & 0xFF)
+    ptr_write_u8(reg_addr, 1, (val >> 8) & 0xFF)
+    ptr_write_u8(reg_addr, 2, (val >> 16) & 0xFF)
+    ptr_write_u8(reg_addr, 3, (val >> 24) & 0xFF)
+}
+
+@no_alloc
+fn mmio_read64(reg_addr: i64) -> i64 {
+    lo := mmio_read32(reg_addr)
+    hi := mmio_read32(reg_addr + 4)
+    return lo | (hi << 32)
+}
+
+@no_alloc
+fn mmio_write64(reg_addr: i64, val: i64) {
+    mmio_write32(reg_addr, val & 0xFFFFFFFF)
+    mmio_write32(reg_addr + 4, (val >> 32) & 0xFFFFFFFF)
+}
+
+// Atomically set bits matching mask in 32-bit register
+@no_alloc
+fn mmio_set_bits32(reg_addr: i64, mask: i64) {
+    old := mmio_read32(reg_addr)
+    mmio_write32(reg_addr, old | mask)
+}
+
+// Atomically clear bits matching mask in 32-bit register
+@no_alloc
+fn mmio_clear_bits32(reg_addr: i64, mask: i64) {
+    old := mmio_read32(reg_addr)
+    inv := mask ^ 0xFFFFFFFF
+    mmio_write32(reg_addr, old & inv)
+}
+
+// Atomically toggle bits matching mask in 32-bit register
+@no_alloc
+fn mmio_toggle_bits32(reg_addr: i64, mask: i64) {
+    old := mmio_read32(reg_addr)
+    mmio_write32(reg_addr, old ^ mask)
+}
+
+// Wait until register bits match expected value or timeout
+@no_alloc
+fn mmio_poll_bits32(reg_addr: i64, mask: i64, expected: i64, max_cycles: i64) -> bool {
+    mut cycles := 0
+    while cycles < max_cycles {
+        v := mmio_read32(reg_addr) & mask
+        if v == expected {
+            return true
+        }
+        cycles += 1
+    }
+    return false
+}
+
+// --- 2. Register Bitfield Extraction & Deposition ---
+
+@no_alloc
+fn bitfield_extract(reg_val: i64, lsb: i64, width: i64) -> i64 {
+    if width <= 0 or width > 64 or lsb < 0 or lsb >= 64 { return 0 }
+    mut mask := 0
+    if width == 64 {
+        mask = -1
+    } else {
+        mask = (1 << width) - 1
+    }
+    return (reg_val >> lsb) & mask
+}
+
+@no_alloc
+fn bitfield_deposit(reg_val: i64, lsb: i64, width: i64, field_val: i64) -> i64 {
+    if width <= 0 or width > 64 or lsb < 0 or lsb >= 64 { return reg_val }
+    mut mask := 0
+    if width == 64 {
+        mask = -1
+    } else {
+        mask = (1 << width) - 1
+    }
+    inv_mask := (mask << lsb) ^ -1
+    cleared := reg_val & inv_mask
+    inserted := (field_val & mask) << lsb
+    return cleared | inserted
+}
+
+// --- 3. Hardware Timing, Delay & Calibrated Cycles ---
+
+@no_alloc
+fn delay_cycles(cycles: i64) {
+    mut i := 0
+    while i < cycles {
+        i += 1
+    }
+}
+
+// Microsecond busy delay calibrated against hardware CPU frequency
+@no_alloc
+fn delay_us(us: i64, cpu_mhz: i64 = 1000) {
+    total_cycles := us * cpu_mhz / 4
+    delay_cycles(total_cycles)
+}
+
+// Millisecond busy delay
+@no_alloc
+fn delay_ms(ms: i64, cpu_mhz: i64 = 1000) {
+    mut i := 0
+    while i < ms {
+        delay_us(1000, cpu_mhz)
+        i += 1
+    }
+}
+
+// --- 4. Circular DMA Ring Descriptors ---
+// Layout per descriptor: 32 bytes = 4 x i64 slots
+//   Slot 0 (offset 0):  Buffer Address (64-bit)
+//   Slot 1 (offset 8):  [31..0] = Length, [63..32] = Flags (Bit 62: OWN by HW, Bit 61: End of Ring, Bit 60: IOC)
+//   Slot 2 (offset 16): Next Descriptor Address (Chaining)
+//   Slot 3 (offset 24): User Context / Tag (64-bit)
+
+fn dma_flag_own() -> i64 { return 1 << 62 }
+fn dma_flag_end_ring() -> i64 { return 1 << 61 }
+fn dma_flag_ioc() -> i64 { return 1 << 60 }
+
+struct DmaRing {
+    desc_mem_ptr: i64
+    num_descs: i64
+    head_idx: i64
+    tail_idx: i64
+}
+
+fn dma_ring_new(num_descriptors: i64) -> DmaRing {
+    mut n := num_descriptors
+    if n < 2 { n = 2 }
+    stride_bytes := 32
+    total_bytes := n * stride_bytes
+    mem := mem_alloc_aligned(total_bytes + 64)
+    
+    // Initialize circular chain
+    mut i := 0
+    while i < n {
+        d_slot := i * 4
+        ptr_write_i64(mem, d_slot, 0)         // Slot 0: buf_addr
+        mut flags := 0
+        if i == n - 1 {
+            flags = dma_flag_end_ring()
+        }
+        ptr_write_i64(mem, d_slot + 1, flags) // Slot 1: flags + len
+        next_addr := mem + ((i + 1) % n) * stride_bytes
+        ptr_write_i64(mem, d_slot + 2, next_addr) // Slot 2: next_desc
+        ptr_write_i64(mem, d_slot + 3, 0)         // Slot 3: user_tag
+        i += 1
+    }
+
+    return DmaRing(
+        desc_mem_ptr = mem,
+        num_descs = n,
+        head_idx = 0,
+        tail_idx = 0
+    )
+}
+
+// Queue buffer into next available DMA descriptor
+@no_alloc
+fn dma_ring_enqueue(mut ring: DmaRing, buf_addr: i64, buf_len: i64, ioc: bool) -> bool {
+    d_slot := ring.head_idx * 4
+    cur_flags := ptr_read_i64(ring.desc_mem_ptr, d_slot + 1)
+    // If descriptor is still owned by HW, ring is full!
+    if (cur_flags & dma_flag_own()) != 0 {
+        return false
+    }
+
+    ptr_write_i64(ring.desc_mem_ptr, d_slot, buf_addr)
+    
+    mut flags := dma_flag_own() | (buf_len & 0xFFFFFFFF)
+    if (cur_flags & dma_flag_end_ring()) != 0 {
+        flags = flags | dma_flag_end_ring()
+    }
+    if ioc {
+        flags = flags | dma_flag_ioc()
+    }
+    ptr_write_i64(ring.desc_mem_ptr, d_slot + 1, flags)
+
+    ring.head_idx = (ring.head_idx + 1) % ring.num_descs
+    return true
+}
+
+// Reclaim completed DMA descriptor transferred by HW
+@no_alloc
+fn dma_ring_reclaim(mut ring: DmaRing) -> i64 {
+    d_slot := ring.tail_idx * 4
+    flags := ptr_read_i64(ring.desc_mem_ptr, d_slot + 1)
+    // If still owned by HW, not finished yet
+    if (flags & dma_flag_own()) != 0 {
+        return -1
+    }
+    buf_addr := ptr_read_i64(ring.desc_mem_ptr, d_slot)
+    if buf_addr != 0 {
+        ptr_write_i64(ring.desc_mem_ptr, d_slot, 0)
+        ring.tail_idx = (ring.tail_idx + 1) % ring.num_descs
+        return buf_addr
+    }
+    return -1
+}
+
+fn dma_ring_free(move ring: DmaRing) {
+    if ring.desc_mem_ptr != 0 {
+        mem_free_aligned(ring.desc_mem_ptr)
+    }
+}
+
+// --- 5. Nested Vectored Interrupt Controller (NVIC) / PLIC Model ---
+
+struct NvicController {
+    base_addr: i64
+    max_irqs: i64
+}
+
+fn nvic_controller_new(base_addr: i64, max_irqs: i64 = 64) -> NvicController {
+    return NvicController(base_addr = base_addr, max_irqs = max_irqs)
+}
+
+@no_alloc
+fn nvic_enable_irq(ctrl: NvicController, irq_num: i64) {
+    if irq_num < 0 or irq_num >= ctrl.max_irqs { return }
+    reg_idx := irq_num / 32
+    bit_idx := irq_num % 32
+    iser_reg := ctrl.base_addr + 0x100 + reg_idx * 4
+    mmio_write32(iser_reg, 1 << bit_idx)
+}
+
+@no_alloc
+fn nvic_disable_irq(ctrl: NvicController, irq_num: i64) {
+    if irq_num < 0 or irq_num >= ctrl.max_irqs { return }
+    reg_idx := irq_num / 32
+    bit_idx := irq_num % 32
+    icer_reg := ctrl.base_addr + 0x180 + reg_idx * 4
+    iser_reg := ctrl.base_addr + 0x100 + reg_idx * 4
+    mmio_write32(icer_reg, 1 << bit_idx)
+    mmio_clear_bits32(iser_reg, 1 << bit_idx)
+}
+
+@no_alloc
+fn nvic_set_pending(ctrl: NvicController, irq_num: i64) {
+    if irq_num < 0 or irq_num >= ctrl.max_irqs { return }
+    reg_idx := irq_num / 32
+    bit_idx := irq_num % 32
+    ispr_reg := ctrl.base_addr + 0x200 + reg_idx * 4
+    mmio_write32(ispr_reg, 1 << bit_idx)
+}
+
+@no_alloc
+fn nvic_clear_pending(ctrl: NvicController, irq_num: i64) {
+    if irq_num < 0 or irq_num >= ctrl.max_irqs { return }
+    reg_idx := irq_num / 32
+    bit_idx := irq_num % 32
+    icpr_reg := ctrl.base_addr + 0x280 + reg_idx * 4
+    ispr_reg := ctrl.base_addr + 0x200 + reg_idx * 4
+    mmio_write32(icpr_reg, 1 << bit_idx)
+    mmio_clear_bits32(ispr_reg, 1 << bit_idx)
+}
+
+@no_alloc
+fn nvic_is_pending(ctrl: NvicController, irq_num: i64) -> bool {
+    if irq_num < 0 or irq_num >= ctrl.max_irqs { return false }
+    reg_idx := irq_num / 32
+    bit_idx := irq_num % 32
+    ispr_reg := ctrl.base_addr + 0x200 + reg_idx * 4
+    return (mmio_read32(ispr_reg) & (1 << bit_idx)) != 0
+}
+
+@no_alloc
+fn nvic_set_priority(ctrl: NvicController, irq_num: i64, priority: i64) {
+    if irq_num < 0 or irq_num >= ctrl.max_irqs { return }
+    ipr_reg := ctrl.base_addr + 0x400 + irq_num
+    mmio_write8(ipr_reg, priority & 0xFF)
+}
+
+// --- 6. Low-Power Power Management & Clock Gating ---
+
+fn pwr_mode_run() -> i64    { return 0 }
+fn pwr_mode_sleep() -> i64  { return 1 }
+fn pwr_mode_stop() -> i64   { return 2 }
+fn pwr_mode_standby() -> i64{ return 3 }
+
+struct PowerManager {
+    ctrl_reg_addr: i64
+    clock_gate_reg: i64
+}
+
+fn pwr_manager_new(ctrl_reg: i64, clock_gate_reg: i64) -> PowerManager {
+    return PowerManager(ctrl_reg_addr = ctrl_reg, clock_gate_reg = clock_gate_reg)
+}
+
+@no_alloc
+fn pwr_set_clock_gate(pwr: PowerManager, peripheral_bit: i64, enable: bool) {
+    if enable {
+        mmio_set_bits32(pwr.clock_gate_reg, 1 << peripheral_bit)
+    } else {
+        mmio_clear_bits32(pwr.clock_gate_reg, 1 << peripheral_bit)
+    }
+}
+
+@no_alloc
+fn pwr_enter_sleep_mode(pwr: PowerManager, mode: i64) {
+    old := mmio_read32(pwr.ctrl_reg_addr)
+    cfg := bitfield_deposit(old, 0, 4, mode)
+    mmio_write32(pwr.ctrl_reg_addr, cfg)
+}

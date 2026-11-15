@@ -1,0 +1,495 @@
+// Axon PyTorch-Style Tensor & Autograd Module (`std/torch.ax`)
+// 100% Pure Axon: Zero Python, Zero C++, Zero LibTorch.
+// Implements:
+//   - Tensor containers with gradient storage & explicit backward step kernels
+//   - Ops: Add, Mul, MatMul, ReLU, Linear layer forward/backward
+//   - Losses: MSELoss, CrossEntropyLoss
+//   - Optimizers: SGD+Momentum, AdamW (bias-corrected decoupled weight decay)
+
+use std::numpy
+use std::ai_math
+use std::os
+
+// --- Tensor Node & Autograd Tape ---
+// Op Codes:
+fn op_leaf() -> i64    { return 0 }
+fn op_add() -> i64     { return 1 }
+fn op_mul() -> i64     { return 2 }
+fn op_matmul() -> i64  { return 3 }
+fn op_relu() -> i64    { return 4 }
+fn op_sigmoid() -> i64 { return 5 }
+fn op_gelu() -> i64    { return 6 }
+
+struct Tensor {
+    data: NdArray
+    grad: NdArray
+    requires_grad: bool
+    op_code: i64
+    src_a_ptr: i64   // pointer to parent Tensor A
+    src_b_ptr: i64   // pointer to parent Tensor B
+}
+
+fn tensor_new(rows: i64, cols: i64 = 1, requires_grad: bool = false) -> Tensor {
+    d := np_zeros(rows, cols)
+    g := np_zeros(rows, cols)
+    return Tensor(
+        data = d,
+        grad = g,
+        requires_grad = requires_grad,
+        op_code = op_leaf(),
+        src_a_ptr = 0,
+        src_b_ptr = 0
+    )
+}
+
+fn tensor_from_array(arr: NdArray, requires_grad: bool = false) -> Tensor {
+    g := np_zeros(arr.rows, arr.cols)
+    return Tensor(
+        data = arr,
+        grad = g,
+        requires_grad = requires_grad,
+        op_code = op_leaf(),
+        src_a_ptr = 0,
+        src_b_ptr = 0
+    )
+}
+
+// In-place gradient zeroing
+@no_alloc
+fn tensor_zero_grad(t: Tensor) {
+    mut i := 0
+    while i < t.grad.size {
+        ptr_write_f32(t.grad.data_ptr, i, 0.0)
+        i += 1
+    }
+}
+
+// Set gradient to 1.0 (for scalar loss backward root)
+@no_alloc
+fn tensor_grad_one(t: Tensor) {
+    if t.grad.size > 0 {
+        ptr_write_f32(t.grad.data_ptr, 0, 1.0)
+    }
+}
+
+// --- 2. Tensor Operations with Tape Recording ---
+
+fn torch_add(a: Tensor, b: Tensor) -> Tensor {
+    out_arr := np_add(a.data, b.data)
+    req := a.requires_grad or b.requires_grad
+    t := tensor_from_array(out_arr, req)
+    return Tensor(
+        data = t.data,
+        grad = t.grad,
+        requires_grad = req,
+        op_code = op_add(),
+        src_a_ptr = a.data.data_ptr,
+        src_b_ptr = b.data.data_ptr
+    )
+}
+
+fn torch_mul(a: Tensor, b: Tensor) -> Tensor {
+    out_arr := np_multiply(a.data, b.data)
+    req := a.requires_grad or b.requires_grad
+    t := tensor_from_array(out_arr, req)
+    return Tensor(
+        data = t.data,
+        grad = t.grad,
+        requires_grad = req,
+        op_code = op_mul(),
+        src_a_ptr = a.data.data_ptr,
+        src_b_ptr = b.data.data_ptr
+    )
+}
+
+fn torch_matmul(a: Tensor, b: Tensor) -> Tensor {
+    out_arr := np_matmul(a.data, b.data)
+    req := a.requires_grad or b.requires_grad
+    t := tensor_from_array(out_arr, req)
+    return Tensor(
+        data = t.data,
+        grad = t.grad,
+        requires_grad = req,
+        op_code = op_matmul(),
+        src_a_ptr = a.data.data_ptr,
+        src_b_ptr = b.data.data_ptr
+    )
+}
+
+fn torch_relu(a: Tensor) -> Tensor {
+    out_arr := np_zeros(a.data.rows, a.data.cols)
+    mut i := 0
+    while i < a.data.size {
+        v := ptr_read_f32(a.data.data_ptr, i)
+        val := if v > 0.0 { v } else { 0.0 }
+        ptr_write_f32(out_arr.data_ptr, i, val)
+        i += 1
+    }
+    t := tensor_from_array(out_arr, a.requires_grad)
+    return Tensor(
+        data = t.data,
+        grad = t.grad,
+        requires_grad = a.requires_grad,
+        op_code = op_relu(),
+        src_a_ptr = a.data.data_ptr,
+        src_b_ptr = 0
+    )
+}
+
+// --- 3. Backward Pass / Autograd Propagation ---
+
+// Propagate backward from output gradient to input tensors
+@no_alloc
+fn tensor_backward_step_relu(out_grad_ptr: i64, in_data_ptr: i64, in_grad_ptr: i64, size: i64) {
+    mut i := 0
+    while i < size {
+        d_out := ptr_read_f32(out_grad_ptr, i)
+        in_val := ptr_read_f32(in_data_ptr, i)
+        d_in := if in_val > 0.0 { d_out } else { 0.0 }
+        old_g := ptr_read_f32(in_grad_ptr, i)
+        ptr_write_f32(in_grad_ptr, i, old_g + d_in)
+        i += 1
+    }
+}
+
+@no_alloc
+fn tensor_backward_step_add(out_grad_ptr: i64, grad_a_ptr: i64, grad_b_ptr: i64, size: i64) {
+    mut i := 0
+    while i < size {
+        d_out := ptr_read_f32(out_grad_ptr, i)
+        ga := ptr_read_f32(grad_a_ptr, i)
+        gb := ptr_read_f32(grad_b_ptr, i)
+        ptr_write_f32(grad_a_ptr, i, ga + d_out)
+        ptr_write_f32(grad_b_ptr, i, gb + d_out)
+        i += 1
+    }
+}
+
+// dL/dA = (dL/dC) x B^T ; dL/dB = A^T x (dL/dC)
+@no_alloc
+fn tensor_backward_step_matmul(
+    d_out_ptr: i64,
+    a_data_ptr: i64,
+    a_grad_ptr: i64,
+    b_data_ptr: i64,
+    b_grad_ptr: i64,
+    m: i64, k: i64, n: i64
+) {
+    // dL/dA = d_out [M x N] * B^T [N x K] -> [M x K]
+    mut i := 0
+    while i < m {
+        mut p := 0
+        while p < k {
+            mut sum_a := 0.0
+            mut j := 0
+            while j < n {
+                do := ptr_read_f32(d_out_ptr, i * n + j)
+                b_val := ptr_read_f32(b_data_ptr, p * n + j) // B^T[j, p] = B[p, j]
+                sum_a = sum_a + do * b_val
+                j += 1
+            }
+            old_ga := ptr_read_f32(a_grad_ptr, i * k + p)
+            ptr_write_f32(a_grad_ptr, i * k + p, old_ga + sum_a)
+            p += 1
+        }
+        i += 1
+    }
+
+    // dL/dB = A^T [K x M] * d_out [M x N] -> [K x N]
+    mut p := 0
+    while p < k {
+        mut j := 0
+        while j < n {
+            mut sum_b := 0.0
+            mut i_m := 0
+            while i_m < m {
+                a_val := ptr_read_f32(a_data_ptr, i_m * k + p) // A^T[p, i_m] = A[i_m, p]
+                do := ptr_read_f32(d_out_ptr, i_m * n + j)
+                sum_b = sum_b + a_val * do
+                i_m += 1
+            }
+            old_gb := ptr_read_f32(b_grad_ptr, p * n + j)
+            ptr_write_f32(b_grad_ptr, p * n + j, old_gb + sum_b)
+            j += 1
+        }
+        p += 1
+    }
+}
+
+// --- 4. Deep Learning Modules (nn.Module) ---
+
+struct TorchLinear {
+    weight: Tensor // [in_features x out_features]
+    bias: Tensor   // [1 x out_features]
+    in_features: i64
+    out_features: i64
+}
+
+fn torch_linear_new(in_features: i64, out_features: i64) -> TorchLinear {
+    w := tensor_new(in_features, out_features, true)
+    b := tensor_new(1, out_features, true)
+    
+    // Xavier / Glorot uniform weight initialization
+    limit := sqrt_f64(6.0 / ((in_features + out_features) as f64))
+    mut i := 0
+    while i < w.data.size {
+        // Deterministic pseudo-random initialization
+        r := (((i * 1103515245 + 12345) & 0x7FFFFFFF) as f64) / 2147483648.0
+        val := (r * 2.0 - 1.0) * limit
+        ptr_write_f32(w.data.data_ptr, i, val)
+        i += 1
+    }
+
+    return TorchLinear(
+        weight = w,
+        bias = b,
+        in_features = in_features,
+        out_features = out_features
+    )
+}
+
+fn tensor_free(move t: Tensor) {
+    np_free(move t.data)
+    np_free(move t.grad)
+}
+
+fn torch_linear_forward(layer: TorchLinear, input: Tensor) -> Tensor {
+    // Y = X * W + b (fused without leaking intermediate mm Tensor)
+    mm := np_matmul(input.data, layer.weight.data)
+    mut r := 0
+    while r < mm.rows {
+        mut c := 0
+        while c < mm.cols {
+            v := np_get(mm, r, c)
+            bias_val := np_get(layer.bias.data, 0, c)
+            np_set(mm, r, c, v + bias_val)
+            c += 1
+        }
+        r += 1
+    }
+    req := input.requires_grad or layer.weight.requires_grad or layer.bias.requires_grad
+    t := tensor_from_array(mm, req)
+    return Tensor(
+        data = t.data,
+        grad = t.grad,
+        requires_grad = req,
+        op_code = op_matmul(),
+        src_a_ptr = input.data.data_ptr,
+        src_b_ptr = layer.weight.data.data_ptr
+    )
+}
+
+@no_alloc
+fn torch_linear_backward(layer: TorchLinear, input: Tensor, out_grad: Tensor) {
+    m := input.data.rows
+    k := input.data.cols
+    n := layer.weight.data.cols
+    tensor_backward_step_matmul(
+        out_grad.grad.data_ptr,
+        input.data.data_ptr,
+        input.grad.data_ptr,
+        layer.weight.data.data_ptr,
+        layer.weight.grad.data_ptr,
+        m, k, n
+    )
+    if layer.bias.requires_grad {
+        mut c := 0
+        while c < n {
+            mut sb := 0.0
+            mut r := 0
+            while r < m {
+                sb = sb + ptr_read_f32(out_grad.grad.data_ptr, r * n + c)
+                r += 1
+            }
+            old_bg := ptr_read_f32(layer.bias.grad.data_ptr, c)
+            ptr_write_f32(layer.bias.grad.data_ptr, c, old_bg + sb)
+            c += 1
+        }
+    }
+}
+
+// --- 5. Loss Functions ---
+
+// Mean Squared Error (MSE) Loss: L = (1/N) * sum((pred - target)^2)
+@no_alloc
+fn nn_mse_loss(pred: Tensor, target: Tensor, mut loss_tensor: Tensor) -> f64 {
+    mut sum_sq := 0.0
+    n := pred.data.size
+    mut i := 0
+    while i < n {
+        p := ptr_read_f32(pred.data.data_ptr, i)
+        t := ptr_read_f32(target.data.data_ptr, i)
+        diff := p - t
+        sum_sq = sum_sq + diff * diff
+        // dL/dp = (2/N) * (p - t)
+        if pred.requires_grad {
+            ptr_write_f32(pred.grad.data_ptr, i, (2.0 / (n as f64)) * diff)
+        }
+        i += 1
+    }
+    mse := sum_sq / (n as f64)
+    if loss_tensor.data.size > 0 {
+        ptr_write_f32(loss_tensor.data.data_ptr, 0, mse)
+        ptr_write_f32(loss_tensor.grad.data_ptr, 0, 1.0)
+    }
+    return mse
+}
+
+// Cross Entropy Loss with Logits: L = -sum(target * log_softmax(logits))
+@no_alloc
+fn nn_cross_entropy_loss(logits: Tensor, target_class: i64, mut loss_tensor: Tensor) -> f64 {
+    n := logits.data.cols
+    if n <= 0 or target_class < 0 or target_class >= n {
+        return 0.0
+    }
+    // 1. Find max for numerical stability
+    mut max_val := ptr_read_f32(logits.data.data_ptr, 0)
+    mut i := 1
+    while i < n {
+        v := ptr_read_f32(logits.data.data_ptr, i)
+        if v > max_val { max_val = v }
+        i += 1
+    }
+
+    // 2. Sum exp
+    mut sum_exp := 0.0
+    i = 0
+    while i < n {
+        v := ptr_read_f32(logits.data.data_ptr, i)
+        sum_exp = sum_exp + exp_f64(v - max_val)
+        i += 1
+    }
+    log_sum_exp := max_val + log2_f64(sum_exp) * 0.6931471805599453
+
+    target_logit := ptr_read_f32(logits.data.data_ptr, target_class)
+    loss := log_sum_exp - target_logit
+
+    // 3. Compute gradients: dL/d(logit_i) = softmax(logit_i) - (i == target)
+    if logits.requires_grad {
+        i = 0
+        while i < n {
+            v := ptr_read_f32(logits.data.data_ptr, i)
+            sm := exp_f64(v - max_val) / sum_exp
+            grad := if i == target_class { sm - 1.0 } else { sm }
+            ptr_write_f32(logits.grad.data_ptr, i, grad)
+            i += 1
+        }
+    }
+
+    if loss_tensor.data.size > 0 {
+        ptr_write_f32(loss_tensor.data.data_ptr, 0, loss)
+        ptr_write_f32(loss_tensor.grad.data_ptr, 0, 1.0)
+    }
+    return loss
+}
+
+// --- 6. Production Optimizers ---
+
+// SGD with Momentum
+struct SgdOptimizer {
+    velocity_ptr: i64
+    lr: f64
+    momentum: f64
+    weight_decay: f64
+}
+
+fn optim_sgd_new(total_params: i64, lr: f64 = 0.01, momentum: f64 = 0.9, weight_decay: f64 = 0.0001) -> SgdOptimizer {
+    v_mem := mem_alloc_aligned(total_params * 4 + 64)
+    mut i := 0
+    while i < total_params {
+        ptr_write_f32(v_mem, i, 0.0)
+        i += 1
+    }
+    return SgdOptimizer(velocity_ptr = v_mem, lr = lr, momentum = momentum, weight_decay = weight_decay)
+}
+
+@no_alloc
+fn optim_sgd_step(opt: SgdOptimizer, param: Tensor, param_offset: i64) {
+    mut i := 0
+    while i < param.data.size {
+        w := ptr_read_f32(param.data.data_ptr, i)
+        g := ptr_read_f32(param.grad.data_ptr, i) + opt.weight_decay * w
+        idx := param_offset + i
+        v := ptr_read_f32(opt.velocity_ptr, idx)
+        new_v := opt.momentum * v + g
+        ptr_write_f32(opt.velocity_ptr, idx, new_v)
+        ptr_write_f32(param.data.data_ptr, i, w - opt.lr * new_v)
+        i += 1
+    }
+}
+
+// AdamW with Decoupled Weight Decay
+struct AdamWOptimizer {
+    m_ptr: i64 // 1st moment
+    v_ptr: i64 // 2nd moment
+    lr: f64
+    beta1: f64
+    beta2: f64
+    eps: f64
+    weight_decay: f64
+    step_count: i64
+}
+
+fn optim_adamw_new(total_params: i64, lr: f64 = 0.001, beta1: f64 = 0.9, beta2: f64 = 0.999, wd: f64 = 0.01) -> AdamWOptimizer {
+    m_mem := mem_alloc_aligned(total_params * 4 + 64)
+    v_mem := mem_alloc_aligned(total_params * 4 + 64)
+    mut i := 0
+    while i < total_params {
+        ptr_write_f32(m_mem, i, 0.0)
+        ptr_write_f32(v_mem, i, 0.0)
+        i += 1
+    }
+    return AdamWOptimizer(
+        m_ptr = m_mem,
+        v_ptr = v_mem,
+        lr = lr,
+        beta1 = beta1,
+        beta2 = beta2,
+        eps = 0.00000001,
+        weight_decay = wd,
+        step_count = 0
+    )
+}
+
+@no_alloc
+fn torch_pow_i64(base: f64, exp: i64) -> f64 {
+    mut res := 1.0
+    mut i := 0
+    while i < exp {
+        res = res * base
+        i += 1
+    }
+    return res
+}
+
+@no_alloc
+fn optim_adamw_step(mut opt: AdamWOptimizer, param: Tensor, param_offset: i64) {
+    opt.step_count = opt.step_count + 1
+    b1_t := torch_pow_i64(opt.beta1, opt.step_count)
+    b2_t := torch_pow_i64(opt.beta2, opt.step_count)
+    bias_correction1 := 1.0 - b1_t
+    bias_correction2 := 1.0 - b2_t
+    bc1 := if bias_correction1 > 0.000000001 { bias_correction1 } else { 0.000000001 }
+    step_size := opt.lr * (sqrt_f64(bias_correction2) / bc1)
+
+    mut i := 0
+    while i < param.data.size {
+        w := ptr_read_f32(param.data.data_ptr, i)
+        g := ptr_read_f32(param.grad.data_ptr, i)
+        idx := param_offset + i
+
+        m := ptr_read_f32(opt.m_ptr, idx)
+        v := ptr_read_f32(opt.v_ptr, idx)
+
+        new_m := opt.beta1 * m + (1.0 - opt.beta1) * g
+        new_v := opt.beta2 * v + (1.0 - opt.beta2) * g * g
+
+        ptr_write_f32(opt.m_ptr, idx, new_m)
+        ptr_write_f32(opt.v_ptr, idx, new_v)
+
+        denom := sqrt_f64(new_v) + opt.eps
+        decoupled_wd := opt.lr * opt.weight_decay * w
+        ptr_write_f32(param.data.data_ptr, i, w - step_size * (new_m / denom) - decoupled_wd)
+        i += 1
+    }
+}

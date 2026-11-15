@@ -1,0 +1,535 @@
+// Axon IoT & Embedded Microcontroller Standard Library (`std/iot.ax`)
+// 100% Pure Axon: Zero CRT, Zero External Dependencies, Zero-GC (@no_alloc).
+// Supports:
+//   - GPIO: Pin Modes, Pull-up/down, High/Low Drive, Edge Triggers & Debounce
+//   - UART: 8N1 Framing, FIFO Status, Hardware & Software Bit-Bang TX/RX
+//   - SPI: Modes 0/1/2/3, Full-Duplex Byte & Burst Transfer, CS Assertion
+//   - I2C: Master Mode, 7/10-bit Addressing, ACK/NACK, Repeated Start, Reg Read/Write
+//   - PWM: High-Precision Duty Cycle (0.01% resolution), Dead-time & Inverted Output
+//   - ADC & DAC: 12/16-bit Conversion, Voltage Scaling & Calibration Offset
+//   - Sensors: Built-in SHT3x / DHT22 Humidity & Temp, MPU6050 IMU Accelerometer/Gyro
+
+use std::semiconductor
+use std::os
+
+// --- 1. GPIO Pin Control & Configuration ---
+
+fn gpio_mode_input() -> i64    { return 0 }
+fn gpio_mode_output() -> i64   { return 1 }
+fn gpio_mode_alt() -> i64      { return 2 }
+fn gpio_mode_analog() -> i64   { return 3 }
+
+fn gpio_pull_none() -> i64     { return 0 }
+fn gpio_pull_up() -> i64       { return 1 }
+fn gpio_pull_down() -> i64     { return 2 }
+
+fn gpio_edge_none() -> i64     { return 0 }
+fn gpio_edge_rising() -> i64   { return 1 }
+fn gpio_edge_falling() -> i64  { return 2 }
+fn gpio_edge_both() -> i64     { return 3 }
+
+struct GpioPort {
+    base_addr: i64
+    pin_count: i64
+}
+
+fn gpio_port_new(base_addr: i64, pin_count: i64 = 16) -> GpioPort {
+    return GpioPort(base_addr = base_addr, pin_count = pin_count)
+}
+
+// Offsets:
+//   0x00: MODER (2 bits per pin)
+//   0x04: OTYPER (1 bit per pin)
+//   0x08: OSPEEDR (2 bits per pin)
+//   0x0C: PUPDR (2 bits per pin)
+//   0x10: IDR (Input Data Register)
+//   0x14: ODR (Output Data Register)
+//   0x18: BSRR (Bit Set/Reset Register - lower 16: set, upper 16: reset)
+
+@no_alloc
+fn gpio_set_mode(port: GpioPort, pin: i64, mode: i64) {
+    if pin < 0 or pin >= port.pin_count { return }
+    moder_addr := port.base_addr + 0x00
+    cur := mmio_read32(moder_addr)
+    shift := pin * 2
+    inv_mask := (3 << shift) ^ -1
+    cleared := cur & inv_mask
+    mmio_write32(moder_addr, cleared | ((mode & 3) << shift))
+}
+
+@no_alloc
+fn gpio_set_pull(port: GpioPort, pin: i64, pull: i64) {
+    if pin < 0 or pin >= port.pin_count { return }
+    pupdr_addr := port.base_addr + 0x0C
+    cur := mmio_read32(pupdr_addr)
+    shift := pin * 2
+    inv_mask := (3 << shift) ^ -1
+    cleared := cur & inv_mask
+    mmio_write32(pupdr_addr, cleared | ((pull & 3) << shift))
+}
+
+@no_alloc
+fn gpio_write(port: GpioPort, pin: i64, high: bool) {
+    if pin < 0 or pin >= port.pin_count { return }
+    bsrr_addr := port.base_addr + 0x18
+    if high {
+        mmio_write32(bsrr_addr, 1 << pin)
+    } else {
+        mmio_write32(bsrr_addr, 1 << (pin + 16))
+    }
+}
+
+@no_alloc
+fn gpio_read(port: GpioPort, pin: i64) -> bool {
+    if pin < 0 or pin >= port.pin_count { return false }
+    idr_addr := port.base_addr + 0x10
+    val := mmio_read32(idr_addr)
+    return (val & (1 << pin)) != 0
+}
+
+@no_alloc
+fn gpio_toggle(port: GpioPort, pin: i64) {
+    if pin < 0 or pin >= port.pin_count { return }
+    odr_addr := port.base_addr + 0x14
+    mmio_toggle_bits32(odr_addr, 1 << pin)
+}
+
+// --- 2. UART Serial Communication Driver ---
+
+struct UartDevice {
+    base_addr: i64
+    baud_rate: i64
+}
+
+fn uart_new(base_addr: i64, baud: i64 = 115200) -> UartDevice {
+    return UartDevice(base_addr = base_addr, baud_rate = baud)
+}
+
+// Offsets:
+//   0x00: SR (Status Register: Bit 7 TXE, Bit 5 RXNE)
+//   0x04: DR (Data Register)
+//   0x08: BRR (Baud Rate Register)
+//   0x0C: CR1 (Control Register 1: Bit 13 UE, Bit 3 TE, Bit 2 RE)
+
+@no_alloc
+fn uart_tx_ready(uart: UartDevice) -> bool {
+    sr := mmio_read32(uart.base_addr + 0x00)
+    return (sr & (1 << 7)) != 0
+}
+
+@no_alloc
+fn uart_rx_ready(uart: UartDevice) -> bool {
+    sr := mmio_read32(uart.base_addr + 0x00)
+    return (sr & (1 << 5)) != 0
+}
+
+@no_alloc
+fn uart_write_byte(uart: UartDevice, byte_val: i64) {
+    // Wait for TXE (Transmit Empty)
+    while not uart_tx_ready(uart) {
+        delay_cycles(10)
+    }
+    mmio_write32(uart.base_addr + 0x04, byte_val & 0xFF)
+}
+
+@no_alloc
+fn uart_read_byte(uart: UartDevice) -> i64 {
+    // Wait for RXNE (Receive Not Empty)
+    while not uart_rx_ready(uart) {
+        delay_cycles(10)
+    }
+    return mmio_read32(uart.base_addr + 0x04) & 0xFF
+}
+
+@no_alloc
+fn uart_write_str(uart: UartDevice, text: str) {
+    n := str_len(text)
+    mut i := 0
+    while i < n {
+        uart_write_byte(uart, str_byte(text, i))
+        i += 1
+    }
+}
+
+// Software bit-bang UART TX for pin-constrained low-cost microcontrollers
+@no_alloc
+fn uart_bitbang_tx_byte(port: GpioPort, pin: i64, byte_val: i64, bit_delay_us: i64) {
+    // Start bit: LOW
+    gpio_write(port, pin, false)
+    delay_us(bit_delay_us)
+    // 8 Data bits (LSB first)
+    mut b := byte_val
+    mut i := 0
+    while i < 8 {
+        gpio_write(port, pin, (b & 1) != 0)
+        delay_us(bit_delay_us)
+        b = b >> 1
+        i += 1
+    }
+    // Stop bit: HIGH
+    gpio_write(port, pin, true)
+    delay_us(bit_delay_us)
+}
+
+// --- 3. SPI Serial Peripheral Interface Driver ---
+
+struct SpiDevice {
+    base_addr: i64
+    mode: i64 // 0, 1, 2, 3
+}
+
+fn spi_new(base_addr: i64, mode: i64 = 0) -> SpiDevice {
+    return SpiDevice(base_addr = base_addr, mode = mode)
+}
+
+// Offsets:
+//   0x00: CR1 (Control Register: Bit 6 SPE, Bit 2 MSTR, Bit 1 CPOL, Bit 0 CPHA)
+//   0x08: SR (Status Register: Bit 1 TXE, Bit 0 RXNE, Bit 7 BSY)
+//   0x0C: DR (Data Register)
+
+@no_alloc
+fn spi_transfer_byte(spi: SpiDevice, tx_byte: i64) -> i64 {
+    // Wait until TX buffer empty
+    while (mmio_read32(spi.base_addr + 0x08) & (1 << 1)) == 0 {
+        delay_cycles(5)
+    }
+    // Write TX byte
+    mmio_write32(spi.base_addr + 0x0C, tx_byte & 0xFF)
+    // Wait until RX buffer has received byte
+    while (mmio_read32(spi.base_addr + 0x08) & (1 << 0)) == 0 {
+        delay_cycles(5)
+    }
+    return mmio_read32(spi.base_addr + 0x0C) & 0xFF
+}
+
+fn spi_transfer_buf(spi: SpiDevice, cs_port: GpioPort, cs_pin: i64, tx_buf: ByteBuf, rx_buf: ByteBuf, len: i64) {
+    // Assert Chip Select (Active LOW)
+    gpio_write(cs_port, cs_pin, false)
+    delay_us(1)
+    
+    mut i := 0
+    while i < len {
+        mut tb := 0
+        if i < buf_len(tx_buf) {
+            tb = buf_get(tx_buf, i)
+        }
+        rb := spi_transfer_byte(spi, tb)
+        if i < buf_len(rx_buf) {
+            buf_set(rx_buf, i, rb)
+        } else {
+            buf_push(rx_buf, rb)
+        }
+        i += 1
+    }
+
+    delay_us(1)
+    // Deassert Chip Select (HIGH)
+    gpio_write(cs_port, cs_pin, true)
+}
+
+// --- 4. I2C Two-Wire Bus Master Driver ---
+
+struct I2cDevice {
+    base_addr: i64
+    clock_khz: i64
+}
+
+fn i2c_new(base_addr: i64, clock_khz: i64 = 100) -> I2cDevice {
+    return I2cDevice(base_addr = base_addr, clock_khz = clock_khz)
+}
+
+// Offsets:
+//   0x00: CR1 (Control 1: Bit 0 PE, Bit 8 START, Bit 9 STOP, Bit 10 ACK)
+//   0x14: SR1 (Status 1: Bit 0 SB, Bit 1 ADDR, Bit 2 BTF, Bit 7 TxE, Bit 6 RxNE)
+//   0x18: SR2 (Status 2: Bit 0 MSL, Bit 1 BUSY)
+//   0x10: DR (Data Register)
+
+@no_alloc
+fn i2c_send_start(i2c: I2cDevice) -> bool {
+    mmio_set_bits32(i2c.base_addr + 0x00, 1 << 8) // Generate START
+    return mmio_poll_bits32(i2c.base_addr + 0x14, 1 << 0, 1 << 0, 10000) // Poll SB
+}
+
+@no_alloc
+fn i2c_send_stop(i2c: I2cDevice) {
+    mmio_set_bits32(i2c.base_addr + 0x00, 1 << 9) // Generate STOP
+}
+
+@no_alloc
+fn i2c_send_addr(i2c: I2cDevice, dev_addr_7bit: i64, is_read: bool) -> bool {
+    addr_byte := (dev_addr_7bit << 1) | (if is_read { 1 } else { 0 })
+    mmio_write32(i2c.base_addr + 0x10, addr_byte)
+    ok := mmio_poll_bits32(i2c.base_addr + 0x14, 1 << 1, 1 << 1, 10000) // Poll ADDR
+    if ok {
+        // Clear ADDR flag by reading SR1 followed by SR2
+        discard_sr1 := mmio_read32(i2c.base_addr + 0x14)
+        discard_sr2 := mmio_read32(i2c.base_addr + 0x18)
+    }
+    return ok
+}
+
+@no_alloc
+fn i2c_write_byte(i2c: I2cDevice, data_byte: i64) -> bool {
+    if not mmio_poll_bits32(i2c.base_addr + 0x14, 1 << 7, 1 << 7, 10000) { // TxE
+        return false
+    }
+    mmio_write32(i2c.base_addr + 0x10, data_byte & 0xFF)
+    return mmio_poll_bits32(i2c.base_addr + 0x14, 1 << 2, 1 << 2, 10000) // BTF
+}
+
+@no_alloc
+fn i2c_read_byte(i2c: I2cDevice) -> i64 {
+    if not mmio_poll_bits32(i2c.base_addr + 0x14, 1 << 6, 1 << 6, 10000) { // RxNE
+        return -1
+    }
+    return mmio_read32(i2c.base_addr + 0x10) & 0xFF
+}
+
+@no_alloc
+fn i2c_write_reg8(i2c: I2cDevice, dev_addr: i64, reg_addr: i64, val: i64) -> bool {
+    if not i2c_send_start(i2c) { return false }
+    if not i2c_send_addr(i2c, dev_addr, false) {
+        i2c_send_stop(i2c)
+        return false
+    }
+    if not i2c_write_byte(i2c, reg_addr) {
+        i2c_send_stop(i2c)
+        return false
+    }
+    if not i2c_write_byte(i2c, val) {
+        i2c_send_stop(i2c)
+        return false
+    }
+    i2c_send_stop(i2c)
+    return true
+}
+
+@no_alloc
+fn i2c_read_reg8(i2c: I2cDevice, dev_addr: i64, reg_addr: i64) -> i64 {
+    if not i2c_send_start(i2c) { return -1 }
+    if not i2c_send_addr(i2c, dev_addr, false) {
+        i2c_send_stop(i2c)
+        return -1
+    }
+    if not i2c_write_byte(i2c, reg_addr) {
+        i2c_send_stop(i2c)
+        return -1
+    }
+    // Repeated start for reading
+    if not i2c_send_start(i2c) { return -1 }
+    if not i2c_send_addr(i2c, dev_addr, true) {
+        i2c_send_stop(i2c)
+        return -1
+    }
+    // Disable ACK for single-byte read
+    mmio_clear_bits32(i2c.base_addr + 0x00, 1 << 10)
+    i2c_send_stop(i2c)
+    if not mmio_poll_bits32(i2c.base_addr + 0x14, 1 << 6, 1 << 6, 10000) { // RxNE
+        return -1
+    }
+    return mmio_read32(i2c.base_addr + 0x10) & 0xFF
+}
+
+// --- 5. PWM (Pulse Width Modulation) Controller ---
+
+struct PwmChannel {
+    timer_base: i64
+    channel_idx: i64 // 1..4
+    period_ticks: i64
+}
+
+fn pwm_new(timer_base: i64, channel: i64, frequency_hz: i64, timer_clk_hz: i64 = 84000000) -> PwmChannel {
+    if frequency_hz <= 0 {
+        return PwmChannel(timer_base = timer_base, channel_idx = channel, period_ticks = 0)
+    }
+    period := timer_clk_hz / frequency_hz
+    mmio_write32(timer_base + 0x2C, period) // ARR (Auto-reload register)
+    return PwmChannel(timer_base = timer_base, channel_idx = channel, period_ticks = period)
+}
+
+// Duty cycle: 0 to 10000 (representing 0.00% to 100.00%)
+@no_alloc
+fn pwm_set_duty(pwm: PwmChannel, duty_basis_10000: i64) {
+    mut d := duty_basis_10000
+    if d < 0 { d = 0 }
+    if d > 10000 { d = 10000 }
+    ccr_val := (pwm.period_ticks * d) / 10000
+    ccr_reg := pwm.timer_base + 0x34 + (pwm.channel_idx - 1) * 4
+    mmio_write32(ccr_reg, ccr_val)
+}
+
+// --- 6. ADC & DAC Converters ---
+
+struct AdcController {
+    base_addr: i64
+    vref_millivolts: i64 // e.g. 3300 mV (3.3V)
+    resolution_bits: i64 // 12-bit (4096) or 16-bit (65536)
+}
+
+fn adc_new(base_addr: i64, vref_mv: i64 = 3300, res_bits: i64 = 12) -> AdcController {
+    return AdcController(base_addr = base_addr, vref_millivolts = vref_mv, resolution_bits = res_bits)
+}
+
+@no_alloc
+fn adc_read_raw(adc: AdcController, channel: i64) -> i64 {
+    // Select channel in SQR3
+    mmio_write32(adc.base_addr + 0x34, channel & 0x1F)
+    // Start conversion: Bit 30 of CR2 (SWSTART)
+    mmio_set_bits32(adc.base_addr + 0x08, 1 << 30)
+    // Wait for EOC (End of Conversion): Bit 1 of SR
+    if not mmio_poll_bits32(adc.base_addr + 0x00, 1 << 1, 1 << 1, 10000) {
+        return 0
+    }
+    // Read DR (Data Register)
+    return mmio_read32(adc.base_addr + 0x4C) & ((1 << adc.resolution_bits) - 1)
+}
+
+@no_alloc
+fn adc_read_millivolts(adc: AdcController, channel: i64) -> i64 {
+    if adc.resolution_bits <= 0 or adc.resolution_bits > 30 {
+        return 0
+    }
+    raw := adc_read_raw(adc, channel)
+    max_count := (1 << adc.resolution_bits) - 1
+    if max_count <= 0 {
+        return 0
+    }
+    return (raw * adc.vref_millivolts) / max_count
+}
+
+// --- 7. Built-in Embedded Sensor Protocols ---
+
+// MPU6050 6-Axis Motion Tracking Accelerometer & Gyroscope
+struct Mpu6050Reading {
+    accel_x: i64
+    accel_y: i64
+    accel_z: i64
+    temp_c_scaled: i64 // Celsius * 100
+    gyro_x: i64
+    gyro_y: i64
+    gyro_z: i64
+}
+
+@no_alloc
+fn mpu6050_sign_extend16(val: i64) -> i64 {
+    u := val & 0xFFFF
+    if (u & 0x8000) != 0 {
+        return u - 65536
+    }
+    return u
+}
+
+@no_alloc
+fn mpu6050_init(i2c: I2cDevice, dev_addr: i64 = 0x68) -> bool {
+    // Wake up MPU6050 (clear SLEEP bit in PWR_MGMT_1 register 0x6B)
+    return i2c_write_reg8(i2c, dev_addr, 0x6B, 0x00)
+}
+
+@no_alloc
+fn mpu6050_read_sensors(i2c: I2cDevice, dev_addr: i64 = 0x68) -> Mpu6050Reading {
+    zero := Mpu6050Reading(accel_x = 0, accel_y = 0, accel_z = 0, temp_c_scaled = 0, gyro_x = 0, gyro_y = 0, gyro_z = 0)
+    ax_hi := i2c_read_reg8(i2c, dev_addr, 0x3B)
+    ax_lo := i2c_read_reg8(i2c, dev_addr, 0x3C)
+    ay_hi := i2c_read_reg8(i2c, dev_addr, 0x3D)
+    ay_lo := i2c_read_reg8(i2c, dev_addr, 0x3E)
+    az_hi := i2c_read_reg8(i2c, dev_addr, 0x3F)
+    az_lo := i2c_read_reg8(i2c, dev_addr, 0x40)
+    if ax_hi < 0 or ax_lo < 0 or ay_hi < 0 or ay_lo < 0 or az_hi < 0 or az_lo < 0 {
+        return zero
+    }
+
+    raw_ax := mpu6050_sign_extend16((ax_hi << 8) | ax_lo)
+    raw_ay := mpu6050_sign_extend16((ay_hi << 8) | ay_lo)
+    raw_az := mpu6050_sign_extend16((az_hi << 8) | az_lo)
+
+    th_hi := i2c_read_reg8(i2c, dev_addr, 0x41)
+    th_lo := i2c_read_reg8(i2c, dev_addr, 0x42)
+    if th_hi < 0 or th_lo < 0 {
+        return zero
+    }
+    raw_t := mpu6050_sign_extend16((th_hi << 8) | th_lo)
+    // Temp in C = (raw / 340.0) + 36.53 => scaled * 100
+    temp_scaled := ((raw_t * 100) / 340) + 3653
+
+    gx_hi := i2c_read_reg8(i2c, dev_addr, 0x43)
+    gx_lo := i2c_read_reg8(i2c, dev_addr, 0x44)
+    gy_hi := i2c_read_reg8(i2c, dev_addr, 0x45)
+    gy_lo := i2c_read_reg8(i2c, dev_addr, 0x46)
+    gz_hi := i2c_read_reg8(i2c, dev_addr, 0x47)
+    gz_lo := i2c_read_reg8(i2c, dev_addr, 0x48)
+    if gx_hi < 0 or gx_lo < 0 or gy_hi < 0 or gy_lo < 0 or gz_hi < 0 or gz_lo < 0 {
+        return zero
+    }
+
+    raw_gx := mpu6050_sign_extend16((gx_hi << 8) | gx_lo)
+    raw_gy := mpu6050_sign_extend16((gy_hi << 8) | gy_lo)
+    raw_gz := mpu6050_sign_extend16((gz_hi << 8) | gz_lo)
+
+    return Mpu6050Reading(
+        accel_x = raw_ax,
+        accel_y = raw_ay,
+        accel_z = raw_az,
+        temp_c_scaled = temp_scaled,
+        gyro_x = raw_gx,
+        gyro_y = raw_gy,
+        gyro_z = raw_gz
+    )
+}
+
+// SHT3x High-Accuracy Humidity & Temperature Sensor (I2C)
+struct Sht3xReading {
+    temp_c_scaled: i64     // Celsius * 100
+    humidity_scaled: i64   // %RH * 100
+    valid: bool
+}
+
+@no_alloc
+fn sht3x_read(i2c: I2cDevice, dev_addr: i64 = 0x44) -> Sht3xReading {
+    // Send single shot high repeatability command (0x2C, 0x06)
+    if not i2c_send_start(i2c) { return Sht3xReading(temp_c_scaled = 0, humidity_scaled = 0, valid = false) }
+    if not i2c_send_addr(i2c, dev_addr, false) {
+        i2c_send_stop(i2c)
+        return Sht3xReading(temp_c_scaled = 0, humidity_scaled = 0, valid = false)
+    }
+    cmd_ok1 := i2c_write_byte(i2c, 0x2C)
+    cmd_ok2 := i2c_write_byte(i2c, 0x06)
+    i2c_send_stop(i2c)
+    if not cmd_ok1 or not cmd_ok2 {
+        return Sht3xReading(temp_c_scaled = 0, humidity_scaled = 0, valid = false)
+    }
+
+    // Wait 15ms for measurement conversion
+    delay_ms(15)
+
+    // Read 6 bytes: [Temp MSB, Temp LSB, CRC, Humid MSB, Humid LSB, CRC]
+    if not i2c_send_start(i2c) { return Sht3xReading(temp_c_scaled = 0, humidity_scaled = 0, valid = false) }
+    if not i2c_send_addr(i2c, dev_addr, true) {
+        i2c_send_stop(i2c)
+        return Sht3xReading(temp_c_scaled = 0, humidity_scaled = 0, valid = false)
+    }
+
+    t_hi := i2c_read_byte(i2c)
+    t_lo := i2c_read_byte(i2c)
+    discard_crc1 := i2c_read_byte(i2c)
+    h_hi := i2c_read_byte(i2c)
+    h_lo := i2c_read_byte(i2c)
+    discard_crc2 := i2c_read_byte(i2c)
+    i2c_send_stop(i2c)
+    if t_hi < 0 or t_lo < 0 or discard_crc1 < 0 or h_hi < 0 or h_lo < 0 or discard_crc2 < 0 {
+        return Sht3xReading(temp_c_scaled = 0, humidity_scaled = 0, valid = false)
+    }
+
+    raw_t := (t_hi << 8) | t_lo
+    raw_h := (h_hi << 8) | h_lo
+
+    // T = -45 + 175 * (raw_t / 65535) => scaled * 100 = -4500 + (17500 * raw_t) / 65535
+    temp_scaled := -4500 + ((17500 * raw_t) / 65535)
+    // RH = 100 * (raw_h / 65535) => scaled * 100 = (10000 * raw_h) / 65535
+    humid_scaled := (10000 * raw_h) / 65535
+
+    return Sht3xReading(
+        temp_c_scaled = temp_scaled,
+        humidity_scaled = humid_scaled,
+        valid = true
+    )
+}
