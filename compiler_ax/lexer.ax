@@ -1,7 +1,9 @@
-// Axon v5.0 Self-Hosted Compiler — Zero-Ceremony Native Lexer (`compiler_ax/lexer.ax`)
-// Scans raw UTF-8 `ByteBuf` into flat 5-word tokens (`toks: IntBuf`) + interned `pool: ByteBuf`.
+// Axon v7.0 Self-Hosted Compiler - Zero-Ceremony Native Lexer (`compiler_ax/lexer.ax`)
+// Scans raw UTF-8 `ByteBuf` into flat 5-word tokens (`toks: IntBuf`) + interned `pool: ByteBuf`
+// with exact `(file_id, line, column)` source spans (`span_pack`).
 // Supports Pythonic `and`/`or`/`not`, `:=`, `f"..."` interpolation, `29.99d` exact `dec`,
-// IEEE-754 `f64` bit synthesis, `0x...` 64-bit hex, `|>`, `T ! E`, `@shield`, `@whitebox`, `@secret`.
+// IEEE-754 `f64` bit synthesis, `0x...` 64-bit hex, `|>`, `T ! E`, `comptime`, `par_for`,
+// `async`/`await`, `@shield`, `@whitebox`, `@secret`, `@no_alloc`, `@nan_guard`, `@gpu_kernel`, `@cImport`.
 
 use compiler_ax::tokens_ast
 
@@ -88,6 +90,8 @@ fn classify_keyword(pool: ByteBuf, off: i64, slen: i64) -> i64 {
         if b0 == 102 and pool_str_eq_lit(pool, off, slen, "false") { return tk_false() }
         if b0 == 98 and pool_str_eq_lit(pool, off, slen, "break") { return tk_break() }
         if b0 == 84 and pool_str_eq_lit(pool, off, slen, "Table") { return tk_table() }
+        if b0 == 97 and pool_str_eq_lit(pool, off, slen, "async") { return tk_async() }
+        if b0 == 97 and pool_str_eq_lit(pool, off, slen, "await") { return tk_await() }
         return tk_ident()
     }
     if slen == 6 {
@@ -95,9 +99,14 @@ fn classify_keyword(pool: ByteBuf, off: i64, slen: i64) -> i64 {
         if b0 == 115 and pool_str_eq_lit(pool, off, slen, "struct") { return tk_struct() }
         return tk_ident()
     }
+    if slen == 7 {
+        if b0 == 112 and pool_str_eq_lit(pool, off, slen, "par_for") { return tk_par_for() }
+        return tk_ident()
+    }
     if slen == 8 {
         if b0 == 99 and pool_str_eq_lit(pool, off, slen, "continue") { return tk_continue() }
         if b0 == 105 and pool_str_eq_lit(pool, off, slen, "isolated") { return tk_isolated() }
+        if b0 == 99 and pool_str_eq_lit(pool, off, slen, "comptime") { return tk_comptime() }
         return tk_ident()
     }
     if slen == 9 {
@@ -117,14 +126,15 @@ fn unescape_char(b: i64) -> i64 {
 }
 
 // `packed` = `start_pos | (end_pos << 24) | (start_line << 48)`
-// Returns `0` on success, or `> 0` line number on lexical error.
-fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
+// Returns `0` on success, or `> 0` packed span on lexical error.
+fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64, file_id: i64, init_line_start: i64) -> i64 {
     mut i := packed & 0xFFFFFF
     end_pos := (packed >> 24) & 0xFFFFFF
     mut line := (packed >> 48) & 0x7FFF
     if line <= 0 {
         line = 1
     }
+    mut line_start := init_line_start
 
     while i < end_pos {
         b := buf_get(src, i)
@@ -135,6 +145,7 @@ fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
         } else if b == 10 {
             line += 1
             i += 1
+            line_start = i
         } else if b == 47 and i + 1 < end_pos and buf_get(src, i + 1) == 47 {
             // Line comment `// ...`
             i += 2
@@ -147,6 +158,7 @@ fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
             while i + 1 < end_pos {
                 if buf_get(src, i) == 10 {
                     line += 1
+                    line_start = i + 1
                 }
                 if buf_get(src, i) == 42 and buf_get(src, i + 1) == 47 {
                     i += 2
@@ -156,9 +168,9 @@ fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
             }
         } else if b == 102 and i + 1 < end_pos and buf_get(src, i + 1) == 34 {
             // 2. Interpolated f-string: `f"..."`
-            tok_ln := line
+            tok_sp := span_pack(line, i - line_start + 1, file_id)
             t_start := tok_push(toks, tk_fstr_start(), 0, 0)
-            tok_set_meta(toks, t_start, 0, tok_ln)
+            tok_set_meta(toks, t_start, 0, tok_sp)
             i += 2
             mut lit_off := buf_len(pool)
             mut closed := false
@@ -169,7 +181,7 @@ fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
                     lit_len := buf_len(pool) - lit_off
                     if lit_len > 0 {
                         tl := tok_push(toks, tk_fstr_lit(), lit_off, lit_len)
-                        tok_set_meta(toks, tl, 0, line)
+                        tok_set_meta(toks, tl, 0, span_pack(line, i - line_start + 1, file_id))
                     }
                     i += 1
                     closed = true
@@ -191,10 +203,12 @@ fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
                     lit_len := buf_len(pool) - lit_off
                     if lit_len > 0 {
                         tl := tok_push(toks, tk_fstr_lit(), lit_off, lit_len)
-                        tok_set_meta(toks, tl, 0, line)
+                        tok_set_meta(toks, tl, 0, span_pack(line, i - line_start + 1, file_id))
                     }
                     i += 1
                     expr_start := i
+                    expr_ln := line
+                    expr_ls := line_start
                     mut depth := 1
                     while i < end_pos and depth > 0 {
                         ec := buf_get(src, i)
@@ -210,7 +224,10 @@ fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
                                 i += 1
                             }
                         } else {
-                            if ec == 123 {
+                            if ec == 10 {
+                                line += 1
+                                line_start = i + 1
+                            } else if ec == 123 {
                                 depth += 1
                             } else if ec == 125 {
                                 depth -= 1
@@ -222,34 +239,35 @@ fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
                         }
                     }
                     if depth != 0 {
-                        return tok_ln
+                        return tok_sp
                     }
                     expr_end := i
                     i += 1 // skip closing '}'
-                    sub_pack := expr_start | (expr_end << 24) | (line << 48)
-                    sub_err := lex_subrange(src, toks, pool, sub_pack)
+                    sub_pack := expr_start | (expr_end << 24) | (expr_ln << 48)
+                    sub_err := lex_subrange(src, toks, pool, sub_pack, file_id, expr_ls)
                     if sub_err != 0 {
                         return sub_err
                     }
                     te_end := tok_push(toks, tk_fstr_expr_end(), 0, 0)
-                    tok_set_meta(toks, te_end, 0, line)
+                    tok_set_meta(toks, te_end, 0, span_pack(line, i - line_start + 1, file_id))
                     lit_off = buf_len(pool)
                 } else {
                     if c == 10 {
                         line += 1
+                        line_start = i + 1
                     }
                     buf_push(pool, c)
                     i += 1
                 }
             }
             if not closed {
-                return tok_ln
+                return tok_sp
             }
             t_end := tok_push(toks, tk_fstr_end(), 0, 0)
-            tok_set_meta(toks, t_end, 0, tok_ln)
+            tok_set_meta(toks, t_end, 0, tok_sp)
         } else if b == 34 {
             // 3. Standard string literal: `"..."`
-            tok_ln := line
+            tok_sp := span_pack(line, i - line_start + 1, file_id)
             i += 1
             soff := buf_len(pool)
             mut closed := false
@@ -267,20 +285,21 @@ fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
                 } else {
                     if c == 10 {
                         line += 1
+                        line_start = i + 1
                     }
                     buf_push(pool, c)
                     i += 1
                 }
             }
             if not closed {
-                return tok_ln
+                return tok_sp
             }
             slen := buf_len(pool) - soff
             tid := tok_push(toks, tk_str(), soff, slen)
-            tok_set_meta(toks, tid, 0, tok_ln)
+            tok_set_meta(toks, tid, 0, tok_sp)
         } else if b == 64 {
-            // 4. Attribute `@shield`, `@whitebox`, `@secret`
-            tok_ln := line
+            // 4. Attribute `@shield`, `@whitebox`, `@secret`, `@cImport`, etc.
+            tok_sp := span_pack(line, i - line_start + 1, file_id)
             i += 1
             soff := buf_len(pool)
             while i < end_pos and is_alnum_or_under(buf_get(src, i)) {
@@ -289,10 +308,10 @@ fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
             }
             slen := buf_len(pool) - soff
             tid := tok_push(toks, tk_attr(), soff, slen)
-            tok_set_meta(toks, tid, 0, tok_ln)
+            tok_set_meta(toks, tid, 0, tok_sp)
         } else if is_digit(b) {
             // 5. Numbers: 0x... hex, fixed-point `29.99d`, IEEE-754 `f64`, or `i64`
-            tok_ln := line
+            tok_sp := span_pack(line, i - line_start + 1, file_id)
             if b == 48 and i + 1 < end_pos and (buf_get(src, i + 1) == 120 or buf_get(src, i + 1) == 88) {
                 i += 2
                 mut hval := 0
@@ -314,7 +333,7 @@ fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
                     }
                 }
                 tid := tok_push(toks, tk_int(), 0, 0)
-                tok_set_meta(toks, tid, hval, tok_ln)
+                tok_set_meta(toks, tid, hval, tok_sp)
             } else {
                 mut ival := 0
                 while i < end_pos {
@@ -361,7 +380,7 @@ fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
                     i += 1
                     scaled := ival *% 10000 +% dec_frac
                     tid := tok_push(toks, tk_dec(), 0, 0)
-                    tok_set_meta(toks, tid, scaled, tok_ln)
+                    tok_set_meta(toks, tid, scaled, tok_sp)
                 } else {
                     // Optional numeric type suffix (`i64`, `u32`, `f32`, `f64`)
                     if i < end_pos {
@@ -380,16 +399,16 @@ fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
                         f_total := (ival as f64) + f_frac
                         fbits := f64_to_bits(f_total)
                         tid := tok_push(toks, tk_float(), 0, 0)
-                        tok_set_meta(toks, tid, fbits, tok_ln)
+                        tok_set_meta(toks, tid, fbits, tok_sp)
                     } else {
                         tid := tok_push(toks, tk_int(), 0, 0)
-                        tok_set_meta(toks, tid, ival, tok_ln)
+                        tok_set_meta(toks, tid, ival, tok_sp)
                     }
                 }
             }
         } else if is_alpha_or_under(b) {
             // 6. Identifiers & Keywords
-            tok_ln := line
+            tok_sp := span_pack(line, i - line_start + 1, file_id)
             soff := buf_len(pool)
             while i < end_pos and is_alnum_or_under(buf_get(src, i)) {
                 buf_push(pool, buf_get(src, i))
@@ -398,10 +417,10 @@ fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
             slen := buf_len(pool) - soff
             kw := classify_keyword(pool, soff, slen)
             tid := tok_push(toks, kw, soff, slen)
-            tok_set_meta(toks, tid, 0, tok_ln)
+            tok_set_meta(toks, tid, 0, tok_sp)
         } else {
             // 7. Operators & Punctuation
-            tok_ln := line
+            tok_sp := span_pack(line, i - line_start + 1, file_id)
             mut b2 := 0
             if i + 1 < end_pos {
                 b2 = buf_get(src, i + 1)
@@ -452,28 +471,32 @@ fn lex_subrange(src: ByteBuf, toks: IntBuf, pool: ByteBuf, packed: i64) -> i64 {
             else if b == 62 { kind = tk_gt() }
 
             if kind < 0 {
-                return tok_ln
+                return tok_sp
             }
             tid := tok_push(toks, kind, 0, 0)
-            tok_set_meta(toks, tid, 0, tok_ln)
+            tok_set_meta(toks, tid, 0, tok_sp)
             i += step
         }
     }
     return 0
 }
 
-fn tokenize_source(src: ByteBuf, toks: IntBuf, pool: ByteBuf) -> i64 {
+fn tokenize_source_file(src: ByteBuf, toks: IntBuf, pool: ByteBuf, file_id: i64) -> i64 {
     n := buf_len(src)
     mut start := 0
     if n >= 3 and buf_get(src, 0) == 0xEF and buf_get(src, 1) == 0xBB and buf_get(src, 2) == 0xBF {
         start = 3
     }
     packed := start | (n << 24) | (1 << 48)
-    err_ln := lex_subrange(src, toks, pool, packed)
-    if err_ln != 0 {
-        return err_ln
+    err_sp := lex_subrange(src, toks, pool, packed, file_id, start)
+    if err_sp != 0 {
+        return err_sp
     }
     tid := tok_push(toks, tk_eof(), 0, 0)
-    tok_set_meta(toks, tid, 0, 1)
+    tok_set_meta(toks, tid, 0, span_pack(1, 1, file_id))
     return 0
+}
+
+fn tokenize_source(src: ByteBuf, toks: IntBuf, pool: ByteBuf) -> i64 {
+    return tokenize_source_file(src, toks, pool, 0)
 }

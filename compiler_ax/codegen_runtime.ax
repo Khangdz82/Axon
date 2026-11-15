@@ -1,5 +1,10 @@
-// Axon v6.0 Self-Hosted Compiler - Compact x86_64 Primitives, GF(2^8) Whitebox & On-Demand Win64 Runtime
-// (`compiler_ax/codegen_runtime.ax`) - 100% Pure Axon, Zero CRT, Direct `KERNEL32.dll` Win64 ABI.
+// Axon v7.0 Self-Hosted Compiler - Multi-OS x86_64 Primitives, CPUID Dispatch, GF(2^8) Whitebox & Runtime
+// (`compiler_ax/codegen_runtime.ax`) - 100% Pure Axon, Zero CRT, Multi-OS Native ABI:
+//   `os_mode == 0`: Win64 PE32+ `.exe` (`KERNEL32.dll` + IOCP + OS Threads)
+//   `os_mode == 1`: Win64 PE32+ `--shared` `.dll`/`.pyd` (`DllMain` + C-ABI `.edata`)
+//   `os_mode == 2`: Linux x86_64 `ELF64` (Direct `SYSCALL`: `openat`/`read`/`write`/`mmap`/`clock_gettime`)
+//   `os_mode == 3`: macOS x86_64 `Mach-O 64` (Direct Darwin `0x2000000+N` `SYSCALL`)
+//   `os_mode == 4`: Bare-Metal / Unikernel x86_64 (`Multiboot2` + `COM1 0x3F8` UART + Bump Heap)
 
 use compiler_ax::tokens_ast
 use compiler_ax::linker_pe
@@ -17,25 +22,42 @@ struct CodegenCtx {
     state: IntBuf
 }
 
-// Runtime Helper IDs (code offsets in `state[32 + id]`, usage flags in `state[3900 + id - 2000]`)
-fn h_print_bytes() -> i64   { return 2001 }
-fn h_print_i64() -> i64     { return 2002 }
-fn h_print_dec() -> i64     { return 2003 }
-fn h_clock_ns() -> i64      { return 2004 }
-fn h_sec_trap() -> i64      { return 2005 }
-fn h_shield_trap() -> i64   { return 2006 }
-fn h_str_eq() -> i64        { return 2007 }
-fn h_args_get() -> i64      { return 2008 }
-fn h_args_count() -> i64    { return 2009 }
-fn h_fs_read() -> i64       { return 2010 }
-fn h_fs_write() -> i64      { return 2011 }
-fn h_shield_verify() -> i64 { return 2012 }
+// Runtime Helper IDs (`3001..3020`, offsets in `state[32 + hid]`, usage flags in `state[7900 + hid - 3000]`)
+fn h_print_bytes() -> i64    { return 3001 }
+fn h_print_i64() -> i64      { return 3002 }
+fn h_print_dec() -> i64      { return 3003 }
+fn h_clock_ns() -> i64       { return 3004 }
+fn h_sec_trap() -> i64       { return 3005 }
+fn h_shield_trap() -> i64    { return 3006 }
+fn h_str_eq() -> i64         { return 3007 }
+fn h_args_get() -> i64       { return 3008 }
+fn h_args_count() -> i64     { return 3009 }
+fn h_fs_read() -> i64        { return 3010 }
+fn h_fs_write() -> i64       { return 3011 }
+fn h_shield_verify() -> i64  { return 3012 }
+fn h_detect_cpuid() -> i64   { return 3013 }
+fn h_nan_trap() -> i64       { return 3014 }
+fn h_par_soa_worker() -> i64 { return 3015 }
+fn h_alloc_mem() -> i64       { return 3016 }
+fn h_free_mem() -> i64        { return 3017 }
+fn h_stdin_read_line() -> i64 { return 3018 }
+fn h_os_exec() -> i64         { return 3019 }
 
 // Fixup Kinds
 fn fx_iat() -> i64    { return 1 }
 fn fx_rdata() -> i64  { return 2 }
 fn fx_shield() -> i64 { return 3 }
 fn fx_fn() -> i64     { return 4 }
+fn fx_data() -> i64   { return 5 }
+
+// `.data` RW Section Offsets (W^X Clean Mutable Globals)
+fn data_off_simd_tier() -> i64   { return 0x00 }
+fn data_off_cpu_threads() -> i64 { return 0x08 }
+fn data_off_unix_rsp() -> i64    { return 0x10 }
+fn data_off_arena_ptr() -> i64   { return 0x18 }
+fn data_off_arena_off() -> i64   { return 0x20 }
+fn data_off_bare_heap() -> i64   { return 0x28 }
+fn data_off_par_ctx() -> i64     { return 0x40 }
 
 fn mc_b1(code: ByteBuf, b0: i64) {
     buf_push(code, b0 & 255)
@@ -150,15 +172,23 @@ fn mc_mov_rax_imm(code: ByteBuf, val: i64) {
     }
 }
 
+fn cg_os_mode(cg: CodegenCtx) -> i64 {
+    return ibuf_get(cg.state, 16)
+}
+
+fn cg_is_win64(cg: CodegenCtx) -> bool {
+    return ibuf_get(cg.state, 16) <= 1
+}
+
 fn cg_mark_helper_used(cg: CodegenCtx, hid: i64) {
-    if hid >= 2001 and hid <= 2020 {
-        ibuf_set(cg.state, 3900 + (hid - 2000), 1)
+    if hid >= 3001 and hid <= 3030 {
+        ibuf_set(cg.state, 7900 + (hid - 3000), 1)
     }
 }
 
 fn cg_is_helper_used(cg: CodegenCtx, hid: i64) -> bool {
-    if hid >= 2001 and hid <= 2020 {
-        return ibuf_get(cg.state, 3900 + (hid - 2000)) == 1
+    if hid >= 3001 and hid <= 3030 {
+        return ibuf_get(cg.state, 7900 + (hid - 3000)) == 1
     }
     return false
 }
@@ -173,6 +203,15 @@ fn cg_add_fixup(fixups: IntBuf, disp_pos: i64, next_rip: i64, kind_and_tgt: i64)
 fn cg_call_fn(cg: CodegenCtx, fn_id: i64) {
     cg_mark_helper_used(cg, fn_id)
     buf_push(cg.code, 0xE8)
+    dp := buf_len(cg.code)
+    buf_push_u32(cg.code, 0)
+    nr := buf_len(cg.code)
+    cg_add_fixup(cg.fixups, dp, nr, fx_fn() | (fn_id << 8))
+}
+
+fn cg_lea_rax_fn(cg: CodegenCtx, fn_id: i64) {
+    cg_mark_helper_used(cg, fn_id)
+    mc_b3(cg.code, 0x48, 0x8D, 0x05)
     dp := buf_len(cg.code)
     buf_push_u32(cg.code, 0)
     nr := buf_len(cg.code)
@@ -204,10 +243,62 @@ fn cg_lea_rax_rdata(cg: CodegenCtx, rdata_off: i64) {
     cg_add_fixup(cg.fixups, dp, nr, fx_rdata() | (rdata_off << 8))
 }
 
+fn cg_lea_rax_data(cg: CodegenCtx, data_off: i64) {
+    mc_b3(cg.code, 0x48, 0x8D, 0x05)
+    dp := buf_len(cg.code)
+    buf_push_u32(cg.code, 0)
+    nr := buf_len(cg.code)
+    cg_add_fixup(cg.fixups, dp, nr, fx_data() | (data_off << 8))
+}
+
+fn cg_mov_rax_data(cg: CodegenCtx, data_off: i64) {
+    mc_b3(cg.code, 0x48, 0x8B, 0x05)
+    dp := buf_len(cg.code)
+    buf_push_u32(cg.code, 0)
+    nr := buf_len(cg.code)
+    cg_add_fixup(cg.fixups, dp, nr, fx_data() | (data_off << 8))
+}
+
+fn cg_store_rax_data(cg: CodegenCtx, data_off: i64) {
+    mc_b3(cg.code, 0x48, 0x89, 0x05)
+    dp := buf_len(cg.code)
+    buf_push_u32(cg.code, 0)
+    nr := buf_len(cg.code)
+    cg_add_fixup(cg.fixups, dp, nr, fx_data() | (data_off << 8))
+}
+
 fn cg_reg_helper(cg: CodegenCtx, hid: i64, start_off: i64, end_off: i64) {
     ibuf_set(cg.state, 32 + hid, start_off)
     ibuf_push(cg.fn_ranges, start_off)
     ibuf_push(cg.fn_ranges, end_off)
+}
+
+fn cg_emit_exit_imm(cg: CodegenCtx, exit_code: i64) {
+    c := cg.code
+    osm := cg_os_mode(cg)
+    if osm <= 1 {
+        mc_b1(c, 0xB9)
+        mc_u32(c, exit_code)
+        cg_call_iat(cg, iat_exit_process())
+        mc_b1(c, 0xCC)
+    } else if osm == 2 {
+        mc_b1(c, 0xBF) // MOV EDI, exit_code
+        mc_u32(c, exit_code)
+        mc_b1(c, 0xB8) // MOV EAX, 231 (sys_exit_group)
+        mc_u32(c, 231)
+        mc_b2(c, 0x0F, 0x05) // SYSCALL
+        mc_b1(c, 0xCC)
+    } else if osm == 3 {
+        mc_b1(c, 0xBF)
+        mc_u32(c, exit_code)
+        mc_b1(c, 0xB8) // MOV EAX, 0x2000001 (Darwin exit)
+        mc_u32(c, 0x2000001)
+        mc_b2(c, 0x0F, 0x05)
+        mc_b1(c, 0xCC)
+    } else {
+        mc_b2(c, 0xFA, 0xF4) // CLI; HLT
+        mc_b2(c, 0xEB, 0xFD) // JMP -3
+    }
 }
 
 fn cg_intern_pool_slice(cg: CodegenCtx, soff: i64, slen: i64) -> i64 {
@@ -345,15 +436,47 @@ fn find_fn_idx_rt(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
     return -1
 }
 
-// Emits `_start` at `.text + 0`. Runtime helpers are emitted on-demand after user functions.
+// Emits `_start` (or `DllMain` when `os_mode == 1`) at `.text + 0`.
 fn emit_entry_only(cg: CodegenCtx) {
     c := cg.code
+    osm := cg_os_mode(cg)
     start_beg := buf_len(c)
-    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA) // ENDBR64
+
+    // DLL entry (`--shared` `.dll` / `.pyd`): `BOOL WINAPI DllMain(HINSTANCE, DWORD fdwReason, LPVOID)`
+    if osm == 1 {
+        mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+        mc_b4(c, 0x48, 0x83, 0xEC, 0x30)
+        mc_b3(c, 0x83, 0xFA, 0x01) // CMP EDX, DLL_PROCESS_ATTACH (1)
+        jne_ret := mc_jcc8(c, 0x75)
+        cg_call_fn(cg, h_detect_cpuid())
+        if ibuf_get(cg.state, 0) == 1 {
+            cg_call_fn(cg, h_shield_verify())
+        }
+        mc_patch_jcc8(c, jne_ret, buf_len(c))
+        mc_b1(c, 0xB8)
+        mc_u32(c, 1) // return TRUE
+        mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+        mc_b1(c, 0xC3)
+        ibuf_push(cg.fn_ranges, start_beg)
+        ibuf_push(cg.fn_ranges, buf_len(c))
+        return
+    }
+
+    // Linux / macOS `_start`: save initial `RSP` (`[RSP] = argc, [RSP+8] = argv[0]`) BEFORE pushing RBP!
+    if osm == 2 or osm == 3 {
+        mc_b3(c, 0x48, 0x89, 0xE0) // MOV RAX, RSP
+        cg_store_rax_data(cg, data_off_unix_rsp())
+        mc_b4(c, 0x48, 0x83, 0xE4, 0xF0) // AND RSP, -16
+    }
+
     mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
     mc_b4(c, 0x48, 0x83, 0xEC, 0x40)
 
-    if ibuf_get(cg.state, 0) == 1 {
+    if osm != 4 {
+        cg_call_fn(cg, h_detect_cpuid())
+    }
+    if ibuf_get(cg.state, 0) == 1 and osm <= 1 {
         cg_call_fn(cg, h_shield_verify())
     }
 
@@ -369,11 +492,503 @@ fn emit_entry_only(cg: CodegenCtx) {
     } else {
         mc_b2(c, 0x31, 0xC0)
     }
-    mc_b2(c, 0x89, 0xC1)
-    cg_call_iat(cg, iat_exit_process())
-    mc_b1(c, 0xCC)
+
+    if osm <= 1 {
+        mc_b2(c, 0x89, 0xC1)
+        cg_call_iat(cg, iat_exit_process())
+        mc_b1(c, 0xCC)
+    } else if osm == 2 {
+        mc_b2(c, 0x89, 0xC7) // MOV EDI, EAX
+        mc_b1(c, 0xB8)
+        mc_u32(c, 231) // sys_exit_group
+        mc_b2(c, 0x0F, 0x05)
+        mc_b1(c, 0xCC)
+    } else if osm == 3 {
+        mc_b2(c, 0x89, 0xC7)
+        mc_b1(c, 0xB8)
+        mc_u32(c, 0x2000001)
+        mc_b2(c, 0x0F, 0x05)
+        mc_b1(c, 0xCC)
+    } else {
+        mc_b2(c, 0xFA, 0xF4) // CLI; HLT
+        mc_b2(c, 0xEB, 0xFD)
+    }
     ibuf_push(cg.fn_ranges, start_beg)
     ibuf_push(cg.fn_ranges, buf_len(c))
+}
+
+// Emits `h_detect_cpuid` (`3013`), `h_nan_trap` (`3014`), `h_par_soa_worker` (`3015`), `h_alloc_mem` (`3016`), `h_free_mem` (`3017`).
+fn emit_v7_core_helpers_used(cg: CodegenCtx) {
+    c := cg.code
+    osm := cg_os_mode(cg)
+
+    // 1. `h_detect_cpuid`: Runtime CPUID + OS XGETBV check -> `g_simd_tier` (`0=Scalar`, `1=AVX2+FMA3`, `2=AVX-512F`)
+    //    and Win64 `GetSystemInfo` -> `g_cpu_threads` (`1..8`).
+    if cg_is_helper_used(cg, h_detect_cpuid()) {
+        mc_align16(c)
+        s_cp := buf_len(c)
+        mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+        mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+        mc_b1(c, 0x53) // PUSH RBX (non-volatile, clobbered by CPUID)
+        mc_b4(c, 0x48, 0x83, 0xEC, 0x58) // 16B aligned frame (`PUSH RBP` + `PUSH RBX` + `0x58` = `0x68` -> +8 ret = `0x70`)
+
+        simd_ov := ibuf_get(cg.state, 17)
+        if simd_ov >= 0 {
+            mc_mov_rax_imm(c, simd_ov)
+            cg_store_rax_data(cg, data_off_simd_tier())
+        } else {
+            mc_b3(c, 0x45, 0x31, 0xC0) // XOR R8D, R8D (`tier = 0` Scalar SSE2)
+            // CPUID Leaf 1: check FMA (bit 12), OSXSAVE (bit 27), AVX (bit 28) in ECX (`0x18001000`)
+            mc_b1(c, 0xB8); mc_u32(c, 1)
+            mc_b2(c, 0x31, 0xC9)
+            mc_b2(c, 0x0F, 0xA2) // CPUID
+            mc_b2(c, 0x81, 0xE1); mc_u32(c, 0x18001000)
+            mc_b2(c, 0x81, 0xF9); mc_u32(c, 0x18001000)
+            jne_c1 := mc_jcc8(c, 0x75)
+
+            // XGETBV(0): verify OS enabled XMM + YMM state (`(EAX & 6) == 6`)
+            mc_b2(c, 0x31, 0xC9)
+            mc_b3(c, 0x0F, 0x01, 0xD0) // XGETBV
+            mc_b3(c, 0x41, 0x89, 0xC1) // MOV R9D, EAX (save XCR0)
+            mc_b3(c, 0x83, 0xE0, 0x06)
+            mc_b3(c, 0x83, 0xF8, 0x06)
+            jne_c2 := mc_jcc8(c, 0x75)
+
+            // CPUID Leaf 7, Subleaf 0: check AVX2 (EBX bit 5 = `0x20`) and AVX-512F (EBX bit 16 = `0x10000`)
+            mc_b1(c, 0xB8); mc_u32(c, 7)
+            mc_b2(c, 0x31, 0xC9)
+            mc_b2(c, 0x0F, 0xA2) // CPUID
+            mc_b3(c, 0xF6, 0xC3, 0x20) // TEST BL, 0x20 (AVX2)
+            jz_c3 := mc_jcc8(c, 0x74)
+            mc_b2(c, 0x41, 0xB8); mc_u32(c, 1) // R8D = 1 (`AVX2 + FMA3`)
+
+            mc_b2(c, 0xF7, 0xC3); mc_u32(c, 0x00010000) // TEST EBX, 0x10000 (AVX-512F)
+            jz_c4 := mc_jcc8(c, 0x74)
+            mc_b3(c, 0x41, 0x81, 0xE1); mc_u32(c, 0xE6) // AND R9D, 0xE6 (XMM+YMM+ZMM OS state)
+            mc_b3(c, 0x41, 0x81, 0xF9); mc_u32(c, 0xE6)
+            jne_c5 := mc_jcc8(c, 0x75)
+            mc_b2(c, 0x41, 0xB8); mc_u32(c, 2) // R8D = 2 (`AVX-512F EVEX`)
+
+            mc_patch_jcc8(c, jne_c1, buf_len(c))
+            mc_patch_jcc8(c, jne_c2, buf_len(c))
+            mc_patch_jcc8(c, jz_c3, buf_len(c))
+            mc_patch_jcc8(c, jz_c4, buf_len(c))
+            mc_patch_jcc8(c, jne_c5, buf_len(c))
+            mc_b3(c, 0x4C, 0x89, 0xC0) // MOV RAX, R8
+            cg_store_rax_data(cg, data_off_simd_tier())
+        }
+
+        // Detect OS hardware thread count (`1..8`)
+        if osm <= 1 {
+            mc_b4(c, 0x48, 0x8D, 0x4C, 0x24)
+            mc_b1(c, 0x20) // LEA RCX, [RSP + 0x20]
+            cg_call_iat(cg, iat_get_system_info())
+            mc_b4(c, 0x8B, 0x44, 0x24, 0x40) // EAX = dwNumberOfProcessors (`[RSP + 0x20 + 0x20]`)
+            mc_b3(c, 0x83, 0xF8, 0x01)
+            jge_t1 := mc_jcc8(c, 0x7D)
+            mc_b1(c, 0xB8); mc_u32(c, 1)
+            mc_patch_jcc8(c, jge_t1, buf_len(c))
+            mc_b3(c, 0x83, 0xF8, 0x08)
+            jle_t8 := mc_jcc8(c, 0x7E)
+            mc_b1(c, 0xB8); mc_u32(c, 8)
+            mc_patch_jcc8(c, jle_t8, buf_len(c))
+            cg_store_rax_data(cg, data_off_cpu_threads())
+        } else {
+            mc_mov_rax_imm(c, 1)
+            cg_store_rax_data(cg, data_off_cpu_threads())
+        }
+
+        mc_b4(c, 0x48, 0x83, 0xC4, 0x58)
+        mc_b1(c, 0x5B) // POP RBX
+        mc_b1(c, 0x5D) // POP RBP
+        mc_b1(c, 0xC3)
+        cg_reg_helper(cg, h_detect_cpuid(), s_cp, buf_len(c))
+    }
+
+    // 2. `h_nan_trap(RCX = line)`: `@nan_guard` hardware IEEE-754 NaN/Inf trap -> exit 254
+    if cg_is_helper_used(cg, h_nan_trap()) {
+        nan_hdr := "[AXON NAN GUARD] IEEE-754 NaN/Inf trapped at line "
+        nan_nl := "\n"
+        nh_off := cg_intern_lit(cg, nan_hdr)
+        nn_off := cg_intern_lit(cg, nan_nl)
+        mc_align16(c)
+        s_nt := buf_len(c)
+        mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+        mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+        mc_b4(c, 0x48, 0x83, 0xE4, 0xF0)
+        mc_b4(c, 0x48, 0x83, 0xEC, 0x30)
+        mc_b4(c, 0x48, 0x89, 0x4D, 0xF8) // save line
+        cg_lea_rax_rdata(cg, nh_off)
+        mc_b3(c, 0x48, 0x89, 0xC1)
+        mc_b1(c, 0xBA)
+        mc_u32(c, str_len(nan_hdr))
+        cg_call_fn(cg, h_print_bytes())
+        mc_b4(c, 0x48, 0x8B, 0x4D, 0xF8)
+        cg_call_fn(cg, h_print_i64())
+        cg_lea_rax_rdata(cg, nn_off)
+        mc_b3(c, 0x48, 0x89, 0xC1)
+        mc_b1(c, 0xBA)
+        mc_u32(c, 1)
+        cg_call_fn(cg, h_print_bytes())
+        cg_emit_exit_imm(cg, 254)
+        cg_reg_helper(cg, h_nan_trap(), s_nt, buf_len(c))
+    }
+
+    // 3. `h_par_soa_worker(RCX = tid)`: Win64 `LPTHREAD_START_ROUTINE` for Multi-Core `par_for`!
+    if cg_is_helper_used(cg, h_par_soa_worker()) {
+        mc_align16(c)
+        s_pw := buf_len(c)
+        mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+        mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+        mc_b2(c, 0x56, 0x57) // PUSH RSI; PUSH RDI
+        // R9 = tid (RCX), R10 = .data base
+        mc_b3(c, 0x49, 0x89, 0xC9) // MOV R9, RCX
+        cg_lea_rax_data(cg, 0)
+        mc_b3(c, 0x49, 0x89, 0xC2) // MOV R10, RAX
+
+        // RSI = [R10 + 0x40] (src_col_ptr), RDI = [R10 + 0x48] (dst_col_ptr), R11 = [R10 + 0x58] (op_kind)
+        mc_b4(c, 0x49, 0x8B, 0x72, 0x40)
+        mc_b4(c, 0x49, 0x8B, 0x7A, 0x48)
+        mc_b4(c, 0x4D, 0x8B, 0x5A, 0x58)
+        // XMM0 = scale_f32 (`[R10 + 0x50]`)
+        mc_b4(c, 0x41, 0x8B, 0x42, 0x50)
+        mc_b4(c, 0x66, 0x0F, 0x6E, 0xC0) // MOVD XMM0, EAX
+
+        // RAX = start_elem (`[R10 + 0x60 + R9*16]`), RCX = end_elem (`[R10 + 0x68 + R9*16]`)
+        mc_b4(c, 0x49, 0xC1, 0xE1, 0x04) // SHL R9, 4
+        mc_b3(c, 0x4D, 0x01, 0xCA)       // ADD R10, R9
+        mc_b4(c, 0x49, 0x8B, 0x42, 0x60) // RAX = start_elem
+        mc_b4(c, 0x49, 0x8B, 0x4A, 0x68) // RCX = end_elem
+        mc_b4(c, 0x48, 0xC1, 0xE0, 0x02) // RAX = start_byte
+        mc_b4(c, 0x48, 0xC1, 0xE1, 0x02) // RCX = end_byte
+
+        // Check `g_simd_tier` >= 1 for AVX2 32B/iter loop before scalar tail
+        mc_b3(c, 0x48, 0x89, 0xC2) // RDX = save RAX
+        cg_mov_rax_data(cg, data_off_simd_tier())
+        mc_b3(c, 0x48, 0x85, 0xC0)
+        mc_b3(c, 0x48, 0x89, 0xD0) // restore RAX = start_byte
+        jz_scalar := mc_jcc8(c, 0x74)
+
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0x18)
+        mc_b1(c, 0xC0) // VBROADCASTSS YMM0, XMM0
+        avx_top := buf_len(c)
+        mc_b4(c, 0x48, 0x8D, 0x50, 0x20) // LEA RDX, [RAX + 32]
+        mc_b3(c, 0x48, 0x39, 0xCA)       // CMP RDX, RCX
+        ja_stail := mc_jcc8(c, 0x77)
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x14); mc_b1(c, 0x07) // VMOVUPS YMM2, [RDI+RAX]
+        mc_b4(c, 0x49, 0x83, 0xFB, 0x02) // CMP R11, 2 (mul-only?)
+        je_wmul := mc_jcc8(c, 0x74)
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x0C); mc_b1(c, 0x06) // VMOVUPS YMM1, [RSI+RAX]
+        mc_b4(c, 0xC4, 0xE2, 0x75, 0xB8); mc_b1(c, 0xD0) // VFMADD231PS YMM2, YMM1, YMM0
+        jmp_wst := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, je_wmul, buf_len(c))
+        mc_b4(c, 0xC5, 0xEC, 0x59, 0xD0) // VMULPS YMM2, YMM2, YMM0
+        mc_patch_jcc8(c, jmp_wst, buf_len(c))
+        mc_b4(c, 0xC5, 0xFC, 0x11, 0x14); mc_b1(c, 0x07) // VMOVUPS [RDI+RAX], YMM2
+        mc_b4(c, 0x48, 0x83, 0xC0, 0x20)
+        jmp_avxt := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_avxt, avx_top)
+        mc_patch_jcc8(c, ja_stail, buf_len(c))
+        mc_b3(c, 0xC5, 0xF8, 0x77) // VZEROUPPER
+
+        mc_patch_jcc8(c, jz_scalar, buf_len(c))
+        // Scalar SSE2 tail loop (`while RAX < RCX`)
+        sc_top := buf_len(c)
+        mc_b3(c, 0x48, 0x39, 0xC8)
+        jae_wdone := mc_jcc8(c, 0x73)
+        mc_b4(c, 0xF3, 0x0F, 0x10, 0x14); mc_b1(c, 0x07) // MOVSS XMM2, [RDI+RAX]
+        mc_b4(c, 0x49, 0x83, 0xFB, 0x02)
+        je_smul := mc_jcc8(c, 0x74)
+        mc_b4(c, 0xF3, 0x0F, 0x10, 0x0C); mc_b1(c, 0x06) // MOVSS XMM1, [RSI+RAX]
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xC8) // MULSS XMM1, XMM0
+        mc_b4(c, 0xF3, 0x0F, 0x58, 0xD1) // ADDSS XMM2, XMM1
+        jmp_sst := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, je_smul, buf_len(c))
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xD0) // MULSS XMM2, XMM0
+        mc_patch_jcc8(c, jmp_sst, buf_len(c))
+        mc_b4(c, 0xF3, 0x0F, 0x11, 0x14); mc_b1(c, 0x07) // MOVSS [RDI+RAX], XMM2
+        mc_b4(c, 0x48, 0x83, 0xC0, 0x04)
+        jmp_sct := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_sct, sc_top)
+
+        mc_patch_jcc8(c, jae_wdone, buf_len(c))
+        mc_b2(c, 0x31, 0xC0) // return 0
+        mc_b2(c, 0x5F, 0x5E) // POP RDI; POP RSI
+        mc_b1(c, 0x5D)
+        mc_b1(c, 0xC3)
+        cg_reg_helper(cg, h_par_soa_worker(), s_pw, buf_len(c))
+    }
+
+    // 4. `h_alloc_mem(RCX = bytes) -> RAX = ptr` (Win64 VirtualAlloc / Linux+macOS mmap / Bare-Metal bump)
+    if cg_is_helper_used(cg, h_alloc_mem()) {
+        mc_align16(c)
+        s_am := buf_len(c)
+        mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+        if osm <= 1 {
+            mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+            mc_b4(c, 0x48, 0x83, 0xEC, 0x30)
+            mc_b3(c, 0x48, 0x89, 0xCA) // RDX = size
+            mc_b2(c, 0x31, 0xC9)       // RCX = NULL
+            mc_b2(c, 0x41, 0xB8); mc_u32(c, 0x3000)
+            mc_b2(c, 0x41, 0xB9); mc_u32(c, 4)
+            cg_call_iat(cg, iat_virtual_alloc())
+            mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+            mc_b1(c, 0xC3)
+        } else if osm == 2 or osm == 3 {
+            mc_b2(c, 0x56, 0x57) // preserve RSI, RDI
+            mc_b3(c, 0x48, 0x89, 0xCE) // RSI = size
+            mc_b2(c, 0x31, 0xFF)       // RDI = NULL
+            mc_b1(c, 0xBA); mc_u32(c, 3) // PROT_READ | PROT_WRITE
+            mc_b3(c, 0x49, 0xC7, 0xC2)
+            if osm == 2 { mc_u32(c, 0x22) } else { mc_u32(c, 0x1002) } // MAP_PRIVATE | MAP_ANON
+            mc_b3(c, 0x49, 0xC7, 0xC0); mc_u32(c, 0xFFFFFFFF) // R8 = -1
+            mc_b3(c, 0x45, 0x31, 0xC9) // R9 = 0
+            mc_b1(c, 0xB8)
+            if osm == 2 { mc_u32(c, 9) } else { mc_u32(c, 0x20000C5) } // sys_mmap
+            mc_b2(c, 0x0F, 0x05)
+            mc_b2(c, 0x5F, 0x5E)
+            mc_b1(c, 0xC3)
+        } else {
+            // Bare-metal / Unikernel bump allocator starting at physical 4 MB (`0x400000`)
+            mc_b4(c, 0x48, 0x83, 0xC1, 0x3F)
+            mc_b4(c, 0x48, 0x83, 0xE1, 0xC0) // align_up(RCX, 64)
+            cg_mov_rax_data(cg, data_off_bare_heap())
+            mc_b3(c, 0x48, 0x89, 0xC2) // RDX = old_off
+            mc_b3(c, 0x48, 0x01, 0xC8) // RAX = old_off + aligned_size
+            cg_store_rax_data(cg, data_off_bare_heap())
+            mc_b3(c, 0x48, 0x8D, 0x82)
+            mc_u32(c, 0x400000) // LEA RAX, [RDX + 0x400000]
+            mc_b1(c, 0xC3)
+        }
+        cg_reg_helper(cg, h_alloc_mem(), s_am, buf_len(c))
+    }
+
+    // 5. `h_free_mem(RCX = ptr)`
+    if cg_is_helper_used(cg, h_free_mem()) {
+        mc_align16(c)
+        s_fm := buf_len(c)
+        mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+        if osm <= 1 {
+            mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+            mc_b4(c, 0x48, 0x83, 0xEC, 0x30)
+            mc_b2(c, 0x31, 0xD2)
+            mc_b2(c, 0x41, 0xB8); mc_u32(c, 0x8000)
+            cg_call_iat(cg, iat_virtual_free())
+            mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+        }
+        mc_b1(c, 0xC3)
+        cg_reg_helper(cg, h_free_mem(), s_fm, buf_len(c))
+    }
+
+    // 6. `h_stdin_read_line(RCX = ByteBuf_ptr) -> RAX = line_len_or_minus1` (Win64 ReadFile / Unix SYS_read(0))
+    if cg_is_helper_used(cg, h_stdin_read_line()) {
+        mc_align16(c)
+        s_rl := buf_len(c)
+        mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+        mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+        mc_b1(c, 0x53)             // PUSH RBX
+        mc_b2(c, 0x41, 0x54)       // PUSH R12
+        mc_b2(c, 0x41, 0x55)       // PUSH R13
+        mc_b4(c, 0x48, 0x83, 0xEC, 0x48)
+        mc_b3(c, 0x48, 0x89, 0xCB) // RBX = ByteBuf ptr
+        mc_b3(c, 0x48, 0x85, 0xDB)
+        jz_null := mc_jcc32(c, 0x84)
+        mc_b3(c, 0x48, 0xC7, 0x03); mc_u32(c, 0) // [RBX] = 0 (len = 0)
+        mc_b3(c, 0x45, 0x31, 0xED) // R13 = 0 (cur_len)
+
+        if osm <= 1 {
+            mc_b1(c, 0xB9); mc_u32(c, 0xFFFFFFF6) // STD_INPUT_HANDLE (-10)
+            cg_call_iat(cg, iat_get_std_handle())
+            mc_b3(c, 0x49, 0x89, 0xC4) // R12 = hStdin
+
+            rd_loop := buf_len(c)
+            mc_b3(c, 0xC7, 0x45, 0xD8); mc_u32(c, 0) // [RBP-0x28] = 0 (nread)
+            mc_b3(c, 0x4C, 0x89, 0xE1)               // RCX = R12
+            mc_b4(c, 0x48, 0x8D, 0x55, 0xE0)         // RDX = &ch ([RBP-0x20])
+            mc_b3(c, 0x41, 0xB8, 0x01); mc_b3(c, 0x00, 0x00, 0x00) // R8D = 1
+            mc_b4(c, 0x4C, 0x8D, 0x4D, 0xD8)         // R9 = &nread ([RBP-0x28])
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24); mc_b1(c, 0x20); mc_u32(c, 0)
+            cg_call_iat(cg, iat_read_file())
+            mc_b2(c, 0x85, 0xC0)
+            jz_eof1 := mc_jcc8(c, 0x74)
+            mc_b4(c, 0x83, 0x7D, 0xD8, 0x00)
+            je_eof2 := mc_jcc8(c, 0x74)
+
+            mc_b4(c, 0x0F, 0xB6, 0x45, 0xE0) // MOVZX EAX, BYTE [RBP-0x20]
+            mc_b2(c, 0x3C, 10)
+            je_nl := mc_jcc8(c, 0x74)
+            mc_b2(c, 0x3C, 13)
+            je_cr := mc_jcc8(c, 0x74)
+
+            mc_b4(c, 0x4C, 0x3B, 0x6B, 0x08) // CMP R13, [RBX+8]
+            jae_full := mc_jcc8(c, 0x73)
+            mc_b4(c, 0x48, 0x8D, 0x4B, 0x10) // LEA RCX, [RBX+16]
+            mc_b3(c, 0x4C, 0x01, 0xE9)       // ADD RCX, R13
+            mc_b2(c, 0x88, 0x01)             // MOV [RCX], AL
+            mc_b3(c, 0x49, 0xFF, 0xC5)       // INC R13
+
+            mc_patch_jcc8(c, je_cr, rd_loop)
+            mc_patch_jcc8(c, jae_full, rd_loop)
+            jmp_rd := mc_jcc8(c, 0xEB)
+            mc_patch_jcc8(c, jmp_rd, rd_loop)
+
+            mc_patch_jcc8(c, jz_eof1, buf_len(c))
+            mc_patch_jcc8(c, je_eof2, buf_len(c))
+            mc_b3(c, 0x4D, 0x85, 0xED)
+            jnz_part := mc_jcc8(c, 0x75)
+            mc_b3(c, 0x48, 0xC7, 0xC0); mc_u32(c, 0xFFFFFFFF) // RAX = -1
+            jmp_done1 := mc_jcc8(c, 0xEB)
+
+            mc_patch_jcc8(c, je_nl, buf_len(c))
+            mc_patch_jcc8(c, jnz_part, buf_len(c))
+            mc_b3(c, 0x4C, 0x89, 0x2B) // [RBX] = R13
+            mc_b3(c, 0x4C, 0x89, 0xE8) // RAX = R13
+            mc_patch_jcc8(c, jmp_done1, buf_len(c))
+        } else if osm == 2 or osm == 3 {
+            mc_b4(c, 0x48, 0x89, 0x75, 0xD0) // save RSI
+            mc_b4(c, 0x48, 0x89, 0x7D, 0xC8) // save RDI
+            urd_loop := buf_len(c)
+            mc_b2(c, 0x31, 0xFF)             // EDI = 0 (stdin)
+            mc_b4(c, 0x48, 0x8D, 0x75, 0xE0) // RSI = &ch
+            mc_b1(c, 0xBA); mc_u32(c, 1)     // EDX = 1
+            mc_b1(c, 0xB8)
+            if osm == 2 { mc_u32(c, 0) } else { mc_u32(c, 0x2000003) } // sys_read
+            mc_b2(c, 0x0F, 0x05)
+            mc_b3(c, 0x48, 0x85, 0xC0)
+            jle_ueof := mc_jcc8(c, 0x7E)
+
+            mc_b4(c, 0x0F, 0xB6, 0x45, 0xE0)
+            mc_b2(c, 0x3C, 10)
+            je_unl := mc_jcc8(c, 0x74)
+            mc_b2(c, 0x3C, 13)
+            je_ucr := mc_jcc8(c, 0x74)
+
+            mc_b4(c, 0x4C, 0x3B, 0x6B, 0x08)
+            jae_ufull := mc_jcc8(c, 0x73)
+            mc_b4(c, 0x48, 0x8D, 0x4B, 0x10)
+            mc_b3(c, 0x4C, 0x01, 0xE9)
+            mc_b2(c, 0x88, 0x01)
+            mc_b3(c, 0x49, 0xFF, 0xC5)
+
+            mc_patch_jcc8(c, je_ucr, urd_loop)
+            mc_patch_jcc8(c, jae_ufull, urd_loop)
+            jmp_urd := mc_jcc8(c, 0xEB)
+            mc_patch_jcc8(c, jmp_urd, urd_loop)
+
+            mc_patch_jcc8(c, jle_ueof, buf_len(c))
+            mc_b3(c, 0x4D, 0x85, 0xED)
+            jnz_upart := mc_jcc8(c, 0x75)
+            mc_b3(c, 0x48, 0xC7, 0xC0); mc_u32(c, 0xFFFFFFFF)
+            jmp_udone := mc_jcc8(c, 0xEB)
+
+            mc_patch_jcc8(c, je_unl, buf_len(c))
+            mc_patch_jcc8(c, jnz_upart, buf_len(c))
+            mc_b3(c, 0x4C, 0x89, 0x2B)
+            mc_b3(c, 0x4C, 0x89, 0xE8)
+            mc_patch_jcc8(c, jmp_udone, buf_len(c))
+            mc_b4(c, 0x48, 0x8B, 0x75, 0xD0)
+            mc_b4(c, 0x48, 0x8B, 0x7D, 0xC8)
+        } else {
+            mc_b3(c, 0x48, 0xC7, 0xC0); mc_u32(c, 0xFFFFFFFF)
+        }
+
+        jmp_rl_end := mc_jcc8(c, 0xEB)
+        mc_patch_rel32(c, jz_null, buf_len(c))
+        mc_b3(c, 0x48, 0xC7, 0xC0); mc_u32(c, 0xFFFFFFFF)
+        mc_patch_jcc8(c, jmp_rl_end, buf_len(c))
+
+        mc_b4(c, 0x48, 0x83, 0xC4, 0x48)
+        mc_b2(c, 0x41, 0x5D)
+        mc_b2(c, 0x41, 0x5C)
+        mc_b1(c, 0x5B)
+        mc_b1(c, 0x5D)
+        mc_b1(c, 0xC3)
+        cg_reg_helper(cg, h_stdin_read_line(), s_rl, buf_len(c))
+    }
+
+    // 7. `h_os_exec(RCX = cmd_ptr, RDX = cmd_len) -> RAX = exit_code` (Win64 Zero-CRT CreateProcessA)
+    if cg_is_helper_used(cg, h_os_exec()) {
+        mc_align16(c)
+        s_ox := buf_len(c)
+        mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+        if osm <= 1 {
+            mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+            mc_b3(c, 0x53, 0x56, 0x57) // PUSH RBX; PUSH RSI; PUSH RDI
+            mc_b3(c, 0x48, 0x81, 0xEC); mc_u32(c, 0x528)
+            mc_b3(c, 0x48, 0x89, 0xCE) // RSI = cmd_ptr
+            mc_b3(c, 0x48, 0x89, 0xD3) // RBX = cmd_len
+            mc_b3(c, 0x48, 0x81, 0xFB); mc_u32(c, 1000)
+            jle_cl := mc_jcc8(c, 0x7E)
+            mc_b3(c, 0x48, 0xC7, 0xC3); mc_u32(c, 1000)
+            mc_patch_jcc8(c, jle_cl, buf_len(c))
+
+            // Zero `PROCESS_INFORMATION` (`[RSP+0x50]`) + `STARTUPINFOA` (`[RSP+0x80]`) = 22 qwords
+            mc_b4(c, 0x48, 0x8D, 0x7C, 0x24); mc_b1(c, 0x50)
+            mc_b1(c, 0xB9); mc_u32(c, 22)
+            mc_b2(c, 0x31, 0xC0)
+            mc_b3(c, 0xF3, 0x48, 0xAB)
+
+            // Copy `cmd_ptr[0..RBX]` into mutable `[RSP + 0x100]` and NUL-terminate
+            mc_b4(c, 0x48, 0x8D, 0xBC, 0x24); mc_u32(c, 0x100)
+            mc_b3(c, 0x48, 0x89, 0xD9)
+            mc_b2(c, 0xF3, 0xA4)
+            mc_b3(c, 0xC6, 0x07, 0x00)
+
+            // `STARTUPINFOA.cb = 104`
+            mc_b3(c, 0xC7, 0x84, 0x24); mc_u32(c, 0x80); mc_u32(c, 104)
+
+            // Stack args 5..10 for `CreateProcessA`
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24); mc_b1(c, 0x20); mc_u32(c, 1) // bInheritHandles = TRUE
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24); mc_b1(c, 0x28); mc_u32(c, 0)
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24); mc_b1(c, 0x30); mc_u32(c, 0)
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24); mc_b1(c, 0x38); mc_u32(c, 0)
+            mc_b4(c, 0x48, 0x8D, 0x84, 0x24); mc_u32(c, 0x80)
+            mc_b4(c, 0x48, 0x89, 0x44, 0x24); mc_b1(c, 0x40) // lpStartupInfo
+            mc_b4(c, 0x48, 0x8D, 0x44, 0x24); mc_b1(c, 0x50)
+            mc_b4(c, 0x48, 0x89, 0x44, 0x24); mc_b1(c, 0x48) // lpProcessInformation
+
+            mc_b2(c, 0x31, 0xC9) // RCX = NULL
+            mc_b4(c, 0x48, 0x8D, 0x94, 0x24); mc_u32(c, 0x100) // RDX = lpCommandLine
+            mc_b3(c, 0x45, 0x31, 0xC0) // R8 = NULL
+            mc_b3(c, 0x45, 0x31, 0xC9) // R9 = NULL
+            cg_call_iat(cg, iat_create_process_a())
+            mc_b2(c, 0x85, 0xC0)
+            jz_fail := mc_jcc8(c, 0x74)
+
+            // WaitForSingleObject(hProcess, INFINITE)
+            mc_b4(c, 0x48, 0x8B, 0x4C, 0x24); mc_b1(c, 0x50)
+            mc_b1(c, 0xBA); mc_u32(c, 0xFFFFFFFF)
+            cg_call_iat(cg, iat_wait_single())
+
+            // GetExitCodeProcess(hProcess, &exit_code)
+            mc_b4(c, 0xC7, 0x44, 0x24, 0x78); mc_u32(c, 0)
+            mc_b4(c, 0x48, 0x8B, 0x4C, 0x24); mc_b1(c, 0x50)
+            mc_b4(c, 0x48, 0x8D, 0x54, 0x24); mc_b1(c, 0x78)
+            cg_call_iat(cg, iat_get_exit_code())
+
+            // CloseHandle(hProcess) & CloseHandle(hThread)
+            mc_b4(c, 0x48, 0x8B, 0x4C, 0x24); mc_b1(c, 0x50)
+            cg_call_iat(cg, iat_close_handle())
+            mc_b4(c, 0x48, 0x8B, 0x4C, 0x24); mc_b1(c, 0x58)
+            cg_call_iat(cg, iat_close_handle())
+
+            mc_b4(c, 0x8B, 0x44, 0x24, 0x78) // RAX = exit_code
+            jmp_ox_ok := mc_jcc8(c, 0xEB)
+
+            mc_patch_jcc8(c, jz_fail, buf_len(c))
+            mc_b3(c, 0x48, 0xC7, 0xC0); mc_u32(c, 0xFFFFFFFF)
+            mc_patch_jcc8(c, jmp_ox_ok, buf_len(c))
+
+            mc_b3(c, 0x48, 0x81, 0xC4); mc_u32(c, 0x528)
+            mc_b3(c, 0x5F, 0x5E, 0x5B) // POP RDI; POP RSI; POP RBX
+            mc_b1(c, 0x5D)
+            mc_b1(c, 0xC3)
+        } else {
+            mc_b2(c, 0x31, 0xC0)
+            mc_b1(c, 0xC3)
+        }
+        cg_reg_helper(cg, h_os_exec(), s_ox, buf_len(c))
+    }
 }
 
 // Propagates transitive helper dependencies and emits ONLY helpers actually called by the binary.
@@ -383,6 +998,10 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
     }
     if cg_is_helper_used(cg, h_args_count()) {
         cg_mark_helper_used(cg, h_args_get())
+    }
+    if cg_is_helper_used(cg, h_nan_trap()) {
+        cg_mark_helper_used(cg, h_print_i64())
+        cg_mark_helper_used(cg, h_print_bytes())
     }
     if cg_is_helper_used(cg, h_print_dec()) {
         cg_mark_helper_used(cg, h_print_i64())
@@ -397,8 +1016,14 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
     if cg_is_helper_used(cg, h_shield_trap()) {
         cg_mark_helper_used(cg, h_print_bytes())
     }
+    if cg_is_helper_used(cg, h_fs_read()) and not cg_is_win64(cg) {
+        cg_mark_helper_used(cg, h_alloc_mem())
+    }
+
+    emit_v7_core_helpers_used(cg)
 
     c := cg.code
+    osm := cg_os_mode(cg)
 
     if cg_is_helper_used(cg, h_shield_verify()) {
         poly_seed := ibuf_get(cg.state, 15)
@@ -450,23 +1075,50 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
         mc_align16(c)
         s_pb := buf_len(c)
         mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
-        mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
-        mc_b4(c, 0x48, 0x83, 0xEC, 0x50)
-        mc_b4(c, 0x48, 0x89, 0x4D, 0xF8)
-        mc_b4(c, 0x48, 0x89, 0x55, 0xF0)
-        mc_b1(c, 0xB9)
-        mc_u32(c, 0xFFFFFFF5)
-        cg_call_iat(cg, iat_get_std_handle())
-        mc_b3(c, 0x48, 0x89, 0xC1)
-        mc_b4(c, 0x48, 0x8B, 0x55, 0xF8)
-        mc_b4(c, 0x44, 0x8B, 0x45, 0xF0)
-        mc_b4(c, 0x4C, 0x8D, 0x4D, 0xE8)
-        mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
-        mc_b1(c, 0x20)
-        mc_u32(c, 0)
-        cg_call_iat(cg, iat_write_file())
-        mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
-        mc_b1(c, 0xC3)
+        if osm <= 1 {
+            mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+            mc_b4(c, 0x48, 0x83, 0xEC, 0x50)
+            mc_b4(c, 0x48, 0x89, 0x4D, 0xF8)
+            mc_b4(c, 0x48, 0x89, 0x55, 0xF0)
+            mc_b1(c, 0xB9)
+            mc_u32(c, 0xFFFFFFF5)
+            cg_call_iat(cg, iat_get_std_handle())
+            mc_b3(c, 0x48, 0x89, 0xC1)
+            mc_b4(c, 0x48, 0x8B, 0x55, 0xF8)
+            mc_b4(c, 0x44, 0x8B, 0x45, 0xF0)
+            mc_b4(c, 0x4C, 0x8D, 0x4D, 0xE8)
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+            mc_b1(c, 0x20)
+            mc_u32(c, 0)
+            cg_call_iat(cg, iat_write_file())
+            mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+            mc_b1(c, 0xC3)
+        } else if osm == 2 or osm == 3 {
+            mc_b2(c, 0x56, 0x57)
+            mc_b3(c, 0x48, 0x89, 0xCE) // RSI = ptr (RCX)
+            mc_b1(c, 0xBF); mc_u32(c, 1) // EDI = 1 (stdout), RDX already = len!
+            mc_b1(c, 0xB8)
+            if osm == 2 { mc_u32(c, 1) } else { mc_u32(c, 0x2000004) } // sys_write
+            mc_b2(c, 0x0F, 0x05)
+            mc_b2(c, 0x5F, 0x5E)
+            mc_b1(c, 0xC3)
+        } else {
+            // Bare-metal / Unikernel `COM1 0x3F8` serial UART output
+            mc_b3(c, 0x49, 0x89, 0xC8) // R8 = ptr
+            mc_b3(c, 0x49, 0x89, 0xD1) // R9 = len
+            mc_b3(c, 0x45, 0x31, 0xD2) // R10 = 0
+            mc_b4(c, 0x66, 0xBA, 0xF8, 0x03) // MOV DX, 0x3F8
+            ul := buf_len(c)
+            mc_b3(c, 0x4D, 0x39, 0xCA)
+            jae_u := mc_jcc8(c, 0x73)
+            mc_b4(c, 0x43, 0x8A, 0x04, 0x10) // MOV AL, [R8 + R10]
+            mc_b1(c, 0xEE)                   // OUT DX, AL
+            mc_b3(c, 0x49, 0xFF, 0xC2)
+            jmp_u := mc_jcc8(c, 0xEB)
+            mc_patch_jcc8(c, jmp_u, ul)
+            mc_patch_jcc8(c, jae_u, buf_len(c))
+            mc_b1(c, 0xC3)
+        }
         cg_reg_helper(cg, h_print_bytes(), s_pb, buf_len(c))
     }
 
@@ -563,20 +1215,42 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
         mc_align16(c)
         s_ck := buf_len(c)
         mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
-        mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
-        mc_b4(c, 0x48, 0x83, 0xEC, 0x40)
-        mc_b4(c, 0x48, 0x8D, 0x4D, 0xF8)
-        cg_call_iat(cg, iat_qpc())
-        mc_b4(c, 0x48, 0x8D, 0x4D, 0xF0)
-        cg_call_iat(cg, iat_qpf())
-        mc_b4(c, 0x48, 0x8B, 0x45, 0xF8)
-        mc_b3(c, 0x48, 0xC7, 0xC1)
-        mc_u32(c, 1000000000)
-        mc_b3(c, 0x48, 0xF7, 0xE1)
-        mc_b4(c, 0x48, 0x8B, 0x4D, 0xF0)
-        mc_b3(c, 0x48, 0xF7, 0xF1)
-        mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
-        mc_b1(c, 0xC3)
+        if osm <= 1 {
+            mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+            mc_b4(c, 0x48, 0x83, 0xEC, 0x40)
+            mc_b4(c, 0x48, 0x8D, 0x4D, 0xF8)
+            cg_call_iat(cg, iat_qpc())
+            mc_b4(c, 0x48, 0x8D, 0x4D, 0xF0)
+            cg_call_iat(cg, iat_qpf())
+            mc_b4(c, 0x48, 0x8B, 0x45, 0xF8)
+            mc_b3(c, 0x48, 0xC7, 0xC1)
+            mc_u32(c, 1000000000)
+            mc_b3(c, 0x48, 0xF7, 0xE1)
+            mc_b4(c, 0x48, 0x8B, 0x4D, 0xF0)
+            mc_b3(c, 0x48, 0xF7, 0xF1)
+            mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+            mc_b1(c, 0xC3)
+        } else if osm == 2 {
+            mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+            mc_b2(c, 0x56, 0x57)
+            mc_b4(c, 0x48, 0x83, 0xEC, 0x20)
+            mc_b1(c, 0xBF); mc_u32(c, 1) // CLOCK_MONOTONIC = 1
+            mc_b3(c, 0x48, 0x89, 0xE6)   // RSI = RSP (&timespec)
+            mc_b1(c, 0xB8); mc_u32(c, 228) // sys_clock_gettime
+            mc_b2(c, 0x0F, 0x05)
+            mc_b3(c, 0x48, 0x8B, 0x04); mc_b1(c, 0x24) // tv_sec
+            mc_b3(c, 0x48, 0x69, 0xC0); mc_u32(c, 1000000000)
+            mc_b4(c, 0x48, 0x03, 0x44, 0x24); mc_b1(c, 0x08) // + tv_nsec
+            mc_b4(c, 0x48, 0x83, 0xC4, 0x20)
+            mc_b2(c, 0x5F, 0x5E)
+            mc_b1(c, 0x5D)
+            mc_b1(c, 0xC3)
+        } else {
+            mc_b2(c, 0x0F, 0x31) // RDTSC
+            mc_b4(c, 0x48, 0xC1, 0xE2, 0x20)
+            mc_b3(c, 0x48, 0x09, 0xD0)
+            mc_b1(c, 0xC3)
+        }
         cg_reg_helper(cg, h_clock_ns(), s_ck, buf_len(c))
     }
 
@@ -594,10 +1268,7 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
         mc_b1(c, 0xBA)
         mc_u32(c, str_len(sec_msg))
         cg_call_fn(cg, h_print_bytes())
-        mc_b1(c, 0xB9)
-        mc_u32(c, 101)
-        cg_call_iat(cg, iat_exit_process())
-        mc_b1(c, 0xCC)
+        cg_emit_exit_imm(cg, 101)
         cg_reg_helper(cg, h_sec_trap(), s_t1, buf_len(c))
     }
 
@@ -615,10 +1286,7 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
         mc_b1(c, 0xBA)
         mc_u32(c, str_len(shd_msg))
         cg_call_fn(cg, h_print_bytes())
-        mc_b1(c, 0xB9)
-        mc_u32(c, 255)
-        cg_call_iat(cg, iat_exit_process())
-        mc_b1(c, 0xCC)
+        cg_emit_exit_imm(cg, 255)
         cg_reg_helper(cg, h_shield_trap(), s_t2, buf_len(c))
     }
 
@@ -627,6 +1295,7 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
 
 fn emit_io_helpers_used(cg: CodegenCtx) {
     c := cg.code
+    osm := cg_os_mode(cg)
 
     if cg_is_helper_used(cg, h_str_eq()) {
         mc_align16(c)
@@ -660,94 +1329,123 @@ fn emit_io_helpers_used(cg: CodegenCtx) {
         mc_align16(c)
         s_ag := buf_len(c)
         mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
-        mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
-        mc_b4(c, 0x48, 0x83, 0xEC, 0x30)
-        mc_b4(c, 0x48, 0x89, 0x4D, 0xF8)
-        cg_call_iat(cg, iat_get_command_line_a())
-        mc_b3(c, 0x49, 0x89, 0xC0)
-        mc_b3(c, 0x45, 0x31, 0xC9)
-        mc_b4(c, 0x4C, 0x8B, 0x55, 0xF8)
+        if osm <= 1 {
+            mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+            mc_b4(c, 0x48, 0x83, 0xEC, 0x30)
+            mc_b4(c, 0x48, 0x89, 0x4D, 0xF8)
+            cg_call_iat(cg, iat_get_command_line_a())
+            mc_b3(c, 0x49, 0x89, 0xC0)
+            mc_b3(c, 0x45, 0x31, 0xC9)
+            mc_b4(c, 0x4C, 0x8B, 0x55, 0xF8)
 
-        next_tok := buf_len(c)
-        skip_ws := buf_len(c)
-        mc_b4(c, 0x41, 0x0F, 0xB6, 0x00)
-        mc_b2(c, 0x3C, 32)
-        je_sp := mc_jcc8(c, 0x74)
-        mc_b2(c, 0x3C, 9)
-        jne_wsd := mc_jcc8(c, 0x75)
-        mc_patch_jcc8(c, je_sp, buf_len(c))
-        mc_b3(c, 0x49, 0xFF, 0xC0)
-        jmp_ws := mc_jcc8(c, 0xEB)
-        mc_patch_jcc8(c, jmp_ws, skip_ws)
-        mc_patch_jcc8(c, jne_wsd, buf_len(c))
+            next_tok := buf_len(c)
+            skip_ws := buf_len(c)
+            mc_b4(c, 0x41, 0x0F, 0xB6, 0x00)
+            mc_b2(c, 0x3C, 32)
+            je_sp := mc_jcc8(c, 0x74)
+            mc_b2(c, 0x3C, 9)
+            jne_wsd := mc_jcc8(c, 0x75)
+            mc_patch_jcc8(c, je_sp, buf_len(c))
+            mc_b3(c, 0x49, 0xFF, 0xC0)
+            jmp_ws := mc_jcc8(c, 0xEB)
+            mc_patch_jcc8(c, jmp_ws, skip_ws)
+            mc_patch_jcc8(c, jne_wsd, buf_len(c))
 
-        mc_b2(c, 0x84, 0xC0)
-        jz_done := mc_jcc32(c, 0x84)
-        mc_b2(c, 0x3C, 34)
-        jne_uq := mc_jcc8(c, 0x75)
+            mc_b2(c, 0x84, 0xC0)
+            jz_done := mc_jcc32(c, 0x84)
+            mc_b2(c, 0x3C, 34)
+            jne_uq := mc_jcc8(c, 0x75)
 
-        mc_b3(c, 0x49, 0xFF, 0xC0)
-        mc_b3(c, 0x4C, 0x89, 0xC1)
-        ql := buf_len(c)
-        mc_b4(c, 0x41, 0x0F, 0xB6, 0x00)
-        mc_b2(c, 0x84, 0xC0)
-        jz_qe := mc_jcc8(c, 0x74)
-        mc_b2(c, 0x3C, 34)
-        je_qe := mc_jcc8(c, 0x74)
-        mc_b3(c, 0x49, 0xFF, 0xC0)
-        j_ql := mc_jcc8(c, 0xEB)
-        mc_patch_jcc8(c, j_ql, ql)
-        mc_patch_jcc8(c, jz_qe, buf_len(c))
-        mc_patch_jcc8(c, je_qe, buf_len(c))
-        mc_b3(c, 0x4C, 0x89, 0xC2)
-        mc_b3(c, 0x48, 0x29, 0xCA)
-        mc_b2(c, 0x3C, 34)
-        jne_gfq := mc_jcc8(c, 0x75)
-        mc_b3(c, 0x49, 0xFF, 0xC0)
-        jmp_gfq := mc_jcc8(c, 0xEB)
+            mc_b3(c, 0x49, 0xFF, 0xC0)
+            mc_b3(c, 0x4C, 0x89, 0xC1)
+            ql := buf_len(c)
+            mc_b4(c, 0x41, 0x0F, 0xB6, 0x00)
+            mc_b2(c, 0x84, 0xC0)
+            jz_qe := mc_jcc8(c, 0x74)
+            mc_b2(c, 0x3C, 34)
+            je_qe := mc_jcc8(c, 0x74)
+            mc_b3(c, 0x49, 0xFF, 0xC0)
+            j_ql := mc_jcc8(c, 0xEB)
+            mc_patch_jcc8(c, j_ql, ql)
+            mc_patch_jcc8(c, jz_qe, buf_len(c))
+            mc_patch_jcc8(c, je_qe, buf_len(c))
+            mc_b3(c, 0x4C, 0x89, 0xC2)
+            mc_b3(c, 0x48, 0x29, 0xCA)
+            mc_b2(c, 0x3C, 34)
+            jne_gfq := mc_jcc8(c, 0x75)
+            mc_b3(c, 0x49, 0xFF, 0xC0)
+            jmp_gfq := mc_jcc8(c, 0xEB)
 
-        mc_patch_jcc8(c, jne_uq, buf_len(c))
-        mc_b3(c, 0x4C, 0x89, 0xC1)
-        uql := buf_len(c)
-        mc_b4(c, 0x41, 0x0F, 0xB6, 0x00)
-        mc_b2(c, 0x84, 0xC0)
-        jz_uqe := mc_jcc8(c, 0x74)
-        mc_b2(c, 0x3C, 32)
-        je_uqs := mc_jcc8(c, 0x74)
-        mc_b2(c, 0x3C, 9)
-        je_uqt := mc_jcc8(c, 0x74)
-        mc_b3(c, 0x49, 0xFF, 0xC0)
-        j_uql := mc_jcc8(c, 0xEB)
-        mc_patch_jcc8(c, j_uql, uql)
-        mc_patch_jcc8(c, jz_uqe, buf_len(c))
-        mc_patch_jcc8(c, je_uqs, buf_len(c))
-        mc_patch_jcc8(c, je_uqt, buf_len(c))
-        mc_b3(c, 0x4C, 0x89, 0xC2)
-        mc_b3(c, 0x48, 0x29, 0xCA)
+            mc_patch_jcc8(c, jne_uq, buf_len(c))
+            mc_b3(c, 0x4C, 0x89, 0xC1)
+            uql := buf_len(c)
+            mc_b4(c, 0x41, 0x0F, 0xB6, 0x00)
+            mc_b2(c, 0x84, 0xC0)
+            jz_uqe := mc_jcc8(c, 0x74)
+            mc_b2(c, 0x3C, 32)
+            je_uqs := mc_jcc8(c, 0x74)
+            mc_b2(c, 0x3C, 9)
+            je_uqt := mc_jcc8(c, 0x74)
+            mc_b3(c, 0x49, 0xFF, 0xC0)
+            j_uql := mc_jcc8(c, 0xEB)
+            mc_patch_jcc8(c, j_uql, uql)
+            mc_patch_jcc8(c, jz_uqe, buf_len(c))
+            mc_patch_jcc8(c, je_uqs, buf_len(c))
+            mc_patch_jcc8(c, je_uqt, buf_len(c))
+            mc_b3(c, 0x4C, 0x89, 0xC2)
+            mc_b3(c, 0x48, 0x29, 0xCA)
 
-        mc_patch_jcc8(c, jne_gfq, buf_len(c))
-        mc_patch_jcc8(c, jmp_gfq, buf_len(c))
-        mc_b3(c, 0x4D, 0x39, 0xD1)
-        je_fnd := mc_jcc8(c, 0x74)
-        mc_b3(c, 0x49, 0xFF, 0xC1)
-        j_nt := mc_jmp32(c)
-        mc_patch_rel32(c, j_nt, next_tok)
+            mc_patch_jcc8(c, jne_gfq, buf_len(c))
+            mc_patch_jcc8(c, jmp_gfq, buf_len(c))
+            mc_b3(c, 0x4D, 0x39, 0xD1)
+            je_fnd := mc_jcc8(c, 0x74)
+            mc_b3(c, 0x49, 0xFF, 0xC1)
+            j_nt := mc_jmp32(c)
+            mc_patch_rel32(c, j_nt, next_tok)
 
-        mc_patch_jcc8(c, je_fnd, buf_len(c))
-        mc_b3(c, 0x48, 0x89, 0xC8)
-        mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
-        mc_b1(c, 0xC3)
+            mc_patch_jcc8(c, je_fnd, buf_len(c))
+            mc_b3(c, 0x48, 0x89, 0xC8)
+            mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+            mc_b1(c, 0xC3)
 
-        mc_patch_rel32(c, jz_done, buf_len(c))
-        mc_b3(c, 0x4D, 0x85, 0xD2)
-        jns_nc := mc_jcc8(c, 0x79)
-        mc_b3(c, 0x4C, 0x89, 0xC8)
-        mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
-        mc_b1(c, 0xC3)
-        mc_patch_jcc8(c, jns_nc, buf_len(c))
-        mc_b4(c, 0x31, 0xC0, 0x31, 0xD2)
-        mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
-        mc_b1(c, 0xC3)
+            mc_patch_rel32(c, jz_done, buf_len(c))
+            mc_b3(c, 0x4D, 0x85, 0xD2)
+            jns_nc := mc_jcc8(c, 0x79)
+            mc_b3(c, 0x4C, 0x89, 0xC8)
+            mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+            mc_b1(c, 0xC3)
+            mc_patch_jcc8(c, jns_nc, buf_len(c))
+            mc_b4(c, 0x31, 0xC0, 0x31, 0xD2)
+            mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+            mc_b1(c, 0xC3)
+        } else {
+            // Linux / macOS SysV `_start` stack: `[saved_rsp] = argc`, `[saved_rsp + 8 + idx*8] = argv[idx]`
+            cg_mov_rax_data(cg, data_off_unix_rsp())
+            mc_b3(c, 0x48, 0x85, 0xC0)
+            jz_no_rsp := mc_jcc8(c, 0x74)
+            mc_b3(c, 0x4C, 0x8B, 0x00) // R8 = argc
+            mc_b3(c, 0x48, 0x85, 0xC9) // TEST RCX, RCX (`idx < 0` -> return `argc`)
+            jns_idx := mc_jcc8(c, 0x79)
+            mc_b3(c, 0x4C, 0x89, 0xC0)
+            mc_b1(c, 0xC3)
+            mc_patch_jcc8(c, jns_idx, buf_len(c))
+            mc_b3(c, 0x4C, 0x39, 0xC1) // CMP RCX, R8
+            jae_oob := mc_jcc8(c, 0x73)
+            mc_b4(c, 0x48, 0x8B, 0x44, 0xC8); mc_b1(c, 0x08) // RAX = [RAX + RCX*8 + 8]
+            mc_b2(c, 0x31, 0xD2)
+            sl_top := buf_len(c)
+            mc_b4(c, 0x80, 0x3C, 0x10, 0x00) // CMP byte [RAX + RDX], 0
+            je_sld := mc_jcc8(c, 0x74)
+            mc_b3(c, 0x48, 0xFF, 0xC2)
+            jmp_sl := mc_jcc8(c, 0xEB)
+            mc_patch_jcc8(c, jmp_sl, sl_top)
+            mc_patch_jcc8(c, je_sld, buf_len(c))
+            mc_b1(c, 0xC3)
+            mc_patch_jcc8(c, jz_no_rsp, buf_len(c))
+            mc_patch_jcc8(c, jae_oob, buf_len(c))
+            mc_b4(c, 0x31, 0xC0, 0x31, 0xD2)
+            mc_b1(c, 0xC3)
+        }
         cg_reg_helper(cg, h_args_get(), s_ag, buf_len(c))
 
         if cg_is_helper_used(cg, h_args_count()) {
@@ -767,98 +1465,185 @@ fn emit_io_helpers_used(cg: CodegenCtx) {
 
 fn emit_fs_helpers_used(cg: CodegenCtx) {
     c := cg.code
+    osm := cg_os_mode(cg)
 
     if cg_is_helper_used(cg, h_fs_read()) {
         mc_align16(c)
         s_fr := buf_len(c)
         mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
-        mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
-        mc_b3(c, 0x48, 0x81, 0xEC)
-        mc_u32(c, 0x280)
-        mc_b3(c, 0x4C, 0x8D, 0x85)
-        mc_u32(c, 0 - 0x220)
-        mc_b2(c, 0x31, 0xC0)
-        cpl1 := buf_len(c)
-        mc_b3(c, 0x48, 0x39, 0xD0)
-        ja1 := mc_jcc8(c, 0x73)
-        mc_b2(c, 0x48, 0x3D)
-        mc_u32(c, 500)
-        ja2 := mc_jcc8(c, 0x73)
-        mc_b4(c, 0x44, 0x8A, 0x0C, 0x01)
-        mc_b4(c, 0x45, 0x88, 0x0C, 0x00)
-        mc_b3(c, 0x48, 0xFF, 0xC0)
-        jcp1 := mc_jcc8(c, 0xEB)
-        mc_patch_jcc8(c, jcp1, cpl1)
-        mc_patch_jcc8(c, ja1, buf_len(c))
-        mc_patch_jcc8(c, ja2, buf_len(c))
-        mc_b4(c, 0x41, 0xC6, 0x04, 0x00)
-        mc_b1(c, 0)
+        if osm <= 1 {
+            mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+            mc_b3(c, 0x48, 0x81, 0xEC)
+            mc_u32(c, 0x280)
+            mc_b3(c, 0x4C, 0x8D, 0x85)
+            mc_u32(c, 0 - 0x220)
+            mc_b2(c, 0x31, 0xC0)
+            cpl1 := buf_len(c)
+            mc_b3(c, 0x48, 0x39, 0xD0)
+            ja1 := mc_jcc8(c, 0x73)
+            mc_b2(c, 0x48, 0x3D)
+            mc_u32(c, 500)
+            ja2 := mc_jcc8(c, 0x73)
+            mc_b4(c, 0x44, 0x8A, 0x0C, 0x01)
+            mc_b4(c, 0x45, 0x88, 0x0C, 0x00)
+            mc_b3(c, 0x48, 0xFF, 0xC0)
+            jcp1 := mc_jcc8(c, 0xEB)
+            mc_patch_jcc8(c, jcp1, cpl1)
+            mc_patch_jcc8(c, ja1, buf_len(c))
+            mc_patch_jcc8(c, ja2, buf_len(c))
+            mc_b4(c, 0x41, 0xC6, 0x04, 0x00)
+            mc_b1(c, 0)
 
-        mc_b3(c, 0x4C, 0x89, 0xC1)
-        mc_b1(c, 0xBA)
-        mc_u32(c, 0x80000000)
-        mc_b2(c, 0x41, 0xB8)
-        mc_u32(c, 1)
-        mc_b3(c, 0x45, 0x31, 0xC9)
-        mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
-        mc_b1(c, 0x20)
-        mc_u32(c, 3)
-        mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
-        mc_b1(c, 0x28)
-        mc_u32(c, 0x80)
-        mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
-        mc_b1(c, 0x30)
-        mc_u32(c, 0)
-        cg_call_iat(cg, iat_create_file_a())
+            mc_b3(c, 0x4C, 0x89, 0xC1)
+            mc_b1(c, 0xBA)
+            mc_u32(c, 0x80000000)
+            mc_b2(c, 0x41, 0xB8)
+            mc_u32(c, 1)
+            mc_b3(c, 0x45, 0x31, 0xC9)
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+            mc_b1(c, 0x20)
+            mc_u32(c, 3)
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+            mc_b1(c, 0x28)
+            mc_u32(c, 0x80)
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+            mc_b1(c, 0x30)
+            mc_u32(c, 0)
+            cg_call_iat(cg, iat_create_file_a())
 
-        mc_b4(c, 0x48, 0x83, 0xF8, 0xFF)
-        je_er1 := mc_jcc32(c, 0x84)
-        mc_b4(c, 0x48, 0x89, 0x45, 0xF8)
-        mc_b3(c, 0x48, 0x89, 0xC1)
-        mc_b4(c, 0x48, 0x8D, 0x55, 0xF0)
-        cg_call_iat(cg, iat_get_file_size_ex())
+            mc_b4(c, 0x48, 0x83, 0xF8, 0xFF)
+            je_er1 := mc_jcc32(c, 0x84)
+            mc_b4(c, 0x48, 0x89, 0x45, 0xF8)
+            mc_b3(c, 0x48, 0x89, 0xC1)
+            mc_b4(c, 0x48, 0x8D, 0x55, 0xF0)
+            cg_call_iat(cg, iat_get_file_size_ex())
 
-        mc_b2(c, 0x31, 0xC9)
-        mc_b4(c, 0x48, 0x8B, 0x55, 0xF0)
-        mc_b4(c, 0x48, 0x83, 0xC2, 0x40)
-        mc_b2(c, 0x41, 0xB8)
-        mc_u32(c, 0x3000)
-        mc_b2(c, 0x41, 0xB9)
-        mc_u32(c, 4)
-        cg_call_iat(cg, iat_virtual_alloc())
+            mc_b2(c, 0x31, 0xC9)
+            mc_b4(c, 0x48, 0x8B, 0x55, 0xF0)
+            mc_b4(c, 0x48, 0x83, 0xC2, 0x40)
+            mc_b2(c, 0x41, 0xB8)
+            mc_u32(c, 0x3000)
+            mc_b2(c, 0x41, 0xB9)
+            mc_u32(c, 4)
+            cg_call_iat(cg, iat_virtual_alloc())
 
-        mc_b4(c, 0x48, 0x89, 0x45, 0xE8)
-        mc_b4(c, 0x48, 0x8B, 0x55, 0xF0)
-        mc_b4(c, 0x48, 0x83, 0xC2, 0x20)
-        mc_b4(c, 0x48, 0x89, 0x50, 0x08)
-        mc_b4(c, 0x48, 0x8B, 0x4D, 0xF8)
-        mc_b4(c, 0x48, 0x8D, 0x50, 0x10)
-        mc_b4(c, 0x44, 0x8B, 0x45, 0xF0)
-        mc_b4(c, 0x4C, 0x8D, 0x4D, 0xE0)
-        mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
-        mc_b1(c, 0x20)
-        mc_u32(c, 0)
-        mc_b4(c, 0x48, 0xC7, 0x45, 0xE0)
-        mc_u32(c, 0)
-        cg_call_iat(cg, iat_read_file())
+            mc_b4(c, 0x48, 0x89, 0x45, 0xE8)
+            mc_b4(c, 0x48, 0x8B, 0x55, 0xF0)
+            mc_b4(c, 0x48, 0x83, 0xC2, 0x20)
+            mc_b4(c, 0x48, 0x89, 0x50, 0x08)
+            mc_b4(c, 0x48, 0x8B, 0x4D, 0xF8)
+            mc_b4(c, 0x48, 0x8D, 0x50, 0x10)
+            mc_b4(c, 0x44, 0x8B, 0x45, 0xF0)
+            mc_b4(c, 0x4C, 0x8D, 0x4D, 0xE0)
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+            mc_b1(c, 0x20)
+            mc_u32(c, 0)
+            mc_b4(c, 0x48, 0xC7, 0x45, 0xE0)
+            mc_u32(c, 0)
+            cg_call_iat(cg, iat_read_file())
 
-        mc_b4(c, 0x48, 0x8B, 0x45, 0xE8)
-        mc_b3(c, 0x8B, 0x55, 0xE0)
-        mc_b3(c, 0x48, 0x89, 0x10)
-        mc_b4(c, 0x48, 0x8B, 0x4D, 0xF8)
-        cg_call_iat(cg, iat_close_handle())
+            mc_b4(c, 0x48, 0x8B, 0x45, 0xE8)
+            mc_b3(c, 0x8B, 0x55, 0xE0)
+            mc_b3(c, 0x48, 0x89, 0x10)
+            mc_b4(c, 0x48, 0x8B, 0x4D, 0xF8)
+            cg_call_iat(cg, iat_close_handle())
 
-        mc_b2(c, 0x31, 0xC0)
-        mc_b4(c, 0x48, 0x8B, 0x55, 0xE8)
-        mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
-        mc_b1(c, 0xC3)
+            mc_b2(c, 0x31, 0xC0)
+            mc_b4(c, 0x48, 0x8B, 0x55, 0xE8)
+            mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+            mc_b1(c, 0xC3)
 
-        mc_patch_rel32(c, je_er1, buf_len(c))
-        mc_b1(c, 0xB8)
-        mc_u32(c, 1)
-        mc_b2(c, 0x31, 0xD2)
-        mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
-        mc_b1(c, 0xC3)
+            mc_patch_rel32(c, je_er1, buf_len(c))
+            mc_b1(c, 0xB8)
+            mc_u32(c, 1)
+            mc_b2(c, 0x31, 0xD2)
+            mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+            mc_b1(c, 0xC3)
+        } else {
+            // Direct Linux x86_64 `openat(257)` + `lseek(8)` + `h_alloc_mem` + `read(0)` + `close(3)`
+            mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+            mc_b2(c, 0x56, 0x57)
+            mc_b3(c, 0x48, 0x81, 0xEC); mc_u32(c, 0x260)
+            mc_b3(c, 0x4C, 0x8D, 0x85); mc_u32(c, 0 - 0x220)
+            mc_b2(c, 0x31, 0xC0)
+            lcpl := buf_len(c)
+            mc_b3(c, 0x48, 0x39, 0xD0)
+            lja1 := mc_jcc8(c, 0x73)
+            mc_b2(c, 0x48, 0x3D); mc_u32(c, 500)
+            lja2 := mc_jcc8(c, 0x73)
+            mc_b4(c, 0x44, 0x8A, 0x0C, 0x01)
+            mc_b4(c, 0x45, 0x88, 0x0C, 0x00)
+            mc_b3(c, 0x48, 0xFF, 0xC0)
+            ljcp := mc_jcc8(c, 0xEB)
+            mc_patch_jcc8(c, ljcp, lcpl)
+            mc_patch_jcc8(c, lja1, buf_len(c))
+            mc_patch_jcc8(c, lja2, buf_len(c))
+            mc_b4(c, 0x41, 0xC6, 0x04, 0x00); mc_b1(c, 0)
+
+            // sys_openat(AT_FDCWD=-100, path, O_RDONLY=0, 0)
+            mc_b3(c, 0x48, 0xC7, 0xC7); mc_u32(c, 0 - 100)
+            mc_b3(c, 0x4C, 0x89, 0xC6) // RSI = path
+            mc_b2(c, 0x31, 0xD2)       // RDX = 0
+            mc_b3(c, 0x45, 0x31, 0xD2) // R10 = 0
+            mc_b1(c, 0xB8); mc_u32(c, 257)
+            mc_b2(c, 0x0F, 0x05)
+            mc_b3(c, 0x48, 0x85, 0xC0)
+            jl_er := mc_jcc32(c, 0x8C)
+            mc_b4(c, 0x48, 0x89, 0x45, 0xE8) // [RBP-0x18] = fd
+
+            // size = sys_lseek(fd, 0, SEEK_END=2)
+            mc_b3(c, 0x48, 0x89, 0xC7)
+            mc_b2(c, 0x31, 0xF6)
+            mc_b1(c, 0xBA); mc_u32(c, 2)
+            mc_b1(c, 0xB8); mc_u32(c, 8)
+            mc_b2(c, 0x0F, 0x05)
+            mc_b4(c, 0x48, 0x89, 0x45, 0xE0) // [RBP-0x20] = size
+
+            // sys_lseek(fd, 0, SEEK_SET=0)
+            mc_b4(c, 0x48, 0x8B, 0x7D, 0xE8)
+            mc_b2(c, 0x31, 0xF6)
+            mc_b2(c, 0x31, 0xD2)
+            mc_b1(c, 0xB8); mc_u32(c, 8)
+            mc_b2(c, 0x0F, 0x05)
+
+            // buf = h_alloc_mem(size + 64)
+            mc_b4(c, 0x48, 0x8B, 0x4D, 0xE0)
+            mc_b4(c, 0x48, 0x83, 0xC1, 0x40)
+            cg_call_fn(cg, h_alloc_mem())
+            mc_b4(c, 0x48, 0x89, 0x45, 0xD8) // [RBP-0x28] = buf
+            mc_b4(c, 0x48, 0x8B, 0x55, 0xE0)
+            mc_b4(c, 0x48, 0x83, 0xC2, 0x20)
+            mc_b4(c, 0x48, 0x89, 0x50, 0x08) // [buf+8] = cap
+
+            // nread = sys_read(fd, buf+16, size)
+            mc_b4(c, 0x48, 0x8B, 0x7D, 0xE8)
+            mc_b4(c, 0x48, 0x8D, 0x70, 0x10)
+            mc_b4(c, 0x48, 0x8B, 0x55, 0xE0)
+            mc_b2(c, 0x31, 0xC0) // sys_read = 0
+            mc_b2(c, 0x0F, 0x05)
+            mc_b4(c, 0x48, 0x8B, 0x55, 0xD8)
+            mc_b3(c, 0x48, 0x89, 0x02) // [buf] = nread
+
+            // sys_close(fd)
+            mc_b4(c, 0x48, 0x8B, 0x7D, 0xE8)
+            mc_b1(c, 0xB8); mc_u32(c, 3)
+            mc_b2(c, 0x0F, 0x05)
+
+            mc_b2(c, 0x31, 0xC0)
+            mc_b4(c, 0x48, 0x8B, 0x55, 0xD8)
+            mc_b3(c, 0x48, 0x81, 0xC4); mc_u32(c, 0x260)
+            mc_b2(c, 0x5F, 0x5E)
+            mc_b1(c, 0x5D)
+            mc_b1(c, 0xC3)
+
+            mc_patch_rel32(c, jl_er, buf_len(c))
+            mc_b1(c, 0xB8); mc_u32(c, 1)
+            mc_b2(c, 0x31, 0xD2)
+            mc_b3(c, 0x48, 0x81, 0xC4); mc_u32(c, 0x260)
+            mc_b2(c, 0x5F, 0x5E)
+            mc_b1(c, 0x5D)
+            mc_b1(c, 0xC3)
+        }
         cg_reg_helper(cg, h_fs_read(), s_fr, buf_len(c))
     }
 
@@ -866,74 +1651,134 @@ fn emit_fs_helpers_used(cg: CodegenCtx) {
         mc_align16(c)
         s_fw := buf_len(c)
         mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
-        mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
-        mc_b3(c, 0x48, 0x81, 0xEC)
-        mc_u32(c, 0x280)
-        mc_b4(c, 0x4C, 0x89, 0x45, 0xE8)
-        mc_b3(c, 0x4C, 0x8D, 0x85)
-        mc_u32(c, 0 - 0x220)
-        mc_b2(c, 0x31, 0xC0)
-        cpl2 := buf_len(c)
-        mc_b3(c, 0x48, 0x39, 0xD0)
-        jb1 := mc_jcc8(c, 0x73)
-        mc_b2(c, 0x48, 0x3D)
-        mc_u32(c, 500)
-        jb2 := mc_jcc8(c, 0x73)
-        mc_b4(c, 0x44, 0x8A, 0x0C, 0x01)
-        mc_b4(c, 0x45, 0x88, 0x0C, 0x00)
-        mc_b3(c, 0x48, 0xFF, 0xC0)
-        jcp2 := mc_jcc8(c, 0xEB)
-        mc_patch_jcc8(c, jcp2, cpl2)
-        mc_patch_jcc8(c, jb1, buf_len(c))
-        mc_patch_jcc8(c, jb2, buf_len(c))
-        mc_b4(c, 0x41, 0xC6, 0x04, 0x00)
-        mc_b1(c, 0)
+        if osm <= 1 {
+            mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+            mc_b3(c, 0x48, 0x81, 0xEC)
+            mc_u32(c, 0x280)
+            mc_b4(c, 0x4C, 0x89, 0x45, 0xE8)
+            mc_b3(c, 0x4C, 0x8D, 0x85)
+            mc_u32(c, 0 - 0x220)
+            mc_b2(c, 0x31, 0xC0)
+            cpl2 := buf_len(c)
+            mc_b3(c, 0x48, 0x39, 0xD0)
+            jb1 := mc_jcc8(c, 0x73)
+            mc_b2(c, 0x48, 0x3D)
+            mc_u32(c, 500)
+            jb2 := mc_jcc8(c, 0x73)
+            mc_b4(c, 0x44, 0x8A, 0x0C, 0x01)
+            mc_b4(c, 0x45, 0x88, 0x0C, 0x00)
+            mc_b3(c, 0x48, 0xFF, 0xC0)
+            jcp2 := mc_jcc8(c, 0xEB)
+            mc_patch_jcc8(c, jcp2, cpl2)
+            mc_patch_jcc8(c, jb1, buf_len(c))
+            mc_patch_jcc8(c, jb2, buf_len(c))
+            mc_b4(c, 0x41, 0xC6, 0x04, 0x00)
+            mc_b1(c, 0)
 
-        mc_b3(c, 0x4C, 0x89, 0xC1)
-        mc_b1(c, 0xBA)
-        mc_u32(c, 0x40000000)
-        mc_b3(c, 0x45, 0x31, 0xC0)
-        mc_b3(c, 0x45, 0x31, 0xC9)
-        mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
-        mc_b1(c, 0x20)
-        mc_u32(c, 2)
-        mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
-        mc_b1(c, 0x28)
-        mc_u32(c, 0x80)
-        mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
-        mc_b1(c, 0x30)
-        mc_u32(c, 0)
-        cg_call_iat(cg, iat_create_file_a())
+            mc_b3(c, 0x4C, 0x89, 0xC1)
+            mc_b1(c, 0xBA)
+            mc_u32(c, 0x40000000)
+            mc_b3(c, 0x45, 0x31, 0xC0)
+            mc_b3(c, 0x45, 0x31, 0xC9)
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+            mc_b1(c, 0x20)
+            mc_u32(c, 2)
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+            mc_b1(c, 0x28)
+            mc_u32(c, 0x80)
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+            mc_b1(c, 0x30)
+            mc_u32(c, 0)
+            cg_call_iat(cg, iat_create_file_a())
 
-        mc_b4(c, 0x48, 0x83, 0xF8, 0xFF)
-        je_er2 := mc_jcc32(c, 0x84)
-        mc_b4(c, 0x48, 0x89, 0x45, 0xF8)
-        mc_b4(c, 0x4C, 0x8B, 0x55, 0xE8)
-        mc_b3(c, 0x48, 0x89, 0xC1)
-        mc_b4(c, 0x49, 0x8D, 0x52, 0x10)
-        mc_b3(c, 0x45, 0x8B, 0x02)
-        mc_b4(c, 0x4C, 0x8D, 0x4D, 0xE0)
-        mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
-        mc_b1(c, 0x20)
-        mc_u32(c, 0)
-        mc_b4(c, 0x48, 0xC7, 0x45, 0xE0)
-        mc_u32(c, 0)
-        cg_call_iat(cg, iat_write_file())
+            mc_b4(c, 0x48, 0x83, 0xF8, 0xFF)
+            je_er2 := mc_jcc32(c, 0x84)
+            mc_b4(c, 0x48, 0x89, 0x45, 0xF8)
+            mc_b4(c, 0x4C, 0x8B, 0x55, 0xE8)
+            mc_b3(c, 0x48, 0x89, 0xC1)
+            mc_b4(c, 0x49, 0x8D, 0x52, 0x10)
+            mc_b3(c, 0x45, 0x8B, 0x02)
+            mc_b4(c, 0x4C, 0x8D, 0x4D, 0xE0)
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24)
+            mc_b1(c, 0x20)
+            mc_u32(c, 0)
+            mc_b4(c, 0x48, 0xC7, 0x45, 0xE0)
+            mc_u32(c, 0)
+            cg_call_iat(cg, iat_write_file())
 
-        mc_b4(c, 0x48, 0x8B, 0x4D, 0xF8)
-        cg_call_iat(cg, iat_close_handle())
+            mc_b4(c, 0x48, 0x8B, 0x4D, 0xF8)
+            cg_call_iat(cg, iat_close_handle())
 
-        mc_b2(c, 0x31, 0xC0)
-        mc_b3(c, 0x8B, 0x55, 0xE0)
-        mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
-        mc_b1(c, 0xC3)
+            mc_b2(c, 0x31, 0xC0)
+            mc_b3(c, 0x8B, 0x55, 0xE0)
+            mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+            mc_b1(c, 0xC3)
 
-        mc_patch_rel32(c, je_er2, buf_len(c))
-        mc_b1(c, 0xB8)
-        mc_u32(c, 1)
-        mc_b2(c, 0x31, 0xD2)
-        mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
-        mc_b1(c, 0xC3)
+            mc_patch_rel32(c, je_er2, buf_len(c))
+            mc_b1(c, 0xB8)
+            mc_u32(c, 1)
+            mc_b2(c, 0x31, 0xD2)
+            mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
+            mc_b1(c, 0xC3)
+        } else {
+            // Direct Linux x86_64 `openat(257, O_WRONLY|O_CREAT|O_TRUNC=0x241, 0755=493)` + `write(1)` + `close(3)`
+            mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+            mc_b2(c, 0x56, 0x57)
+            mc_b3(c, 0x48, 0x81, 0xEC); mc_u32(c, 0x260)
+            mc_b4(c, 0x4C, 0x89, 0x45, 0xE8) // [RBP-0x18] = buf (R8)
+            mc_b3(c, 0x4C, 0x8D, 0x85); mc_u32(c, 0 - 0x220)
+            mc_b2(c, 0x31, 0xC0)
+            lcpl2 := buf_len(c)
+            mc_b3(c, 0x48, 0x39, 0xD0)
+            ljb1 := mc_jcc8(c, 0x73)
+            mc_b2(c, 0x48, 0x3D); mc_u32(c, 500)
+            ljb2 := mc_jcc8(c, 0x73)
+            mc_b4(c, 0x44, 0x8A, 0x0C, 0x01)
+            mc_b4(c, 0x45, 0x88, 0x0C, 0x00)
+            mc_b3(c, 0x48, 0xFF, 0xC0)
+            ljcp2 := mc_jcc8(c, 0xEB)
+            mc_patch_jcc8(c, ljcp2, lcpl2)
+            mc_patch_jcc8(c, ljb1, buf_len(c))
+            mc_patch_jcc8(c, ljb2, buf_len(c))
+            mc_b4(c, 0x41, 0xC6, 0x04, 0x00); mc_b1(c, 0)
+
+            mc_b3(c, 0x48, 0xC7, 0xC7); mc_u32(c, 0 - 100) // AT_FDCWD
+            mc_b3(c, 0x4C, 0x89, 0xC6)
+            mc_b1(c, 0xBA); mc_u32(c, 0x241)
+            mc_b3(c, 0x49, 0xC7, 0xC2); mc_u32(c, 493) // 0755 executable permissions!
+            mc_b1(c, 0xB8); mc_u32(c, 257)
+            mc_b2(c, 0x0F, 0x05)
+            mc_b3(c, 0x48, 0x85, 0xC0)
+            jl_er2 := mc_jcc32(c, 0x8C)
+            mc_b4(c, 0x48, 0x89, 0x45, 0xE0) // [RBP-0x20] = fd
+
+            mc_b3(c, 0x48, 0x89, 0xC7) // EDI = fd
+            mc_b4(c, 0x48, 0x8B, 0x45, 0xE8)
+            mc_b4(c, 0x48, 0x8D, 0x70, 0x10) // RSI = buf + 16
+            mc_b3(c, 0x48, 0x8B, 0x10)       // RDX = [buf]
+            mc_b1(c, 0xB8); mc_u32(c, 1)     // sys_write
+            mc_b2(c, 0x0F, 0x05)
+            mc_b4(c, 0x48, 0x89, 0x45, 0xD8) // [RBP-0x28] = nwritten
+
+            mc_b4(c, 0x48, 0x8B, 0x7D, 0xE0)
+            mc_b1(c, 0xB8); mc_u32(c, 3)     // sys_close
+            mc_b2(c, 0x0F, 0x05)
+
+            mc_b2(c, 0x31, 0xC0)
+            mc_b4(c, 0x48, 0x8B, 0x55, 0xD8)
+            mc_b3(c, 0x48, 0x81, 0xC4); mc_u32(c, 0x260)
+            mc_b2(c, 0x5F, 0x5E)
+            mc_b1(c, 0x5D)
+            mc_b1(c, 0xC3)
+
+            mc_patch_rel32(c, jl_er2, buf_len(c))
+            mc_b1(c, 0xB8); mc_u32(c, 1)
+            mc_b2(c, 0x31, 0xD2)
+            mc_b3(c, 0x48, 0x81, 0xC4); mc_u32(c, 0x260)
+            mc_b2(c, 0x5F, 0x5E)
+            mc_b1(c, 0x5D)
+            mc_b1(c, 0xC3)
+        }
         cg_reg_helper(cg, h_fs_write(), s_fw, buf_len(c))
     }
 }

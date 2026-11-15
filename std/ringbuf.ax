@@ -1,0 +1,63 @@
+// Axon v7.0 Lock-Free Cache-Line Padded SPSC Ring Buffer (`std/ringbuf.ax`)
+// Designed for sub-microsecond HFT / audio / telemetry pipelines:
+//   - Head (`idx 0`, byte `0`) and Tail (`idx 8`, byte `64`) sit on separate 64-byte L1 cache lines
+//     to eliminate false sharing between producer and consumer cores.
+//   - `spsc_try_push`, `spsc_try_pop`, and `spsc_len` are statically verified `@no_alloc`.
+
+struct SpscRing {
+    base_ptr: i64
+    mask: i64
+    cap: i64
+}
+
+fn spsc_new(pow2_cap: i64) -> SpscRing {
+    mut c := 16
+    while c < pow2_cap {
+        c = c * 2
+    }
+    // 16 i64 header slots (128 bytes = two 64B cache lines) + `c` i64 payload slots
+    total_bytes := (16 + c) * 8
+    ptr := mem_alloc_aligned(total_bytes)
+    atomic_store_i64(ptr, 0, 0) // cache line 0: head (write index)
+    atomic_store_i64(ptr, 8, 0) // cache line 1: tail (read index)
+    return SpscRing(base_ptr = ptr, mask = c - 1, cap = c)
+}
+
+@no_alloc
+fn spsc_len(r: SpscRing) -> i64 {
+    h := atomic_load_i64(r.base_ptr, 0)
+    t := atomic_load_i64(r.base_ptr, 8)
+    return h - t
+}
+
+@no_alloc
+fn spsc_try_push(r: SpscRing, val: i64) -> bool {
+    h := atomic_load_i64(r.base_ptr, 0)
+    t := atomic_load_i64(r.base_ptr, 8)
+    if (h - t) >= r.cap {
+        return false
+    }
+    slot := 16 + (h & r.mask)
+    ptr_write_i64(r.base_ptr, slot, val)
+    atomic_store_i64(r.base_ptr, 0, h + 1)
+    return true
+}
+
+@no_alloc
+fn spsc_try_pop(r: SpscRing) -> i64 ! i64 {
+    t := atomic_load_i64(r.base_ptr, 8)
+    h := atomic_load_i64(r.base_ptr, 0)
+    if t == h {
+        return err(1)
+    }
+    slot := 16 + (t & r.mask)
+    val := ptr_read_i64(r.base_ptr, slot)
+    atomic_store_i64(r.base_ptr, 8, t + 1)
+    return ok(val)
+}
+
+fn spsc_free(move r: SpscRing) {
+    if r.base_ptr != 0 {
+        mem_free_aligned(r.base_ptr)
+    }
+}

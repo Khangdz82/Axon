@@ -1,23 +1,39 @@
-// Axon v6.0 Self-Hosted Native Compiler Driver (`compiler_ax/main.ax`)
-// 100% Pure Axon Self-Hosting Compiler:
-//   `.ax` Source -> Lexer -> Recursive-Descent/Pratt Parser -> Static Type/Capability/Perceus/Polyhedral Verifier
-//   -> Direct x86_64 + AVX2/FMA3 Machine Code -> Standalone Win64 PE32+ Executable (Zero LLVM/Rustc/Clang/Link.exe)
+// Axon v7.0 Multi-OS, Scale-First, AI/Game/HFT/Security/Embedded Native Compiler Driver (`compiler_ax/main.ax`)
+// 100% Pure Axon Self-Hosting Compiler + Linker + Package Manager (`axpm`) + MCP Server (`axc mcp`):
+//   `.ax` / `.h` Source -> Lexer -> Pratt/RD Parser -> `@cImport` C Header Reader -> `comptime` AST VM
+//   -> Static Type / Perceus 0-GC FBIP / Capability / Taint / `@no_alloc` / Symbolic-Shape Verifier
+//   -> Direct Native Machine Code (`x86_64` SSE2/AVX2/AVX-512, `ARM64` NEON, `RV64GC`, `WASM32` SIMD128,
+//      `SPIR-V 1.6`, `NVIDIA PTX 8.0`) -> Standalone `PE32+` / `ELF64` / `Mach-O 64` / `Multiboot2` Binary
+//   Zero LLVM, Zero Clang, Zero GCC, Zero Link.exe, Zero CRT.
 
 use std::cap
 use compiler_ax::tokens_ast
+use compiler_ax::diagnostics
 use compiler_ax::lexer
 use compiler_ax::parser
+use compiler_ax::c_import
+use compiler_ax::comptime
+use compiler_ax::sema_effects
 use compiler_ax::sema_perceus
 use compiler_ax::linker_pe
+use compiler_ax::linker_unix_bare
 use compiler_ax::codegen_runtime
 use compiler_ax::codegen_calls
 use compiler_ax::codegen_x86_64
+use compiler_ax::codegen_arm64_rv64
+use compiler_ax::backend_gpu_wasm
+use compiler_ax::pkg_mcp
 
 fn print_axc_usage() {
-    println("Axon v6.0 Self-Hosted Native Compiler (100% Pure Axon, Zero External Toolchain)")
+    println("Axon v7.0 Self-Hosted Multi-OS Native Compiler, Package Manager & AI MCP Server")
     println("Usage:")
-    println("  axc build <file.ax> [-o out.exe] [--shield]  Compile .ax directly to standalone Win64 PE32+")
-    println("  axc check <file.ax>                          Verify types, Perceus FBIP & capabilities")
+    println("  axc build [file.ax] [-o out] [--target <tgt>] [--shared] [--shield] [--simd=scalar|avx2|avx512] [--link-lib <obj|lib>] [--emit-gpu]")
+    println("  axc check [file.ax] [--json]                 Verify types, Perceus FBIP, taint, @no_alloc & shapes")
+    println("  axc run   [file.ax] [--simd=...]             Compile and execute immediately")
+    println("  axc test  [file.ax]                          Compile and run all @test functions")
+    println("  axc init  [name]                             Initialize a new Axon v7.0 project (axon.toml + lock)")
+    println("  axc targets                                  List all 11 direct native cross-compilation targets")
+    println("  axc mcp                                      Start AI-Native JSON-RPC 2.0 stdio MCP server")
     println("  axc version                                  Show compiler version & architecture")
 }
 
@@ -36,36 +52,29 @@ fn has_decl_named(pool: ByteBuf, nodes: IntBuf, list: IntBuf, soff: i64, slen: i
     return false
 }
 
-fn is_mod_loaded(pool: ByteBuf, loaded: IntBuf, s0_off: i64, s0_len: i64, s1_off: i64, s1_len: i64) -> bool {
-    cnt := ibuf_len(loaded) / 4
-    mut i := 0
-    while i < cnt {
-        b := i * 4
-        if ibuf_get(loaded, b + 1) == s0_len and ibuf_get(loaded, b + 3) == s1_len {
-            if pool_str_eq2(pool, ibuf_get(loaded, b), s0_len, s0_off) and pool_str_eq2(pool, ibuf_get(loaded, b + 2), s1_len, s1_off) {
-                return true
-            }
-        }
-        i += 1
-    }
-    return false
-}
-
-fn build_mod_rel_path(pool: ByteBuf, path_buf: ByteBuf, prefix: str, s0_off: i64, s0_len: i64, s1_off: i64, s1_len: i64) -> str {
+// Multi-segment module path builder (`use a::b::c` -> `<prefix>a/b/c.ax`)
+fn build_use_mod_path(pool: ByteBuf, extra: IntBuf, path_buf: ByteBuf, prefix: str, seg_off: i64, seg_cnt: i64) -> str {
     start := buf_len(path_buf)
     if str_len(prefix) > 0 {
         buf_push_str(path_buf, prefix)
     }
-    buf_push_str(path_buf, buf_slice_str(pool, s0_off, s0_off + s0_len))
-    buf_push_str(path_buf, "/")
-    buf_push_str(path_buf, buf_slice_str(pool, s1_off, s1_off + s1_len))
+    mut i := 0
+    while i < seg_cnt {
+        if i > 0 {
+            buf_push(path_buf, 47)
+        }
+        soff := ibuf_get(extra, seg_off + i * 2)
+        slen := ibuf_get(extra, seg_off + i * 2 + 1)
+        buf_push_str(path_buf, buf_slice_str(pool, soff, soff + slen))
+        i += 1
+    }
     buf_push_str(path_buf, ".ax")
     end := buf_len(path_buf)
     buf_push(path_buf, 0)
     return buf_slice_str(path_buf, start, end)
 }
 
-fn build_install_mod_path(pool: ByteBuf, path_buf: ByteBuf, s0_off: i64, s0_len: i64, s1_off: i64, s1_len: i64) -> str {
+fn get_install_root_prefix(path_buf: ByteBuf) -> str {
     argv0 := args_get(0)
     mut sp := str_len(argv0) - 1
     while sp >= 0 {
@@ -75,34 +84,49 @@ fn build_install_mod_path(pool: ByteBuf, path_buf: ByteBuf, s0_off: i64, s0_len:
         }
         sp -= 1
     }
-    start := buf_len(path_buf)
-    if sp >= 0 {
-        buf_push_str(path_buf, str_slice(argv0, 0, sp + 1))
-        buf_push_str(path_buf, "../")
+    if sp < 0 {
+        return ""
     }
-    buf_push_str(path_buf, buf_slice_str(pool, s0_off, s0_off + s0_len))
-    buf_push_str(path_buf, "/")
-    buf_push_str(path_buf, buf_slice_str(pool, s1_off, s1_off + s1_len))
-    buf_push_str(path_buf, ".ax")
+    start := buf_len(path_buf)
+    buf_push_str(path_buf, str_slice(argv0, 0, sp + 1))
+    buf_push_str(path_buf, "../")
     end := buf_len(path_buf)
     buf_push(path_buf, 0)
     return buf_slice_str(path_buf, start, end)
 }
 
-fn derive_default_exe_path(path_buf: ByteBuf, in_path: str) -> str {
-    n := str_len(in_path)
-    mut stem_len := n
-    if n > 3 {
-        if str_slice(in_path, n - 3, n) == ".ax" {
-            stem_len = n - 3
+fn get_parent_dir_prefix(path_buf: ByteBuf, file_path: str) -> str {
+    mut sp := str_len(file_path) - 1
+    while sp >= 0 {
+        b := str_byte(file_path, sp)
+        if b == 47 or b == 92 {
+            break
         }
+        sp -= 1
+    }
+    if sp < 0 {
+        return ""
     }
     start := buf_len(path_buf)
-    buf_push_str(path_buf, str_slice(in_path, 0, stem_len))
-    buf_push_str(path_buf, ".exe")
+    buf_push_str(path_buf, str_slice(file_path, 0, sp + 1))
     end := buf_len(path_buf)
     buf_push(path_buf, 0)
     return buf_slice_str(path_buf, start, end)
+}
+
+fn is_rel_mod_loaded(pool: ByteBuf, loaded: IntBuf, rel_soff: i64, rel_slen: i64) -> bool {
+    cnt := ibuf_len(loaded) / 2
+    mut i := 0
+    while i < cnt {
+        b := i * 2
+        if ibuf_get(loaded, b + 1) == rel_slen {
+            if pool_str_eq2(pool, ibuf_get(loaded, b), rel_slen, rel_soff) {
+                return true
+            }
+        }
+        i += 1
+    }
+    return false
 }
 
 fn push_extra_slice(dst: IntBuf, extra: IntBuf, off: i64, cnt: i64) {
@@ -113,135 +137,222 @@ fn push_extra_slice(dst: IntBuf, extra: IntBuf, off: i64, cnt: i64) {
     }
 }
 
-fn push_use_queue(mod_queue: IntBuf, nodes: IntBuf, extra: IntBuf, u_off: i64, u_cnt: i64) {
+fn push_use_nodes(mod_queue: IntBuf, extra: IntBuf, u_off: i64, u_cnt: i64) {
     mut i := 0
     while i < u_cnt {
-        un := ibuf_get(extra, u_off + i)
-        ibuf_push(mod_queue, ast_get(nodes, un, 1))
-        ibuf_push(mod_queue, ast_get(nodes, un, 2))
-        ibuf_push(mod_queue, ast_get(nodes, un, 3))
-        ibuf_push(mod_queue, ast_get(nodes, un, 4))
+        ibuf_push(mod_queue, ibuf_get(extra, u_off + i))
         i += 1
     }
 }
 
-fn load_and_merge_program(in_path: str, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> bool {
-    entry_src := fs_read_file(in_path) or return false
-    toks := ibuf_new(131072)
-    lex_err := tokenize_source(entry_src, toks, pool)
+// Loads, tokenizes, parses, resolves multi-segment `use` imports AND `@cImport("header.h")` declarations,
+// and records per-file source buffers in `(files_meta, src_arena)` for `file:line:col` diagnostics!
+// On failure, writes `[err_code, err_span]` into `err_out[0..1]` and returns `false`.
+fn load_and_merge_program_v7(in_path: str, pool: ByteBuf, nodes: IntBuf, extra: IntBuf, files_meta: IntBuf, src_arena: ByteBuf, err_out: IntBuf) -> bool {
+    entry_src := fs_read_file(in_path) or buf_new(0)
+    if buf_len(entry_src) == 0 {
+        ibuf_set(err_out, 0, 30)
+        ibuf_set(err_out, 1, span_pack(1, 1, 0))
+        buf_free(move entry_src)
+        return false
+    }
+
+    entry_fid := diag_register_file(pool, files_meta, src_arena, in_path, entry_src)
+    entry_hash := fnv1a_bytebuf(entry_src)
+    toks := ibuf_new(262144)
+    lex_sp := tokenize_source_file(entry_src, toks, pool, entry_fid)
     buf_free(move entry_src)
-    if lex_err != 0 {
-        println(f"[LEX ERROR] Invalid token in `{in_path}` at line {lex_err}")
+    if lex_sp != 0 {
+        ibuf_set(err_out, 0, 10)
+        ibuf_set(err_out, 1, lex_sp)
         buf_free(move toks)
         return false
     }
 
     parser_init(toks, nodes, extra)
+    ibuf_set(nodes, 15, entry_fid)
     entry_prog := parse_program_into_ast(toks, pool, nodes, extra)
     p_errs := ibuf_get(nodes, 2)
-    p_err_ln := ibuf_get(nodes, 3)
+    p_err_sp := ibuf_get(nodes, 3)
     buf_free(move toks)
     if p_errs > 0 {
-        println(f"[PARSE ERROR] Syntax error in `{in_path}` at line {p_err_ln}")
+        ibuf_set(err_out, 0, 20)
+        ibuf_set(err_out, 1, p_err_sp)
         return false
     }
 
     all_structs := ibuf_new(1024)
     all_ifaces := ibuf_new(512)
     all_funcs := ibuf_new(4096)
+    all_cimports := ibuf_new(128)
+    all_comptimes := ibuf_new(256)
     mod_queue := ibuf_new(512)
     loaded_mods := ibuf_new(512)
-    path_scratch := buf_new(16384)
+    path_scratch := buf_new(32768)
 
-    push_use_queue(mod_queue, nodes, extra, ast_get(nodes, entry_prog, 1), ast_get(nodes, entry_prog, 2))
+    push_use_nodes(mod_queue, extra, ast_get(nodes, entry_prog, 1), ast_get(nodes, entry_prog, 2))
     push_extra_slice(all_structs, extra, ast_get(nodes, entry_prog, 3), ast_get(nodes, entry_prog, 4))
     push_extra_slice(all_ifaces, extra, ast_get(nodes, entry_prog, 5), ast_get(nodes, entry_prog, 6))
     push_extra_slice(all_funcs, extra, ibuf_get(nodes, 8), ibuf_get(nodes, 9))
+    push_extra_slice(all_cimports, extra, ibuf_get(nodes, 10), ibuf_get(nodes, 11))
+    push_extra_slice(all_comptimes, extra, ibuf_get(nodes, 12), ibuf_get(nodes, 13))
 
-    // Recursively load & parse imported `.ax` modules into the shared arena
+    entry_dir := get_parent_dir_prefix(path_scratch, in_path)
+    install_dir := get_install_root_prefix(path_scratch)
+
+    // 1. Recursively load & parse multi-segment `use` `.ax` modules
     mut qi := 0
-    while qi < ibuf_len(mod_queue) / 4 {
-        qb := qi * 4
-        s0_off := ibuf_get(mod_queue, qb)
-        s0_len := ibuf_get(mod_queue, qb + 1)
-        s1_off := ibuf_get(mod_queue, qb + 2)
-        s1_len := ibuf_get(mod_queue, qb + 3)
+    while qi < ibuf_len(mod_queue) {
+        un := ibuf_get(mod_queue, qi)
         qi += 1
+        seg_off := ast_get(nodes, un, 5)
+        seg_cnt := ast_get(nodes, un, 6)
+        if seg_cnt >= 2 {
+            rel_key := build_use_mod_path(pool, extra, path_scratch, "", seg_off, seg_cnt)
+            rel_soff := pool_intern_str(pool, rel_key)
+            rel_slen := str_len(rel_key)
+            if not is_rel_mod_loaded(pool, loaded_mods, rel_soff, rel_slen) {
+                ibuf_push(loaded_mods, rel_soff)
+                ibuf_push(loaded_mods, rel_slen)
 
-        if s1_len > 0 and not is_mod_loaded(pool, loaded_mods, s0_off, s0_len, s1_off, s1_len) {
-            ibuf_push(loaded_mods, s0_off)
-            ibuf_push(loaded_mods, s0_len)
-            ibuf_push(loaded_mods, s1_off)
-            ibuf_push(loaded_mods, s1_len)
+                p1 := rel_key
+                p2 := build_use_mod_path(pool, extra, path_scratch, entry_dir, seg_off, seg_cnt)
+                p3 := build_use_mod_path(pool, extra, path_scratch, "../", seg_off, seg_cnt)
+                p4 := build_use_mod_path(pool, extra, path_scratch, install_dir, seg_off, seg_cnt)
+                msrc := fs_read_file(p1) or (fs_read_file(p2) or (fs_read_file(p3) or (fs_read_file(p4) or buf_new(64))))
 
-            p1 := build_mod_rel_path(pool, path_scratch, "", s0_off, s0_len, s1_off, s1_len)
-            p2 := build_mod_rel_path(pool, path_scratch, "../", s0_off, s0_len, s1_off, s1_len)
-            p3 := build_install_mod_path(pool, path_scratch, s0_off, s0_len, s1_off, s1_len)
-            msrc := fs_read_file(p1) or (fs_read_file(p2) or (fs_read_file(p3) or buf_new(64)))
-            if buf_len(msrc) > 0 {
-                mtoks := ibuf_new(131072)
-                ml_err := tokenize_source(msrc, mtoks, pool)
-                buf_free(move msrc)
-                if ml_err != 0 {
-                    println(f"[LEX ERROR] Invalid token in module `{p1}` at line {ml_err}")
+                if buf_len(msrc) > 0 {
+                    mfid := diag_register_file(pool, files_meta, src_arena, p1, msrc)
+                    mtoks := ibuf_new(262144)
+                    ml_sp := tokenize_source_file(msrc, mtoks, pool, mfid)
+                    buf_free(move msrc)
+                    if ml_sp != 0 {
+                        ibuf_set(err_out, 0, 10)
+                        ibuf_set(err_out, 1, ml_sp)
+                        buf_free(move mtoks)
+                        return false
+                    }
+                    parser_init(mtoks, nodes, extra)
+                    ibuf_set(nodes, 15, mfid)
+                    mprog := parse_program_into_ast(mtoks, pool, nodes, extra)
+                    mp_errs := ibuf_get(nodes, 2)
+                    mp_sp := ibuf_get(nodes, 3)
                     buf_free(move mtoks)
-                    return false
-                }
-                parser_init(mtoks, nodes, extra)
-                mprog := parse_program_into_ast(mtoks, pool, nodes, extra)
-                mp_errs := ibuf_get(nodes, 2)
-                mp_ln := ibuf_get(nodes, 3)
-                buf_free(move mtoks)
-                if mp_errs > 0 {
-                    println(f"[PARSE ERROR] Syntax error in module `{p1}` at line {mp_ln}")
-                    return false
-                }
-
-                push_use_queue(mod_queue, nodes, extra, ast_get(nodes, mprog, 1), ast_get(nodes, mprog, 2))
-
-                ms_off := ast_get(nodes, mprog, 3)
-                ms_cnt := ast_get(nodes, mprog, 4)
-                mut k := 0
-                while k < ms_cnt {
-                    sn := ibuf_get(extra, ms_off + k)
-                    if not has_decl_named(pool, nodes, all_structs, ast_get(nodes, sn, 1), ast_get(nodes, sn, 2)) {
-                        ibuf_push(all_structs, sn)
+                    if mp_errs > 0 {
+                        ibuf_set(err_out, 0, 20)
+                        ibuf_set(err_out, 1, mp_sp)
+                        return false
                     }
-                    k += 1
-                }
 
-                mi_off := ast_get(nodes, mprog, 5)
-                mi_cnt := ast_get(nodes, mprog, 6)
-                k = 0
-                while k < mi_cnt {
-                    inid := ibuf_get(extra, mi_off + k)
-                    if not has_decl_named(pool, nodes, all_ifaces, ast_get(nodes, inid, 1), ast_get(nodes, inid, 2)) {
-                        ibuf_push(all_ifaces, inid)
-                    }
-                    k += 1
-                }
+                    push_use_nodes(mod_queue, extra, ast_get(nodes, mprog, 1), ast_get(nodes, mprog, 2))
+                    push_extra_slice(all_cimports, extra, ibuf_get(nodes, 10), ibuf_get(nodes, 11))
+                    push_extra_slice(all_comptimes, extra, ibuf_get(nodes, 12), ibuf_get(nodes, 13))
 
-                mf_off := ibuf_get(nodes, 8)
-                mf_cnt := ibuf_get(nodes, 9)
-                k = 0
-                while k < mf_cnt {
-                    fnid := ibuf_get(extra, mf_off + k)
-                    fn_soff := ast_get(nodes, fnid, 1)
-                    fn_slen := ast_get(nodes, fnid, 2)
-                    if not pool_str_eq_lit(pool, fn_soff, fn_slen, "main") {
-                        if not has_decl_named(pool, nodes, all_funcs, fn_soff, fn_slen) {
-                            ibuf_push(all_funcs, fnid)
+                    ms_off := ast_get(nodes, mprog, 3)
+                    ms_cnt := ast_get(nodes, mprog, 4)
+                    mut k := 0
+                    while k < ms_cnt {
+                        sn := ibuf_get(extra, ms_off + k)
+                        if not has_decl_named(pool, nodes, all_structs, ast_get(nodes, sn, 1), ast_get(nodes, sn, 2)) {
+                            ibuf_push(all_structs, sn)
                         }
+                        k += 1
                     }
-                    k += 1
+
+                    mi_off := ast_get(nodes, mprog, 5)
+                    mi_cnt := ast_get(nodes, mprog, 6)
+                    k = 0
+                    while k < mi_cnt {
+                        inid := ibuf_get(extra, mi_off + k)
+                        if not has_decl_named(pool, nodes, all_ifaces, ast_get(nodes, inid, 1), ast_get(nodes, inid, 2)) {
+                            ibuf_push(all_ifaces, inid)
+                        }
+                        k += 1
+                    }
+
+                    mf_off := ibuf_get(nodes, 8)
+                    mf_cnt := ibuf_get(nodes, 9)
+                    k = 0
+                    while k < mf_cnt {
+                        fnid := ibuf_get(extra, mf_off + k)
+                        fn_soff := ast_get(nodes, fnid, 1)
+                        fn_slen := ast_get(nodes, fnid, 2)
+                        if not pool_str_eq_lit(pool, fn_soff, fn_slen, "main") {
+                            if not has_decl_named(pool, nodes, all_funcs, fn_soff, fn_slen) {
+                                ibuf_push(all_funcs, fnid)
+                            }
+                        }
+                        k += 1
+                    }
+                } else {
+                    buf_free(move msrc)
+                    ibuf_set(err_out, 0, 30)
+                    ibuf_set(err_out, 1, ast_span(nodes, un))
+                    return false
                 }
-            } else {
-                println(f"[MODULE ERROR] Cannot locate imported module `{p1}`")
-                buf_free(move msrc)
-                return false
             }
         }
     }
+
+    // 2. Process all `@cImport("header.h", link = "...")` declarations directly into Axon AST!
+    mut ci := 0
+    while ci < ibuf_len(all_cimports) {
+        cin := ibuf_get(all_cimports, ci)
+        ci += 1
+        h_soff := ast_get(nodes, cin, 1)
+        h_slen := ast_get(nodes, cin, 2)
+        l_soff := ast_get(nodes, cin, 3)
+        l_slen := ast_get(nodes, cin, 4)
+        hp1 := buf_slice_str(pool, h_soff, h_soff + h_slen)
+
+        hs0 := buf_len(path_scratch)
+        buf_push_str(path_scratch, entry_dir)
+        buf_push_str(path_scratch, hp1)
+        hs1 := buf_len(path_scratch)
+        buf_push(path_scratch, 0)
+        hp2 := buf_slice_str(path_scratch, hs0, hs1)
+
+        hsrc := fs_read_file(hp1) or (fs_read_file(hp2) or buf_new(64))
+        if buf_len(hsrc) == 0 {
+            buf_free(move hsrc)
+            ibuf_set(err_out, 0, 30)
+            ibuf_set(err_out, 1, ast_span(nodes, cin))
+            return false
+        }
+        hfid := diag_register_file(pool, files_meta, src_arena, hp1, hsrc)
+        c_structs := ibuf_new(64)
+        c_funcs := ibuf_new(128)
+        c_consts := ibuf_new(128)
+        parse_c_header_into_program(hsrc, pool, nodes, extra, l_soff, l_slen, hfid, c_structs, c_funcs, c_consts)
+        buf_free(move hsrc)
+
+        mut cs := 0
+        while cs < ibuf_len(c_structs) {
+            sn := ibuf_get(c_structs, cs)
+            if not has_decl_named(pool, nodes, all_structs, ast_get(nodes, sn, 1), ast_get(nodes, sn, 2)) {
+                ibuf_push(all_structs, sn)
+            }
+            cs += 1
+        }
+        mut cf := 0
+        while cf < ibuf_len(c_funcs) {
+            fnid := ibuf_get(c_funcs, cf)
+            if not has_decl_named(pool, nodes, all_funcs, ast_get(nodes, fnid, 1), ast_get(nodes, fnid, 2)) {
+                ibuf_push(all_funcs, fnid)
+            }
+            cf += 1
+        }
+        mut cc := 0
+        while cc < ibuf_len(c_consts) {
+            ibuf_push(all_comptimes, ibuf_get(c_consts, cc))
+            cc += 1
+        }
+        buf_free(move c_consts)
+        buf_free(move c_funcs)
+        buf_free(move c_structs)
+    }
+
+    ibuf_set(err_out, 2, entry_hash)
 
     final_soff := ibuf_len(extra)
     final_scnt := ibuf_len(all_structs)
@@ -255,6 +366,23 @@ fn load_and_merge_program(in_path: str, pool: ByteBuf, nodes: IntBuf, extra: Int
     final_fcnt := ibuf_len(all_funcs)
     push_extra_slice(extra, all_funcs, 0, final_fcnt)
 
+    final_cioff := ibuf_len(extra)
+    final_cicnt := ibuf_len(all_cimports)
+    push_extra_slice(extra, all_cimports, 0, final_cicnt)
+
+    final_ctoff := ibuf_len(extra)
+    final_ctcnt := ibuf_len(all_comptimes)
+    push_extra_slice(extra, all_comptimes, 0, final_ctcnt)
+
+    buf_free(move path_scratch)
+    buf_free(move loaded_mods)
+    buf_free(move mod_queue)
+    buf_free(move all_comptimes)
+    buf_free(move all_cimports)
+    buf_free(move all_funcs)
+    buf_free(move all_ifaces)
+    buf_free(move all_structs)
+
     merged_prog := ast_alloc(nodes, nk_program(), 1)
     ast_set(nodes, merged_prog, 1, 0)
     ast_set(nodes, merged_prog, 2, 0)
@@ -265,7 +393,175 @@ fn load_and_merge_program(in_path: str, pool: ByteBuf, nodes: IntBuf, extra: Int
     ibuf_set(nodes, 7, merged_prog)
     ibuf_set(nodes, 8, final_foff)
     ibuf_set(nodes, 9, final_fcnt)
+    ibuf_set(nodes, 10, final_cioff)
+    ibuf_set(nodes, 11, final_cicnt)
+    ibuf_set(nodes, 12, final_ctoff)
+    ibuf_set(nodes, 13, final_ctcnt)
     return true
+}
+
+fn compile_for_target_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, target_id: i64, is_shared: bool, test_mode: bool, force_shield: bool, simd_override: i64, static_libs: IntBuf, out_buf: ByteBuf) -> i64 {
+    if target_id == tgt_linux_arm64() {
+        return compile_module_to_arm64(pool, nodes, extra, sym, false, out_buf)
+    }
+    if target_id == tgt_macos_arm64() {
+        return compile_module_to_arm64(pool, nodes, extra, sym, true, out_buf)
+    }
+    if target_id == tgt_wasm32() {
+        return compile_module_to_wasm32(pool, nodes, extra, sym, out_buf)
+    }
+    if target_id == tgt_riscv64() {
+        return compile_module_to_riscv64(pool, nodes, extra, sym, out_buf)
+    }
+    if target_id == tgt_spirv() {
+        return compile_gpu_spirv(pool, nodes, extra, sym, out_buf)
+    }
+    if target_id == tgt_ptx() {
+        return compile_gpu_ptx(pool, nodes, extra, sym, out_buf)
+    }
+    return compile_module_x86_64_v7(pool, nodes, extra, sym, target_id, is_shared, test_mode, force_shield, simd_override, static_libs, out_buf)
+}
+
+// In-memory JSON check helper used by both `axc check --json` and `axc mcp` (`axon_check`)
+fn check_file_to_json_buf(in_path: str, out_json: ByteBuf) -> bool {
+    t0 := clock_ns()
+    pool := buf_new(524288)
+    nodes := ibuf_new(262144)
+    extra := ibuf_new(262144)
+    sym := ibuf_new(131072)
+    files_meta := ibuf_new(128)
+    src_arena := buf_new(262144)
+    err_out := ibuf_new(8)
+    ibuf_push(err_out, 0); ibuf_push(err_out, 0); ibuf_push(err_out, 0)
+
+    mut ok_res := true
+    if not load_and_merge_program_v7(in_path, pool, nodes, extra, files_meta, src_arena, err_out) {
+        el_us := (clock_ns() - t0) / 1000
+        diag_format_json_report(pool, files_meta, src_arena, in_path, false, ibuf_get(err_out, 0), ibuf_get(err_out, 1), el_us, out_json)
+        ok_res = false
+    } else if not analyze_semantics_and_perceus(pool, nodes, extra, sym) {
+        el_us := (clock_ns() - t0) / 1000
+        diag_format_json_report(pool, files_meta, src_arena, in_path, false, ibuf_get(sym, 2), ibuf_get(sym, 1), el_us, out_json)
+        ok_res = false
+    } else {
+        el_us := (clock_ns() - t0) / 1000
+        diag_format_json_report(pool, files_meta, src_arena, in_path, true, 0, 0, el_us, out_json)
+    }
+
+    buf_free(move err_out)
+    buf_free(move src_arena)
+    buf_free(move files_meta)
+    buf_free(move sym)
+    buf_free(move extra)
+    buf_free(move nodes)
+    buf_free(move pool)
+    return ok_res
+}
+
+fn run_mcp_server_stdio() -> i32 {
+    line_buf := buf_new(65536)
+    while true {
+        nread := ax_stdin_line(line_buf)
+        if nread < 0 {
+            break
+        }
+        if nread > 0 {
+            scratch := buf_new(8192)
+            line := buf_slice_str(line_buf, 0, nread)
+            // Only process JSON object lines (`{...}`); skip LSP `Content-Length:` header lines cleanly
+            mut first_ch := 0
+            mut li := 0
+            while li < nread {
+                b := str_byte(line, li)
+                if b != 32 and b != 9 {
+                    first_ch = b
+                    break
+                }
+                li += 1
+            }
+            if first_ch == 123 {
+                method := mcp_json_get_str(line, "method", scratch)
+                raw_id := mcp_json_get_raw_id(line, scratch)
+                if method == "initialize" {
+                    mcp_emit_initialize_resp(raw_id)
+                } else if method == "ping" {
+                    println(f"{{\"jsonrpc\":\"2.0\",\"id\":{raw_id},\"result\":{{}}}}")
+                } else if method == "tools/list" {
+                    mcp_emit_tools_list_resp(raw_id)
+                } else if method == "tools/call" {
+                    tname := mcp_json_get_str(line, "name", scratch)
+                    if tname == "axon_check" {
+                        fpath := mcp_json_get_str(line, "path", scratch)
+                        jrep := buf_new(4096)
+                        ok_c := check_file_to_json_buf(fpath, jrep)
+                        mcp_emit_tool_text_resp(raw_id, not ok_c, buf_slice_str(jrep, 0, buf_len(jrep)))
+                        buf_free(move jrep)
+                    } else if tname == "axon_build" {
+                        fpath := mcp_json_get_str(line, "path", scratch)
+                        tstr := mcp_json_get_str(line, "target", scratch)
+                        mut tid := tgt_win_x64()
+                        if str_len(tstr) > 0 {
+                            pt := parse_target_flag(tstr)
+                            if pt >= 0 { tid = pt }
+                        }
+                        pool := buf_new(524288)
+                        nodes := ibuf_new(262144)
+                        extra := ibuf_new(262144)
+                        sym := ibuf_new(131072)
+                        fmeta := ibuf_new(128)
+                        sarena := buf_new(262144)
+                        eout := ibuf_new(8)
+                        ibuf_push(eout, 0); ibuf_push(eout, 0); ibuf_push(eout, 0)
+                        if not load_and_merge_program_v7(fpath, pool, nodes, extra, fmeta, sarena, eout) {
+                            mcp_emit_tool_text_resp(raw_id, true, "Failed to load/parse Axon source file")
+                        } else if not analyze_semantics_and_perceus(pool, nodes, extra, sym) {
+                            jerr := buf_new(2048)
+                            diag_format_json_report(pool, fmeta, sarena, fpath, false, ibuf_get(sym, 2), ibuf_get(sym, 1), 0, jerr)
+                            mcp_emit_tool_text_resp(raw_id, true, buf_slice_str(jerr, 0, buf_len(jerr)))
+                            buf_free(move jerr)
+                        } else {
+                            pbuf := buf_new(512)
+                            opath := derive_output_path_v7(pbuf, fpath, tid, false)
+                            bout := buf_new(1048576)
+                            elibs := ibuf_new(4)
+                            _fc := compile_for_target_v7(pool, nodes, extra, sym, tid, false, false, false, -1, elibs, bout)
+                            wr := fs_write_file(opath, bout) or -1
+                            buf_free(move elibs)
+                            buf_free(move bout)
+                            if wr >= 0 {
+                                mcp_emit_tool_text_resp(raw_id, false, f"Built `{opath}` ({wr} bytes) for target `{target_display_name(tid)}`")
+                            } else {
+                                mcp_emit_tool_text_resp(raw_id, true, f"Failed to write output `{opath}`")
+                            }
+                            buf_free(move pbuf)
+                        }
+                        buf_free(move eout)
+                        buf_free(move sarena)
+                        buf_free(move fmeta)
+                        buf_free(move sym)
+                        buf_free(move extra)
+                        buf_free(move nodes)
+                        buf_free(move pool)
+                    } else if tname == "axon_targets" {
+                        mcp_emit_tool_text_resp(raw_id, false, "Targets: win-x64, linux-x64, linux-arm64, macos-arm64, macos-x64, wasm32, unikernel-x64, freestanding-x64, freestanding-riscv64, spirv, ptx")
+                    } else if tname == "axon_spec" {
+                        sp_buf := fs_read_file("AXON_LLM_SPEC.md") or buf_new(0)
+                        if buf_len(sp_buf) > 0 {
+                            mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(sp_buf, 0, buf_len(sp_buf)))
+                        } else {
+                            mcp_emit_tool_text_resp(raw_id, false, "Axon v7.0 AI Spec: Perceus 0-GC (`move`), `Table[T]` SoA SIMD (`par_for`), `comptime`, `@cImport`, `tainted[str]`, `Tensor[f32, [B, S, D]]`, `@nan_guard`, `@no_alloc`.")
+                        }
+                        buf_free(move sp_buf)
+                    } else {
+                        mcp_emit_tool_text_resp(raw_id, true, f"Unknown MCP tool `{tname}`")
+                    }
+                }
+            }
+            buf_free(move scratch)
+        }
+    }
+    buf_free(move line_buf)
+    return 0
 }
 
 @shield
@@ -280,15 +576,27 @@ fn main() -> i32 {
 
     cmd := args_get(1)
     if cmd == "version" or cmd == "-v" or cmd == "--version" {
-        println("axc 6.0.0-selfhosted (100% Pure Axon Self-Hosted Native x86_64/AVX2/PE32+ Compiler)")
+        println("axc 7.0.0-selfhosted (100% Pure Axon Multi-OS Native Compiler: x86_64 AVX-512 / ARM64 NEON / RV64GC / WASM32 / SPIR-V / PTX)")
         return 0
     }
     if cmd == "help" or cmd == "-h" or cmd == "--help" {
         print_axc_usage()
         return 0
     }
+    if cmd == "targets" {
+        print_axc_targets()
+        return 0
+    }
+    if cmd == "mcp" {
+        return run_mcp_server_stdio()
+    }
+    if cmd == "init" {
+        mut init_name := ""
+        if argc >= 3 { init_name = args_get(2) }
+        return cmd_init_project(init_name)
+    }
 
-    if cmd != "check" and cmd != "build" and cmd != "bundle" and cmd != "specialize" {
+    if cmd != "check" and cmd != "build" and cmd != "run" and cmd != "test" and cmd != "bundle" and cmd != "specialize" {
         println(f"Unknown command `{cmd}`")
         print_axc_usage()
         return 1
@@ -296,10 +604,16 @@ fn main() -> i32 {
 
     mut in_path := ""
     mut out_path := ""
-    mut force_shield := false
-    if cmd == "bundle" {
-        force_shield = true
-    }
+    mut target_id := tgt_win_x64()
+    mut force_shield := cmd == "bundle"
+    mut is_shared := false
+    mut json_mode := false
+    mut emit_gpu := false
+    mut simd_override := -1
+    test_mode := cmd == "test"
+
+    pool := buf_new(4194304)
+    static_libs := ibuf_new(64)
 
     mut ai := 2
     while ai < argc {
@@ -308,9 +622,43 @@ fn main() -> i32 {
             out_path = args_get(ai + 1)
             ai += 2
         } else if arg == "--target" and ai + 1 < argc {
+            t_arg := args_get(ai + 1)
+            parsed_t := parse_target_flag(t_arg)
+            if parsed_t < 0 {
+                println(f"Error: unknown `--target {t_arg}` (run `axc targets` to see all 11 targets)")
+                return 1
+            }
+            target_id = parsed_t
             ai += 2
+        } else if (arg == "--link-lib" or arg == "-l") and ai + 1 < argc {
+            lpath := args_get(ai + 1)
+            lsoff := pool_intern_str(pool, lpath)
+            ibuf_push(static_libs, lsoff)
+            ibuf_push(static_libs, str_len(lpath))
+            ai += 2
+        } else if arg == "--simd" and ai + 1 < argc {
+            simd_override = parse_simd_flag(args_get(ai + 1))
+            ai += 2
+        } else if arg == "--simd=scalar" or arg == "--simd=sse2" {
+            simd_override = 0
+            ai += 1
+        } else if arg == "--simd=avx2" {
+            simd_override = 1
+            ai += 1
+        } else if arg == "--simd=avx512" {
+            simd_override = 2
+            ai += 1
         } else if arg == "--shield" or arg == "--ultra" {
             force_shield = true
+            ai += 1
+        } else if arg == "--shared" or arg == "--dll" {
+            is_shared = true
+            ai += 1
+        } else if arg == "--json" {
+            json_mode = true
+            ai += 1
+        } else if arg == "--emit-gpu" {
+            emit_gpu = true
             ai += 1
         } else if str_len(arg) > 0 and str_byte(arg, 0) == 45 {
             ai += 1
@@ -322,50 +670,101 @@ fn main() -> i32 {
         }
     }
 
+    path_buf := buf_new(8192)
     if str_len(in_path) == 0 {
-        println("Error: missing `.ax` input file")
-        return 1
+        in_path = resolve_entry_from_axon_toml(path_buf)
+        if str_len(in_path) == 0 {
+            println("Error: missing `.ax` input file and no `axon.toml` found in current directory")
+            return 1
+        }
     }
 
-    path_buf := buf_new(4096)
     if str_len(out_path) == 0 {
-        out_path = derive_default_exe_path(path_buf, in_path)
+        if cmd == "run" or cmd == "test" {
+            s0 := buf_len(path_buf)
+            buf_push_str(path_buf, ".axon_run_tmp.exe")
+            s1 := buf_len(path_buf)
+            buf_push(path_buf, 0)
+            out_path = buf_slice_str(path_buf, s0, s1)
+        } else {
+            out_path = derive_output_path_v7(path_buf, in_path, target_id, is_shared)
+        }
     }
 
-    pool := buf_new(1048576)
-    nodes := ibuf_new(524288)
-    extra := ibuf_new(524288)
-    sym := ibuf_new(262144)
+    nodes := ibuf_new(2097152)
+    extra := ibuf_new(2097152)
+    sym := ibuf_new(1048576)
+    files_meta := ibuf_new(512)
+    src_arena := buf_new(4194304)
+    err_out := ibuf_new(8)
+    ibuf_push(err_out, 0); ibuf_push(err_out, 0); ibuf_push(err_out, 0)
 
-    if not load_and_merge_program(in_path, pool, nodes, extra) {
-        println(f"Compilation aborted for `{in_path}`")
+    if not load_and_merge_program_v7(in_path, pool, nodes, extra, files_meta, src_arena, err_out) {
+        elapsed_us := (clock_ns() - t0) / 1000
+        diag_emit_error(pool, files_meta, src_arena, in_path, ibuf_get(err_out, 0), ibuf_get(err_out, 1), json_mode, elapsed_us)
+        if not json_mode {
+            println(f"Compilation aborted for `{in_path}`")
+        }
         return 1
     }
 
     if not analyze_semantics_and_perceus(pool, nodes, extra, sym) {
-        err_ln := ibuf_get(sym, 1)
-        err_code := ibuf_get(sym, 2)
-        println(f"[SAFETY ERROR E0{err_code}] Compile-time safety violation in `{in_path}` at line {err_ln}")
+        elapsed_us := (clock_ns() - t0) / 1000
+        diag_emit_error(pool, files_meta, src_arena, in_path, ibuf_get(sym, 2), ibuf_get(sym, 1), json_mode, elapsed_us)
         return 1
+    }
+
+    // Update `axon.lock` when building from a workspace with `axon.toml`
+    if cmd == "build" {
+        update_axon_lockfile(in_path, ibuf_get(err_out, 2))
     }
 
     if cmd == "check" {
         elapsed_us := (clock_ns() - t0) / 1000
-        println(f"[OK] `{in_path}` verified in {elapsed_us} us (Perceus 0-GC, Capabilities & Types clean)")
+        if json_mode {
+            jbuf := buf_new(1024)
+            diag_format_json_report(pool, files_meta, src_arena, in_path, true, 0, 0, elapsed_us, jbuf)
+            println(buf_slice_str(jbuf, 0, buf_len(jbuf)))
+            buf_free(move jbuf)
+        } else {
+            println(f"[OK] `{in_path}` verified in {elapsed_us} us (0 errors | Perceus 0-GC + Taint + @no_alloc + Shapes clean)")
+        }
         return 0
     }
 
-    pe_out := buf_new(4194304)
-    f_cnt := compile_module_to_pe_ax(pool, nodes, extra, sym, force_shield, pe_out)
+    bin_out := buf_new(8388608)
+    f_cnt := compile_for_target_v7(pool, nodes, extra, sym, target_id, is_shared, test_mode, force_shield, simd_override, static_libs, bin_out)
 
-    written := fs_write_file(out_path, pe_out) or -1
+    written := fs_write_file(out_path, bin_out) or -1
     if written < 0 {
-        println(f"Error: cannot write output executable `{out_path}`")
+        println(f"Error: cannot write output binary `{out_path}`")
         return 1
     }
 
+    if emit_gpu {
+        spv_path := derive_sidecar_ext_path(path_buf, out_path, ".spv")
+        ptx_path := derive_sidecar_ext_path(path_buf, out_path, ".ptx")
+        spv_buf := buf_new(65536)
+        ptx_buf := buf_new(65536)
+        _s := compile_gpu_spirv(pool, nodes, extra, sym, spv_buf)
+        _p := compile_gpu_ptx(pool, nodes, extra, sym, ptx_buf)
+        sw := fs_write_file(spv_path, spv_buf) or -1
+        pw := fs_write_file(ptx_path, ptx_buf) or -1
+        buf_free(move ptx_buf)
+        buf_free(move spv_buf)
+        println(f"[AXC GPU] Emitted `{spv_path}` ({sw} bytes SPIR-V 1.6) + `{ptx_path}` ({pw} bytes NVIDIA PTX 8.0)")
+    }
+
+    if cmd == "run" or cmd == "test" {
+        rc := ax_os_exec(out_path)
+        if rc != 0 {
+            return 1
+        }
+        return 0
+    }
+
     elapsed_ms := (clock_ns() - t0) / 1000000
-    println(f"[AXC SELF-HOSTED] Built `{out_path}` ({written} bytes, {f_cnt} native fns, W^X + @shield) in {elapsed_ms} ms")
+    println(f"[AXC v7.0] Built `{out_path}` ({written} bytes, {f_cnt} units, target={target_display_name(target_id)}) in {elapsed_ms} ms")
     if root_cap.token_id == 0 {
         return 1
     }

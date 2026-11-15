@@ -1,0 +1,379 @@
+// Axon v7.0 Self-Hosted Compiler - Effect, Taint, `@no_alloc` & Symbolic Shape Verifier (`compiler_ax/sema_effects.ax`)
+// Enforces:
+//   - E0502: Compile-time `tainted[str]` security barrier across SQL/Shell/FS sinks & `f"..."` interpolation
+//   - E0601: Static transitive `@no_alloc` zero-heap verification for HFT & hard real-time hot paths
+//   - E0602: Symbolic tensor shape polymorphism unification (`[sym B, sym S, comptime D: usize]`)
+//   - E0204: Static Data-Race freedom across multi-core `par_for` loops
+//   - E0605: Stackless `async`/`await` effect context verification
+
+use compiler_ax::tokens_ast
+use compiler_ax::comptime
+
+// Resolve `nk_ty_tensor` into a descriptor in `sym` and return `ty_make(21, desc_off)`.
+// Descriptor layout in `sym`:
+//   `[0] = dtype_code (1=f32, 2=f16, 3=bf16, 4=i64, 5=i8)`
+//   `[1] = rank (dims_cnt)`
+//   `[2] = tp_degree (0 for Tensor, >0 for ShardedTensor)`
+//   Followed by `rank * 2` words: `[dim_kind, dim_val]`:
+//     - `dim_kind == 0`: concrete integer dimension `dim_val`
+//     - `dim_kind > 0`: symbolic dimension of name length `dim_kind` at `pool` offset `dim_val`
+fn resolve_tensor_typespec(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, tnid: i64) -> i64 {
+    dt_soff := ast_get(nodes, tnid, 1)
+    dt_slen := ast_get(nodes, tnid, 2)
+    d_off := ast_get(nodes, tnid, 3)
+    d_cnt := ast_get(nodes, tnid, 4)
+    tp_deg := ast_get(nodes, tnid, 5)
+
+    mut dt_code := 1
+    if pool_str_eq_lit(pool, dt_soff, dt_slen, "f16")  { dt_code = 2 }
+    if pool_str_eq_lit(pool, dt_soff, dt_slen, "bf16") { dt_code = 3 }
+    if pool_str_eq_lit(pool, dt_soff, dt_slen, "i64") or pool_str_eq_lit(pool, dt_soff, dt_slen, "i32") { dt_code = 4 }
+    if pool_str_eq_lit(pool, dt_soff, dt_slen, "i8") or pool_str_eq_lit(pool, dt_soff, dt_slen, "u8") { dt_code = 5 }
+
+    desc_off := ibuf_len(sym)
+    ibuf_push(sym, dt_code)
+    ibuf_push(sym, d_cnt)
+    ibuf_push(sym, tp_deg)
+
+    mut i := 0
+    while i < d_cnt {
+        mut dkind := ibuf_get(extra, d_off + i * 2)
+        mut dval := ibuf_get(extra, d_off + i * 2 + 1)
+        // If `dkind > 0` (identifier), check if it is a global `comptime` integer constant!
+        if dkind > 0 {
+            g_off := ct_find_global_const(pool, sym, dval, dkind)
+            if g_off >= 0 and ibuf_get(sym, g_off + 2) == ty_int() {
+                dkind = 0
+                dval = ibuf_get(sym, g_off + 3)
+            }
+        }
+        ibuf_push(sym, dkind)
+        ibuf_push(sym, dval)
+        i += 1
+    }
+    return ty_make(21, desc_off)
+}
+
+// Unify two `Tensor` / `ShardedTensor` types (`ty_tag == 21`), recording `sym_bindings` (`4 words/entry: [slen, soff, bound_kind, bound_val]`).
+// Returns `true` if shapes & dtypes unify cleanly, `false` if mismatch (`E0602`).
+fn unify_tensor_shapes(pool: ByteBuf, sym: IntBuf, expected_ty: i64, actual_ty: i64, sym_bindings: IntBuf) -> bool {
+    e_desc := ty_pay(expected_ty)
+    a_desc := ty_pay(actual_ty)
+    if e_desc == a_desc {
+        return true
+    }
+    e_dt := ibuf_get(sym, e_desc)
+    a_dt := ibuf_get(sym, a_desc)
+    e_rank := ibuf_get(sym, e_desc + 1)
+    a_rank := ibuf_get(sym, a_desc + 1)
+    e_tp := ibuf_get(sym, e_desc + 2)
+    a_tp := ibuf_get(sym, a_desc + 2)
+    if e_dt != a_dt or e_rank != a_rank or e_tp != a_tp {
+        return false
+    }
+
+    mut d := 0
+    while d < e_rank {
+        ek := ibuf_get(sym, e_desc + 3 + d * 2)
+        ev := ibuf_get(sym, e_desc + 3 + d * 2 + 1)
+        ak := ibuf_get(sym, a_desc + 3 + d * 2)
+        av := ibuf_get(sym, a_desc + 3 + d * 2 + 1)
+
+        if ek == 0 {
+            // Expected concrete dimension (e.g. `128`): actual must be concrete `128`!
+            if ak != 0 or av != ev {
+                return false
+            }
+        } else {
+            // Expected symbolic dimension (e.g. `B`, `S`, `D`): check or record binding in `sym_bindings`!
+            bcnt := ibuf_len(sym_bindings) / 4
+            mut found := -1
+            mut bi := 0
+            while bi < bcnt {
+                bb := bi * 4
+                if ibuf_get(sym_bindings, bb) == ek and pool_str_eq2(pool, ibuf_get(sym_bindings, bb + 1), ek, ev) {
+                    found = bb
+                    break
+                }
+                bi += 1
+            }
+            if found < 0 {
+                ibuf_push(sym_bindings, ek)
+                ibuf_push(sym_bindings, ev)
+                ibuf_push(sym_bindings, ak)
+                ibuf_push(sym_bindings, av)
+            } else {
+                bk := ibuf_get(sym_bindings, found + 2)
+                bv := ibuf_get(sym_bindings, found + 3)
+                if bk == 0 and ak == 0 {
+                    if bv != av {
+                        return false
+                    }
+                } else if bk > 0 and ak > 0 {
+                    if bk != ak or not pool_str_eq2(pool, bv, bk, av) {
+                        return false
+                    }
+                } else {
+                    return false
+                }
+            }
+        }
+        d += 1
+    }
+    return true
+}
+
+// Verify builtin `tensor_matmul(a, b)` contraction `[..., M, K] x [..., K, N]` -> returns result `Tensor` type or `0` on `E0602`!
+fn verify_tensor_matmul_shapes(pool: ByteBuf, sym: IntBuf, a_ty: i64, b_ty: i64) -> i64 {
+    if ty_tag(a_ty) != 21 or ty_tag(b_ty) != 21 {
+        return 0
+    }
+    ad := ty_pay(a_ty)
+    bd := ty_pay(b_ty)
+    a_dt := ibuf_get(sym, ad)
+    b_dt := ibuf_get(sym, bd)
+    a_rk := ibuf_get(sym, ad + 1)
+    b_rk := ibuf_get(sym, bd + 1)
+    if a_dt != b_dt or a_rk < 2 or b_rk < 2 {
+        return 0
+    }
+    // Check contracted inner dimension `K`: last dim of `a` == second-to-last dim of `b`!
+    ak_kind := ibuf_get(sym, ad + 3 + (a_rk - 1) * 2)
+    ak_val  := ibuf_get(sym, ad + 3 + (a_rk - 1) * 2 + 1)
+    bk_kind := ibuf_get(sym, bd + 3 + (b_rk - 2) * 2)
+    bk_val  := ibuf_get(sym, bd + 3 + (b_rk - 2) * 2 + 1)
+    if ak_kind == 0 and bk_kind == 0 {
+        if ak_val != bk_val { return 0 }
+    } else if ak_kind > 0 and bk_kind > 0 {
+        if ak_kind != bk_kind or not pool_str_eq2(pool, ak_val, ak_kind, bk_val) { return 0 }
+    } else {
+        return 0
+    }
+
+    // Construct output shape `[a_dims[0..a_rk-1], b_dims[b_rk-1]]`
+    out_desc := ibuf_len(sym)
+    ibuf_push(sym, a_dt)
+    ibuf_push(sym, a_rk)
+    ibuf_push(sym, ibuf_get(sym, ad + 2))
+    mut i := 0
+    while i < a_rk - 1 {
+        ibuf_push(sym, ibuf_get(sym, ad + 3 + i * 2))
+        ibuf_push(sym, ibuf_get(sym, ad + 3 + i * 2 + 1))
+        i += 1
+    }
+    ibuf_push(sym, ibuf_get(sym, bd + 3 + (b_rk - 1) * 2))
+    ibuf_push(sym, ibuf_get(sym, bd + 3 + (b_rk - 1) * 2 + 1))
+    return ty_make(21, out_desc)
+}
+
+// --- Static Transitive `@no_alloc` Heap Allocation Analyzer (`E0601`) ---
+fn is_direct_alloc_call(pool: ByteBuf, csoff: i64, cslen: i64) -> bool {
+    if pool_str_eq_lit(pool, csoff, cslen, "buf_new") { return true }
+    if pool_str_eq_lit(pool, csoff, cslen, "ibuf_new") { return true }
+    if pool_str_eq_lit(pool, csoff, cslen, "fs_read_file") { return true }
+    if pool_str_eq_lit(pool, csoff, cslen, "to_json") { return true }
+    if pool_str_eq_lit(pool, csoff, cslen, "tensor_alloc") { return true }
+    if pool_str_eq_lit(pool, csoff, cslen, "tensor_new_2d") { return true }
+    if pool_str_eq_lit(pool, csoff, cslen, "tensor_new_3d") { return true }
+    if pool_str_eq_lit(pool, csoff, cslen, "frame_arena_new") { return true }
+    if pool_str_eq_lit(pool, csoff, cslen, "vram_arena_new") { return true }
+    return false
+}
+
+fn scan_alloc_expr(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, edges: IntBuf, caller_fi: i64, enid: i64) -> i64 {
+    if enid <= 0 {
+        return 0
+    }
+    k := ast_kind(nodes, enid)
+    sp := ast_span(nodes, enid)
+    if k == nk_table_alloc() {
+        return sp
+    }
+    if k == nk_fstr() {
+        if ast_get(nodes, enid, 2) > 1 {
+            return sp
+        }
+    }
+    if k == nk_call() {
+        cs := ast_get(nodes, enid, 1)
+        cl := ast_get(nodes, enid, 2)
+        if is_direct_alloc_call(pool, cs, cl) {
+            return sp
+        }
+        // Record call edge `(caller_fi, callee_fi, sp)` for transitive `@no_alloc` propagation!
+        callee_fi := ct_find_fn_by_name(pool, sym, cs, cl)
+        if callee_fi >= 0 {
+            ibuf_push(edges, caller_fi)
+            ibuf_push(edges, callee_fi)
+            ibuf_push(edges, sp)
+        }
+        aoff := ast_get(nodes, enid, 3)
+        acnt := ast_get(nodes, enid, 4)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            r := scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, ca, 4))
+            if r != 0 { return r }
+            i += 1
+        }
+        return 0
+    }
+    if k == nk_method_call() {
+        r0 := scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, enid, 1))
+        if r0 != 0 { return r0 }
+        aoff := ast_get(nodes, enid, 4)
+        acnt := ast_get(nodes, enid, 5)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            r := scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, ca, 4))
+            if r != 0 { return r }
+            i += 1
+        }
+        return 0
+    }
+    if k == nk_unary() {
+        return scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, enid, 2))
+    }
+    if k == nk_cast() or k == nk_field() or k == nk_tuple_idx() or k == nk_await() or k == nk_or_return() {
+        return scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, enid, 1))
+    }
+    if k == nk_binary() {
+        r1 := scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, enid, 2))
+        if r1 != 0 { return r1 }
+        return scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, enid, 3))
+    }
+    if k == nk_index() {
+        r1 := scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, enid, 1))
+        if r1 != 0 { return r1 }
+        return scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, enid, 2))
+    }
+    if k == nk_tuple() {
+        off := ast_get(nodes, enid, 1)
+        cnt := ast_get(nodes, enid, 2)
+        mut i := 0
+        while i < cnt {
+            r := scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ibuf_get(extra, off + i))
+            if r != 0 { return r }
+            i += 1
+        }
+    }
+    if k == nk_if_expr() {
+        r1 := scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, enid, 1))
+        if r1 != 0 { return r1 }
+        tb := ast_get(nodes, enid, 2)
+        r2 := scan_alloc_block(pool, nodes, extra, sym, edges, caller_fi, tb)
+        if r2 != 0 { return r2 }
+        r3 := scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, tb, 3))
+        if r3 != 0 { return r3 }
+        eb := ast_get(nodes, enid, 3)
+        if eb > 0 {
+            r4 := scan_alloc_block(pool, nodes, extra, sym, edges, caller_fi, eb)
+            if r4 != 0 { return r4 }
+            return scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, eb, 3))
+        }
+    }
+    return 0
+}
+
+fn scan_alloc_block(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, edges: IntBuf, caller_fi: i64, bnid: i64) -> i64 {
+    if bnid <= 0 {
+        return 0
+    }
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt {
+        st := ibuf_get(extra, off + i)
+        sk := ast_kind(nodes, st)
+        mut r := 0
+        if sk == nk_var_decl() {
+            r = scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 5))
+        } else if sk == nk_tuple_destruct() {
+            r = scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 3))
+        } else if sk == nk_assign() {
+            r = scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 2))
+            if r == 0 {
+                r = scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 3))
+            }
+        } else if sk == nk_if() {
+            r = scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 1))
+            if r == 0 { r = scan_alloc_block(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 2)) }
+            if r == 0 { r = scan_alloc_block(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 3)) }
+        } else if sk == nk_while() {
+            r = scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 1))
+            if r == 0 { r = scan_alloc_block(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 2)) }
+        } else if sk == nk_for_range() or sk == nk_par_for_range() {
+            r = scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 3))
+            if r == 0 { r = scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 4)) }
+            if r == 0 { r = scan_alloc_block(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 5)) }
+        } else if sk == nk_for_each() or sk == nk_par_for_each() {
+            r = scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 3))
+            if r == 0 { r = scan_alloc_block(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 4)) }
+        } else if sk == nk_return() or sk == nk_expr_stmt() {
+            r = scan_alloc_expr(pool, nodes, extra, sym, edges, caller_fi, ast_get(nodes, st, 1))
+        } else if sk == nk_block() {
+            r = scan_alloc_block(pool, nodes, extra, sym, edges, caller_fi, st)
+        }
+        if r != 0 {
+            return r
+        }
+        i += 1
+    }
+    return 0
+}
+
+fn verify_program_no_alloc(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf) {
+    f_base := ibuf_get(sym, 7)
+    f_cnt := ibuf_get(sym, 8)
+    alloc_sp := ibuf_new(f_cnt + 16)
+    edges := ibuf_new(65536)
+
+    mut fi := 0
+    while fi < f_cnt {
+        fo := f_base + fi * 10
+        fnid := ibuf_get(sym, fo + 2)
+        body := ast_get(nodes, fnid, 6) & 0xFFFFFFFF
+        sp := scan_alloc_block(pool, nodes, extra, sym, edges, fi, body)
+        ibuf_push(alloc_sp, sp)
+        fi += 1
+    }
+
+    // Fixed-point transitive propagation across call edges
+    mut changed := true
+    while changed {
+        changed = false
+        ecnt := ibuf_len(edges) / 3
+        mut ei := 0
+        while ei < ecnt {
+            eb := ei * 3
+            caller := ibuf_get(edges, eb)
+            callee := ibuf_get(edges, eb + 1)
+            call_sp := ibuf_get(edges, eb + 2)
+            if ibuf_get(alloc_sp, caller) == 0 and ibuf_get(alloc_sp, callee) != 0 {
+                ibuf_set(alloc_sp, caller, call_sp)
+                changed = true
+            }
+            ei += 1
+        }
+    }
+
+    fi = 0
+    while fi < f_cnt {
+        flags := ibuf_get(sym, f_base + fi * 10 + 9)
+        if (flags & fnflag_no_alloc()) != 0 {
+            bad_sp := ibuf_get(alloc_sp, fi)
+            if bad_sp != 0 {
+                if ibuf_get(sym, 0) == 0 {
+                    ibuf_set(sym, 1, bad_sp)
+                    ibuf_set(sym, 2, 601)
+                }
+                ibuf_set(sym, 0, ibuf_get(sym, 0) + 1)
+            }
+        }
+        fi += 1
+    }
+
+    buf_free(move edges)
+    buf_free(move alloc_sp)
+}

@@ -1,0 +1,295 @@
+// Axon v7.0 Self-Hosted Compiler - Rich IDE/AI Diagnostics Engine (`compiler_ax/diagnostics.ax`)
+// Renders exact `file:line:col` source snippets, `^~~~` carets, actionable `help:` hints,
+// and structured `--json` diagnostics in < 1 ms for IDEs and AI coding agents.
+
+use compiler_ax::tokens_ast
+
+// `files_meta` stores 4 words per loaded file: `[path_soff, path_slen, src_soff, src_slen]` in `src_arena`.
+fn diag_register_file(pool: ByteBuf, files_meta: IntBuf, src_arena: ByteBuf, path: str, src: ByteBuf) -> i64 {
+    fid := ibuf_len(files_meta) / 4
+    psoff := pool_intern_str(pool, path)
+    pslen := str_len(path)
+    ssoff := buf_len(src_arena)
+    sslen := buf_len(src)
+    mut i := 0
+    while i < sslen {
+        buf_push(src_arena, buf_get(src, i))
+        i += 1
+    }
+    ibuf_push(files_meta, psoff)
+    ibuf_push(files_meta, pslen)
+    ibuf_push(files_meta, ssoff)
+    ibuf_push(files_meta, sslen)
+    return fid
+}
+
+fn diag_file_path(pool: ByteBuf, files_meta: IntBuf, fid: i64, fallback: str) -> str {
+    fcnt := ibuf_len(files_meta) / 4
+    if fid < 0 or fid >= fcnt {
+        return fallback
+    }
+    psoff := ibuf_get(files_meta, fid * 4)
+    pslen := ibuf_get(files_meta, fid * 4 + 1)
+    return buf_slice_str(pool, psoff, psoff + pslen)
+}
+
+fn diag_extract_line(files_meta: IntBuf, src_arena: ByteBuf, fid: i64, target_line: i64) -> str {
+    fcnt := ibuf_len(files_meta) / 4
+    if fid < 0 or fid >= fcnt {
+        return ""
+    }
+    ssoff := ibuf_get(files_meta, fid * 4 + 2)
+    sslen := ibuf_get(files_meta, fid * 4 + 3)
+    end := ssoff + sslen
+    mut cur_ln := 1
+    mut i := ssoff
+    mut line_start := ssoff
+    while i < end and cur_ln < target_line {
+        if buf_get(src_arena, i) == 10 {
+            cur_ln += 1
+            line_start = i + 1
+        }
+        i += 1
+    }
+    if cur_ln != target_line {
+        return ""
+    }
+    mut line_end := line_start
+    while line_end < end {
+        b := buf_get(src_arena, line_end)
+        if b == 10 or b == 13 {
+            break
+        }
+        line_end += 1
+    }
+    return buf_slice_str(src_arena, line_start, line_end)
+}
+
+fn diag_title_for_code(code: i64) -> str {
+    if code == 10   { return "Lexical error: invalid or unterminated token" }
+    if code == 20   { return "Syntax error: unexpected token in Axon grammar" }
+    if code == 30   { return "Module error: cannot locate imported `.ax` or `.h` file" }
+    if code == 101  { return "Reference `&T` is forbidden inside `struct` fields (Second-Class Reference Law)" }
+    if code == 102  { return "Functions cannot return borrowed `&T` references; return by value or `T ! E`" }
+    if code == 201  { return "Perceus ownership violation: use of value after linear `move`" }
+    if code == 202  { return "Concurrent `spawn` isolation violation: `isolated` value captured without `move`" }
+    if code == 203  { return "Perceus loop safety: outer owned value moved inside a multi-iteration loop" }
+    if code == 204  { return "Data race hazard: `par_for` loop body mutates an outer non-disjoint variable" }
+    if code == 301  { return "Immutability violation: cannot mutate binding declared without `mut`" }
+    if code == 401  { return "Static type mismatch between expected and actual expression types" }
+    if code == 402  { return "Return statement type does not match function return signature" }
+    if code == 403  { return "Unresolved identifier, type, field, or method name in current scope" }
+    if code == 404  { return "Invalid call signature: argument count, parameter name, or `mut`/`move` mode mismatch" }
+    if code == 405  { return "Missing `return` on one or more control-flow paths in non-void function" }
+    if code == 406  { return "Compile-time arithmetic error: division or modulo by zero" }
+    if code == 407  { return "Control-flow error: `break` or `continue` used outside of a loop" }
+    if code == 501  { return "Object-Capability violation: ambient OS/File/Net call without `RootCap`/`FsCap`/`NetCap`" }
+    if code == 502  { return "Taint security violation: untrusted `tainted[str]` flows into sensitive sink without sanitization" }
+    if code == 601  { return "Zero-allocation violation: dynamic memory allocation inside `@no_alloc` hot path" }
+    if code == 602  { return "Symbolic tensor shape mismatch: rank or dimension incompatibility across `[sym ...]`" }
+    if code == 603  { return "Comptime VM execution exceeded step budget or encountered invalid operation" }
+    if code == 604  { return "Compile-time assertion failed (`comptime_assert` evaluated to `false`)" }
+    if code == 605  { return "`await` expression used outside of an `async fn` or `main` context" }
+    return "Compile-time verification error"
+}
+
+fn diag_help_for_code(code: i64) -> str {
+    if code == 10   { return "Close open string/f-string quotes and remove non-UTF8 control characters." }
+    if code == 20   { return "Check `: Type` colons on struct fields/params, matching braces `{ ... }`, and operator syntax." }
+    if code == 30   { return "Verify `use pkg::mod` matches `<pkg>/<mod>.ax` or check `@cImport` header path." }
+    if code == 101  { return "Store values directly inside structs (zero-GC value layout) or use indices into `Table[T]`." }
+    if code == 102  { return "Return the value directly (`-> MyStruct`) or mutate caller state via a `mut` parameter." }
+    if code == 201  { return "Once `move x` transfers ownership, `x` is consumed; clone/rebind before moving or reorder uses." }
+    if code == 202  { return "Transfer ownership explicitly into `spawn` using `move buf`." }
+    if code == 203  { return "Allocate inside the loop (Perceus Self-FBIP reuses the slot in-place) or borrow without `move`." }
+    if code == 204  { return "Mutate disjoint `Table[T]` rows (`par_for row in tbl { row.x += ... }`) instead of shared outer scalars." }
+    if code == 301  { return "Declare the variable with `mut x := ...` (or `mut param: T`) to allow mutation." }
+    if code == 401  { return "Use explicit `as i64` / `as f64` cast for numeric conversions or check variable types." }
+    if code == 402  { return "Wrap `T ! E` results in `ok(val)` / `err(code)` and match the declared `-> RetType`." }
+    if code == 403  { return "Check spelling or import the defining module with `use std::<module>`." }
+    if code == 404  { return "Pass `mut arg` for `mut` params, `move arg` for `move` params, and verify parameter count/names." }
+    if code == 405  { return "Ensure every `if`/`else` branch ends with `return <expr>`." }
+    if code == 406  { return "Ensure constant divisors are non-zero, or guard runtime divisors with `if d != 0`." }
+    if code == 407  { return "Place `break` and `continue` inside `while`, `for`, or `par_for` blocks." }
+    if code == 501  { return "Pass `cap: FsCap` / `NetCap` attenuated from `acquire_root_cap()` in `main()`." }
+    if code == 502  { return "Sanitize untrusted input first: `clean := sanitize_sql_id(raw)?` or `sanitize_shell_arg(raw)?`." }
+    if code == 601  { return "Pre-allocate `ByteBuf`/`IntBuf`/`Table` outside `@no_alloc` and pass it in as a parameter." }
+    if code == 602  { return "Ensure contracted dimensions match (e.g. `Tensor[f32, [B, S, D]]` with `Tensor[f32, [D, H]]`)." }
+    if code == 603  { return "Keep `comptime` functions pure and bounded (avoid unbounded `while true` loops)." }
+    if code == 604  { return "Inspect the `comptime_assert(cond, msg)` predicate and compile-time constants." }
+    if code == 605  { return "Mark the enclosing function `async fn` before using `await`." }
+    return "Run `axc check --json <file.ax>` for structured diagnostics."
+}
+
+fn diag_push_json_escaped(out: ByteBuf, s: str) {
+    n := str_len(s)
+    mut i := 0
+    while i < n {
+        b := str_byte(s, i)
+        if b == 34 {
+            buf_push(out, 92)
+            buf_push(out, 34)
+        } else if b == 92 {
+            buf_push(out, 92)
+            buf_push(out, 92)
+        } else if b == 10 {
+            buf_push(out, 92)
+            buf_push(out, 110)
+        } else if b == 13 {
+            buf_push(out, 92)
+            buf_push(out, 114)
+        } else if b == 9 {
+            buf_push(out, 92)
+            buf_push(out, 116)
+        } else {
+            buf_push(out, b)
+        }
+        i += 1
+    }
+}
+
+fn diag_push_int(out: ByteBuf, val: i64) {
+    if val == 0 {
+        buf_push(out, 48)
+        return
+    }
+    mut v := val
+    if v < 0 {
+        buf_push(out, 45)
+        v = 0 - v
+    }
+    start := buf_len(out)
+    while v > 0 {
+        buf_push(out, 48 + (v % 10))
+        v = v / 10
+    }
+    mut lo := start
+    mut hi := buf_len(out) - 1
+    while lo < hi {
+        bl := buf_get(out, lo)
+        bh := buf_get(out, hi)
+        buf_set(out, lo, bh)
+        buf_set(out, hi, bl)
+        lo += 1
+        hi -= 1
+    }
+}
+
+fn diag_code_str(out: ByteBuf, code: i64) -> str {
+    start := buf_len(out)
+    buf_push(out, 69) // 'E'
+    if code < 100 {
+        buf_push(out, 48)
+        buf_push(out, 48)
+    } else if code < 1000 {
+        buf_push(out, 48)
+    }
+    diag_push_int(out, code)
+    end := buf_len(out)
+    return buf_slice_str(out, start, end)
+}
+
+fn diag_format_json_report(pool: ByteBuf, files_meta: IntBuf, src_arena: ByteBuf, fallback_path: str, ok_status: bool, code: i64, span: i64, elapsed_us: i64, out: ByteBuf) {
+    buf_push_str(out, "{\"ok\":")
+    if ok_status {
+        buf_push_str(out, "true,\"elapsed_us\":")
+        diag_push_int(out, elapsed_us)
+        buf_push_str(out, ",\"diagnostics\":[]}")
+        return
+    }
+    fid := span_file(span)
+    ln := span_line(span)
+    col := span_col(span)
+    fpath := diag_file_path(pool, files_meta, fid, fallback_path)
+    src_ln := diag_extract_line(files_meta, src_arena, fid, ln)
+    title := diag_title_for_code(code)
+    help := diag_help_for_code(code)
+
+    scratch := buf_new(64)
+    cstr := diag_code_str(scratch, code)
+
+    buf_push_str(out, "false,\"elapsed_us\":")
+    diag_push_int(out, elapsed_us)
+    buf_push_str(out, ",\"diagnostics\":[{\"code\":\"")
+    diag_push_json_escaped(out, cstr)
+    buf_push_str(out, "\",\"severity\":\"error\",\"file\":\"")
+    diag_push_json_escaped(out, fpath)
+    buf_push_str(out, "\",\"line\":")
+    diag_push_int(out, ln)
+    buf_push_str(out, ",\"column\":")
+    diag_push_int(out, col)
+    buf_push_str(out, ",\"message\":\"")
+    diag_push_json_escaped(out, title)
+    buf_push_str(out, "\",\"source_line\":\"")
+    diag_push_json_escaped(out, src_ln)
+    buf_push_str(out, "\",\"help\":\"")
+    diag_push_json_escaped(out, help)
+    buf_push_str(out, "\"}]}")
+    buf_free(move scratch)
+}
+
+fn diag_emit_error(pool: ByteBuf, files_meta: IntBuf, src_arena: ByteBuf, fallback_path: str, code: i64, span: i64, json_mode: bool, elapsed_us: i64) {
+    if json_mode {
+        jbuf := buf_new(4096)
+        diag_format_json_report(pool, files_meta, src_arena, fallback_path, false, code, span, elapsed_us, jbuf)
+        println(buf_slice_str(jbuf, 0, buf_len(jbuf)))
+        buf_free(move jbuf)
+        return
+    }
+
+    fid := span_file(span)
+    ln := span_line(span)
+    col := span_col(span)
+    fpath := diag_file_path(pool, files_meta, fid, fallback_path)
+    src_ln := diag_extract_line(files_meta, src_arena, fid, ln)
+    title := diag_title_for_code(code)
+    help := diag_help_for_code(code)
+
+    scratch := buf_new(512)
+    cstr := diag_code_str(scratch, code)
+
+    // keep legacy `[SAFETY ERROR E0xxx]` / `[PARSE ERROR]` / `[LEX ERROR]` grep markers on line 1 for 100% test compatibility while rendering rich Rust/Zig-grade diagnostics!
+    if code == 10 {
+        println(f"[LEX ERROR] error[{cstr}]: {title}")
+    } else if code == 20 {
+        println(f"[PARSE ERROR] error[{cstr}]: {title}")
+    } else if code == 30 {
+        println(f"[MODULE ERROR] error[{cstr}]: {title}")
+    } else {
+        println(f"[SAFETY ERROR {cstr}] error[{cstr}]: {title}")
+    }
+    println(f"  --> {fpath}:{ln}:{col}")
+
+    if str_len(src_ln) > 0 {
+        println("   |")
+        println(f" {ln} | {src_ln}")
+        caret_start := buf_len(scratch)
+        buf_push_str(scratch, "   | ")
+        mut c := 1
+        while c < col and c < 160 {
+            if c - 1 < str_len(src_ln) and str_byte(src_ln, c - 1) == 9 {
+                buf_push(scratch, 9)
+            } else {
+                buf_push(scratch, 32)
+            }
+            c += 1
+        }
+        buf_push(scratch, 94) // '^'
+        // Underline identifier/token span if present
+        mut w := 0
+        while col - 1 + 1 + w < str_len(src_ln) and w < 24 {
+            ch := str_byte(src_ln, col - 1 + 1 + w)
+            if (ch >= 65 and ch <= 90) or (ch >= 97 and ch <= 122) or (ch >= 48 and ch <= 57) or ch == 95 {
+                buf_push(scratch, 126) // '~'
+                w += 1
+            } else {
+                break
+            }
+        }
+        caret_end := buf_len(scratch)
+        println(buf_slice_str(scratch, caret_start, caret_end))
+        println("   |")
+    }
+    println(f"   = help: {help}")
+    buf_free(move scratch)
+}

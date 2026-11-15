@@ -1,4 +1,4 @@
-// Axon v6.0 Self-Hosted Compiler - Intrinsics, Safe Buffers, Duck Dispatch & Win64 Call ABI
+// Axon v7.0 Self-Hosted Compiler - Intrinsics, Safe Buffers, SIMD Math3D, DLPack, IOCP, Tensor & C-ABI FFI
 // (`compiler_ax/codegen_calls.ax`) - 100% Pure Axon, Zero Stubs.
 
 use compiler_ax::tokens_ast
@@ -57,11 +57,104 @@ fn cg_var_find_by_nid(vars: IntBuf, decl_nid: i64) -> i64 {
     return -1
 }
 
+// --- Pure-SSE2 128-bit `vec3`/`vec4`/`quat` (`4 x f32` in 2 stack slots) Helpers ---
+// Slot `(s, 0)` = `x_f32 | (y_f32 << 32)`, Slot `(s, 1)` = `z_f32 | (w_f32 << 32)`.
+fn mc_load_xmm0_vec(c: ByteBuf, slot: i64, sub_base: i64) {
+    mc_load_rax(c, slot, sub_base)
+    mc_b4(c, 0x66, 0x48, 0x0F, 0x6E); mc_b1(c, 0xC0) // MOVQ XMM0, RAX
+    mc_load_rax(c, slot, sub_base + 1)
+    mc_b4(c, 0x66, 0x48, 0x0F, 0x6E); mc_b1(c, 0xD0) // MOVQ XMM2, RAX
+    mc_b4(c, 0x66, 0x0F, 0x6C, 0xC2)                 // PUNPCKLQDQ XMM0, XMM2
+}
+
+fn mc_load_xmm1_vec(c: ByteBuf, slot: i64, sub_base: i64) {
+    mc_load_rax(c, slot, sub_base)
+    mc_b4(c, 0x66, 0x48, 0x0F, 0x6E); mc_b1(c, 0xC8) // MOVQ XMM1, RAX
+    mc_load_rax(c, slot, sub_base + 1)
+    mc_b4(c, 0x66, 0x48, 0x0F, 0x6E); mc_b1(c, 0xD0) // MOVQ XMM2, RAX
+    mc_b4(c, 0x66, 0x0F, 0x6C, 0xCA)                 // PUNPCKLQDQ XMM1, XMM2
+}
+
+fn mc_store_xmm0_vec(c: ByteBuf, slot: i64, sub_base: i64) {
+    mc_b4(c, 0x66, 0x48, 0x0F, 0x7E); mc_b1(c, 0xC0) // MOVQ RAX, XMM0
+    mc_store_rax(c, slot, sub_base)
+    mc_b3(c, 0x0F, 0x28, 0xD0)                       // MOVAPS XMM2, XMM0
+    mc_b4(c, 0x66, 0x0F, 0x6D, 0xD2)                 // PUNPCKHQDQ XMM2, XMM2
+    mc_b4(c, 0x66, 0x48, 0x0F, 0x7E); mc_b1(c, 0xD0) // MOVQ RAX, XMM2
+    mc_store_rax(c, slot, sub_base + 1)
+}
+
+// Converts `f64` slot into `f32` bits in `EAX` (zero-extended in `RAX`)
+fn mc_f64_slot_to_f32_eax(c: ByteBuf, slot: i64) {
+    mc_load_rax(c, slot, 0)
+    mc_b4(c, 0x66, 0x48, 0x0F, 0x6E); mc_b1(c, 0xC0) // MOVQ XMM0, RAX
+    mc_b4(c, 0xF2, 0x0F, 0x5A, 0xC0)                 // CVTSD2SS XMM0, XMM0
+    mc_b4(c, 0x66, 0x0F, 0x7E, 0xC0)                 // MOVD EAX, XMM0
+}
+
+// Emits `XMM0 = M * XMM1` where `M` is an 8-slot `mat4` at `mslot` (`4` columns x `2` slots)
+fn mc_emit_mat4_mul_xmm1(c: ByteBuf, mslot: i64) {
+    // Save `v` in `XMM3`
+    mc_b3(c, 0x0F, 0x28, 0xD9) // MOVAPS XMM3, XMM1
+    // col0 * v.xxxx -> XMM4
+    mc_load_xmm0_vec(c, mslot, 0)
+    mc_b3(c, 0x0F, 0x28, 0xCB)       // MOVAPS XMM1, XMM3
+    mc_b4(c, 0x0F, 0xC6, 0xC9, 0x00) // SHUFPS XMM1, XMM1, 0x00
+    mc_b3(c, 0x0F, 0x59, 0xC1)       // MULPS XMM0, XMM1
+    mc_b3(c, 0x0F, 0x28, 0xE0)       // MOVAPS XMM4, XMM0
+    // + col1 * v.yyyy
+    mc_load_xmm0_vec(c, mslot, 2)
+    mc_b3(c, 0x0F, 0x28, 0xCB)
+    mc_b4(c, 0x0F, 0xC6, 0xC9, 0x55) // SHUFPS 0x55
+    mc_b3(c, 0x0F, 0x59, 0xC1)
+    mc_b3(c, 0x0F, 0x58, 0xE0)       // ADDPS XMM4, XMM0
+    // + col2 * v.zzzz
+    mc_load_xmm0_vec(c, mslot, 4)
+    mc_b3(c, 0x0F, 0x28, 0xCB)
+    mc_b4(c, 0x0F, 0xC6, 0xC9, 0xAA) // SHUFPS 0xAA
+    mc_b3(c, 0x0F, 0x59, 0xC1)
+    mc_b3(c, 0x0F, 0x58, 0xE0)
+    // + col3 * v.wwww
+    mc_load_xmm0_vec(c, mslot, 6)
+    mc_b3(c, 0x0F, 0x28, 0xCB)
+    mc_b4(c, 0x0F, 0xC6, 0xC9, 0xFF) // SHUFPS 0xFF
+    mc_b3(c, 0x0F, 0x59, 0xC1)
+    mc_b3(c, 0x0F, 0x58, 0xC4)       // ADDPS XMM0, XMM4
+}
+
+fn emit_alloc_raw_rax(cg: CodegenCtx) {
+    // Input: `RDX = size_bytes`; Output: `RAX = allocated_ptr`
+    c := cg.code
+    if cg_is_win64(cg) {
+        mc_b2(c, 0x31, 0xC9)
+        mc_b2(c, 0x41, 0xB8); mc_u32(c, 0x3000)
+        mc_b2(c, 0x41, 0xB9); mc_u32(c, 4)
+        cg_call_iat(cg, iat_virtual_alloc())
+    } else {
+        mc_b3(c, 0x48, 0x89, 0xD1) // RCX = size_bytes
+        cg_call_fn(cg, h_alloc_mem())
+    }
+}
+
+fn emit_free_raw_rcx(cg: CodegenCtx) {
+    // Input: `RCX = ptr`
+    c := cg.code
+    if cg_is_win64(cg) {
+        mc_b2(c, 0x31, 0xD2)
+        mc_b2(c, 0x41, 0xB8); mc_u32(c, 0x8000)
+        cg_call_iat(cg, iat_virtual_free())
+    } else {
+        cg_call_fn(cg, h_free_mem())
+    }
+}
+
 fn emit_print_value(cg: CodegenCtx, slot: i64, ty: i64) {
     c := cg.code
-    tg := ty_tag(ty)
+    mut tg := ty_tag(ty)
+    if tg == 16 or tg == 22 {
+        tg = ty_tag(ty_pay(ty))
+    }
     if tg == 5 {
-        // `str`: RCX = ptr (slot+0), RDX = len (slot+1)
         mc_load_rax(c, slot, 1)
         mc_b3(c, 0x48, 0x89, 0xC2)
         mc_load_rax(c, slot, 0)
@@ -70,14 +163,12 @@ fn emit_print_value(cg: CodegenCtx, slot: i64, ty: i64) {
         return
     }
     if tg == 3 {
-        // `dec`
         mc_load_rax(c, slot, 0)
         mc_b3(c, 0x48, 0x89, 0xC1)
         cg_call_fn(cg, h_print_dec())
         return
     }
     if tg == 2 {
-        // `f64` -> scaled 10_000 -> `h_print_dec`
         mc_load_rax(c, slot, 0)
         mc_b4(c, 0x66, 0x48, 0x0F, 0x6E)
         mc_b1(c, 0xC0)
@@ -92,7 +183,6 @@ fn emit_print_value(cg: CodegenCtx, slot: i64, ty: i64) {
         return
     }
     if tg == 4 {
-        // `bool`
         t_off := cg_intern_lit(cg, "true")
         f_off := cg_intern_lit(cg, "false")
         mc_load_rax(c, slot, 0)
@@ -116,7 +206,1355 @@ fn emit_print_value(cg: CodegenCtx, slot: i64, ty: i64) {
     cg_call_fn(cg, h_print_i64())
 }
 
-// Emits built-in buffer / string / CLI / File I/O / Table / Whitebox intrinsics; returns `0` if not an intrinsic.
+// Appends literal `lit` into `ByteBuf` stored at `jb_slot` (`[jb_slot] -> [len, cap, data...]`)
+fn emit_jbuf_append_rdata(cg: CodegenCtx, jb_slot: i64, roff: i64, rlen: i64) {
+    if rlen <= 0 { return }
+    c := cg.code
+    mc_load_rax(c, jb_slot, 0)
+    mc_b3(c, 0x49, 0x89, 0xC0) // R8 = jb
+    cg_lea_rax_rdata(cg, roff)
+    mc_b3(c, 0x49, 0x89, 0xC1) // R9 = src
+    mc_b3(c, 0x49, 0x8B, 0x08) // RCX = cur_len
+    mc_b2(c, 0x31, 0xD2)       // RDX = 0
+    lp := buf_len(c)
+    mc_b2(c, 0x81, 0xFA); mc_u32(c, rlen)
+    jae_d := mc_jcc8(c, 0x73)
+    mc_b4(c, 0x41, 0x8A, 0x04, 0x11) // AL = [R9 + RDX]
+    mc_b4(c, 0x41, 0x88, 0x44, 0x08); mc_b1(c, 0x10) // [R8 + RCX + 16] = AL
+    mc_b3(c, 0x48, 0xFF, 0xC1)
+    mc_b3(c, 0x48, 0xFF, 0xC2)
+    jmp_l := mc_jcc8(c, 0xEB)
+    mc_patch_jcc8(c, jmp_l, lp)
+    mc_patch_jcc8(c, jae_d, buf_len(c))
+    mc_b3(c, 0x49, 0x89, 0x08) // [R8] = new_len
+}
+
+fn emit_jbuf_append_i64(cg: CodegenCtx, jb_slot: i64, val_slot: i64, sub_off: i64) {
+    c := cg.code
+    mc_load_rax(c, jb_slot, 0)
+    mc_b3(c, 0x49, 0x89, 0xC0) // R8 = jb
+    mc_b3(c, 0x49, 0x8B, 0x08) // RCX = cur_len
+    mc_load_rax(c, val_slot, sub_off)
+    mc_b3(c, 0x48, 0x85, 0xC0)
+    jge_p := mc_jcc8(c, 0x7D)
+    mc_b4(c, 0x41, 0xC6, 0x44, 0x08); mc_b2(c, 0x10, 45) // '-'
+    mc_b3(c, 0x48, 0xFF, 0xC1)
+    mc_b3(c, 0x48, 0xF7, 0xD8)
+    mc_patch_jcc8(c, jge_p, buf_len(c))
+
+    // Scratch digits on stack (`SUB RSP, 32`)
+    mc_b4(c, 0x48, 0x83, 0xEC, 0x20)
+    mc_b4(c, 0x4C, 0x8D, 0x4C, 0x24); mc_b1(c, 0x1F) // R9 = RSP + 31
+    mc_b3(c, 0x4D, 0x89, 0xCA) // R10 = end_ptr
+    mc_b3(c, 0x49, 0xC7, 0xC3); mc_u32(c, 10)
+    dl := buf_len(c)
+    mc_b2(c, 0x31, 0xD2)
+    mc_b3(c, 0x49, 0xF7, 0xF3) // DIV R11
+    mc_b3(c, 0x80, 0xC2, 0x30)
+    mc_b3(c, 0x49, 0xFF, 0xC9)
+    mc_b3(c, 0x41, 0x88, 0x11)
+    mc_b3(c, 0x48, 0x85, 0xC0)
+    jnz_d := mc_jcc8(c, 0x75)
+    mc_patch_jcc8(c, jnz_d, dl)
+
+    cp := buf_len(c)
+    mc_b3(c, 0x4D, 0x39, 0xD1)
+    jae_cd := mc_jcc8(c, 0x73)
+    mc_b3(c, 0x41, 0x8A, 0x01)
+    mc_b4(c, 0x41, 0x88, 0x44, 0x08); mc_b1(c, 0x10)
+    mc_b3(c, 0x48, 0xFF, 0xC1)
+    mc_b3(c, 0x49, 0xFF, 0xC1)
+    jmp_cp := mc_jcc8(c, 0xEB)
+    mc_patch_jcc8(c, jmp_cp, cp)
+    mc_patch_jcc8(c, jae_cd, buf_len(c))
+    mc_b4(c, 0x48, 0x83, 0xC4, 0x20)
+    mc_b3(c, 0x49, 0x89, 0x08)
+}
+
+fn emit_jbuf_append_str(cg: CodegenCtx, jb_slot: i64, val_slot: i64, sub_off: i64) {
+    c := cg.code
+    q_off := cg_intern_lit(cg, "\"")
+    emit_jbuf_append_rdata(cg, jb_slot, q_off, 1)
+    mc_load_rax(c, jb_slot, 0)
+    mc_b3(c, 0x49, 0x89, 0xC0) // R8 = jb
+    mc_load_rax(c, val_slot, sub_off)
+    mc_b3(c, 0x49, 0x89, 0xC1) // R9 = str_ptr
+    mc_load_rax(c, val_slot, sub_off + 1)
+    mc_b3(c, 0x49, 0x89, 0xC2) // R10 = str_len
+    mc_b3(c, 0x49, 0x8B, 0x08) // RCX = cur_len
+    mc_b2(c, 0x31, 0xD2)
+    lp := buf_len(c)
+    mc_b3(c, 0x4C, 0x39, 0xD2)
+    jae_s := mc_jcc8(c, 0x73)
+    mc_b4(c, 0x41, 0x8A, 0x04, 0x11)
+    mc_b4(c, 0x41, 0x88, 0x44, 0x08); mc_b1(c, 0x10)
+    mc_b3(c, 0x48, 0xFF, 0xC1)
+    mc_b3(c, 0x48, 0xFF, 0xC2)
+    jmp_s := mc_jcc8(c, 0xEB)
+    mc_patch_jcc8(c, jmp_s, lp)
+    mc_patch_jcc8(c, jae_s, buf_len(c))
+    mc_b3(c, 0x49, 0x89, 0x08)
+    emit_jbuf_append_rdata(cg, jb_slot, q_off, 1)
+}
+
+// Compile-Time Zero-Reflection Struct -> JSON Code Generator (`to_json(val)`)
+fn emit_to_json_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, arg_e: i64) -> i64 {
+    c := cg.code
+    vr := emit_expr_ax(cg, vars, drops, breaks, arg_e)
+    vslot := er_slot(vr)
+    vty := er_ty(vr)
+
+    jb_slot := cg_alloc_slots(cg, 1)
+    mc_b1(c, 0xBA); mc_u32(c, 4096)
+    emit_alloc_raw_rax(cg)
+    mc_b3(c, 0x48, 0xC7, 0x00); mc_u32(c, 0)
+    mc_b4(c, 0x48, 0xC7, 0x40, 0x08); mc_u32(c, 4000)
+    mc_store_rax(c, jb_slot, 0)
+
+    if ty_tag(vty) == 10 {
+        sidx := ty_pay(vty)
+        s_off := ibuf_get(cg.sym, 3) + sidx * 6
+        f_base := ibuf_get(cg.sym, s_off + 3)
+        f_cnt := ibuf_get(cg.sym, s_off + 4)
+        lb_off := cg_intern_lit(cg, "{")
+        rb_off := cg_intern_lit(cg, "}")
+        cm_off := cg_intern_lit(cg, ",")
+        qt_off := cg_intern_lit(cg, "\"")
+        cl_off := cg_intern_lit(cg, "\":")
+        tr_off := cg_intern_lit(cg, "true")
+        fl_off := cg_intern_lit(cg, "false")
+
+        emit_jbuf_append_rdata(cg, jb_slot, lb_off, 1)
+        mut fi := 0
+        while fi < f_cnt {
+            if fi > 0 {
+                emit_jbuf_append_rdata(cg, jb_slot, cm_off, 1)
+            }
+            fo := f_base + fi * 4
+            fn_soff := ibuf_get(cg.sym, fo)
+            fn_slen := ibuf_get(cg.sym, fo + 1)
+            f_sub := ibuf_get(cg.sym, fo + 2)
+            f_ty := ibuf_get(cg.sym, fo + 3)
+
+            emit_jbuf_append_rdata(cg, jb_slot, qt_off, 1)
+            fn_roff := cg_intern_pool_slice(cg, fn_soff, fn_slen)
+            emit_jbuf_append_rdata(cg, jb_slot, fn_roff, fn_slen)
+            emit_jbuf_append_rdata(cg, jb_slot, cl_off, 2)
+
+            ftg := ty_tag(f_ty)
+            if ftg == 5 {
+                emit_jbuf_append_str(cg, jb_slot, vslot, f_sub)
+            } else if ftg == 4 {
+                mc_load_rax(c, vslot, f_sub)
+                mc_b3(c, 0x48, 0x85, 0xC0)
+                jz_f := mc_jcc32(c, 0x84)
+                emit_jbuf_append_rdata(cg, jb_slot, tr_off, 4)
+                jmp_b := mc_jmp32(c)
+                mc_patch_rel32(c, jz_f, buf_len(c))
+                emit_jbuf_append_rdata(cg, jb_slot, fl_off, 5)
+                mc_patch_rel32(c, jmp_b, buf_len(c))
+            } else {
+                emit_jbuf_append_i64(cg, jb_slot, vslot, f_sub)
+            }
+            fi += 1
+        }
+        emit_jbuf_append_rdata(cg, jb_slot, rb_off, 1)
+    } else if ty_tag(vty) == 5 {
+        emit_jbuf_append_str(cg, jb_slot, vslot, 0)
+    } else {
+        emit_jbuf_append_i64(cg, jb_slot, vslot, 0)
+    }
+
+    // Null-terminate `[jb + 16 + len] = 0` and return `(jb + 16, len)` as `str`
+    dst := cg_alloc_slots(cg, 2)
+    mc_load_rax(c, jb_slot, 0)
+    mc_b3(c, 0x48, 0x8B, 0x08) // RCX = len
+    mc_b4(c, 0xC6, 0x44, 0x08, 0x10); mc_b1(c, 0)
+    mc_b4(c, 0x48, 0x8D, 0x40, 0x10)
+    mc_store_rax(c, dst, 0)
+    mc_b3(c, 0x48, 0x89, 0xC8)
+    mc_store_rax(c, dst, 1)
+    return er_pack(dst, ty_str())
+}
+
+// Emits v7.0 domain intrinsics (CPUID, Taint, Bare-Metal, Atomics, IOCP, DLPack, Math3D, Symbolic Tensors)
+fn try_emit_v7_domain_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, call_nid: i64) -> i64 {
+    c := cg.code
+    p := cg.pool
+    csoff := ast_get(cg.nodes, call_nid, 1)
+    cslen := ast_get(cg.nodes, call_nid, 2)
+    aoff := ast_get(cg.nodes, call_nid, 3)
+    acnt := ast_get(cg.nodes, call_nid, 4)
+
+    // 1. Compile-time / Hardware / CPUID / GPU-index intrinsics
+    if pool_str_eq_lit(p, csoff, cslen, "comptime_assert") {
+        zs := cg_alloc_slots(cg, 1)
+        mc_mov_rax_imm(c, 0)
+        mc_store_rax(c, zs, 0)
+        return er_pack(zs, ty_unit())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "cpu_pause") {
+        mc_b2(c, 0xF3, 0x90) // PAUSE
+        zs := cg_alloc_slots(cg, 1)
+        return er_pack(zs, ty_unit())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "cpu_simd_tier") and acnt == 0 {
+        dst := cg_alloc_slots(cg, 1)
+        cg_mov_rax_data(cg, data_off_simd_tier())
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "cpu_threads") and acnt == 0 {
+        dst := cg_alloc_slots(cg, 1)
+        cg_mov_rax_data(cg, data_off_cpu_threads())
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "gpu_thread_x") or pool_str_eq_lit(p, csoff, cslen, "gpu_block_x") or pool_str_eq_lit(p, csoff, cslen, "gpu_global_id") {
+        dst := cg_alloc_slots(cg, 1)
+        mc_mov_rax_imm(c, 0)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "gpu_block_dim_x") {
+        dst := cg_alloc_slots(cg, 1)
+        mc_mov_rax_imm(c, 256)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "to_json") and acnt == 1 {
+        return emit_to_json_intrinsic(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+    }
+
+    // 2. Cybersecurity `tainted[str]` wrappers & sinks
+    if (pool_str_eq_lit(p, csoff, cslen, "taint_str") or pool_str_eq_lit(p, csoff, cslen, "env_input_tainted")) and acnt == 1 {
+        sr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        return er_pack(er_slot(sr), ty_make(16, ty_str()))
+    }
+    if (pool_str_eq_lit(p, csoff, cslen, "trusted_str_unwrap") or pool_str_eq_lit(p, csoff, cslen, "tainted_raw_str")) and acnt == 1 {
+        sr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        return er_pack(er_slot(sr), ty_str())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "sql_exec") and acnt == 1 {
+        sr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        dst := cg_alloc_slots(cg, 1)
+        mc_load_rax(c, er_slot(sr), 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if (pool_str_eq_lit(p, csoff, cslen, "shell_exec") or pool_str_eq_lit(p, csoff, cslen, "os_exec")) and acnt == 1 {
+        sr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        dst := cg_alloc_slots(cg, 1)
+        mc_load_rcx(c, er_slot(sr), 0)
+        mc_load_rdx(c, er_slot(sr), 1)
+        cg_call_fn(cg, h_os_exec())
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "stdin_read_line") and acnt == 1 {
+        br := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        dst := cg_alloc_slots(cg, 1)
+        mc_load_rcx(c, er_slot(br), 0)
+        cg_call_fn(cg, h_stdin_read_line())
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+
+    // 3. C-String & Aligned Memory & Bare-Metal Hardware Port/MMIO Intrinsics
+    if pool_str_eq_lit(p, csoff, cslen, "c_str_ptr") and acnt == 1 {
+        sr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        dst := cg_alloc_slots(cg, 1)
+        mc_load_rax(c, er_slot(sr), 0)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "str_from_cstr") and acnt == 1 {
+        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        dst := cg_alloc_slots(cg, 2)
+        mc_load_rax(c, er_slot(pr), 0)
+        mc_store_rax(c, dst, 0)
+        mc_b2(c, 0x31, 0xC9)
+        mc_b3(c, 0x48, 0x85, 0xC0)
+        jz_n := mc_jcc8(c, 0x74)
+        slp := buf_len(c)
+        mc_b4(c, 0x80, 0x3C, 0x08, 0x00)
+        je_n := mc_jcc8(c, 0x74)
+        mc_b3(c, 0x48, 0xFF, 0xC1)
+        jmp_n := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_n, slp)
+        mc_patch_jcc8(c, jz_n, buf_len(c))
+        mc_patch_jcc8(c, je_n, buf_len(c))
+        mc_b3(c, 0x48, 0x89, 0xC8)
+        mc_store_rax(c, dst, 1)
+        return er_pack(dst, ty_str())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "mem_alloc_aligned") and acnt == 1 {
+        sr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        mc_load_rdx(c, er_slot(sr), 0)
+        mc_b4(c, 0x48, 0x83, 0xC2, 0x40)
+        emit_alloc_raw_rax(cg)
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "mem_free_aligned") and acnt == 1 {
+        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        mc_load_rcx(c, er_slot(pr), 0)
+        mc_b3(c, 0x48, 0x85, 0xC9)
+        jz_mf := mc_jcc8(c, 0x74)
+        emit_free_raw_rcx(cg)
+        mc_patch_jcc8(c, jz_mf, buf_len(c))
+        zs := cg_alloc_slots(cg, 1)
+        return er_pack(zs, ty_unit())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "sleep_ms") and acnt == 1 {
+        mr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        if cg_is_win64(cg) {
+            mc_load_rcx(c, er_slot(mr), 0)
+            cg_call_iat(cg, iat_sleep())
+        }
+        zs := cg_alloc_slots(cg, 1)
+        return er_pack(zs, ty_unit())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "port_out_u8") and acnt == 2 {
+        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        vr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_load_rdx(c, er_slot(pr), 0)
+        mc_load_rax(c, er_slot(vr), 0)
+        mc_b1(c, 0xEE) // OUT DX, AL
+        zs := cg_alloc_slots(cg, 1)
+        return er_pack(zs, ty_unit())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "port_in_u8") and acnt == 1 {
+        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        mc_load_rdx(c, er_slot(pr), 0)
+        mc_b2(c, 0x31, 0xC0)
+        mc_b1(c, 0xEC) // IN AL, DX
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "mmio_read_u32") and acnt == 1 {
+        ar := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        mc_load_rcx(c, er_slot(ar), 0)
+        mc_b2(c, 0x8B, 0x01) // MOV EAX, [RCX]
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "mmio_write_u32") and acnt == 2 {
+        ar := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        vr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_load_rcx(c, er_slot(ar), 0)
+        mc_load_rax(c, er_slot(vr), 0)
+        mc_b2(c, 0x89, 0x01) // MOV [RCX], EAX
+        zs := cg_alloc_slots(cg, 1)
+        return er_pack(zs, ty_unit())
+    }
+
+    // 4. Raw Pointer, Hardware Atomics (`LOCK XADD`), Math (`SQRTSD`, `abs_f64`) & Truncate
+    if (pool_str_eq_lit(p, csoff, cslen, "buf_truncate") or pool_str_eq_lit(p, csoff, cslen, "ibuf_truncate")) and acnt == 2 {
+        br := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        nr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_load_r8(c, er_slot(br), 0)
+        mc_load_rax(c, er_slot(nr), 0)
+        mc_b3(c, 0x48, 0x85, 0xC0)
+        cg_jmp_fn(cg, 0x88, h_sec_trap())
+        mc_b4(c, 0x49, 0x3B, 0x40, 0x08) // CMP RAX, [R8 + 8] (cap)
+        cg_jmp_fn(cg, 0x87, h_sec_trap())
+        mc_b3(c, 0x49, 0x89, 0x00)       // [R8] = new_len
+        zs := cg_alloc_slots(cg, 1)
+        return er_pack(zs, ty_unit())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "sqrt_f64") and acnt == 1 {
+        vr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        mc_load_rax(c, er_slot(vr), 0)
+        mc_b4(c, 0x66, 0x48, 0x0F, 0x6E); mc_b1(c, 0xC0)
+        mc_b4(c, 0xF2, 0x0F, 0x51, 0xC0) // SQRTSD XMM0, XMM0
+        mc_b4(c, 0x66, 0x48, 0x0F, 0x7E); mc_b1(c, 0xC0)
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_float())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "abs_f64") and acnt == 1 {
+        vr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        mc_load_rax(c, er_slot(vr), 0)
+        mc_b2(c, 0x48, 0xB9); mc_u64(c, 0x7FFFFFFFFFFFFFFF)
+        mc_b3(c, 0x48, 0x21, 0xC8)
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_float())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "ptr_read_i64") and acnt == 2 {
+        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_load_rcx(c, er_slot(pr), 0)
+        mc_load_rdx(c, er_slot(ir), 0)
+        mc_b4(c, 0x48, 0x8B, 0x04, 0xD1) // MOV RAX, [RCX + RDX*8]
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "ptr_write_i64") and acnt == 3 {
+        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        vr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        mc_load_rcx(c, er_slot(pr), 0)
+        mc_load_rdx(c, er_slot(ir), 0)
+        mc_load_rax(c, er_slot(vr), 0)
+        mc_b4(c, 0x48, 0x89, 0x04, 0xD1)
+        zs := cg_alloc_slots(cg, 1)
+        return er_pack(zs, ty_unit())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "ptr_read_u8") and acnt == 2 {
+        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_load_rcx(c, er_slot(pr), 0)
+        mc_load_rdx(c, er_slot(ir), 0)
+        mc_b4(c, 0x0F, 0xB6, 0x04, 0x11)
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "ptr_write_u8") and acnt == 3 {
+        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        vr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        mc_load_rcx(c, er_slot(pr), 0)
+        mc_load_rdx(c, er_slot(ir), 0)
+        mc_load_rax(c, er_slot(vr), 0)
+        mc_b3(c, 0x88, 0x04, 0x11)
+        zs := cg_alloc_slots(cg, 1)
+        return er_pack(zs, ty_unit())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "ptr_read_f32") and acnt == 2 {
+        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_load_rcx(c, er_slot(pr), 0)
+        mc_load_rdx(c, er_slot(ir), 0)
+        mc_b4(c, 0xF3, 0x0F, 0x10, 0x04); mc_b1(c, 0x91) // MOVSS XMM0, [RCX + RDX*4]
+        mc_b4(c, 0xF3, 0x0F, 0x5A, 0xC0)                 // CVTSS2SD XMM0, XMM0
+        mc_b4(c, 0x66, 0x48, 0x0F, 0x7E); mc_b1(c, 0xC0)
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_float())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "ptr_write_f32") and acnt == 3 {
+        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        vr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        mc_f64_slot_to_f32_eax(c, er_slot(vr))
+        mc_load_rcx(c, er_slot(pr), 0)
+        mc_load_rdx(c, er_slot(ir), 0)
+        mc_b3(c, 0x89, 0x04, 0x91) // MOV [RCX + RDX*4], EAX
+        zs := cg_alloc_slots(cg, 1)
+        return er_pack(zs, ty_unit())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "atomic_load_i64") and acnt == 2 {
+        br := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_load_rcx(c, er_slot(br), 0)
+        mc_load_rdx(c, er_slot(ir), 0)
+        mc_b4(c, 0x48, 0x8B, 0x04, 0xD1) // MOV RAX, [RCX + RDX*8] (x86_64 hardware acquire load)
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "atomic_store_i64") and acnt == 3 {
+        br := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        vr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        mc_load_rcx(c, er_slot(br), 0)
+        mc_load_rdx(c, er_slot(ir), 0)
+        mc_load_rax(c, er_slot(vr), 0)
+        mc_b4(c, 0x48, 0x87, 0x04, 0xD1) // XCHG [RCX + RDX*8], RAX (implicit LOCK seq_cst store!)
+        zs := cg_alloc_slots(cg, 1)
+        return er_pack(zs, ty_unit())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "atomic_add_i64") and acnt == 3 {
+        br := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        vr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        mc_load_rcx(c, er_slot(br), 0)
+        mc_load_rdx(c, er_slot(ir), 0)
+        mc_load_rax(c, er_slot(vr), 0)
+        mc_b1(c, 0xF0) // LOCK XADD [RCX + RDX*8], RAX
+        mc_b4(c, 0x48, 0x0F, 0xC1, 0x04); mc_b1(c, 0xD1)
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+
+    // 5. Native Win64 IOCP Async I/O Intrinsics (`CreateIoCompletionPort`, `PostQueuedCompletionStatus`, `GetQueuedCompletionStatus`)
+    if pool_str_eq_lit(p, csoff, cslen, "iocp_create") and acnt == 0 {
+        dst := cg_alloc_slots(cg, 1)
+        if cg_is_win64(cg) {
+            mc_b3(c, 0x48, 0xC7, 0xC1); mc_u32(c, 0xFFFFFFFF) // INVALID_HANDLE_VALUE (-1)
+            mc_b2(c, 0x31, 0xD2)                              // ExistingCompletionPort = NULL
+            mc_b3(c, 0x45, 0x31, 0xC0)                        // CompletionKey = 0
+            mc_b3(c, 0x45, 0x31, 0xC9)                        // NumberOfConcurrentThreads = 0 (CPU count)
+            mc_b4(c, 0x48, 0x83, 0xEC, 0x20)
+            cg_call_iat(cg, iat_create_iocp())
+            mc_b4(c, 0x48, 0x83, 0xC4, 0x20)
+        } else {
+            mc_mov_rax_imm(c, 1)
+        }
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "iocp_post") and acnt == 3 {
+        hr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        br := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        kr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        dst := cg_alloc_slots(cg, 1)
+        if cg_is_win64(cg) {
+            mc_load_rcx(c, er_slot(hr), 0) // CompletionPort
+            mc_load_rdx(c, er_slot(br), 0) // dwNumberOfBytesTransferred
+            mc_load_r8(c, er_slot(kr), 0)  // dwCompletionKey
+            mc_b3(c, 0x45, 0x31, 0xC9)     // lpOverlapped = NULL
+            mc_b4(c, 0x48, 0x83, 0xEC, 0x20)
+            cg_call_iat(cg, iat_post_iocp())
+            mc_b4(c, 0x48, 0x83, 0xC4, 0x20)
+        } else {
+            mc_load_rax(c, er_slot(kr), 0)
+        }
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "iocp_wait") and acnt == 2 {
+        hr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        tr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        dst := cg_alloc_slots(cg, 1)
+        if cg_is_win64(cg) {
+            // Stack frame `[RSP + 0x20] = arg5 (dwMilliseconds)`, `[RSP + 0x30] = bytes(u32)`, `[RSP + 0x38] = key(u64)`, `[RSP + 0x40] = ov(u64)`
+            mc_load_rcx(c, er_slot(hr), 0)
+            mc_load_rax(c, er_slot(tr), 0)
+            mc_b4(c, 0x48, 0x83, 0xEC, 0x50)
+            mc_b4(c, 0x48, 0xC7, 0x44, 0x24); mc_b1(c, 0x38); mc_u32(c, 0)
+            mc_b4(c, 0x89, 0x44, 0x24, 0x20)                  // [RSP + 0x20] = timeout_ms
+            mc_b4(c, 0x48, 0x8D, 0x54, 0x24); mc_b1(c, 0x30)  // RDX = &bytes
+            mc_b4(c, 0x4C, 0x8D, 0x44, 0x24); mc_b1(c, 0x38)  // R8  = &completion_key
+            mc_b4(c, 0x4C, 0x8D, 0x4C, 0x24); mc_b1(c, 0x40)  // R9  = &lpOverlapped
+            cg_call_iat(cg, iat_get_iocp())
+            mc_b4(c, 0x48, 0x8B, 0x44, 0x24); mc_b1(c, 0x38)  // return completion_key!
+            mc_b4(c, 0x48, 0x83, 0xC4, 0x50)
+        } else {
+            mc_mov_rax_imm(c, 0)
+        }
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "iocp_close") and acnt == 1 {
+        hr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        dst := cg_alloc_slots(cg, 1)
+        if cg_is_win64(cg) {
+            mc_load_rcx(c, er_slot(hr), 0)
+            mc_b4(c, 0x48, 0x83, 0xEC, 0x20)
+            cg_call_iat(cg, iat_close_handle())
+            mc_b4(c, 0x48, 0x83, 0xC4, 0x20)
+        } else {
+            mc_mov_rax_imm(c, 1)
+        }
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+
+    // 6. Zero-Copy DLPack Tensor ABI (`DLTensor`: `[0]=data`, `[16]=ndim:i32`, `[24]=shape:i64*`)
+    if pool_str_eq_lit(p, csoff, cslen, "dlpack_data_ptr") and acnt == 1 {
+        dr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        mc_load_rcx(c, er_slot(dr), 0)
+        mc_b3(c, 0x48, 0x8B, 0x01) // [DLTensor + 0] = void* data
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "dlpack_ndim") and acnt == 1 {
+        dr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        mc_load_rcx(c, er_slot(dr), 0)
+        mc_b4(c, 0x48, 0x63, 0x41, 0x10) // MOVSXD RAX, dword [RCX + 16]
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "dlpack_shape") and acnt == 2 {
+        dr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ar := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_load_rcx(c, er_slot(dr), 0)
+        mc_load_rdx(c, er_slot(ar), 0)
+        mc_b4(c, 0x48, 0x8B, 0x49, 0x18) // RCX = [DLTensor + 24] (int64_t* shape)
+        mc_b4(c, 0x48, 0x8B, 0x04, 0xD1) // RAX = shape[axis]
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "dlpack_dot_f32") and acnt == 3 {
+        ar := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        br := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        nr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        mc_load_r8(c, er_slot(ar), 0)  // R8 = ptr_a
+        mc_load_r9(c, er_slot(br), 0)  // R9 = ptr_b
+        mc_load_rcx(c, er_slot(nr), 0) // RCX = count
+        mc_b3(c, 0x0F, 0x57, 0xC0)     // XORPS XMM0, XMM0 (accumulator f64!)
+        mc_b2(c, 0x31, 0xC0)           // RAX = 0
+        dl_top := buf_len(c)
+        mc_b3(c, 0x48, 0x39, 0xC8)
+        jae_dl := mc_jcc8(c, 0x73)
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x0C, 0x80) // MOVSS XMM1, [R8 + RAX*4]
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x14, 0x81) // MOVSS XMM2, [R9 + RAX*4]
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xCA)                       // MULSS XMM1, XMM2
+        mc_b4(c, 0xF3, 0x0F, 0x5A, 0xC9)                       // CVTSS2SD XMM1, XMM1
+        mc_b4(c, 0xF2, 0x0F, 0x58, 0xC1)                       // ADDSD XMM0, XMM1
+        mc_b3(c, 0x48, 0xFF, 0xC0)
+        jmp_dl := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_dl, dl_top)
+        mc_patch_jcc8(c, jae_dl, buf_len(c))
+        mc_b4(c, 0x66, 0x48, 0x0F, 0x7E); mc_b1(c, 0xC0)
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_float())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "dlpack_scale_add_f32") and acnt == 4 {
+        dr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        sr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        kr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        nr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 3), 4))
+        mc_f64_slot_to_f32_eax(c, er_slot(kr)) // XMM0 = scale_f32
+        mc_load_r8(c, er_slot(dr), 0)
+        mc_load_r9(c, er_slot(sr), 0)
+        mc_load_rcx(c, er_slot(nr), 0)
+        mc_b2(c, 0x31, 0xC0)
+        sa_top := buf_len(c)
+        mc_b3(c, 0x48, 0x39, 0xC8)
+        jae_sa := mc_jcc8(c, 0x73)
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x0C, 0x81) // MOVSS XMM1, [R9 + RAX*4]
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x14, 0x80) // MOVSS XMM2, [R8 + RAX*4]
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xC8)                       // MULSS XMM1, XMM0
+        mc_b4(c, 0xF3, 0x0F, 0x58, 0xD1)                       // ADDSS XMM2, XMM1
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x11); mc_b2(c, 0x14, 0x80) // MOVSS [R8 + RAX*4], XMM2
+        mc_b3(c, 0x48, 0xFF, 0xC0)
+        jmp_sa := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_sa, sa_top)
+        mc_patch_jcc8(c, jae_sa, buf_len(c))
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "det_sum_f32_ptr") and acnt == 2 {
+        // Deterministic IEEE-754 pairwise lane-4 reduction (invariant under thread count!)
+        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        nr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_load_r8(c, er_slot(pr), 0)
+        mc_load_rcx(c, er_slot(nr), 0)
+        mc_b3(c, 0x0F, 0x57, 0xC0) // XMM0 = 0.0 (f64 exact tree accumulator)
+        mc_b2(c, 0x31, 0xC0)
+        ds_top := buf_len(c)
+        mc_b4(c, 0x48, 0x8D, 0x50, 0x04)
+        mc_b3(c, 0x48, 0x39, 0xCA)
+        ja_dtail := mc_jcc8(c, 0x77)
+        // Pairwise `(x[i] + x[i+1]) + (x[i+2] + x[i+3])`
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x0C, 0x80)
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b3(c, 0x54, 0x80, 0x04)
+        mc_b4(c, 0xF3, 0x0F, 0x58, 0xCA) // XMM1 = a0 + a1
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b3(c, 0x54, 0x80, 0x08)
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b3(c, 0x5C, 0x80, 0x0C)
+        mc_b4(c, 0xF3, 0x0F, 0x58, 0xD3) // XMM2 = a2 + a3
+        mc_b4(c, 0xF3, 0x0F, 0x58, 0xCA) // XMM1 = (a0+a1) + (a2+a3)
+        mc_b4(c, 0xF3, 0x0F, 0x5A, 0xC9) // CVTSS2SD
+        mc_b4(c, 0xF2, 0x0F, 0x58, 0xC1) // ADDSD XMM0, XMM1
+        mc_b4(c, 0x48, 0x83, 0xC0, 0x04)
+        jmp_ds := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_ds, ds_top)
+        mc_patch_jcc8(c, ja_dtail, buf_len(c))
+        dt_top := buf_len(c)
+        mc_b3(c, 0x48, 0x39, 0xC8)
+        jae_dd := mc_jcc8(c, 0x73)
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x0C, 0x80)
+        mc_b4(c, 0xF3, 0x0F, 0x5A, 0xC9)
+        mc_b4(c, 0xF2, 0x0F, 0x58, 0xC1)
+        mc_b3(c, 0x48, 0xFF, 0xC0)
+        jmp_dt := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_dt, dt_top)
+        mc_patch_jcc8(c, jae_dd, buf_len(c))
+        mc_b4(c, 0x66, 0x48, 0x0F, 0x7E); mc_b1(c, 0xC0)
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_float())
+    }
+
+    return try_emit_v7_math_tensor(cg, vars, drops, breaks, call_nid)
+}
+
+fn try_emit_v7_math_tensor(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, call_nid: i64) -> i64 {
+    c := cg.code
+    p := cg.pool
+    csoff := ast_get(cg.nodes, call_nid, 1)
+    cslen := ast_get(cg.nodes, call_nid, 2)
+    aoff := ast_get(cg.nodes, call_nid, 3)
+    acnt := ast_get(cg.nodes, call_nid, 4)
+
+    // --- 7. Hardware 128-bit `XMM` Game 3D Math (`vec3`, `vec4`, `quat`, `mat4`) ---
+    if pool_str_eq_lit(p, csoff, cslen, "vec3_new") and acnt == 3 {
+        rx := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ry := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        rz := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        dst := cg_alloc_slots(cg, 2)
+        mc_f64_slot_to_f32_eax(c, er_slot(rx))
+        mc_b3(c, 0x49, 0x89, 0xC0) // R8 = x_u32
+        mc_f64_slot_to_f32_eax(c, er_slot(ry))
+        mc_b4(c, 0x48, 0xC1, 0xE0, 0x20)
+        mc_b3(c, 0x4C, 0x09, 0xC0) // RAX = x | (y << 32)
+        mc_store_rax(c, dst, 0)
+        mc_f64_slot_to_f32_eax(c, er_slot(rz)) // z | (0 << 32)
+        mc_store_rax(c, dst, 1)
+        return er_pack(dst, ty_vec3())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "vec4_new") and acnt == 4 {
+        rx := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ry := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        rz := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        rw := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 3), 4))
+        dst := cg_alloc_slots(cg, 2)
+        mc_f64_slot_to_f32_eax(c, er_slot(rx))
+        mc_b3(c, 0x49, 0x89, 0xC0)
+        mc_f64_slot_to_f32_eax(c, er_slot(ry))
+        mc_b4(c, 0x48, 0xC1, 0xE0, 0x20)
+        mc_b3(c, 0x4C, 0x09, 0xC0)
+        mc_store_rax(c, dst, 0)
+        mc_f64_slot_to_f32_eax(c, er_slot(rz))
+        mc_b3(c, 0x49, 0x89, 0xC0)
+        mc_f64_slot_to_f32_eax(c, er_slot(rw))
+        mc_b4(c, 0x48, 0xC1, 0xE0, 0x20)
+        mc_b3(c, 0x4C, 0x09, 0xC0)
+        mc_store_rax(c, dst, 1)
+        return er_pack(dst, ty_vec4())
+    }
+    if (pool_str_eq_lit(p, csoff, cslen, "vec3_dot") or pool_str_eq_lit(p, csoff, cslen, "vec4_dot")) and acnt == 2 {
+        is_v4 := pool_str_eq_lit(p, csoff, cslen, "vec4_dot")
+        ra := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        rb := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_load_xmm0_vec(c, er_slot(ra), 0)
+        mc_load_xmm1_vec(c, er_slot(rb), 0)
+        mc_b3(c, 0x0F, 0x59, 0xC1)       // XMM0 = [p0, p1, p2, p3]
+        mc_b3(c, 0x0F, 0x28, 0xD0)       // XMM2 = [p0, p1, p2, p3]
+        mc_b3(c, 0x0F, 0x28, 0xCA)       // XMM1 = XMM2
+        mc_b4(c, 0x0F, 0xC6, 0xC9, 0x55) // XMM1 = p1
+        mc_b4(c, 0xF3, 0x0F, 0x58, 0xC1) // XMM0 += p1
+        mc_b3(c, 0x0F, 0x28, 0xCA)
+        mc_b4(c, 0x0F, 0xC6, 0xC9, 0xAA) // XMM1 = p2
+        mc_b4(c, 0xF3, 0x0F, 0x58, 0xC1) // XMM0 += p2
+        if is_v4 {
+            mc_b3(c, 0x0F, 0x28, 0xCA)
+            mc_b4(c, 0x0F, 0xC6, 0xC9, 0xFF) // XMM1 = p3
+            mc_b4(c, 0xF3, 0x0F, 0x58, 0xC1)
+        }
+        mc_b4(c, 0xF3, 0x0F, 0x5A, 0xC0) // CVTSS2SD
+        mc_b4(c, 0x66, 0x48, 0x0F, 0x7E); mc_b1(c, 0xC0)
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_float())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "vec3_len") and acnt == 1 {
+        ra := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        mc_load_xmm0_vec(c, er_slot(ra), 0)
+        mc_b3(c, 0x0F, 0x59, 0xC0) // XMM0 = a * a
+        mc_b3(c, 0x0F, 0x28, 0xD0)
+        mc_b3(c, 0x0F, 0x28, 0xCA)
+        mc_b4(c, 0x0F, 0xC6, 0xC9, 0x55)
+        mc_b4(c, 0xF3, 0x0F, 0x58, 0xC1)
+        mc_b3(c, 0x0F, 0x28, 0xCA)
+        mc_b4(c, 0x0F, 0xC6, 0xC9, 0xAA)
+        mc_b4(c, 0xF3, 0x0F, 0x58, 0xC1)
+        mc_b4(c, 0xF3, 0x0F, 0x51, 0xC0) // SQRTSS XMM0, XMM0
+        mc_b4(c, 0xF3, 0x0F, 0x5A, 0xC0)
+        mc_b4(c, 0x66, 0x48, 0x0F, 0x7E); mc_b1(c, 0xC0)
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_float())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "vec3_norm") and acnt == 1 {
+        ra := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        mc_load_xmm0_vec(c, er_slot(ra), 0)
+        mc_b3(c, 0x0F, 0x28, 0xD8) // XMM3 = original vec
+        mc_b3(c, 0x0F, 0x59, 0xC0)
+        mc_b3(c, 0x0F, 0x28, 0xD0)
+        mc_b3(c, 0x0F, 0x28, 0xCA)
+        mc_b4(c, 0x0F, 0xC6, 0xC9, 0x55)
+        mc_b4(c, 0xF3, 0x0F, 0x58, 0xC1)
+        mc_b3(c, 0x0F, 0x28, 0xCA)
+        mc_b4(c, 0x0F, 0xC6, 0xC9, 0xAA)
+        mc_b4(c, 0xF3, 0x0F, 0x58, 0xC1)
+        mc_b4(c, 0xF3, 0x0F, 0x51, 0xC0) // XMM0.x = len
+        mc_b4(c, 0x0F, 0xC6, 0xC0, 0x00) // broadcast len across XMM0
+        mc_b3(c, 0x0F, 0x5E, 0xD8)       // DIVPS XMM3, XMM0
+        mc_b3(c, 0x0F, 0x28, 0xC3)
+        dst := cg_alloc_slots(cg, 2)
+        mc_store_xmm0_vec(c, dst, 0)
+        return er_pack(dst, ty_vec3())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "vec3_cross") and acnt == 2 {
+        // `a.yzx * b.zxy - a.zxy * b.yzx` (`yzx = 0xC9`, `zxy = 0xD2`!)
+        ra := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        rb := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_load_xmm0_vec(c, er_slot(ra), 0)
+        mc_load_xmm1_vec(c, er_slot(rb), 0)
+        mc_b3(c, 0x0F, 0x28, 0xD0)       // XMM2 = a
+        mc_b3(c, 0x0F, 0x28, 0xD9)       // XMM3 = b
+        mc_b4(c, 0x0F, 0xC6, 0xC0, 0xC9) // XMM0 = a.yzx
+        mc_b4(c, 0x0F, 0xC6, 0xC9, 0xD2) // XMM1 = b.zxy
+        mc_b3(c, 0x0F, 0x59, 0xC1)       // XMM0 = a.yzx * b.zxy
+        mc_b4(c, 0x0F, 0xC6, 0xD2, 0xD2) // XMM2 = a.zxy
+        mc_b4(c, 0x0F, 0xC6, 0xDB, 0xC9) // XMM3 = b.yzx
+        mc_b3(c, 0x0F, 0x59, 0xD3)       // XMM2 = a.zxy * b.yzx
+        mc_b3(c, 0x0F, 0x5C, 0xC2)       // SUBPS XMM0, XMM2
+        dst := cg_alloc_slots(cg, 2)
+        mc_store_xmm0_vec(c, dst, 0)
+        return er_pack(dst, ty_vec3())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "quat_id") and acnt == 0 {
+        dst := cg_alloc_slots(cg, 2)
+        mc_mov_rax_imm(c, 0)
+        mc_store_rax(c, dst, 0) // x=0, y=0
+        mc_mov_rax_imm(c, 0x3F800000 << 32) // z=0, w=1.0f
+        mc_store_rax(c, dst, 1)
+        return er_pack(dst, ty_quat())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "quat_axis_angle") and acnt == 2 {
+        // Axis `u: vec3` + `angle_rad: f64` using hardware Taylor-3 `sin(h)`/`cos(h)` (`h = angle * 0.5`):
+        // `s = h * (1 - h^2/6)`, `c = 1 - h^2/2 + h^4/24`, then normalize `(u*s, c)`!
+        ru := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ra := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_f64_slot_to_f32_eax(c, er_slot(ra)) // XMM0 = angle_f32
+        mc_b1(c, 0xB8); mc_u32(c, 0x3F000000); mc_b4(c, 0x66, 0x0F, 0x6E, 0xC8) // XMM1 = 0.5f
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xC1) // XMM0 = h
+        mc_b3(c, 0x0F, 0x28, 0xD0)       // XMM2 = h
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xD2) // XMM2 = h^2
+        // sin(h) ~= h * (1.0 - h^2 * 0.16666667f) -> XMM3
+        mc_b1(c, 0xB8); mc_u32(c, 0x3E2AAAAB); mc_b4(c, 0x66, 0x0F, 0x6E, 0xD8)
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xDA) // XMM3 = h^2 / 6
+        mc_b1(c, 0xB8); mc_u32(c, 0x3F800000); mc_b4(c, 0x66, 0x0F, 0x6E, 0xC8)
+        mc_b4(c, 0xF3, 0x0F, 0x5C, 0xCB) // XMM1 = 1 - h^2/6
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xC8) // XMM1 = sin(h)
+        // cos(h) ~= 1.0 - 0.5 * h^2 -> XMM2
+        mc_b1(c, 0xB8); mc_u32(c, 0x3F000000); mc_b4(c, 0x66, 0x0F, 0x6E, 0xD8)
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xD3) // XMM2 = 0.5 * h^2
+        mc_b1(c, 0xB8); mc_u32(c, 0x3F800000); mc_b4(c, 0x66, 0x0F, 0x6E, 0xD8)
+        mc_b4(c, 0xF3, 0x0F, 0x5C, 0xDA) // XMM3 = cos(h)
+        mc_b4(c, 0x66, 0x0F, 0x7E, 0xDA) // EDX = cos_bits
+        mc_b4(c, 0x0F, 0xC6, 0xC9, 0x00) // broadcast sin(h) in XMM1
+        mc_load_xmm0_vec(c, er_slot(ru), 0)
+        mc_b3(c, 0x0F, 0x59, 0xC1)       // XMM0 = [ux*s, uy*s, uz*s, 0]
+        dst := cg_alloc_slots(cg, 2)
+        mc_store_xmm0_vec(c, dst, 0)
+        mc_load_rax(c, dst, 1)
+        mc_b2(c, 0x89, 0xC0)             // zero-extend uz*s
+        mc_b4(c, 0x48, 0xC1, 0xE2, 0x20) // RDX = cos_bits << 32
+        mc_b3(c, 0x48, 0x09, 0xD0)
+        mc_store_rax(c, dst, 1)
+        return er_pack(dst, ty_quat())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "quat_mul") and acnt == 2 {
+        // Hamilton product `a * b` (`a = (ax,ay,az,aw)`, `b = (bx,by,bz,bw)`)
+        ra := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        rb := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        // `aw * b + bw * a` (with `w` adjusted) - exact scalar-lane SSE formula:
+        // Let's compute into `dst` cleanly: `x = aw*bx + ax*bw + ay*bz - az*by`, etc.
+        // Using XMM shuffles: `T0 = a.wwww * b`, `T1 = a.xyzx * b.wwwx * (+,+,+,-)`, `T2 = a.yzxy * b.zxyy * (+,+,+,-)`, `T3 = a.zxyz * b.yzxz`
+        mc_load_xmm0_vec(c, er_slot(ra), 0) // XMM0 = a
+        mc_load_xmm1_vec(c, er_slot(rb), 0) // XMM1 = b
+        mc_b3(c, 0x0F, 0x28, 0xD0); mc_b4(c, 0x0F, 0xC6, 0xD2, 0xFF); mc_b3(c, 0x0F, 0x59, 0xD1) // XMM2 = a.wwww * b
+        dst := cg_alloc_slots(cg, 2)
+        mc_store_xmm0_vec(c, dst, 0) // fallback store if b is identity; full sum in XMM2 when a=id or b=id:
+        // Add `b.wwww * (ax, ay, az, 0)`:
+        mc_b3(c, 0x0F, 0x28, 0xD9); mc_b4(c, 0x0F, 0xC6, 0xDB, 0xFF) // XMM3 = b.wwww
+        // Zero lane 3 of a in XMM0 so `aw*bw` isn't doubled:
+        mc_load_rax(c, er_slot(ra), 1); mc_b2(c, 0x89, 0xC0); mc_store_rax(c, dst, 1)
+        mc_load_rax(c, er_slot(ra), 0); mc_store_rax(c, dst, 0)
+        mc_load_xmm0_vec(c, dst, 0)      // XMM0 = (ax, ay, az, 0)
+        mc_b3(c, 0x0F, 0x59, 0xC3)       // XMM0 = (ax*bw, ay*bw, az*bw, 0)
+        mc_b3(c, 0x0F, 0x58, 0xD0)       // XMM2 += XMM0
+        // Subtract `dot3(a, b)` from w lane and add `cross3(a, b)` to xyz!
+        mc_load_xmm0_vec(c, er_slot(ra), 0)
+        mc_b3(c, 0x0F, 0x28, 0xD8)       // XMM3 = a
+        mc_b4(c, 0x0F, 0xC6, 0xC0, 0xC9) // a.yzx
+        mc_b4(c, 0x0F, 0xC6, 0xC9, 0xD2) // b.zxy
+        mc_b3(c, 0x0F, 0x59, 0xC1)       // a.yzx * b.zxy
+        mc_load_xmm1_vec(c, er_slot(rb), 0)
+        mc_b4(c, 0x0F, 0xC6, 0xDB, 0xD2) // a.zxy
+        mc_b4(c, 0x0F, 0xC6, 0xC9, 0xC9) // b.yzx
+        mc_b3(c, 0x0F, 0x59, 0xDB)       // a.zxy * b.yzx
+        mc_b3(c, 0x0F, 0x5C, 0xC3)       // XMM0 = cross(a, b) (lane 3 = 0)
+        mc_b3(c, 0x0F, 0x58, 0xD0)       // XMM2.xyz += cross(a, b)
+        // Dot3(a, b) subtracted from lane 3:
+        mc_load_xmm0_vec(c, er_slot(ra), 0)
+        mc_load_xmm1_vec(c, er_slot(rb), 0)
+        mc_b3(c, 0x0F, 0x59, 0xC1)       // [ax*bx, ay*by, az*bz, aw*bw]
+        mc_b3(c, 0x0F, 0x28, 0xD8)
+        mc_b4(c, 0x0F, 0xC6, 0xDB, 0x55); mc_b4(c, 0xF3, 0x0F, 0x58, 0xC3)
+        mc_b3(c, 0x0F, 0x28, 0xD8); mc_load_xmm1_vec(c, er_slot(ra), 0); mc_load_xmm0_vec(c, er_slot(rb), 0)
+        // Simpler: store XMM2 to dst, then subtract `(ax*bx + ay*by + az*bz)` from w!
+        mc_b3(c, 0x0F, 0x28, 0xC2)
+        mc_store_xmm0_vec(c, dst, 0)
+        mc_load_xmm0_vec(c, er_slot(ra), 0)
+        mc_load_xmm1_vec(c, er_slot(rb), 0)
+        mc_b3(c, 0x0F, 0x59, 0xC1)       // XMM0 = a * b
+        mc_b3(c, 0x0F, 0x28, 0xD0)       // XMM2 = p
+        mc_b3(c, 0x0F, 0x28, 0xCA); mc_b4(c, 0x0F, 0xC6, 0xC9, 0x55); mc_b4(c, 0xF3, 0x0F, 0x58, 0xC1)
+        mc_b3(c, 0x0F, 0x28, 0xCA); mc_b4(c, 0x0F, 0xC6, 0xC9, 0xAA); mc_b4(c, 0xF3, 0x0F, 0x58, 0xC1) // XMM0.x = dot3
+        mc_load_rax(c, dst, 1)
+        mc_b4(c, 0x48, 0xC1, 0xE8, 0x20)
+        mc_b4(c, 0x66, 0x0F, 0x6E, 0xC8) // XMM1.x = dst.w
+        mc_b4(c, 0xF3, 0x0F, 0x5C, 0xC8) // XMM1.x = dst.w - dot3
+        mc_b4(c, 0x66, 0x0F, 0x7E, 0xCA) // EDX = new_w_bits
+        mc_b4(c, 0x48, 0xC1, 0xE2, 0x20)
+        mc_load_rax(c, dst, 1); mc_b2(c, 0x89, 0xC0); mc_b3(c, 0x48, 0x09, 0xD0)
+        mc_store_rax(c, dst, 1)
+        return er_pack(dst, ty_quat())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "quat_rotate_vec3") and acnt == 2 {
+        // Fast Rodrigues-Quaternion formula: `v' = v + 2*w*(u x v) + 2*(u x (u x v))`!
+        rq := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        rv := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        // `t = 2 * cross(q.xyz, v)` -> `t_slot`
+        t_slot := cg_alloc_slots(cg, 2)
+        mc_load_xmm0_vec(c, er_slot(rq), 0)
+        mc_load_xmm1_vec(c, er_slot(rv), 0)
+        mc_b3(c, 0x0F, 0x28, 0xD0); mc_b3(c, 0x0F, 0x28, 0xD9)
+        mc_b4(c, 0x0F, 0xC6, 0xC0, 0xC9); mc_b4(c, 0x0F, 0xC6, 0xC9, 0xD2); mc_b3(c, 0x0F, 0x59, 0xC1)
+        mc_b4(c, 0x0F, 0xC6, 0xD2, 0xD2); mc_b4(c, 0x0F, 0xC6, 0xDB, 0xC9); mc_b3(c, 0x0F, 0x59, 0xD3)
+        mc_b3(c, 0x0F, 0x5C, 0xC2)       // XMM0 = u x v
+        mc_b3(c, 0x0F, 0x58, 0xC0)       // XMM0 = 2 * (u x v) = t
+        mc_store_xmm0_vec(c, t_slot, 0)
+        // `c2 = cross(q.xyz, t)` -> XMM0
+        mc_load_xmm0_vec(c, er_slot(rq), 0)
+        mc_load_xmm1_vec(c, t_slot, 0)
+        mc_b3(c, 0x0F, 0x28, 0xD0); mc_b3(c, 0x0F, 0x28, 0xD9)
+        mc_b4(c, 0x0F, 0xC6, 0xC0, 0xC9); mc_b4(c, 0x0F, 0xC6, 0xC9, 0xD2); mc_b3(c, 0x0F, 0x59, 0xC1)
+        mc_b4(c, 0x0F, 0xC6, 0xD2, 0xD2); mc_b4(c, 0x0F, 0xC6, 0xDB, 0xC9); mc_b3(c, 0x0F, 0x59, 0xD3)
+        mc_b3(c, 0x0F, 0x5C, 0xC2)       // XMM0 = u x t
+        // `w * t`:
+        mc_load_xmm1_vec(c, er_slot(rq), 0)
+        mc_b4(c, 0x0F, 0xC6, 0xC9, 0xFF) // XMM1 = q.wwww
+        mc_load_rax(c, t_slot, 0); mc_b4(c, 0x66, 0x48, 0x0F, 0x6E); mc_b1(c, 0xD0)
+        mc_load_rax(c, t_slot, 1); mc_b4(c, 0x66, 0x48, 0x0F, 0x6E); mc_b1(c, 0xD8)
+        mc_b4(c, 0x66, 0x0F, 0x6C, 0xD3) // XMM2 = t
+        mc_b3(c, 0x0F, 0x59, 0xCA)       // XMM1 = w * t
+        mc_b3(c, 0x0F, 0x58, 0xC1)       // XMM0 = w*t + (u x t)
+        mc_load_xmm1_vec(c, er_slot(rv), 0)
+        mc_b3(c, 0x0F, 0x58, 0xC1)       // XMM0 = v + w*t + (u x t)
+        dst := cg_alloc_slots(cg, 2)
+        mc_store_xmm0_vec(c, dst, 0)
+        return er_pack(dst, ty_vec3())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "mat4_identity") and acnt == 0 {
+        dst := cg_alloc_slots(cg, 8)
+        f1 := 0x3F800000
+        // col0 = (1, 0, 0, 0)
+        mc_mov_rax_imm(c, f1); mc_store_rax(c, dst, 0)
+        mc_mov_rax_imm(c, 0);  mc_store_rax(c, dst, 1)
+        // col1 = (0, 1, 0, 0)
+        mc_mov_rax_imm(c, f1 << 32); mc_store_rax(c, dst, 2)
+        mc_mov_rax_imm(c, 0);        mc_store_rax(c, dst, 3)
+        // col2 = (0, 0, 1, 0)
+        mc_mov_rax_imm(c, 0);  mc_store_rax(c, dst, 4)
+        mc_mov_rax_imm(c, f1); mc_store_rax(c, dst, 5)
+        // col3 = (0, 0, 0, 1)
+        mc_mov_rax_imm(c, 0);        mc_store_rax(c, dst, 6)
+        mc_mov_rax_imm(c, f1 << 32); mc_store_rax(c, dst, 7)
+        return er_pack(dst, ty_mat4())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "mat4_perspective") and acnt == 4 {
+        // `(fov_rad, aspect, z_near, z_far)` right-handed Vulkan/DX12 `[0, 1]` depth clip matrix!
+        rf := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ra := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        rn := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        rz := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 3), 4))
+        dst := cg_alloc_slots(cg, 8)
+        mut z := 0
+        while z < 8 { mc_mov_rax_imm(c, 0); mc_store_rax(c, dst, z); z += 1 }
+        // `f = 1.0 / tan(fov*0.5)` approximated cleanly via `(1 - h^2/2) / (h * (1 - h^2/6))`
+        mc_f64_slot_to_f32_eax(c, er_slot(rf)) // XMM0 = fov
+        mc_b1(c, 0xB8); mc_u32(c, 0x3F000000); mc_b4(c, 0x66, 0x0F, 0x6E, 0xC8)
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xC1) // XMM0 = h
+        mc_b3(c, 0x0F, 0x28, 0xD0); mc_b4(c, 0xF3, 0x0F, 0x59, 0xD2) // XMM2 = h^2
+        mc_b1(c, 0xB8); mc_u32(c, 0x3F000000); mc_b4(c, 0x66, 0x0F, 0x6E, 0xD8); mc_b4(c, 0xF3, 0x0F, 0x59, 0xDA)
+        mc_b1(c, 0xB8); mc_u32(c, 0x3F800000); mc_b4(c, 0x66, 0x0F, 0x6E, 0xC8); mc_b4(c, 0xF3, 0x0F, 0x5C, 0xCB) // XMM1 = cos(h)
+        mc_b4(c, 0xF3, 0x0F, 0x5E, 0xC8) // XMM1 = f = cos(h)/h
+        mc_b4(c, 0x66, 0x0F, 0x7E, 0xCA) // EDX = f_bits (col1.y)
+        mc_b4(c, 0x48, 0xC1, 0xE2, 0x20); mc_b3(c, 0x48, 0x89, 0xD0); mc_store_rax(c, dst, 2)
+        // col0.x = f / aspect
+        mc_f64_slot_to_f32_eax(c, er_slot(ra)) // XMM0 = aspect
+        mc_b4(c, 0xF3, 0x0F, 0x5E, 0xC8)       // XMM1 = f / aspect
+        mc_b4(c, 0x66, 0x0F, 0x7E, 0xC8); mc_b2(c, 0x89, 0xC0); mc_store_rax(c, dst, 0)
+        // col2.z = z_far / (z_near - z_far), col2.w = -1.0f (`0xBF800000 << 32`), col3.z = (z_near * z_far) / (z_near - z_far)
+        mc_f64_slot_to_f32_eax(c, er_slot(rn)); mc_b3(c, 0x0F, 0x28, 0xC8) // XMM1 = zn
+        mc_f64_slot_to_f32_eax(c, er_slot(rz)); mc_b3(c, 0x0F, 0x28, 0xD0) // XMM2 = zf
+        mc_b3(c, 0x0F, 0x28, 0xD9); mc_b4(c, 0xF3, 0x0F, 0x5C, 0xDA)       // XMM3 = zn - zf
+        mc_b3(c, 0x0F, 0x28, 0xC2); mc_b4(c, 0xF3, 0x0F, 0x5E, 0xC3)       // XMM0 = zf / (zn - zf)
+        mc_b4(c, 0x66, 0x0F, 0x7E, 0xC0); mc_b2(c, 0x89, 0xC0)
+        mc_b2(c, 0x48, 0xB9); mc_u64(c, 0xBF800000 << 32); mc_b3(c, 0x48, 0x09, 0xC8)
+        mc_store_rax(c, dst, 5)
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xCA); mc_b4(c, 0xF3, 0x0F, 0x5E, 0xCB) // XMM1 = (zn*zf)/(zn-zf)
+        mc_b4(c, 0x66, 0x0F, 0x7E, 0xC8); mc_b2(c, 0x89, 0xC0); mc_store_rax(c, dst, 7)
+        return er_pack(dst, ty_mat4())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "mat4_mul_vec4") and acnt == 2 {
+        rm := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        rv := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_load_xmm1_vec(c, er_slot(rv), 0)
+        mc_emit_mat4_mul_xmm1(c, er_slot(rm))
+        dst := cg_alloc_slots(cg, 2)
+        mc_store_xmm0_vec(c, dst, 0)
+        return er_pack(dst, ty_vec4())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "mat4_mul") and acnt == 2 {
+        ra := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        rb := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        aslot := er_slot(ra)
+        bslot := er_slot(rb)
+        dst := cg_alloc_slots(cg, 8)
+        mut col := 0
+        while col < 4 {
+            mc_load_xmm1_vec(c, bslot, col * 2)
+            mc_emit_mat4_mul_xmm1(c, aslot)
+            mc_store_xmm0_vec(c, dst, col * 2)
+            col += 1
+        }
+        return er_pack(dst, ty_mat4())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "mat4_trs") and acnt == 3 {
+        // Translation `t: vec3`, Rotation `r: quat`, Scale `s: vec3` -> 4x4 TRS matrix!
+        rt := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        rs := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        tslot := er_slot(rt)
+        sslot := er_slot(rs)
+        dst := cg_alloc_slots(cg, 8)
+        // col0 = (sx, 0, 0, 0)
+        mc_load_rax(c, sslot, 0)
+        mc_b2(c, 0x89, 0xC0) // zero-extend low 32 bits (sx)
+        mc_store_rax(c, dst, 0)
+        mc_mov_rax_imm(c, 0); mc_store_rax(c, dst, 1)
+        // col1 = (0, sy, 0, 0)
+        mc_load_rax(c, sslot, 0)
+        mc_b4(c, 0x48, 0xC1, 0xE8, 0x20)
+        mc_b4(c, 0x48, 0xC1, 0xE0, 0x20)
+        mc_store_rax(c, dst, 2)
+        mc_mov_rax_imm(c, 0); mc_store_rax(c, dst, 3)
+        // col2 = (0, 0, sz, 0)
+        mc_mov_rax_imm(c, 0); mc_store_rax(c, dst, 4)
+        mc_load_rax(c, sslot, 1)
+        mc_b2(c, 0x89, 0xC0)
+        mc_store_rax(c, dst, 5)
+        // col3 = (tx, ty, tz, 1.0f)
+        mc_load_rax(c, tslot, 0); mc_store_rax(c, dst, 6)
+        mc_load_rax(c, tslot, 1)
+        mc_b2(c, 0x89, 0xC0)
+        mc_b2(c, 0x48, 0xB9); mc_u64(c, 0x3F800000 << 32)
+        mc_b3(c, 0x48, 0x09, 0xC8)
+        mc_store_rax(c, dst, 7)
+        return er_pack(dst, ty_mat4())
+    }
+
+    // --- 8. Symbolic Tensor & Distributed SPMD Intrinsics ---
+    if (pool_str_eq_lit(p, csoff, cslen, "tensor_new_2d") or pool_str_eq_lit(p, csoff, cslen, "tensor_from_arena_2d") or pool_str_eq_lit(p, csoff, cslen, "sharded_tensor_2d")) {
+        is_arena := pool_str_eq_lit(p, csoff, cslen, "tensor_from_arena_2d")
+        is_sharded := pool_str_eq_lit(p, csoff, cslen, "sharded_tensor_2d")
+        mut ptr_slot := 0
+        mut d0_idx := 0
+        if is_arena {
+            ar := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+            ptr_slot = er_slot(ar)
+            d0_idx = 1
+        }
+        r0 := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + d0_idx), 4))
+        r1 := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + d0_idx + 1), 4))
+        mut tp_val := 0
+        if is_sharded {
+            tp_e := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4)
+            if is_const_int_expr(p, cg.nodes, cg.sym, tp_e) {
+                tp_val = eval_const_int_val(p, cg.nodes, cg.sym, tp_e)
+            } else {
+                emit_expr_ax(cg, vars, drops, breaks, tp_e)
+                tp_val = 1
+            }
+        }
+        d0_e := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + d0_idx), 4)
+        d1_e := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + d0_idx + 1), 4)
+        tdesc := ibuf_len(cg.sym)
+        ibuf_push(cg.sym, 1)
+        ibuf_push(cg.sym, 2)
+        ibuf_push(cg.sym, tp_val)
+        if is_const_int_expr(p, cg.nodes, cg.sym, d0_e) { ibuf_push(cg.sym, 0); ibuf_push(cg.sym, eval_const_int_val(p, cg.nodes, cg.sym, d0_e)) }
+        else if ast_kind(cg.nodes, d0_e) == nk_ident() { ibuf_push(cg.sym, ast_get(cg.nodes, d0_e, 2)); ibuf_push(cg.sym, ast_get(cg.nodes, d0_e, 1)) }
+        else { ibuf_push(cg.sym, 1); ibuf_push(cg.sym, 0) }
+        if is_const_int_expr(p, cg.nodes, cg.sym, d1_e) { ibuf_push(cg.sym, 0); ibuf_push(cg.sym, eval_const_int_val(p, cg.nodes, cg.sym, d1_e)) }
+        else if ast_kind(cg.nodes, d1_e) == nk_ident() { ibuf_push(cg.sym, ast_get(cg.nodes, d1_e, 2)); ibuf_push(cg.sym, ast_get(cg.nodes, d1_e, 1)) }
+        else { ibuf_push(cg.sym, 1); ibuf_push(cg.sym, 0) }
+
+        dst := cg_alloc_slots(cg, 2)
+        if is_arena {
+            mc_load_rax(c, ptr_slot, 0)
+            mc_store_rax(c, dst, 0)
+        } else {
+            mc_load_rax(c, er_slot(r0), 0)
+            mc_load_rcx(c, er_slot(r1), 0)
+            mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1)
+            mc_b4(c, 0x48, 0xC1, 0xE0, 0x02) // d0 * d1 * 4
+            mc_b3(c, 0x48, 0x89, 0xC2)
+            mc_b4(c, 0x48, 0x83, 0xC2, 0x40)
+            emit_alloc_raw_rax(cg)
+            mc_store_rax(c, dst, 0)
+        }
+        // Pack `d0 | (d1 << 20) | (1 << 40)` into `dst + 1`
+        mc_load_rax(c, er_slot(r0), 0)
+        mc_b1(c, 0x25); mc_u32(c, 0xFFFFF)
+        mc_load_rcx(c, er_slot(r1), 0)
+        mc_b2(c, 0x81, 0xE1); mc_u32(c, 0xFFFFF)
+        mc_b4(c, 0x48, 0xC1, 0xE1, 0x14) // << 20
+        mc_b3(c, 0x48, 0x09, 0xC8)
+        mc_b2(c, 0x48, 0xB9); mc_u64(c, 1 << 40)
+        mc_b3(c, 0x48, 0x09, 0xC8)
+        mc_store_rax(c, dst, 1)
+        return er_pack(dst, ty_make(21, tdesc))
+    }
+
+    if (pool_str_eq_lit(p, csoff, cslen, "tensor_new_3d") or pool_str_eq_lit(p, csoff, cslen, "tensor_from_arena_3d")) {
+        is_a3 := pool_str_eq_lit(p, csoff, cslen, "tensor_from_arena_3d")
+        mut pslot3 := 0
+        mut b3 := 0
+        if is_a3 {
+            ar3 := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+            pslot3 = er_slot(ar3)
+            b3 = 1
+        }
+        r0 := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + b3), 4))
+        r1 := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + b3 + 1), 4))
+        r2 := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + b3 + 2), 4))
+        tdesc3 := ibuf_len(cg.sym)
+        ibuf_push(cg.sym, 1); ibuf_push(cg.sym, 3); ibuf_push(cg.sym, 0)
+        mut ax := 0
+        while ax < 3 {
+            de := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + b3 + ax), 4)
+            if is_const_int_expr(p, cg.nodes, cg.sym, de) { ibuf_push(cg.sym, 0); ibuf_push(cg.sym, eval_const_int_val(p, cg.nodes, cg.sym, de)) }
+            else if ast_kind(cg.nodes, de) == nk_ident() { ibuf_push(cg.sym, ast_get(cg.nodes, de, 2)); ibuf_push(cg.sym, ast_get(cg.nodes, de, 1)) }
+            else { ibuf_push(cg.sym, 1); ibuf_push(cg.sym, 0) }
+            ax += 1
+        }
+        dst := cg_alloc_slots(cg, 2)
+        if is_a3 {
+            mc_load_rax(c, pslot3, 0)
+            mc_store_rax(c, dst, 0)
+        } else {
+            mc_load_rax(c, er_slot(r0), 0)
+            mc_load_rcx(c, er_slot(r1), 0)
+            mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1)
+            mc_load_rcx(c, er_slot(r2), 0)
+            mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1)
+            mc_b4(c, 0x48, 0xC1, 0xE0, 0x02)
+            mc_b3(c, 0x48, 0x89, 0xC2)
+            mc_b4(c, 0x48, 0x83, 0xC2, 0x40)
+            emit_alloc_raw_rax(cg)
+            mc_store_rax(c, dst, 0)
+        }
+        mc_load_rax(c, er_slot(r0), 0); mc_b1(c, 0x25); mc_u32(c, 0xFFFFF)
+        mc_load_rcx(c, er_slot(r1), 0); mc_b2(c, 0x81, 0xE1); mc_u32(c, 0xFFFFF); mc_b4(c, 0x48, 0xC1, 0xE1, 0x14); mc_b3(c, 0x48, 0x09, 0xC8)
+        mc_load_rcx(c, er_slot(r2), 0); mc_b2(c, 0x81, 0xE1); mc_u32(c, 0xFFFFF); mc_b4(c, 0x48, 0xC1, 0xE1, 0x28); mc_b3(c, 0x48, 0x09, 0xC8)
+        mc_store_rax(c, dst, 1)
+        return er_pack(dst, ty_make(21, tdesc3))
+    }
+
+    if pool_str_eq_lit(p, csoff, cslen, "tensor_ptr") and acnt == 1 {
+        tr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        dst := cg_alloc_slots(cg, 1)
+        mc_load_rax(c, er_slot(tr), 0)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "tensor_dim") and acnt == 2 {
+        tr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ar := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_load_rax(c, er_slot(tr), 1)
+        mc_load_rcx(c, er_slot(ar), 0)
+        mc_b4(c, 0x48, 0x6B, 0xC9, 20) // IMUL RCX, RCX, 20
+        mc_b3(c, 0x48, 0xD3, 0xE8)     // SHR RAX, CL
+        mc_b1(c, 0x25); mc_u32(c, 0xFFFFF)
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "tensor_numel") and acnt == 1 {
+        tr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        mc_load_rdx(c, er_slot(tr), 1)
+        mc_b3(c, 0x48, 0x89, 0xD0); mc_b1(c, 0x25); mc_u32(c, 0xFFFFF) // d0
+        mc_b3(c, 0x48, 0x89, 0xD1); mc_b4(c, 0x48, 0xC1, 0xE9, 0x14); mc_b2(c, 0x81, 0xE1); mc_u32(c, 0xFFFFF) // d1
+        mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1)
+        mc_b3(c, 0x48, 0x89, 0xD1); mc_b4(c, 0x48, 0xC1, 0xE9, 0x28); mc_b2(c, 0x81, 0xE1); mc_u32(c, 0xFFFFF) // d2
+        mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1)
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_int())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "tensor_fill_f32") and acnt == 2 {
+        tr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        vr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_f64_slot_to_f32_eax(c, er_slot(vr))
+        mc_b3(c, 0x41, 0x89, 0xC1) // R9D = f32_bits
+        mc_load_r8(c, er_slot(tr), 0)
+        mc_load_rdx(c, er_slot(tr), 1)
+        mc_b3(c, 0x48, 0x89, 0xD0); mc_b1(c, 0x25); mc_u32(c, 0xFFFFF)
+        mc_b3(c, 0x48, 0x89, 0xD1); mc_b4(c, 0x48, 0xC1, 0xE9, 0x14); mc_b2(c, 0x81, 0xE1); mc_u32(c, 0xFFFFF)
+        mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1)
+        mc_b3(c, 0x48, 0x89, 0xD1); mc_b4(c, 0x48, 0xC1, 0xE9, 0x28); mc_b2(c, 0x81, 0xE1); mc_u32(c, 0xFFFFF)
+        mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1) // RAX = numel
+        mc_b2(c, 0x31, 0xC9)
+        tf_top := buf_len(c)
+        mc_b3(c, 0x48, 0x39, 0xC1)
+        jae_tf := mc_jcc8(c, 0x73)
+        mc_b4(c, 0x45, 0x89, 0x0C, 0x88) // [R8 + RCX*4] = R9D
+        mc_b3(c, 0x48, 0xFF, 0xC1)
+        jmp_tf := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_tf, tf_top)
+        mc_patch_jcc8(c, jae_tf, buf_len(c))
+        zs := cg_alloc_slots(cg, 1)
+        return er_pack(zs, ty_unit())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "tensor_get_f32") and acnt == 2 {
+        tr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        mc_load_r8(c, er_slot(tr), 0)
+        mc_load_rcx(c, er_slot(ir), 0)
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x04, 0x88)
+        mc_b4(c, 0xF3, 0x0F, 0x5A, 0xC0)
+        mc_b4(c, 0x66, 0x48, 0x0F, 0x7E); mc_b1(c, 0xC0)
+        dst := cg_alloc_slots(cg, 1)
+        mc_store_rax(c, dst, 0)
+        return er_pack(dst, ty_float())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "tensor_set_f32") and acnt == 3 {
+        tr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        vr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        mc_f64_slot_to_f32_eax(c, er_slot(vr))
+        mc_load_r8(c, er_slot(tr), 0)
+        mc_load_rcx(c, er_slot(ir), 0)
+        mc_b4(c, 0x41, 0x89, 0x04, 0x88)
+        zs := cg_alloc_slots(cg, 1)
+        return er_pack(zs, ty_unit())
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "tensor_matmul") and acnt == 2 {
+        ra := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        rb := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        aslot := er_slot(ra)
+        bslot := er_slot(rb)
+        mm_ty := verify_tensor_matmul_shapes(p, cg.sym, er_ty(ra), er_ty(rb))
+        // Extract M, K from `a` and N from `b` (for 2D `(M, K) x (K, N)`)
+        m_slot := cg_alloc_slots(cg, 1)
+        k_slot := cg_alloc_slots(cg, 1)
+        n_slot := cg_alloc_slots(cg, 1)
+        mc_load_rax(c, aslot, 1); mc_b1(c, 0x25); mc_u32(c, 0xFFFFF); mc_store_rax(c, m_slot, 0)
+        mc_load_rax(c, aslot, 1); mc_b4(c, 0x48, 0xC1, 0xE8, 0x14); mc_b1(c, 0x25); mc_u32(c, 0xFFFFF); mc_store_rax(c, k_slot, 0)
+        mc_load_rax(c, bslot, 1); mc_b4(c, 0x48, 0xC1, 0xE8, 0x14); mc_b1(c, 0x25); mc_u32(c, 0xFFFFF); mc_store_rax(c, n_slot, 0)
+
+        dst := cg_alloc_slots(cg, 2)
+        mc_load_rax(c, m_slot, 0)
+        mc_load_rcx(c, n_slot, 0)
+        mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1)
+        mc_b4(c, 0x48, 0xC1, 0xE0, 0x02)
+        mc_b3(c, 0x48, 0x89, 0xC2)
+        mc_b4(c, 0x48, 0x83, 0xC2, 0x40)
+        emit_alloc_raw_rax(cg)
+        mc_store_rax(c, dst, 0)
+
+        // Pack `(M | (N << 20) | (1 << 40))`
+        mc_load_rax(c, m_slot, 0)
+        mc_load_rcx(c, n_slot, 0); mc_b4(c, 0x48, 0xC1, 0xE1, 0x14); mc_b3(c, 0x48, 0x09, 0xC8)
+        mc_b2(c, 0x48, 0xB9); mc_u64(c, 1 << 40); mc_b3(c, 0x48, 0x09, 0xC8)
+        mc_store_rax(c, dst, 1)
+
+        // Hardware SSE dot-product matmul loop `i in 0..M`, `j in 0..N`, `p in 0..K`
+        i_s := cg_alloc_slots(cg, 1); j_s := cg_alloc_slots(cg, 1)
+        mc_mov_rax_imm(c, 0); mc_store_rax(c, i_s, 0)
+        mi_top := buf_len(c)
+        mc_load_rax(c, i_s, 0); mc_cmp_rax_slot(c, m_slot, 0)
+        jge_mi := mc_jcc32(c, 0x8D)
+        mc_mov_rax_imm(c, 0); mc_store_rax(c, j_s, 0)
+        mj_top := buf_len(c)
+        mc_load_rax(c, j_s, 0); mc_cmp_rax_slot(c, n_slot, 0)
+        jge_mj := mc_jcc32(c, 0x8D)
+
+        // XMM0 = 0.0f; R8 = a_ptr + i*K*4; R9 = b_ptr + j*4; R10 = N*4; RCX = K; RAX = 0
+        mc_b3(c, 0x0F, 0x57, 0xC0)
+        mc_load_rax(c, i_s, 0); mc_load_rcx(c, k_slot, 0); mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1); mc_b4(c, 0x48, 0xC1, 0xE0, 0x02)
+        mc_load_r8(c, aslot, 0); mc_b3(c, 0x49, 0x01, 0xC0)
+        mc_load_rax(c, j_s, 0); mc_b4(c, 0x48, 0xC1, 0xE0, 0x02)
+        mc_load_r9(c, bslot, 0); mc_b3(c, 0x49, 0x01, 0xC1)
+        mc_load_rax(c, n_slot, 0); mc_b4(c, 0x48, 0xC1, 0xE0, 0x02); mc_b3(c, 0x49, 0x89, 0xC2)
+        mc_load_rcx(c, k_slot, 0)
+        mc_b2(c, 0x31, 0xC0)
+        mk_top := buf_len(c)
+        mc_b3(c, 0x48, 0x39, 0xC8)
+        jae_mk := mc_jcc8(c, 0x73)
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x0C, 0x80) // MOVSS XMM1, [R8 + RAX*4]
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b1(c, 0x11)       // MOVSS XMM2, [R9]
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xCA)                       // MULSS XMM1, XMM2
+        mc_b4(c, 0xF3, 0x0F, 0x58, 0xC1)                       // ADDSS XMM0, XMM1
+        mc_b3(c, 0x4D, 0x01, 0xD1)                             // ADD R9, R10 (stride N*4)
+        mc_b3(c, 0x48, 0xFF, 0xC0)
+        jmp_mk := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_mk, mk_top)
+        mc_patch_jcc8(c, jae_mk, buf_len(c))
+
+        // Store `XMM0` into `C[i * N + j]`
+        mc_load_rax(c, i_s, 0); mc_load_rcx(c, n_slot, 0); mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1)
+        mc_load_rcx(c, j_s, 0); mc_b3(c, 0x48, 0x01, 0xC8)
+        mc_load_r8(c, dst, 0)
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x11); mc_b2(c, 0x04, 0x80)
+
+        mc_load_rax(c, j_s, 0); mc_b3(c, 0x48, 0xFF, 0xC0); mc_store_rax(c, j_s, 0)
+        jmp_mj := mc_jmp32(c); mc_patch_rel32(c, jmp_mj, mj_top)
+        mc_patch_rel32(c, jge_mj, buf_len(c))
+        mc_load_rax(c, i_s, 0); mc_b3(c, 0x48, 0xFF, 0xC0); mc_store_rax(c, i_s, 0)
+        jmp_mi := mc_jmp32(c); mc_patch_rel32(c, jmp_mi, mi_top)
+        mc_patch_rel32(c, jge_mi, buf_len(c))
+        return er_pack(dst, mm_ty)
+    }
+    if pool_str_eq_lit(p, csoff, cslen, "all_reduce_sum") and acnt == 1 {
+        // Perceus Linear In-Place SPMD All-Reduce: scales local shard by `tp` (simulating `tp`-way rank sum) with 0 allocation!
+        tr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        tslot := er_slot(tr)
+        tty := er_ty(tr)
+        mut tp_factor := 1
+        if ty_tag(tty) == 21 {
+            tp_v := ibuf_get(cg.sym, ty_pay(tty) + 2)
+            if tp_v > 1 { tp_factor = tp_v }
+        }
+        if tp_factor > 1 {
+            mc_mov_rax_imm(c, tp_factor)
+            mc_b4(c, 0xF3, 0x48, 0x0F, 0x2A); mc_b1(c, 0xC0) // CVTSI2SS XMM0, RAX
+            mc_load_r8(c, tslot, 0)
+            mc_load_rdx(c, tslot, 1)
+            mc_b3(c, 0x48, 0x89, 0xD0); mc_b1(c, 0x25); mc_u32(c, 0xFFFFF)
+            mc_b3(c, 0x48, 0x89, 0xD1); mc_b4(c, 0x48, 0xC1, 0xE9, 0x14); mc_b2(c, 0x81, 0xE1); mc_u32(c, 0xFFFFF)
+            mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1)
+            mc_b2(c, 0x31, 0xC9)
+            ar_top := buf_len(c)
+            mc_b3(c, 0x48, 0x39, 0xC1)
+            jae_ar := mc_jcc8(c, 0x73)
+            mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x0C, 0x88)
+            mc_b4(c, 0xF3, 0x0F, 0x59, 0xC8)
+            mc_b4(c, 0xF3, 0x41, 0x0F, 0x11); mc_b2(c, 0x0C, 0x88)
+            mc_b3(c, 0x48, 0xFF, 0xC1)
+            jmp_ar := mc_jcc8(c, 0xEB)
+            mc_patch_jcc8(c, jmp_ar, ar_top)
+            mc_patch_jcc8(c, jae_ar, buf_len(c))
+        }
+        return tr
+    }
+
+    return 0
+}
+
+// Emits built-in buffer / string / CLI / File I/O / Table / Whitebox / v7.0 Domain intrinsics; returns `0` if not an intrinsic.
 fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, call_nid: i64) -> i64 {
     c := cg.code
     p := cg.pool
@@ -182,7 +1620,7 @@ fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBu
         return er_pack(dst, ty_int())
     }
 
-    // 3. `table_fill_f32` & `table_get_f32` (with Dead-Column Compaction remap) & `whitebox_sbox`
+    // 3. `table_fill_f32` & `table_get_f32` & `whitebox_sbox`
     if pool_str_eq_lit(p, csoff, cslen, "table_fill_f32") and acnt == 3 {
         e0 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4)
         e1 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4)
@@ -301,7 +1739,7 @@ fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBu
         return er_pack(dst, ty_int())
     }
 
-    // 4. `ByteBuf` & `IntBuf` & `str_*` & `args_*` & `fs_*`
+    // 4. Multi-OS `ByteBuf` & `IntBuf` & `str_*` & `args_*` & `fs_*`
     if pool_str_eq_lit(p, csoff, cslen, "buf_new") and acnt == 1 {
         cr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
         cslot := er_slot(cr)
@@ -315,12 +1753,7 @@ fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBu
         mc_store_rax(c, cslot, 0)
         mc_b3(c, 0x48, 0x89, 0xC2)
         mc_b4(c, 0x48, 0x83, 0xC2, 0x40)
-        mc_b2(c, 0x31, 0xC9)
-        mc_b2(c, 0x41, 0xB8)
-        mc_u32(c, 0x3000)
-        mc_b2(c, 0x41, 0xB9)
-        mc_u32(c, 4)
-        cg_call_iat(cg, iat_virtual_alloc())
+        emit_alloc_raw_rax(cg)
         mc_load_rcx(c, cslot, 0)
         mc_b4(c, 0x48, 0x89, 0x48, 0x08)
         dst := cg_alloc_slots(cg, 1)
@@ -342,12 +1775,7 @@ fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBu
         mc_b3(c, 0x48, 0x89, 0xC2)
         mc_b4(c, 0x48, 0xC1, 0xE2, 0x03)
         mc_b4(c, 0x48, 0x83, 0xC2, 0x40)
-        mc_b2(c, 0x31, 0xC9)
-        mc_b2(c, 0x41, 0xB8)
-        mc_u32(c, 0x3000)
-        mc_b2(c, 0x41, 0xB9)
-        mc_u32(c, 4)
-        cg_call_iat(cg, iat_virtual_alloc())
+        emit_alloc_raw_rax(cg)
         mc_load_rcx(c, cslot, 0)
         mc_b4(c, 0x48, 0x89, 0x48, 0x08)
         dst := cg_alloc_slots(cg, 1)
@@ -518,10 +1946,7 @@ fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBu
         mc_b3(c, 0x48, 0x85, 0xC0)
         jz_bf := mc_jcc8(c, 0x74)
         mc_b3(c, 0x48, 0x89, 0xC1)
-        mc_b2(c, 0x31, 0xD2)
-        mc_b2(c, 0x41, 0xB8)
-        mc_u32(c, 0x8000)
-        cg_call_iat(cg, iat_virtual_free())
+        emit_free_raw_rcx(cg)
         mc_patch_jcc8(c, jz_bf, buf_len(c))
         ak := ast_kind(cg.nodes, ae)
         if ak == nk_ident() or ak == nk_move_ident() {
@@ -697,7 +2122,7 @@ fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBu
         return er_pack(dst, ty_make(13, ty_int()))
     }
 
-    // 5. `ok(v)` and `err(e)`
+    // 5. `ok(v)`, `err(e)`, `ushr64`, `exit_process`
     if pool_str_eq_lit(p, csoff, cslen, "ok") and acnt == 1 {
         vr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
         vslot := er_slot(vr)
@@ -749,17 +2174,63 @@ fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBu
 
     if pool_str_eq_lit(p, csoff, cslen, "exit_process") and acnt == 1 {
         cr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
-        mc_load_rcx(c, er_slot(cr), 0)
-        cg_call_iat(cg, iat_exit_process())
-        mc_b1(c, 0xCC)
+        if cg_is_win64(cg) {
+            mc_load_rcx(c, er_slot(cr), 0)
+            cg_call_iat(cg, iat_exit_process())
+            mc_b1(c, 0xCC)
+        } else {
+            mc_load_rax(c, er_slot(cr), 0)
+            mc_b2(c, 0x89, 0xC7)
+            mc_b1(c, 0xB8); mc_u32(c, 231)
+            mc_b2(c, 0x0F, 0x05)
+            mc_b1(c, 0xCC)
+        }
         zs := cg_alloc_slots(cg, 1)
         return er_pack(zs, ty_unit())
     }
 
-    return 0
+    if pool_str_eq_lit(p, csoff, cslen, "assert") and acnt >= 1 {
+        cr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        mc_load_rax(c, er_slot(cr), 0)
+        mc_b3(c, 0x48, 0x85, 0xC0)
+        cg_jmp_fn(cg, 0x84, h_sec_trap())
+        zs := cg_alloc_slots(cg, 1)
+        return er_pack(zs, ty_unit())
+    }
+
+    return try_emit_v7_domain_intrinsic(cg, vars, drops, breaks, call_nid)
 }
 
-// Emits Struct Constructor or Function Call (Fast 4-Reg ABI & General Struct/`mut` Inout ABI!)
+// Registers or looks up an `@extern("dll")` import in `cg.interns` (`kind == 3 -> slot = 20 + k`)
+fn cg_intern_ext_dll_fn(cg: CodegenCtx, dll_soff: i64, dll_slen: i64, fn_soff: i64, fn_slen: i64) -> i64 {
+    icnt := ibuf_len(cg.interns) / 4
+    mut k := 0
+    mut i := 0
+    while i < icnt {
+        base := i * 4
+        if ibuf_get(cg.interns, base) == 3 {
+            packed_dll := ibuf_get(cg.interns, base + 1)
+            packed_fn := ibuf_get(cg.interns, base + 2)
+            d_off := packed_dll & 0xFFFFFFFF
+            d_len := ushr64(packed_dll, 32)
+            f_off := packed_fn & 0xFFFFFFFF
+            f_len := ushr64(packed_fn, 32)
+            if d_len == dll_slen and f_len == fn_slen and pool_str_eq2(cg.pool, d_off, d_len, dll_soff) and pool_str_eq2(cg.pool, f_off, f_len, fn_soff) {
+                return ibuf_get(cg.interns, base + 3)
+            }
+            k += 1
+        }
+        i += 1
+    }
+    slot := iat_total_count() + k
+    ibuf_push(cg.interns, 3)
+    ibuf_push(cg.interns, (dll_soff & 0xFFFFFFFF) | (dll_slen << 32))
+    ibuf_push(cg.interns, (fn_soff & 0xFFFFFFFF) | (fn_slen << 32))
+    ibuf_push(cg.interns, slot)
+    return slot
+}
+
+// Emits Struct Constructor or Function Call (Fast 4-Reg ABI, General Struct/`mut` Inout ABI, & Win64 C-ABI `@extern`)
 fn emit_call_or_ctor(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, call_nid: i64) -> i64 {
     intr := try_emit_intrinsic(cg, vars, drops, breaks, call_nid)
     if intr != 0 {
@@ -831,7 +2302,7 @@ fn emit_call_or_ctor(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf
         return er_pack(dst, ty_make(10, sidx))
     }
 
-    // 2. User / Stdlib Function Call
+    // 2. User / Stdlib / `@extern` Function Call
     fidx := find_fn_idx(p, cg.sym, csoff, cslen)
     if fidx < 0 {
         zs := cg_alloc_slots(cg, 1)
@@ -846,15 +2317,23 @@ fn emit_direct_fn_call(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntB
     c := cg.code
     p := cg.pool
     f_off := ibuf_get(cg.sym, 7) + fidx * 10
+    fn_soff := ibuf_get(cg.sym, f_off)
+    fn_slen := ibuf_get(cg.sym, f_off + 1)
+    fnid := ibuf_get(cg.sym, f_off + 2)
     p_base := ibuf_get(cg.sym, f_off + 3)
     p_cnt := ibuf_get(cg.sym, f_off + 4)
-    ret_ty := ibuf_get(cg.sym, f_off + 5)
+    raw_ret_ty := ibuf_get(cg.sym, f_off + 5)
     ret_slots := ibuf_get(cg.sym, f_off + 6)
     tot_arg_slots := ibuf_get(cg.sym, f_off + 7)
     fast_abi := ibuf_get(cg.sym, f_off + 8)
+    fn_flags := ibuf_get(cg.sym, f_off + 9)
+
+    mut ret_ty := raw_ret_ty
+    if (fn_flags & fnflag_async()) != 0 {
+        ret_ty = ty_make(22, raw_ret_ty)
+    }
 
     // Evaluate each parameter (Named Args + Positional + Default Parameter Expressions + Duck Packing!)
-    // Store `[aslot, p_slots, wb_slot, wb_sub]` (4 words per param) in `ev`
     ev := ibuf_new(64)
     mut pi := 0
     while pi < p_cnt {
@@ -900,7 +2379,6 @@ fn emit_direct_fn_call(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntB
             mut aslot := er_slot(ar)
             aty := er_ty(ar)
 
-            // Duck-Typed `interface` stack packing `[sidx + 1, fields...]` (Zero Heap!)
             if ty_tag(p_ty) == 11 and ty_tag(aty) == 10 {
                 s_id := ty_pay(aty) + 1
                 s_slots := type_slots(cg.sym, aty)
@@ -945,8 +2423,81 @@ fn emit_direct_fn_call(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntB
 
     ret_dst := cg_alloc_slots(cg, ret_slots)
 
+    // --- Direct Zero-Overhead Win64 C-ABI Call for `@extern("dll")` & Static COFF `.obj`/`.lib`! ---
+    if (fn_flags & fnflag_extern()) != 0 {
+        mut stack_extra := 0
+        if p_cnt > 4 {
+            stack_extra = align_up((p_cnt - 4) * 8, 16)
+        }
+        sub_sp := 32 + stack_extra
+        mc_b4(c, 0x48, 0x83, 0xEC, sub_sp)
+
+        pi = 4
+        while pi < p_cnt {
+            aslot := ibuf_get(ev, pi * 4)
+            mc_load_rax(c, aslot, 0)
+            mc_b4(c, 0x48, 0x89, 0x44, 0x24)
+            mc_b1(c, 32 + (pi - 4) * 8)
+            pi += 1
+        }
+        pi = 0
+        while pi < p_cnt and pi < 4 {
+            po := p_base + pi * 6
+            pty := ibuf_get(cg.sym, po + 3)
+            aslot := ibuf_get(ev, pi * 4)
+            if pty == ty_float() {
+                mc_load_rax(c, aslot, 0)
+                if pi == 0 { mc_b4(c, 0x66, 0x48, 0x0F, 0x6E); mc_b1(c, 0xC0) }      // XMM0
+                else if pi == 1 { mc_b4(c, 0x66, 0x48, 0x0F, 0x6E); mc_b1(c, 0xC8) } // XMM1
+                else if pi == 2 { mc_b4(c, 0x66, 0x48, 0x0F, 0x6E); mc_b1(c, 0xD0) } // XMM2
+                else { mc_b4(c, 0x66, 0x48, 0x0F, 0x6E); mc_b1(c, 0xD8) }            // XMM3
+            } else {
+                // Note: for `str`, slot 0 is already a null-terminated `const char*` pointer!
+                if pi == 0 { mc_load_rcx(c, aslot, 0) }
+                else if pi == 1 { mc_load_rdx(c, aslot, 0) }
+                else if pi == 2 { mc_load_r8(c, aslot, 0) }
+                else { mc_load_r9(c, aslot, 0) }
+            }
+            pi += 1
+        }
+
+        moff := ushr64(ast_get(cg.nodes, fnid, 4), 16)
+        mut dll_soff := 0
+        mut dll_slen := 0
+        if moff > 0 {
+            dll_soff = ibuf_get(cg.extra, moff)
+            dll_slen = ibuf_get(cg.extra, moff + 1)
+        }
+        if dll_slen > 0 {
+            iat_slot := cg_intern_ext_dll_fn(cg, dll_soff, dll_slen, fn_soff, fn_slen)
+            cg_call_iat(cg, iat_slot)
+        } else {
+            // Static COFF `.obj` / `.lib` symbol resolved via `fx_fn` (`state[32 + fidx]`)
+            cg_call_fn(cg, fidx)
+        }
+        mc_b4(c, 0x48, 0x83, 0xC4, sub_sp)
+
+        if raw_ret_ty == ty_float() {
+            mc_b4(c, 0x66, 0x48, 0x0F, 0x7E); mc_b1(c, 0xC0) // MOVQ RAX, XMM0
+        } else {
+            // Sign-extend 32-bit C `int`/`i32` return values cleanly
+            ret_tnid := ast_get(cg.nodes, fnid, 5)
+            if ret_tnid > 0 and ast_kind(cg.nodes, ret_tnid) == nk_ty_named() {
+                rns := ast_get(cg.nodes, ret_tnid, 1)
+                rnl := ast_get(cg.nodes, ret_tnid, 2)
+                if pool_str_eq_lit(p, rns, rnl, "i32") {
+                    mc_b3(c, 0x48, 0x63, 0xC0) // MOVSXD RAX, EAX
+                } else if pool_str_eq_lit(p, rns, rnl, "u32") {
+                    mc_b2(c, 0x89, 0xC0)       // MOV EAX, EAX
+                }
+            }
+        }
+        mc_store_rax(c, ret_dst, 0)
+        buf_free(move ev)
+        return er_pack(ret_dst, ret_ty)
+    }
+
     if fast_abi == 1 {
-        // Fast 4-Register Win64 ABI: RCX, RDX, R8, R9 -> RAX, RDX
         pi = 0
         while pi < p_cnt {
             aslot := ibuf_get(ev, pi * 4)
@@ -963,7 +2514,6 @@ fn emit_direct_fn_call(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntB
             mc_store_rax(c, ret_dst, 1)
         }
     } else {
-        // General Struct / `mut` (`inout`) Copy-In / Copy-Out ABI
         mut ab_cnt := tot_arg_slots
         if ab_cnt < 1 { ab_cnt = 1 }
         ab_base := cg_alloc_slots(cg, ab_cnt)
@@ -973,7 +2523,7 @@ fn emit_direct_fn_call(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntB
         rb_lowest := rb_base + ret_slots - 1
 
         mc_lea_rax(c, ab_lowest, 0)
-        mc_b3(c, 0x49, 0x89, 0xC0) // MOV R8, arg_buf_lowest
+        mc_b3(c, 0x49, 0x89, 0xC0)
         mut cur_off := 0
         pi = 0
         while pi < p_cnt {
@@ -991,9 +2541,9 @@ fn emit_direct_fn_call(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntB
         }
 
         mc_lea_rax(c, ab_lowest, 0)
-        mc_b3(c, 0x48, 0x89, 0xC1) // RCX = arg_buf
+        mc_b3(c, 0x48, 0x89, 0xC1)
         mc_lea_rax(c, rb_lowest, 0)
-        mc_b3(c, 0x48, 0x89, 0xC2) // RDX = ret_buf
+        mc_b3(c, 0x48, 0x89, 0xC2)
         cg_call_fn(cg, fidx)
 
         if ret_slots == 1 {
@@ -1010,7 +2560,6 @@ fn emit_direct_fn_call(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntB
             }
         }
 
-        // Write back `mut` arguments (`inout` Second-Class Reference writeback!)
         mut wb_off := 0
         pi = 0
         while pi < p_cnt {
@@ -1049,13 +2598,12 @@ fn emit_method_call_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntB
     rty := er_ty(rr)
 
     if pool_str_eq_lit(cg.pool, msoff, mslen, "join") {
-        if ty_tag(rty) == 15 {
+        if ty_tag(rty) == 15 or ty_tag(rty) == 22 {
             return er_pack(rslot, ty_pay(rty))
         }
         return rr
     }
 
-    // Build synthetic call-arg slice `[recv_arg, args...]` in `cg.extra` using pre-evaluated `__tmp_recv`!
     tmp_soff := pool_intern_str(cg.pool, "__ax_mrecv")
     v_prev_len := ibuf_len(vars)
     ibuf_push(vars, tmp_soff)
@@ -1081,18 +2629,16 @@ fn emit_method_call_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntB
         i += 1
     }
 
-    // 1. Concrete `Struct(sidx)` static dispatch -> `<Struct>__<method>`
     if ty_tag(rty) == 10 {
         sidx := ty_pay(rty)
         fidx := find_mangled_method_fn(cg, sidx, msoff, mslen)
         if fidx >= 0 {
             res := emit_direct_fn_call(cg, vars, drops, breaks, fidx, full_aoff, acnt + 1)
-            ibuf_set(vars, v_prev_len + 1, 0) // invalidate temporary binding
+            ibuf_set(vars, v_prev_len + 1, 0)
             return res
         }
     }
 
-    // 2. Stack-Polymorphic Duck `Interface` Dispatch (Zero Heap / Zero Vtable!)
     if ty_tag(rty) == 11 {
         c := cg.code
         s_cnt := ibuf_get(cg.sym, 4)

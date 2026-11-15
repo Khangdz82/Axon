@@ -1,14 +1,14 @@
-# The Official Axon v6.0 Programming Guide (Zero to Systems Mastery)
+# The Official Axon v7.0 Programming Guide (Zero to Multi-OS, AI & Systems Mastery)
 
-This guide covers **Axon v6.0 (`.ax`)**: a self-hosted native systems programming language engineered to combine **Python/Go-level readability** with **bare-metal hardware speed surpassing C++/Rust/Go/Java/Python**, **a ~550 KB total installed toolchain producing 3.5 KB - 5.5 KB standalone binaries**, **zero-leak stability for 24/7 long-running servers**, and **polymorphic anti-tamper security built directly into the compiler**.
+This guide covers **Axon v7.0 (`.ax`)**: a self-hosted, multi-OS native systems programming language engineered to combine **Python/Go-level readability** with **bare-metal hardware speed surpassing C++/Rust/Go/Java/Python**, **direct 11-target cross-compilation across CPU, GPU, WebAssembly, and Unikernels with zero external linkers**, **zero-leak stability for 24/7 long-running servers**, and **first-class breakthroughs for AI/LLM systems, 3D Game Engines, HFT Finance, and Cybersecurity**.
 
-Every code example in this guide is verified directly against the real [`bin/axc.exe`](bin/axc.exe) and [`bin/axc0.exe`](bin/axc0.exe) compilers in this repository.
+Every code example in this guide is verified directly against the self-hosted [`bin/axc.exe`](bin/axc.exe) compiler in this repository.
 
 ---
 
 ## Table of Contents
 
-1. [Getting Started with Axon v6.0 in 2 Minutes](#chapter-1-getting-started-with-axon-v60-in-2-minutes)
+1. [Getting Started with Axon in 2 Minutes](#chapter-1-getting-started-with-axon-v60-in-2-minutes)
 2. [Variables, Types & Pythonic Ergonomics](#chapter-2-variables-types--pythonic-ergonomics)
 3. [Functions, Named/Default Parameters & Pipelines `|>`](#chapter-3-functions-nameddefault-parameters--pipelines-)
 4. [Control Flow & Static Bounds Elision `where`](#chapter-4-control-flow--static-bounds-elision-where)
@@ -21,6 +21,9 @@ Every code example in this guide is verified directly against the real [`bin/axc
 11. [Colorless Concurrency `spawn` & Convergent `CRDT` Types](#chapter-11-colorless-concurrency-spawn--convergent-crdt-types)
 12. [Capability Security, Polymorphic `@shield` v2 & AV-Clean Binaries](#chapter-12-capability-security-polymorphic-shield-v2--av-clean-binaries)
 13. [Self-Hosting Internals, Built-In Intrinsics & Complete Error Reference](#chapter-13-self-hosting-internals-built-in-intrinsics--complete-error-reference)
+14. [`comptime`, Direct C Header Import (`@cImport`) & 11-Target Cross-Compilation](#chapter-14-comptime-direct-c-header-import-cimport--11-target-cross-compilation)
+15. [CPUID Multi-Versioning, Multi-Core `par_for`, `IOCP` Async, 3D SIMD, HFT `@no_alloc` & `tainted[str]`](#chapter-15-cpuid-multi-versioning-multi-core-par_for-iocp-async-3d-simd-hft-no_alloc--taintedstr)
+16. [All 6 AI/LLM Breakthroughs (`PagedKvCache`, Symbolic Shapes, `@gpu_kernel`, `DLPack`, `@nan_guard`) & `axc mcp`](#chapter-16-all-6-aillm-breakthroughs-pagedkvcache-symbolic-shapes-gpu_kernel-dlpack-nan_guard--axc-mcp)
 
 ---
 
@@ -565,11 +568,11 @@ Axon v6.0's direct PE32+ linker produces clean OS-compliant binaries that never 
 ## Chapter 13: Self-Hosting Internals, Built-In Intrinsics & Complete Error Reference
 
 ### 13.1. Deterministic 3-Stage Self-Hosting Bootstrap
-[`bin/axc.exe`](bin/axc.exe) (**533.50 KB**, `546,304 bytes`) is compiled from the 9 pure-Axon modules (9,194 lines) in [`compiler_ax/`](compiler_ax/):
+[`bin/axc.exe`](bin/axc.exe) (**1.27 MB**, `1,333,760 bytes`, embedding all 11 hardware/OS backends, `comptime` VM, `@cImport`, `axpm`, and `axc mcp`) is compiled from the 17 pure-Axon modules (19,858 lines) in [`compiler_ax/`](compiler_ax/):
 - **Stage 1:** `axc0.exe` compiles `compiler_ax/main.ax` $\rightarrow$ `axc_stage1.exe`.
-- **Stage 2:** `axc_stage1.exe` compiles `compiler_ax/main.ax` $\rightarrow$ `axc_stage2.exe` (~215 ms).
-- **Stage 3:** `axc_stage2.exe` compiles `compiler_ax/main.ax` $\rightarrow$ `axc_stage3.exe` (~211 ms).
-- **Fixed-Point Proof:** `SHA256(axc_stage2.exe) == SHA256(axc_stage3.exe) == 15AB01D09E0835EB750ADAA202981D8FB893E761A6882561A60696169B587AF3`.
+- **Stage 2:** `axc_stage1.exe` compiles `compiler_ax/main.ax` $\rightarrow$ `axc_stage2.exe` (~609 ms).
+- **Stage 3:** `axc_stage2.exe` compiles `compiler_ax/main.ax` $\rightarrow$ `axc_stage3.exe` (~619 ms).
+- **Fixed-Point Proof:** `SHA256(axc_stage2.exe) == SHA256(axc_stage3.exe) == F06DFC7F4DF44F9905E1B8F38A169D4506059F99C837F06EF766FF93A0F976F9`.
 
 ### 13.2. Built-In Intrinsics Reference
 
@@ -601,3 +604,109 @@ Axon v6.0's direct PE32+ linker produces clean OS-compliant binaries that never 
 | **`E0406`** | Compile-time constant division (`/`) or modulo (`%`) by zero | Guard the divisor before dividing |
 | **`E0407`** | `break` or `continue` statement placed outside a `while` / `for` loop | Keep `break` / `continue` inside loops, or use `return` to exit a function |
 | **`E0501`** | Privileged ambient I/O called without a capability token in scope | Pass an attenuated capability token (`RootCap` / `FsCap` / `NetCap`) from `std::cap` |
+| **`E0204`** | Non-atomic mutation of an outer variable inside a multi-core `par_for` loop | Write only to disjoint row columns of `Table[T]` or use atomic intrinsics |
+| **`E0502`** | Unsanitized `tainted[str]` passed into a sensitive sink (`sql_exec`, `shell_exec`, `html_render`) | Sanitize first via `sanitize_sql`, `sanitize_html`, or `sanitize_shell` in `std::taint` |
+| **`E0601`** | Heap allocation attempted inside a `@no_alloc` function (HFT / Kernel / Real-Time Audio) | Use pre-allocated `FrameArena`, `SpscRing`, or stack/register value types |
+| **`E0602`** | Symbolic `Tensor` inner-dimension mismatch in `tensor_matmul` (e.g. `[B, 16] x [32, 8]`) | Ensure inner `K` dimensions match (`[B, K] x [K, N] -> [B, N]`) |
+| **`E0603`** | Compile-time execution error or step-budget overflow inside `comptime` VM | Verify loop termination and buffer bounds inside `comptime` functions |
+| **`E0604`** | Compile-time assertion `comptime_assert(cond, msg)` evaluated to `false` | Fix the compile-time configuration constant, SQL query, or lookup table invariant |
+| **`E0605`** | C header file referenced by `@cImport("...")` could not be found | Check the relative path to the `.h` file |
+
+---
+
+## Chapter 14: `comptime`, Direct C Header Import (`@cImport`) & 11-Target Cross-Compilation
+
+### 14.1. Compile-Time Execution (`comptime`) & Zero-Reflection `to_json`
+Instead of a separate macro sub-language, Axon v7.0 executes ordinary Axon functions and loops during semantic analysis (`compiler_ax/comptime.ax`) to materialize zero-allocation `.rdata` lookup tables, validate SQL/schema strings via `comptime_assert`, and emit zero-reflection `to_json(struct_val)` serializers:
+
+```axon
+comptime fn is_valid_sql(q: str) -> bool {
+    return str_len(q) > 10 and str_slice(q, 0, 7) == "SELECT "
+}
+
+comptime {
+    comptime_assert(is_valid_sql("SELECT id, balance FROM accounts"), "Invalid SQL")
+}
+
+struct OrderEvent {
+    id: i64
+    symbol: str
+    active: bool
+}
+
+fn main() -> i32 {
+    ev := OrderEvent(id = 42, symbol = "AXON", active = true)
+    println(to_json(ev))
+    return 0
+}
+```
+
+### 14.2. Direct C Header Reader (`@cImport`) & Static COFF `.obj`/`.lib` Linker
+Axon v7.0 embeds a direct C header parser (`compiler_ax/c_import.ax`), Multi-DLL `.idata` generator, and static Win64 COFF `.obj`/`.lib` linker (`--link-lib`), calling C/Win32/SQLite/Vulkan/Rust libraries with zero wrapper overhead:
+
+```axon
+@cImport("tests/pass/c_demo_header.h", link = "msvcrt.dll")
+
+fn main() -> i32 {
+    win := CWindowDesc(width = 1920, height = 1080)
+    n := strlen("AxonNativeFFI")
+    println(f"Port={C_MAGIC_PORT}, Win={win.width}x{win.height}, len={n}, abs={abs(-99)}")
+    return 0
+}
+```
+
+### 14.3. One-Command 11-Target Cross-Compilation & Integrated `axpm`
+Zero Docker containers, LLVM installs, or external SDKs required:
+- `axc targets`: Lists all 11 built-in targets (`win-x64`, `linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`, `wasm32`, `unikernel-x64`, `freestanding-x64`, `freestanding-riscv64`, `spirv`, `ptx`).
+- `axc init my_service`: Scaffolds `axon.toml` + deterministic FNV-64 `axon.lock`.
+- `axc test file.ax`: Compiles and runs all `@test` functions with built-in `assert(cond)`.
+
+---
+
+## Chapter 15: CPUID Multi-Versioning, Multi-Core `par_for`, `IOCP` Async, 3D SIMD, HFT `@no_alloc` & `tainted[str]`
+
+### 15.1. Runtime CPUID Dispatch (`SSE2 / AVX2 / AVX-512`) & Multi-Core `par_for`
+At startup, every Axon binary inspects hardware `CPUID` + `XGETBV` flags to select the fastest supported SIMD tier (`cpu_simd_tier()`), while `par_for` partitions `Table[T]` columns across all physical CPU cores with static compile-time data-race rejection (`E0204`):
+
+```axon
+struct Particle {
+    px: f32
+    vx: f32
+}
+
+fn main() -> i32 {
+    pts := Table[Particle]::with_capacity(65536)
+    table_fill_f32(pts, 0, 1.0)
+    table_fill_f32(pts, 1, 2.0)
+    par_for p in pts {
+        p.px += p.vx * 0.5
+    }
+    println(f"Threads={cpu_threads()}, Tier={cpu_simd_tier()}, p0={table_get_f32(pts, 0, 0)}")
+    return 0
+}
+```
+
+### 15.2. OS-Native `IOCP` Async I/O, 3D SIMD (`std::math3d`), HFT (`@no_alloc`), & `tainted[str]`
+- **Async I/O (`std::async_io`):** Zero-heap stackless `async fn` / `await` wired directly to Windows I/O Completion Ports (`IOCP`).
+- **3D Game Math (`std::math3d`):** First-class 128-bit `XMM` `vec3`, `vec4`, `quat`, `mat4` primitives plus O(1) `FrameArena`.
+- **HFT Finance (`std::decimal`, `std::ringbuf`):** `@no_alloc` statically forbids heap allocation (`E0601`), paired with `round_half_even` Banker's rounding and 64-byte cache-line-isolated `SpscRing` queues.
+- **Compile-Time Injection Defense (`std::taint`):** Untrusted inputs carry type `tainted[str]`; passing them into `sql_exec`, `html_render`, or `shell_exec` without `sanitize_*` is rejected at compile time with `E0502`.
+
+---
+
+## Chapter 16: All 6 AI/LLM Breakthroughs (`PagedKvCache`, Symbolic Shapes, `@gpu_kernel`, `DLPack`, `@nan_guard`) & `axc mcp`
+
+[`std/ai_engine.ax`](std/ai_engine.ax) and the Axon v7.0 compiler solve six fundamental bottlenecks in modern AI/LLM engineering:
+
+1. **Zero-GC `VramArena` & vLLM-Style `PagedKvCache`:** 64-byte aligned arena sub-allocation paired with non-contiguous KV block tables appends new context tokens with zero `memcpy` fragmentation.
+2. **Symbolic Shape Polymorphism (`[sym B, sym S, comptime D: usize]`):** Compile `rmsnorm_2d[sym B, sym S]` **once** and execute across arbitrary dynamic batch/sequence lengths (`S = 13`, `S = 127`, `S = 4096`) with zero JIT warm-up while catching inner-dimension mismatches at compile time (`E0602`).
+3. **Schedule-Separated GPU Kernels (`@gpu_kernel`, `@tile`, `@pipeline_stages`):** Emit binary Khronos `SPIR-V 1.6` (`.spv`) and NVIDIA `PTX 8.0` (`.ptx`) directly via `--target spirv`, `--target ptx`, or `--emit-gpu`.
+4. **Linear SPMD Distributed Collectives (`ShardedTensor` + `all_reduce_sum(move ...)`):** Perceus linear ownership consumes the unreduced shard on `all_reduce_sum(move shard)`, making stale-gradient reads impossible at compile time.
+5. **Zero-Copy Python `DLPack` Bridge (`--shared` + `@py_export`):** Compile directly into a standalone `.dll`/`.pyd` reading raw `DLTensor*` pointers from Python/PyTorch/NumPy with **zero memory copies**.
+6. **Hardware `@nan_guard` & Bit-Exact Deterministic Reduction (`det_sum_f32_ptr`):** Checks IEEE-754 `0x7FF` exponent bits in registers, trapping `NaN`/`Inf` immediately at the exact source line (`exit 254`), while pairwise lane-4 tree summation guarantees bit-identical results across thread counts.
+
+### Built for AI Coding Agents (`axc check --json` & `axc mcp`)
+- Sub-millisecond (`~0.44 ms`) structured JSON verification of syntax, types, Perceus, taint, `@no_alloc`, and tensor shapes:
+  `axc check --json app.ax`
+- Built-in **Model Context Protocol (JSON-RPC 2.0 over stdio)** server inside `axc` paired with [`AXON_LLM_SPEC.md`](AXON_LLM_SPEC.md):
+  `axc mcp`

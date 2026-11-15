@@ -1,0 +1,1145 @@
+// Axon v7.0 Self-Hosted Compiler - Compile-Time Execution Engine (`comptime` VM) (`compiler_ax/comptime.ax`)
+// Executes real Axon functions, loops (`while`, `for ..`), conditionals, strings, `ByteBuf` & `IntBuf`
+// at compile time during semantic analysis (Zig/Jai model - zero macro sub-language!).
+// Synthesizes zero-allocation `.rdata` lookup tables (CRC32, S-boxes, trig) and enforces `comptime_assert`.
+
+use compiler_ax::tokens_ast
+
+struct CtHeap {
+    ib_meta: IntBuf
+    ib_data: IntBuf
+    bb_meta: IntBuf
+    bb_data: ByteBuf
+}
+
+fn ct_find_global_const(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
+    cbase := ibuf_get(sym, 20)
+    ccnt := ibuf_get(sym, 21)
+    if cbase <= 0 or ccnt <= 0 {
+        return -1
+    }
+    mut i := 0
+    while i < ccnt {
+        off := cbase + i * 6
+        if ibuf_get(sym, off + 1) == slen {
+            if pool_str_eq2(pool, ibuf_get(sym, off), slen, soff) {
+                return off
+            }
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn ct_find_fn_by_name(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
+    base := ibuf_get(sym, 7)
+    cnt := ibuf_get(sym, 8)
+    mut i := 0
+    while i < cnt {
+        off := base + i * 10
+        if ibuf_get(sym, off + 1) == slen {
+            if pool_str_eq2(pool, ibuf_get(sym, off), slen, soff) {
+                return i
+            }
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn ct_frame_cnt(frame: IntBuf) -> i64 {
+    if ibuf_len(frame) == 0 {
+        return 0
+    }
+    return ibuf_get(frame, 0)
+}
+
+fn ct_frame_restore(frame: IntBuf, saved_cnt: i64) {
+    if ibuf_len(frame) > 0 {
+        ibuf_set(frame, 0, saved_cnt)
+    }
+}
+
+fn ct_frame_find(pool: ByteBuf, frame: IntBuf, soff: i64, slen: i64) -> i64 {
+    cnt := ct_frame_cnt(frame)
+    mut i := cnt - 1
+    while i >= 0 {
+        b := 1 + i * 5
+        if ibuf_get(frame, b + 1) == slen {
+            if pool_str_eq2(pool, ibuf_get(frame, b), slen, soff) {
+                return b
+            }
+        }
+        i -= 1
+    }
+    return -1
+}
+
+fn ct_frame_push(frame: IntBuf, soff: i64, slen: i64, ty: i64, v1: i64, v2: i64) -> i64 {
+    if ibuf_len(frame) == 0 {
+        ibuf_push(frame, 0)
+    }
+    cnt := ibuf_get(frame, 0)
+    b := 1 + cnt * 5
+    if b + 5 <= ibuf_len(frame) {
+        ibuf_set(frame, b, soff)
+        ibuf_set(frame, b + 1, slen)
+        ibuf_set(frame, b + 2, ty)
+        ibuf_set(frame, b + 3, v1)
+        ibuf_set(frame, b + 4, v2)
+    } else {
+        ibuf_push(frame, soff)
+        ibuf_push(frame, slen)
+        ibuf_push(frame, ty)
+        ibuf_push(frame, v1)
+        ibuf_push(frame, v2)
+    }
+    ibuf_set(frame, 0, cnt + 1)
+    return b
+}
+
+fn ct_step(vm: IntBuf, sp: i64) -> bool {
+    if ibuf_get(vm, 2) != 0 {
+        return false
+    }
+    used := ibuf_get(vm, 0) + 1
+    ibuf_set(vm, 0, used)
+    if used > ibuf_get(vm, 1) {
+        ibuf_set(vm, 2, 603)
+        ibuf_set(vm, 3, sp)
+        return false
+    }
+    return true
+}
+
+fn ct_err(vm: IntBuf, code: i64, sp: i64) {
+    if ibuf_get(vm, 2) == 0 {
+        ibuf_set(vm, 2, code)
+        ibuf_set(vm, 3, sp)
+    }
+}
+
+fn ct_ibuf_alloc(hp: CtHeap, cap_req: i64) -> i64 {
+    mut cap := cap_req
+    if cap < 64 { cap = 64 }
+    hid := ibuf_len(hp.ib_meta) / 3
+    doff := ibuf_len(hp.ib_data)
+    mut i := 0
+    while i < cap {
+        ibuf_push(hp.ib_data, 0)
+        i += 1
+    }
+    ibuf_push(hp.ib_meta, doff)
+    ibuf_push(hp.ib_meta, 0)
+    ibuf_push(hp.ib_meta, cap)
+    return hid
+}
+
+fn ct_ibuf_push_val(hp: CtHeap, hid: i64, val: i64) {
+    mb := hid * 3
+    mut doff := ibuf_get(hp.ib_meta, mb)
+    cur_len := ibuf_get(hp.ib_meta, mb + 1)
+    mut cap := ibuf_get(hp.ib_meta, mb + 2)
+    if cur_len >= cap {
+        new_cap := cap * 2
+        new_off := ibuf_len(hp.ib_data)
+        mut i := 0
+        while i < new_cap {
+            if i < cur_len {
+                ibuf_push(hp.ib_data, ibuf_get(hp.ib_data, doff + i))
+            } else {
+                ibuf_push(hp.ib_data, 0)
+            }
+            i += 1
+        }
+        doff = new_off
+        cap = new_cap
+        ibuf_set(hp.ib_meta, mb, doff)
+        ibuf_set(hp.ib_meta, mb + 2, cap)
+    }
+    ibuf_set(hp.ib_data, doff + cur_len, val)
+    ibuf_set(hp.ib_meta, mb + 1, cur_len + 1)
+}
+
+fn ct_bbuf_alloc(hp: CtHeap, cap_req: i64) -> i64 {
+    mut cap := cap_req
+    if cap < 64 { cap = 64 }
+    bid := ibuf_len(hp.bb_meta) / 3
+    doff := buf_len(hp.bb_data)
+    mut i := 0
+    while i < cap {
+        buf_push(hp.bb_data, 0)
+        i += 1
+    }
+    ibuf_push(hp.bb_meta, doff)
+    ibuf_push(hp.bb_meta, 0)
+    ibuf_push(hp.bb_meta, cap)
+    return bid
+}
+
+fn ct_bbuf_push_byte(hp: CtHeap, bid: i64, b: i64) {
+    mb := bid * 3
+    mut doff := ibuf_get(hp.bb_meta, mb)
+    cur_len := ibuf_get(hp.bb_meta, mb + 1)
+    mut cap := ibuf_get(hp.bb_meta, mb + 2)
+    if cur_len >= cap {
+        new_cap := cap * 2
+        new_off := buf_len(hp.bb_data)
+        mut i := 0
+        while i < new_cap {
+            if i < cur_len {
+                buf_push(hp.bb_data, buf_get(hp.bb_data, doff + i))
+            } else {
+                buf_push(hp.bb_data, 0)
+            }
+            i += 1
+        }
+        doff = new_off
+        cap = new_cap
+        ibuf_set(hp.bb_meta, mb, doff)
+        ibuf_set(hp.bb_meta, mb + 2, cap)
+    }
+    buf_set(hp.bb_data, doff + cur_len, b & 255)
+    ibuf_set(hp.bb_meta, mb + 1, cur_len + 1)
+}
+
+// Evaluate expression in `comptime` VM -> writes `(ty, v1, v2)` to `vm[5], vm[6], vm[7]`
+fn ct_eval_expr(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, vm: IntBuf, hp: CtHeap, frame: IntBuf, enid: i64) {
+    if enid <= 0 or ibuf_get(vm, 2) != 0 {
+        ibuf_set(vm, 5, ty_unit())
+        ibuf_set(vm, 6, 0)
+        ibuf_set(vm, 7, 0)
+        return
+    }
+    sp := ast_span(nodes, enid)
+    if not ct_step(vm, sp) {
+        return
+    }
+    k := ast_kind(nodes, enid)
+
+    if k == nk_int() {
+        ibuf_set(vm, 5, ty_int())
+        ibuf_set(vm, 6, ast_get(nodes, enid, 1))
+        ibuf_set(vm, 7, 0)
+        return
+    }
+    if k == nk_float() {
+        ibuf_set(vm, 5, ty_float())
+        ibuf_set(vm, 6, ast_get(nodes, enid, 1))
+        ibuf_set(vm, 7, 0)
+        return
+    }
+    if k == nk_dec() {
+        ibuf_set(vm, 5, ty_dec())
+        ibuf_set(vm, 6, ast_get(nodes, enid, 1))
+        ibuf_set(vm, 7, 0)
+        return
+    }
+    if k == nk_bool() {
+        ibuf_set(vm, 5, ty_bool())
+        ibuf_set(vm, 6, ast_get(nodes, enid, 1))
+        ibuf_set(vm, 7, 0)
+        return
+    }
+    if k == nk_str() or k == nk_secret_str() {
+        ibuf_set(vm, 5, ty_str())
+        ibuf_set(vm, 6, ast_get(nodes, enid, 1))
+        ibuf_set(vm, 7, ast_get(nodes, enid, 2))
+        return
+    }
+    if k == nk_comptime_expr() {
+        inner := ast_get(nodes, enid, 1)
+        if ast_kind(nodes, inner) == nk_block() {
+            ct_exec_block(pool, nodes, extra, sym, vm, hp, frame, inner)
+            tail_e := ast_get(nodes, inner, 3)
+            if tail_e > 0 and ibuf_get(vm, 4) == 0 {
+                ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, tail_e)
+            }
+        } else {
+            ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, inner)
+        }
+        return
+    }
+    if k == nk_fstr() {
+        off := ast_get(nodes, enid, 1)
+        cnt := ast_get(nodes, enid, 2)
+        tmp := buf_new(128)
+        mut i := 0
+        while i < cnt {
+            ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ibuf_get(extra, off + i))
+            pty := ibuf_get(vm, 5)
+            pv1 := ibuf_get(vm, 6)
+            pv2 := ibuf_get(vm, 7)
+            if pty == ty_str() {
+                mut j := 0
+                while j < pv2 {
+                    buf_push(tmp, buf_get(pool, pv1 + j))
+                    j += 1
+                }
+            } else if pty == ty_bool() {
+                if pv1 != 0 { buf_push_str(tmp, "true") } else { buf_push_str(tmp, "false") }
+            } else {
+                // Format integer into `tmp`
+                if pv1 == 0 {
+                    buf_push(tmp, 48)
+                } else {
+                    mut v := pv1
+                    if v < 0 { buf_push(tmp, 45); v = 0 - v }
+                    dstart := buf_len(tmp)
+                    while v > 0 {
+                        buf_push(tmp, 48 + (v % 10))
+                        v = v / 10
+                    }
+                    mut lo := dstart
+                    mut hi := buf_len(tmp) - 1
+                    while lo < hi {
+                        bl := buf_get(tmp, lo)
+                        bh := buf_get(tmp, hi)
+                        buf_set(tmp, lo, bh)
+                        buf_set(tmp, hi, bl)
+                        lo += 1
+                        hi -= 1
+                    }
+                }
+            }
+            i += 1
+        }
+        res_off := buf_len(pool)
+        res_len := buf_len(tmp)
+        mut ci := 0
+        while ci < res_len {
+            buf_push(pool, buf_get(tmp, ci))
+            ci += 1
+        }
+        buf_free(move tmp)
+        ibuf_set(vm, 5, ty_str())
+        ibuf_set(vm, 6, res_off)
+        ibuf_set(vm, 7, res_len)
+        return
+    }
+    if k == nk_ident() or k == nk_move_ident() {
+        soff := ast_get(nodes, enid, 1)
+        slen := ast_get(nodes, enid, 2)
+        fb := ct_frame_find(pool, frame, soff, slen)
+        if fb >= 0 {
+            ibuf_set(vm, 5, ibuf_get(frame, fb + 2))
+            ibuf_set(vm, 6, ibuf_get(frame, fb + 3))
+            ibuf_set(vm, 7, ibuf_get(frame, fb + 4))
+            return
+        }
+        goff := ct_find_global_const(pool, sym, soff, slen)
+        if goff >= 0 {
+            gty := ibuf_get(sym, goff + 2)
+            ibuf_set(vm, 5, gty)
+            if gty == ty_intbuf() or gty == ty_bytebuf() {
+                ibuf_set(vm, 6, ibuf_get(sym, goff + 4))
+                ibuf_set(vm, 7, 0)
+            } else {
+                ibuf_set(vm, 6, ibuf_get(sym, goff + 3))
+                ibuf_set(vm, 7, ibuf_get(sym, goff + 4))
+            }
+            return
+        }
+        ct_err(vm, 603, sp)
+        return
+    }
+    if k == nk_unary() {
+        uop := ast_get(nodes, enid, 1)
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, enid, 2))
+        uty := ibuf_get(vm, 5)
+        uv := ibuf_get(vm, 6)
+        if uop == uop_neg() {
+            ibuf_set(vm, 5, uty)
+            ibuf_set(vm, 6, 0 - uv)
+        } else {
+            ibuf_set(vm, 5, ty_bool())
+            if uv == 0 { ibuf_set(vm, 6, 1) } else { ibuf_set(vm, 6, 0) }
+        }
+        return
+    }
+    if k == nk_cast() {
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, enid, 1))
+        return
+    }
+    if k == nk_if_expr() {
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, enid, 1))
+        if ibuf_get(vm, 6) != 0 {
+            tb := ast_get(nodes, enid, 2)
+            ct_exec_block(pool, nodes, extra, sym, vm, hp, frame, tb)
+            if ast_get(nodes, tb, 3) > 0 {
+                ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, tb, 3))
+            }
+        } else if ast_get(nodes, enid, 3) > 0 {
+            eb := ast_get(nodes, enid, 3)
+            ct_exec_block(pool, nodes, extra, sym, vm, hp, frame, eb)
+            if ast_get(nodes, eb, 3) > 0 {
+                ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, eb, 3))
+            }
+        }
+        return
+    }
+    if k == nk_index() {
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, enid, 1))
+        bty := ibuf_get(vm, 5)
+        bv1 := ibuf_get(vm, 6)
+        bv2 := ibuf_get(vm, 7)
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, enid, 2))
+        idx := ibuf_get(vm, 6)
+        if bty == ty_intbuf() {
+            mb := bv1 * 3
+            doff := ibuf_get(hp.ib_meta, mb)
+            blen := ibuf_get(hp.ib_meta, mb + 1)
+            if idx < 0 or idx >= blen { ct_err(vm, 603, sp); return }
+            ibuf_set(vm, 5, ty_int())
+            ibuf_set(vm, 6, ibuf_get(hp.ib_data, doff + idx))
+            ibuf_set(vm, 7, 0)
+            return
+        }
+        if bty == ty_str() {
+            if idx < 0 or idx >= bv2 { ct_err(vm, 603, sp); return }
+            ibuf_set(vm, 5, ty_int())
+            ibuf_set(vm, 6, buf_get(pool, bv1 + idx))
+            ibuf_set(vm, 7, 0)
+            return
+        }
+        ct_err(vm, 603, sp)
+        return
+    }
+    if k == nk_binary() {
+        op := ast_get(nodes, enid, 1)
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, enid, 2))
+        lty := ibuf_get(vm, 5)
+        lv1 := ibuf_get(vm, 6)
+        lv2 := ibuf_get(vm, 7)
+        if op == op_and() and lv1 == 0 {
+            ibuf_set(vm, 5, ty_bool())
+            ibuf_set(vm, 6, 0)
+            return
+        }
+        if op == op_or() and lty == ty_bool() and lv1 != 0 {
+            ibuf_set(vm, 5, ty_bool())
+            ibuf_set(vm, 6, 1)
+            return
+        }
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, enid, 3))
+        rv1 := ibuf_get(vm, 6)
+        rv2 := ibuf_get(vm, 7)
+
+        if lty == ty_str() and (op == op_eq() or op == op_neq()) {
+            mut eq := 0
+            if lv2 == rv2 and pool_str_eq2(pool, lv1, lv2, rv1) {
+                eq = 1
+            }
+            if op == op_neq() {
+                if eq == 1 { eq = 0 } else { eq = 1 }
+            }
+            ibuf_set(vm, 5, ty_bool())
+            ibuf_set(vm, 6, eq)
+            ibuf_set(vm, 7, 0)
+            return
+        }
+
+        if op == op_add() or op == op_wrap_add() { ibuf_set(vm, 5, lty); ibuf_set(vm, 6, lv1 +% rv1); return }
+        if op == op_sub() or op == op_wrap_sub() { ibuf_set(vm, 5, lty); ibuf_set(vm, 6, lv1 -% rv1); return }
+        if op == op_mul() or op == op_wrap_mul() {
+            ibuf_set(vm, 5, lty)
+            if lty == ty_dec() { ibuf_set(vm, 6, (lv1 *% rv1) / 10000) }
+            else { ibuf_set(vm, 6, lv1 *% rv1) }
+            return
+        }
+        if op == op_div() {
+            if rv1 == 0 { ct_err(vm, 406, sp); return }
+            ibuf_set(vm, 5, lty)
+            if lty == ty_dec() { ibuf_set(vm, 6, (lv1 *% 10000) / rv1) }
+            else { ibuf_set(vm, 6, lv1 / rv1) }
+            return
+        }
+        if op == op_mod() {
+            if rv1 == 0 { ct_err(vm, 406, sp); return }
+            ibuf_set(vm, 5, ty_int())
+            ibuf_set(vm, 6, lv1 % rv1)
+            return
+        }
+        if op == op_bit_and() { ibuf_set(vm, 5, ty_int()); ibuf_set(vm, 6, lv1 & rv1); return }
+        if op == op_bit_or()  { ibuf_set(vm, 5, ty_int()); ibuf_set(vm, 6, lv1 | rv1); return }
+        if op == op_bit_xor() { ibuf_set(vm, 5, ty_int()); ibuf_set(vm, 6, lv1 ^ rv1); return }
+        if op == op_shl()     { ibuf_set(vm, 5, ty_int()); ibuf_set(vm, 6, lv1 << (rv1 & 63)); return }
+        if op == op_shr()     { ibuf_set(vm, 5, ty_int()); ibuf_set(vm, 6, lv1 >> (rv1 & 63)); return }
+
+        ibuf_set(vm, 5, ty_bool())
+        ibuf_set(vm, 7, 0)
+        if op == op_eq()  { if lv1 == rv1 { ibuf_set(vm, 6, 1) } else { ibuf_set(vm, 6, 0) }; return }
+        if op == op_neq() { if lv1 != rv1 { ibuf_set(vm, 6, 1) } else { ibuf_set(vm, 6, 0) }; return }
+        if op == op_lt()  { if lv1 < rv1  { ibuf_set(vm, 6, 1) } else { ibuf_set(vm, 6, 0) }; return }
+        if op == op_lte() { if lv1 <= rv1 { ibuf_set(vm, 6, 1) } else { ibuf_set(vm, 6, 0) }; return }
+        if op == op_gt()  { if lv1 > rv1  { ibuf_set(vm, 6, 1) } else { ibuf_set(vm, 6, 0) }; return }
+        if op == op_gte() { if lv1 >= rv1 { ibuf_set(vm, 6, 1) } else { ibuf_set(vm, 6, 0) }; return }
+        if op == op_and() { if lv1 != 0 and rv1 != 0 { ibuf_set(vm, 6, 1) } else { ibuf_set(vm, 6, 0) }; return }
+        if op == op_or()  { if lv1 != 0 or rv1 != 0  { ibuf_set(vm, 6, 1) } else { ibuf_set(vm, 6, 0) }; return }
+        return
+    }
+    if k == nk_call() {
+        csoff := ast_get(nodes, enid, 1)
+        cslen := ast_get(nodes, enid, 2)
+        aoff := ast_get(nodes, enid, 3)
+        acnt := ast_get(nodes, enid, 4)
+
+        // Evaluate arguments first
+        args_v := ibuf_new(acnt * 3 + 4)
+        mut ai := 0
+        while ai < acnt {
+            ca := ibuf_get(extra, aoff + ai)
+            ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, ca, 4))
+            ibuf_push(args_v, ibuf_get(vm, 5))
+            ibuf_push(args_v, ibuf_get(vm, 6))
+            ibuf_push(args_v, ibuf_get(vm, 7))
+            ai += 1
+        }
+        if ibuf_get(vm, 2) != 0 {
+            buf_free(move args_v)
+            return
+        }
+
+        // Builtin intrinsics supported at compile time!
+        if pool_str_eq_lit(pool, csoff, cslen, "comptime_assert") {
+            cond_v := ibuf_get(args_v, 1)
+            buf_free(move args_v)
+            if cond_v == 0 {
+                ct_err(vm, 604, sp)
+            }
+            ibuf_set(vm, 5, ty_unit())
+            ibuf_set(vm, 6, 0)
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "ibuf_new") {
+            cap_v := ibuf_get(args_v, 1)
+            buf_free(move args_v)
+            hid := ct_ibuf_alloc(hp, cap_v)
+            ibuf_set(vm, 5, ty_intbuf())
+            ibuf_set(vm, 6, hid)
+            ibuf_set(vm, 7, 0)
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "ibuf_push") {
+            hid := ibuf_get(args_v, 1)
+            val := ibuf_get(args_v, 4)
+            buf_free(move args_v)
+            ct_ibuf_push_val(hp, hid, val)
+            ibuf_set(vm, 5, ty_unit())
+            ibuf_set(vm, 6, 0)
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "ibuf_get") {
+            hid := ibuf_get(args_v, 1)
+            idx := ibuf_get(args_v, 4)
+            buf_free(move args_v)
+            mb := hid * 3
+            doff := ibuf_get(hp.ib_meta, mb)
+            blen := ibuf_get(hp.ib_meta, mb + 1)
+            if idx < 0 or idx >= blen { ct_err(vm, 603, sp); return }
+            ibuf_set(vm, 5, ty_int())
+            ibuf_set(vm, 6, ibuf_get(hp.ib_data, doff + idx))
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "ibuf_set") {
+            hid := ibuf_get(args_v, 1)
+            idx := ibuf_get(args_v, 4)
+            val := ibuf_get(args_v, 7)
+            buf_free(move args_v)
+            mb := hid * 3
+            doff := ibuf_get(hp.ib_meta, mb)
+            blen := ibuf_get(hp.ib_meta, mb + 1)
+            if idx < 0 or idx >= blen { ct_err(vm, 603, sp); return }
+            ibuf_set(hp.ib_data, doff + idx, val)
+            ibuf_set(vm, 5, ty_unit())
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "ibuf_len") {
+            hid := ibuf_get(args_v, 1)
+            buf_free(move args_v)
+            ibuf_set(vm, 5, ty_int())
+            ibuf_set(vm, 6, ibuf_get(hp.ib_meta, hid * 3 + 1))
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_new") {
+            cap_b := ibuf_get(args_v, 1)
+            buf_free(move args_v)
+            bid := ct_bbuf_alloc(hp, cap_b)
+            ibuf_set(vm, 5, ty_bytebuf())
+            ibuf_set(vm, 6, bid)
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_push") {
+            bid := ibuf_get(args_v, 1)
+            bv := ibuf_get(args_v, 4)
+            buf_free(move args_v)
+            ct_bbuf_push_byte(hp, bid, bv)
+            ibuf_set(vm, 5, ty_unit())
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_push_str") {
+            bid := ibuf_get(args_v, 1)
+            ssoff := ibuf_get(args_v, 4)
+            sslen := ibuf_get(args_v, 5)
+            buf_free(move args_v)
+            mut si := 0
+            while si < sslen {
+                ct_bbuf_push_byte(hp, bid, buf_get(pool, ssoff + si))
+                si += 1
+            }
+            ibuf_set(vm, 5, ty_unit())
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_get") {
+            bid := ibuf_get(args_v, 1)
+            idx := ibuf_get(args_v, 4)
+            buf_free(move args_v)
+            mb := bid * 3
+            doff := ibuf_get(hp.bb_meta, mb)
+            blen := ibuf_get(hp.bb_meta, mb + 1)
+            if idx < 0 or idx >= blen { ct_err(vm, 603, sp); return }
+            ibuf_set(vm, 5, ty_int())
+            ibuf_set(vm, 6, buf_get(hp.bb_data, doff + idx))
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_len") {
+            bid := ibuf_get(args_v, 1)
+            buf_free(move args_v)
+            ibuf_set(vm, 5, ty_int())
+            ibuf_set(vm, 6, ibuf_get(hp.bb_meta, bid * 3 + 1))
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_slice_str") {
+            bid := ibuf_get(args_v, 1)
+            lo := ibuf_get(args_v, 4)
+            hi := ibuf_get(args_v, 7)
+            buf_free(move args_v)
+            mb := bid * 3
+            doff := ibuf_get(hp.bb_meta, mb)
+            out_off := buf_len(pool)
+            mut si := lo
+            while si < hi {
+                buf_push(pool, buf_get(hp.bb_data, doff + si))
+                si += 1
+            }
+            ibuf_set(vm, 5, ty_str())
+            ibuf_set(vm, 6, out_off)
+            ibuf_set(vm, 7, hi - lo)
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "str_len") {
+            sl := ibuf_get(args_v, 2)
+            buf_free(move args_v)
+            ibuf_set(vm, 5, ty_int())
+            ibuf_set(vm, 6, sl)
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "str_byte") {
+            ssoff := ibuf_get(args_v, 1)
+            sslen := ibuf_get(args_v, 2)
+            idx := ibuf_get(args_v, 4)
+            buf_free(move args_v)
+            if idx < 0 or idx >= sslen { ct_err(vm, 603, sp); return }
+            ibuf_set(vm, 5, ty_int())
+            ibuf_set(vm, 6, buf_get(pool, ssoff + idx))
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "str_slice") {
+            ssoff := ibuf_get(args_v, 1)
+            lo := ibuf_get(args_v, 4)
+            hi := ibuf_get(args_v, 7)
+            buf_free(move args_v)
+            ibuf_set(vm, 5, ty_str())
+            ibuf_set(vm, 6, ssoff + lo)
+            ibuf_set(vm, 7, hi - lo)
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "ushr64") {
+            xv := ibuf_get(args_v, 1)
+            kv := ibuf_get(args_v, 4)
+            buf_free(move args_v)
+            ibuf_set(vm, 5, ty_int())
+            ibuf_set(vm, 6, ushr64(xv, kv))
+            return
+        }
+        if pool_str_eq_lit(pool, csoff, cslen, "buf_free") {
+            buf_free(move args_v)
+            ibuf_set(vm, 5, ty_unit())
+            return
+        }
+
+        // User Axon function call at compile time!
+        fidx := ct_find_fn_by_name(pool, sym, csoff, cslen)
+        if fidx < 0 {
+            buf_free(move args_v)
+            ct_err(vm, 603, sp)
+            return
+        }
+        fo := ibuf_get(sym, 7) + fidx * 10
+        fnid := ibuf_get(sym, fo + 2)
+        p_base := ibuf_get(sym, fo + 3)
+        p_cnt := ibuf_get(sym, fo + 4)
+        body_nid := ast_get(nodes, fnid, 6) & 0xFFFFFFFF
+        if body_nid <= 0 or acnt > p_cnt {
+            buf_free(move args_v)
+            ct_err(vm, 603, sp)
+            return
+        }
+
+        callee_frame := ibuf_new(128)
+        mut pi := 0
+        while pi < p_cnt {
+            po := p_base + pi * 6
+            psoff := ibuf_get(sym, po)
+            pslen := ibuf_get(sym, po + 1)
+            if pi < acnt {
+                ct_frame_push(callee_frame, psoff, pslen, ibuf_get(args_v, pi * 3), ibuf_get(args_v, pi * 3 + 1), ibuf_get(args_v, pi * 3 + 2))
+            } else if ibuf_get(sym, po + 5) > 0 {
+                ct_eval_expr(pool, nodes, extra, sym, vm, hp, callee_frame, ibuf_get(sym, po + 5))
+                ct_frame_push(callee_frame, psoff, pslen, ibuf_get(vm, 5), ibuf_get(vm, 6), ibuf_get(vm, 7))
+            }
+            pi += 1
+        }
+        buf_free(move args_v)
+
+        saved_ret := ibuf_get(vm, 4)
+        ibuf_set(vm, 4, 0)
+        ct_exec_block(pool, nodes, extra, sym, vm, hp, callee_frame, body_nid)
+        ibuf_set(vm, 4, saved_ret)
+        buf_free(move callee_frame)
+        return
+    }
+
+    ct_err(vm, 603, sp)
+}
+
+fn ct_exec_stmt(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, vm: IntBuf, hp: CtHeap, frame: IntBuf, snid: i64) {
+    if snid <= 0 or ibuf_get(vm, 2) != 0 or ibuf_get(vm, 4) != 0 {
+        return
+    }
+    sp := ast_span(nodes, snid)
+    if not ct_step(vm, sp) {
+        return
+    }
+    k := ast_kind(nodes, snid)
+
+    if k == nk_var_decl() {
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, snid, 5))
+        ct_frame_push(frame, ast_get(nodes, snid, 1), ast_get(nodes, snid, 2), ibuf_get(vm, 5), ibuf_get(vm, 6), ibuf_get(vm, 7))
+        return
+    }
+    if k == nk_comptime_const() {
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, snid, 4))
+        ct_frame_push(frame, ast_get(nodes, snid, 1), ast_get(nodes, snid, 2), ibuf_get(vm, 5), ibuf_get(vm, 6), ibuf_get(vm, 7))
+        return
+    }
+    if k == nk_comptime_block() {
+        ct_exec_block(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, snid, 1))
+        return
+    }
+    if k == nk_assign() {
+        aop := ast_get(nodes, snid, 1)
+        lhs := ast_get(nodes, snid, 2)
+        if ast_kind(nodes, lhs) != nk_ident() {
+            ct_err(vm, 603, sp)
+            return
+        }
+        fb := ct_frame_find(pool, frame, ast_get(nodes, lhs, 1), ast_get(nodes, lhs, 2))
+        if fb < 0 {
+            ct_err(vm, 603, sp)
+            return
+        }
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, snid, 3))
+        rv1 := ibuf_get(vm, 6)
+        rv2 := ibuf_get(vm, 7)
+        rty := ibuf_get(vm, 5)
+        old_v := ibuf_get(frame, fb + 3)
+        if aop == aop_eq() {
+            ibuf_set(frame, fb + 2, rty)
+            ibuf_set(frame, fb + 3, rv1)
+            ibuf_set(frame, fb + 4, rv2)
+        } else if aop == aop_add() {
+            ibuf_set(frame, fb + 3, old_v +% rv1)
+        } else if aop == aop_sub() {
+            ibuf_set(frame, fb + 3, old_v -% rv1)
+        } else if aop == aop_mul() {
+            ibuf_set(frame, fb + 3, old_v *% rv1)
+        } else if aop == aop_div() {
+            if rv1 == 0 { ct_err(vm, 406, sp); return }
+            ibuf_set(frame, fb + 3, old_v / rv1)
+        }
+        return
+    }
+    if k == nk_if() {
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, snid, 1))
+        if ibuf_get(vm, 6) != 0 {
+            ct_exec_block(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, snid, 2))
+        } else if ast_get(nodes, snid, 3) > 0 {
+            ct_exec_block(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, snid, 3))
+        }
+        return
+    }
+    if k == nk_while() {
+        cond := ast_get(nodes, snid, 1)
+        body := ast_get(nodes, snid, 2)
+        while ibuf_get(vm, 2) == 0 and ibuf_get(vm, 4) == 0 {
+            ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, cond)
+            if ibuf_get(vm, 6) == 0 {
+                break
+            }
+            ct_exec_block(pool, nodes, extra, sym, vm, hp, frame, body)
+            rf := ibuf_get(vm, 4)
+            if rf == 2 {
+                ibuf_set(vm, 4, 0)
+                break
+            }
+            if rf == 3 {
+                ibuf_set(vm, 4, 0)
+            }
+        }
+        return
+    }
+    if k == nk_for_range() {
+        vsoff := ast_get(nodes, snid, 1)
+        vslen := ast_get(nodes, snid, 2)
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, snid, 3))
+        mut cur := ibuf_get(vm, 6)
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, snid, 4))
+        end_v := ibuf_get(vm, 6)
+        body := ast_get(nodes, snid, 5)
+        saved_cnt := ct_frame_cnt(frame)
+        v_base := ct_frame_push(frame, vsoff, vslen, ty_int(), cur, 0)
+        while cur < end_v and ibuf_get(vm, 2) == 0 and ibuf_get(vm, 4) == 0 {
+            ibuf_set(frame, v_base + 3, cur)
+            ct_exec_block(pool, nodes, extra, sym, vm, hp, frame, body)
+            rf := ibuf_get(vm, 4)
+            if rf == 2 {
+                ibuf_set(vm, 4, 0)
+                break
+            }
+            if rf == 3 {
+                ibuf_set(vm, 4, 0)
+            }
+            cur += 1
+        }
+        ct_frame_restore(frame, saved_cnt)
+        return
+    }
+    if k == nk_return() {
+        rv := ast_get(nodes, snid, 1)
+        if rv > 0 {
+            ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, rv)
+        } else {
+            ibuf_set(vm, 5, ty_unit())
+            ibuf_set(vm, 6, 0)
+            ibuf_set(vm, 7, 0)
+        }
+        ibuf_set(vm, 4, 1)
+        return
+    }
+    if k == nk_break() {
+        ibuf_set(vm, 4, 2)
+        return
+    }
+    if k == nk_continue() {
+        ibuf_set(vm, 4, 3)
+        return
+    }
+    if k == nk_expr_stmt() {
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, snid, 1))
+        return
+    }
+    if k == nk_block() {
+        ct_exec_block(pool, nodes, extra, sym, vm, hp, frame, snid)
+        return
+    }
+}
+
+fn ct_exec_block(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, vm: IntBuf, hp: CtHeap, frame: IntBuf, bnid: i64) {
+    if bnid <= 0 or ibuf_get(vm, 2) != 0 or ibuf_get(vm, 4) != 0 {
+        return
+    }
+    saved_cnt := ct_frame_cnt(frame)
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt and ibuf_get(vm, 2) == 0 and ibuf_get(vm, 4) == 0 {
+        ct_exec_stmt(pool, nodes, extra, sym, vm, hp, frame, ibuf_get(extra, off + i))
+        i += 1
+    }
+    ct_frame_restore(frame, saved_cnt)
+}
+
+// Mutate `enid` in-place into its evaluated constant literal AST node!
+fn ct_materialize_expr_node(nodes: IntBuf, enid: i64, rty: i64, v1: i64, v2: i64) {
+    if rty == ty_bool() {
+        ast_set(nodes, enid, 0, nk_bool())
+        ast_set(nodes, enid, 1, v1)
+    } else if rty == ty_float() {
+        ast_set(nodes, enid, 0, nk_float())
+        ast_set(nodes, enid, 1, v1)
+    } else if rty == ty_dec() {
+        ast_set(nodes, enid, 0, nk_dec())
+        ast_set(nodes, enid, 1, v1)
+    } else if rty == ty_str() {
+        ast_set(nodes, enid, 0, nk_str())
+        ast_set(nodes, enid, 1, v1)
+        ast_set(nodes, enid, 2, v2)
+    } else {
+        ast_set(nodes, enid, 0, nk_int())
+        ast_set(nodes, enid, 1, v1)
+    }
+}
+
+// Walk function AST and fold any `nk_comptime_expr`, `nk_comptime_const`, or `nk_comptime_block`!
+fn ct_fold_in_expr(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, vm: IntBuf, hp: CtHeap, enid: i64) {
+    if enid <= 0 or ibuf_get(vm, 2) != 0 {
+        return
+    }
+    k := ast_kind(nodes, enid)
+    if k == nk_comptime_expr() {
+        frame := ibuf_new(64)
+        ibuf_set(vm, 4, 0)
+        ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, enid)
+        buf_free(move frame)
+        if ibuf_get(vm, 2) == 0 {
+            ct_materialize_expr_node(nodes, enid, ibuf_get(vm, 5), ibuf_get(vm, 6), ibuf_get(vm, 7))
+        }
+        return
+    }
+    if k == nk_unary() or k == nk_await() or k == nk_or_return() or k == nk_cast() or k == nk_field() or k == nk_tuple_idx() {
+        ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, enid, 1))
+        if k == nk_unary() {
+            ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, enid, 2))
+        }
+        return
+    }
+    if k == nk_index() {
+        ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, enid, 1))
+        ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, enid, 2))
+        return
+    }
+    if k == nk_binary() {
+        ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, enid, 2))
+        ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, enid, 3))
+        return
+    }
+    if k == nk_call() {
+        aoff := ast_get(nodes, enid, 3)
+        acnt := ast_get(nodes, enid, 4)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, ca, 4))
+            i += 1
+        }
+        return
+    }
+    if k == nk_method_call() {
+        ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, enid, 1))
+        aoff := ast_get(nodes, enid, 4)
+        acnt := ast_get(nodes, enid, 5)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, ca, 4))
+            i += 1
+        }
+        return
+    }
+    if k == nk_fstr() or k == nk_tuple() {
+        off := ast_get(nodes, enid, 1)
+        cnt := ast_get(nodes, enid, 2)
+        mut i := 0
+        while i < cnt {
+            ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ibuf_get(extra, off + i))
+            i += 1
+        }
+    }
+}
+
+fn ct_fold_in_block(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, vm: IntBuf, hp: CtHeap, bnid: i64) {
+    if bnid <= 0 or ibuf_get(vm, 2) != 0 {
+        return
+    }
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt and ibuf_get(vm, 2) == 0 {
+        st := ibuf_get(extra, off + i)
+        sk := ast_kind(nodes, st)
+        if sk == nk_comptime_block() {
+            frame := ibuf_new(64)
+            ibuf_set(vm, 4, 0)
+            ct_exec_block(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, st, 1))
+            buf_free(move frame)
+            // Replace `nk_comptime_block` with empty runtime `nk_block` (0.00 ns at runtime!)
+            ast_set(nodes, st, 0, nk_block())
+            ast_set(nodes, st, 1, 0)
+            ast_set(nodes, st, 2, 0)
+        } else if sk == nk_comptime_const() {
+            frame2 := ibuf_new(64)
+            ibuf_set(vm, 4, 0)
+            ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame2, ast_get(nodes, st, 4))
+            buf_free(move frame2)
+            if ibuf_get(vm, 2) == 0 {
+                lit_nid := ast_alloc(nodes, nk_int(), ast_span(nodes, st))
+                ct_materialize_expr_node(nodes, lit_nid, ibuf_get(vm, 5), ibuf_get(vm, 6), ibuf_get(vm, 7))
+                // Turn local `comptime x := ...` into immutable `nk_var_decl` with pre-evaluated literal!
+                ast_set(nodes, st, 0, nk_var_decl())
+                ast_set(nodes, st, 3, 0)
+                ast_set(nodes, st, 4, 0)
+                ast_set(nodes, st, 5, lit_nid)
+            }
+        } else if sk == nk_var_decl() {
+            ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 5))
+        } else if sk == nk_tuple_destruct() {
+            ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 3))
+        } else if sk == nk_assign() {
+            ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 2))
+            ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 3))
+        } else if sk == nk_if() {
+            ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 1))
+            ct_fold_in_block(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 2))
+            ct_fold_in_block(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 3))
+        } else if sk == nk_while() {
+            ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 1))
+            ct_fold_in_block(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 2))
+        } else if sk == nk_for_range() or sk == nk_par_for_range() {
+            ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 3))
+            ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 4))
+            ct_fold_in_block(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 5))
+        } else if sk == nk_for_each() or sk == nk_par_for_each() {
+            ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 3))
+            ct_fold_in_block(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 4))
+        } else if sk == nk_return() or sk == nk_expr_stmt() {
+            ct_fold_in_expr(pool, nodes, extra, sym, vm, hp, ast_get(nodes, st, 1))
+        }
+        i += 1
+    }
+}
+
+// Execute all top-level `comptime` constants/blocks (`nodes[12], nodes[13]`) + fold in-body `comptime`!
+// Populates `sym[20] = ct_consts_base`, `sym[21] = ct_consts_cnt`.
+fn execute_program_comptime(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf) -> bool {
+    ct_off := ibuf_get(nodes, 12)
+    ct_cnt := ibuf_get(nodes, 13)
+
+    vm := ibuf_new(16)
+    mut zi := 0
+    while zi < 8 {
+        ibuf_push(vm, 0)
+        zi += 1
+    }
+    ibuf_set(vm, 1, 5000000)
+
+    ib_meta := ibuf_new(256)
+    ib_data := ibuf_new(16384)
+    bb_meta := ibuf_new(256)
+    bb_data := buf_new(16384)
+    hp := CtHeap(ib_meta, ib_data, bb_meta, bb_data)
+
+    // Pre-allocate global `ct_consts` table in `sym` (`6 * ct_cnt` max entries)
+    cbase := ibuf_len(sym)
+    ibuf_set(sym, 20, cbase)
+    ibuf_set(sym, 21, 0)
+    mut ci := 0
+    while ci < ct_cnt * 6 {
+        ibuf_push(sym, 0)
+        ci += 1
+    }
+
+    mut added := 0
+    ci = 0
+    while ci < ct_cnt and ibuf_get(vm, 2) == 0 {
+        cnid := ibuf_get(extra, ct_off + ci)
+        ck := ast_kind(nodes, cnid)
+        frame := ibuf_new(512)
+        ibuf_set(vm, 4, 0)
+        if ck == nk_comptime_const() {
+            nsoff := ast_get(nodes, cnid, 1)
+            nslen := ast_get(nodes, cnid, 2)
+            ct_eval_expr(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, cnid, 4))
+            if ibuf_get(vm, 2) == 0 {
+                rty := ibuf_get(vm, 5)
+                mut v1 := ibuf_get(vm, 6)
+                mut orig_v2 := ibuf_get(vm, 7)
+                mut lut_off := 0
+                if rty == ty_intbuf() {
+                    orig_v2 = v1
+                    mb := v1 * 3
+                    doff := ibuf_get(hp.ib_meta, mb)
+                    elen := ibuf_get(hp.ib_meta, mb + 1)
+                    lut_off = ibuf_len(sym)
+                    mut li := 0
+                    while li < elen {
+                        ibuf_push(sym, ibuf_get(hp.ib_data, doff + li))
+                        li += 1
+                    }
+                    v1 = elen
+                } else if rty == ty_bytebuf() {
+                    orig_v2 = v1
+                    mb2 := v1 * 3
+                    doff2 := ibuf_get(hp.bb_meta, mb2)
+                    blen2 := ibuf_get(hp.bb_meta, mb2 + 1)
+                    lut_off = buf_len(pool)
+                    mut bi := 0
+                    while bi < blen2 {
+                        buf_push(pool, buf_get(hp.bb_data, doff2 + bi))
+                        bi += 1
+                    }
+                    v1 = blen2
+                }
+                ent := cbase + added * 6
+                ibuf_set(sym, ent, nsoff)
+                ibuf_set(sym, ent + 1, nslen)
+                ibuf_set(sym, ent + 2, rty)
+                ibuf_set(sym, ent + 3, v1)
+                ibuf_set(sym, ent + 4, orig_v2)
+                ibuf_set(sym, ent + 5, lut_off)
+                added += 1
+                ibuf_set(sym, 21, added)
+            }
+        } else if ck == nk_comptime_block() {
+            ct_exec_block(pool, nodes, extra, sym, vm, hp, frame, ast_get(nodes, cnid, 1))
+        }
+        buf_free(move frame)
+        ci += 1
+    }
+
+    // Fold all in-function `comptime` blocks, constants, and expressions (skipping `@comptime` helper fns)
+    f_base := ibuf_get(sym, 7)
+    f_cnt := ibuf_get(sym, 8)
+    mut fi := 0
+    while fi < f_cnt and ibuf_get(vm, 2) == 0 {
+        fo := f_base + fi * 10
+        fnid := ibuf_get(sym, fo + 2)
+        flags := ibuf_get(sym, fo + 9)
+        if (flags & fnflag_comptime()) == 0 {
+            body := ast_get(nodes, fnid, 6) & 0xFFFFFFFF
+            if body > 0 {
+                ct_fold_in_block(pool, nodes, extra, sym, vm, hp, body)
+            }
+        }
+        fi += 1
+    }
+
+    err_c := ibuf_get(vm, 2)
+    err_sp := ibuf_get(vm, 3)
+
+    buf_free(move hp.bb_data)
+    buf_free(move hp.bb_meta)
+    buf_free(move hp.ib_data)
+    buf_free(move hp.ib_meta)
+    buf_free(move vm)
+
+    if err_c != 0 {
+        if ibuf_get(sym, 0) == 0 {
+            ibuf_set(sym, 1, err_sp)
+            ibuf_set(sym, 2, err_c)
+        }
+        ibuf_set(sym, 0, ibuf_get(sym, 0) + 1)
+        return false
+    }
+    return true
+}

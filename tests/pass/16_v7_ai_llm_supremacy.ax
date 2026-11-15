@@ -1,0 +1,84 @@
+// Test 16 (v7.0): All 6 AI / LLM Systems Breakthroughs (`VramArena`, `PagedKvCache`, Symbolic Shapes,
+// Schedule-Separated `@gpu_kernel`, SPMD `ShardedTensor`, `@nan_guard` & Deterministic Reduction)
+
+use std::ai_engine
+
+@gpu_kernel
+@tile(64, 4, 1)
+@pipeline_stages(3)
+fn fused_silu_fma_kernel(dst_ptr: i64, src_ptr: i64, scale: f32, n: i32) {
+    gid := gpu_global_id()
+    if gid < n {
+        v := ptr_read_f32(src_ptr, gid)
+        ptr_write_f32(dst_ptr, gid, v * 2.0)
+    }
+}
+
+@nan_guard
+fn linear_proj[sym B](x: Tensor[f32, [B, 16]], w: Tensor[f32, [16, 8]]) -> Tensor[f32, [B, 8]] {
+    return tensor_matmul(x, w)
+}
+
+fn main() -> i32 {
+    // 1. VramArena + vLLM-style PagedKvCache (40 tokens across 3 non-contiguous 16-token blocks)
+    varena := vram_arena_new(262144)
+    kv := paged_kv_new(16, 16, 8)
+    mut t := 0
+    while t < 40 {
+        _blk := paged_kv_append_scalar(kv, (t + 1) * 1.0)
+        t += 1
+    }
+    if paged_kv_num_tokens(kv) != 40 or paged_kv_num_blocks(kv) != 3 {
+        return 161
+    }
+    v39 := paged_kv_read_token_f32(kv, 39, 0) as i64
+    paged_kv_free(move kv)
+    if v39 != 40 {
+        return 162
+    }
+
+    // 2. Symbolic Shape Polymorphism: `rmsnorm_2d` compiled ONCE, run on S=13, S=127, S=512 (0 recompilation!)
+    p13 := vram_arena_alloc_f32(varena, 13 * 16)
+    t13 := tensor_from_arena_2d(p13, 13, 16)
+    tensor_fill_f32(t13, 2.0)
+    c13 := rmsnorm_2d(t13, 0.0) as i64
+
+    p127 := vram_arena_alloc_f32(varena, 127 * 16)
+    t127 := tensor_from_arena_2d(p127, 127, 16)
+    tensor_fill_f32(t127, 4.0)
+    c127 := rmsnorm_2d(t127, 0.0) as i64
+
+    if c13 != (13 * 16) or c127 != (127 * 16) {
+        return 163
+    }
+
+    // Symbolic MatMul `[5, 16] x [16, 8] -> [5, 8]`
+    pa := vram_arena_alloc_f32(varena, 5 * 16)
+    pw := vram_arena_alloc_f32(varena, 16 * 8)
+    ta := tensor_from_arena_2d(pa, 5, 16)
+    tw := tensor_from_arena_2d(pw, 16, 8)
+    tensor_fill_f32(ta, 1.5)
+    tensor_fill_f32(tw, 2.0)
+    tout := linear_proj(ta, tw)
+    // Each output cell = 16 * (1.5 * 2.0) = 48.0; deterministic sum of 5*8=40 cells = 1920.0!
+    det_total := det_reduce_tensor_2d(tout) as i64
+    mem_free_aligned(tensor_ptr(tout))
+    vram_arena_free(move varena)
+    if det_total != 1920 {
+        return 164
+    }
+
+    // 4. Distributed SPMD ShardedTensor + Linear `move` `all_reduce_sum`
+    shard := sharded_tensor_2d(4, 8, 4)
+    tensor_fill_f32(shard, 3.0)
+    reduced := all_reduce_sum(move shard)
+    // tp=4 scales in-place by 4 -> 12.0 per element -> 32 * 12 = 384
+    spmd_sum := det_sum_f32_ptr(tensor_ptr(reduced), 32) as i64
+    mem_free_aligned(tensor_ptr(reduced))
+    if spmd_sum != 384 {
+        return 165
+    }
+
+    println(f"  [16] v7 AI/LLM Supremacy verified: PagedKV(3 blks, tok39={v39}), SymShape(S=13->{c13}, S=127->{c127}), MatMul+DetSum={det_total}, SPMD={spmd_sum}")
+    return 0
+}

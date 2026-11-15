@@ -1,10 +1,12 @@
-// Axon v6.0 Self-Hosted Compiler - Standalone Win64 PE32+ Direct Linker (`compiler_ax/linker_pe.ax`)
-// Emits deterministic, W^X, High-Entropy ASLR, NX/DEP, `.pdata`/`.xdata` SEH-compliant PE32+ binaries
-// with polymorphic split-share `@shield` `.text` integrity tags.
+// Axon v7.0 Self-Hosted Compiler - Standalone Win64 PE32+ Direct Linker & Static COFF `.obj`/`.lib` Linker
+// (`compiler_ax/linker_pe.ax`) - 100% Pure Axon, Zero `link.exe`/`lld`.
+// Emits deterministic, W^X, High-Entropy ASLR, NX/DEP, `.pdata`/`.xdata` SEH-compliant PE32+ `.exe` & `.dll`/`.pyd`
+// binaries with Multi-DLL `.idata`, `.edata` Exports, `.data` RW globals, static COFF `.obj`/`.lib` merging,
+// and polymorphic split-share `@shield` `.text` integrity tags.
 
 use compiler_ax::tokens_ast
 
-// IAT slot indices in `KERNEL32.dll`
+// IAT slot indices in `KERNEL32.dll` (`0..19`)
 fn iat_get_std_handle() -> i64     { return 0 }
 fn iat_write_file() -> i64         { return 1 }
 fn iat_exit_process() -> i64       { return 2 }
@@ -17,8 +19,38 @@ fn iat_read_file() -> i64          { return 8 }
 fn iat_close_handle() -> i64       { return 9 }
 fn iat_get_file_size_ex() -> i64   { return 10 }
 fn iat_get_command_line_a() -> i64 { return 11 }
-fn iat_total_count() -> i64        { return 12 }
+fn iat_create_thread() -> i64      { return 12 }
+fn iat_wait_multiple() -> i64      { return 13 }
+fn iat_get_system_info() -> i64    { return 14 }
+fn iat_create_iocp() -> i64        { return 15 }
+fn iat_post_iocp() -> i64          { return 16 }
+fn iat_get_iocp() -> i64           { return 17 }
+fn iat_sleep() -> i64              { return 18 }
+fn iat_is_debugger() -> i64        { return 19 }
+fn iat_create_process_a() -> i64   { return 20 }
+fn iat_wait_single() -> i64        { return 21 }
+fn iat_get_exit_code() -> i64      { return 22 }
+fn iat_total_count() -> i64        { return 23 }
 fn pe_text_rva() -> i64            { return 0x1000 }
+
+// `pe_info` Metadata Layout:
+//   [0]  = rdata_rva
+//   [1]  = unwind_info_rva
+//   [2]  = shield_hash_rva
+//   [3]  = shield_hash_off
+//   [4]  = user_rdata_start_rva
+//   [5]  = data_rva
+//   [6]  = idt_rva
+//   [7]  = idt_size
+//   [8]  = iat_rva
+//   [9]  = iat_size
+//   [10] = edata_rva
+//   [11] = edata_size
+//   [12] = poly_seed
+//   [16 + slot] = IAT RVA for `slot` (`0..19` = KERNEL32, `20 + k` = external `@extern("dll")` imports)
+fn pe_info_iat_rva(info: IntBuf, slot: i64) -> i64 {
+    return ibuf_get(info, 16 + slot)
+}
 
 fn emit_zeros(buf: ByteBuf, count: i64) {
     mut i := 0
@@ -39,52 +71,294 @@ fn append_hint_name(buf: ByteBuf, rdata_rva: i64, fname: str) -> i64 {
     return hn_rva
 }
 
-// Builds `.rdata` import + `.xdata` + 16-byte split-share `@shield` prefix and fills `info: IntBuf` (`[0..16]`).
-fn prepare_pe_rdata_prefix(rdata_rva: i64, prefix: ByteBuf, info: IntBuf) {
-    iat_cnt := iat_total_count()
-    iat_off := 0
-    ilt_off := (iat_cnt + 1) * 8
+fn append_hint_name_pool(pool: ByteBuf, buf: ByteBuf, rdata_rva: i64, fsoff: i64, fslen: i64) -> i64 {
+    if (buf_len(buf) & 1) != 0 {
+        buf_push(buf, 0)
+    }
+    hn_rva := rdata_rva + buf_len(buf)
+    buf_push_u16(buf, 0)
+    mut i := 0
+    while i < fslen {
+        buf_push(buf, buf_get(pool, fsoff + i))
+        i += 1
+    }
+    buf_push(buf, 0)
+    return hn_rva
+}
 
-    emit_zeros(prefix, (iat_cnt + 1) * 16)
+fn pool_ascii_eq_ci(pool: ByteBuf, off1: i64, len1: i64, off2: i64, len2: i64) -> bool {
+    if len1 != len2 {
+        return false
+    }
+    mut i := 0
+    while i < len1 {
+        mut c1 := buf_get(pool, off1 + i)
+        mut c2 := buf_get(pool, off2 + i)
+        if c1 >= 65 and c1 <= 90 { c1 += 32 }
+        if c2 >= 65 and c2 <= 90 { c2 += 32 }
+        if c1 != c2 {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+fn pool_lex_cmp(pool: ByteBuf, off1: i64, len1: i64, off2: i64, len2: i64) -> i64 {
+    mut min_l := len1
+    if len2 < min_l { min_l = len2 }
+    mut i := 0
+    while i < min_l {
+        b1 := buf_get(pool, off1 + i)
+        b2 := buf_get(pool, off2 + i)
+        if b1 != b2 {
+            return b1 - b2
+        }
+        i += 1
+    }
+    return len1 - len2
+}
+
+// Builds `.rdata` Multi-DLL `.idata` + optional `.edata` + `.xdata` + 16-byte `@shield` MAC prefix!
+// `ext_imports`: 4 words per external fn `[dll_soff, dll_slen, fn_soff, fn_slen]` (receives IAT slots `20 + k`).
+// `exports`: 3 words per exported fn `[name_soff, name_slen, code_off]`.
+fn prepare_pe_rdata_v7(pool: ByteBuf, rdata_rva: i64, ext_imports: IntBuf, exports: IntBuf, prefix: ByteBuf, info: IntBuf) {
+    mut z := 0
+    while z < 16 {
+        ibuf_push(info, 0)
+        z += 1
+    }
+
+    k32_cnt := iat_total_count()
+    ext_cnt := ibuf_len(ext_imports) / 4
+
+    // Group `ext_imports` by case-insensitive DLL name -> `dll_groups` (`[dll_soff, dll_slen, fn_count]`)
+    dll_groups := ibuf_new(32)
+    ext_group_id := ibuf_new(ext_cnt + 4)
+    mut ei := 0
+    while ei < ext_cnt {
+        eb := ei * 4
+        dsoff := ibuf_get(ext_imports, eb)
+        dslen := ibuf_get(ext_imports, eb + 1)
+        mut found_g := -1
+        mut gi := 0
+        while gi < ibuf_len(dll_groups) / 3 {
+            gb := gi * 3
+            if pool_ascii_eq_ci(pool, ibuf_get(dll_groups, gb), ibuf_get(dll_groups, gb + 1), dsoff, dslen) {
+                found_g = gi
+                ibuf_set(dll_groups, gb + 2, ibuf_get(dll_groups, gb + 2) + 1)
+                break
+            }
+            gi += 1
+        }
+        if found_g < 0 {
+            found_g = ibuf_len(dll_groups) / 3
+            ibuf_push(dll_groups, dsoff)
+            ibuf_push(dll_groups, dslen)
+            ibuf_push(dll_groups, 1)
+        }
+        ibuf_push(ext_group_id, found_g)
+        ei += 1
+    }
+
+    num_ext_dlls := ibuf_len(dll_groups) / 3
+    total_dlls := 1 + num_ext_dlls
+    // Total qwords across all IAT slices (each DLL has `fn_count + 1` qwords for null terminator)
+    total_iat_qwords := (k32_cnt + 1) + ext_cnt + num_ext_dlls
+    iat_base_off := 0
+    ilt_base_off := total_iat_qwords * 8
+    emit_zeros(prefix, total_iat_qwords * 16)
+
     idt_off := buf_len(prefix)
-    emit_zeros(prefix, 40)
+    idt_bytes := (total_dlls + 1) * 20
+    emit_zeros(prefix, idt_bytes)
 
-    dll_name_rva := rdata_rva + buf_len(prefix)
+    // Pre-reserve `info[16 .. 16 + k32_cnt + ext_cnt]`
+    mut si := 0
+    while si < k32_cnt + ext_cnt {
+        ibuf_push(info, 0)
+        si += 1
+    }
+
+    // 1. Emit `KERNEL32.dll` Descriptor (`IDT[0]`) + Hint/Names
+    k32_name_rva := rdata_rva + buf_len(prefix)
     buf_push_str(prefix, "KERNEL32.dll")
     buf_push(prefix, 0)
-    if (buf_len(prefix) & 1) != 0 {
-        buf_push(prefix, 0)
-    }
 
-    thunks := ibuf_new(16)
-    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "GetStdHandle"))
-    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "WriteFile"))
-    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "ExitProcess"))
-    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "QueryPerformanceCounter"))
-    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "QueryPerformanceFrequency"))
-    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "VirtualAlloc"))
-    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "VirtualFree"))
-    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "CreateFileA"))
-    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "ReadFile"))
-    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "CloseHandle"))
-    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "GetFileSizeEx"))
-    ibuf_push(thunks, append_hint_name(prefix, rdata_rva, "GetCommandLineA"))
+    k32_thunks := ibuf_new(32)
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "GetStdHandle"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "WriteFile"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "ExitProcess"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "QueryPerformanceCounter"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "QueryPerformanceFrequency"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "VirtualAlloc"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "VirtualFree"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "CreateFileA"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "ReadFile"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "CloseHandle"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "GetFileSizeEx"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "GetCommandLineA"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "CreateThread"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "WaitForMultipleObjects"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "GetSystemInfo"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "CreateIoCompletionPort"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "PostQueuedCompletionStatus"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "GetQueuedCompletionStatus"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "Sleep"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "IsDebuggerPresent"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "CreateProcessA"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "WaitForSingleObject"))
+    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "GetExitCodeProcess"))
 
     mut idx := 0
-    while idx < iat_cnt {
-        trva := ibuf_get(thunks, idx)
-        buf_put_u64(prefix, iat_off + idx * 8, trva)
-        buf_put_u64(prefix, ilt_off + idx * 8, trva)
-        ibuf_push(info, rdata_rva + iat_off + idx * 8)
+    while idx < k32_cnt {
+        trva := ibuf_get(k32_thunks, idx)
+        buf_put_u64(prefix, iat_base_off + idx * 8, trva)
+        buf_put_u64(prefix, ilt_base_off + idx * 8, trva)
+        ibuf_set(info, 16 + idx, rdata_rva + iat_base_off + idx * 8)
         idx += 1
     }
-    buf_free(move thunks)
+    buf_free(move k32_thunks)
 
-    buf_put_u32(prefix, idt_off, rdata_rva + ilt_off)
-    buf_put_u32(prefix, idt_off + 12, dll_name_rva)
-    buf_put_u32(prefix, idt_off + 16, rdata_rva + iat_off)
+    buf_put_u32(prefix, idt_off + 0, rdata_rva + ilt_base_off)
+    buf_put_u32(prefix, idt_off + 12, k32_name_rva)
+    buf_put_u32(prefix, idt_off + 16, rdata_rva + iat_base_off)
 
-    // `.xdata` Win64 SEH `UNWIND_INFO` (`ENDBR64; PUSH RBP; MOV RBP, RSP`)
+    // 2. Emit External DLL Descriptors (`IDT[1 .. num_ext_dlls]`)
+    mut cur_qword := k32_cnt + 1
+    mut gi := 0
+    while gi < num_ext_dlls {
+        gb := gi * 3
+        dsoff := ibuf_get(dll_groups, gb)
+        dslen := ibuf_get(dll_groups, gb + 1)
+        g_iat_off := iat_base_off + cur_qword * 8
+        g_ilt_off := ilt_base_off + cur_qword * 8
+
+        dname_rva := rdata_rva + buf_len(prefix)
+        mut bi := 0
+        while bi < dslen {
+            buf_push(prefix, buf_get(pool, dsoff + bi))
+            bi += 1
+        }
+        buf_push(prefix, 0)
+
+        mut local_slot := 0
+        ei = 0
+        while ei < ext_cnt {
+            if ibuf_get(ext_group_id, ei) == gi {
+                eb := ei * 4
+                hn_rva := append_hint_name_pool(pool, prefix, rdata_rva, ibuf_get(ext_imports, eb + 2), ibuf_get(ext_imports, eb + 3))
+                q_off := (cur_qword + local_slot) * 8
+                buf_put_u64(prefix, iat_base_off + q_off, hn_rva)
+                buf_put_u64(prefix, ilt_base_off + q_off, hn_rva)
+                ibuf_set(info, 16 + k32_cnt + ei, rdata_rva + iat_base_off + q_off)
+                local_slot += 1
+            }
+            ei += 1
+        }
+
+        desc_off := idt_off + (1 + gi) * 20
+        buf_put_u32(prefix, desc_off + 0, rdata_rva + g_ilt_off)
+        buf_put_u32(prefix, desc_off + 12, dname_rva)
+        buf_put_u32(prefix, desc_off + 16, rdata_rva + g_iat_off)
+
+        cur_qword += local_slot + 1
+        gi += 1
+    }
+    buf_free(move ext_group_id)
+    buf_free(move dll_groups)
+
+    // 3. Optional `.edata` Export Directory Table (`--shared` `.dll` / `.pyd` & `@py_export`!)
+    exp_cnt := ibuf_len(exports) / 3
+    mut edata_rva := 0
+    mut edata_size := 0
+    if exp_cnt > 0 {
+        while (buf_len(prefix) & 3) != 0 {
+            buf_push(prefix, 0)
+        }
+        // Sort `exports` copy lexicographically by symbol name for `GetProcAddress` binary search
+        sorted := ibuf_new(exp_cnt * 3 + 4)
+        mut xi := 0
+        while xi < exp_cnt * 3 {
+            ibuf_push(sorted, ibuf_get(exports, xi))
+            xi += 1
+        }
+        mut i := 0
+        while i < exp_cnt {
+            mut j := i + 1
+            while j < exp_cnt {
+                bi := i * 3
+                bj := j * 3
+                if pool_lex_cmp(pool, ibuf_get(sorted, bi), ibuf_get(sorted, bi + 1), ibuf_get(sorted, bj), ibuf_get(sorted, bj + 1)) > 0 {
+                    t0 := ibuf_get(sorted, bi)
+                    t1 := ibuf_get(sorted, bi + 1)
+                    t2 := ibuf_get(sorted, bi + 2)
+                    ibuf_set(sorted, bi, ibuf_get(sorted, bj))
+                    ibuf_set(sorted, bi + 1, ibuf_get(sorted, bj + 1))
+                    ibuf_set(sorted, bi + 2, ibuf_get(sorted, bj + 2))
+                    ibuf_set(sorted, bj, t0)
+                    ibuf_set(sorted, bj + 1, t1)
+                    ibuf_set(sorted, bj + 2, t2)
+                }
+                j += 1
+            }
+            i += 1
+        }
+
+        edata_start := buf_len(prefix)
+        edata_rva = rdata_rva + edata_start
+        // Reserve 40-byte `IMAGE_EXPORT_DIRECTORY`
+        emit_zeros(prefix, 40)
+
+        addr_fns_rva := rdata_rva + buf_len(prefix)
+        i = 0
+        while i < exp_cnt {
+            buf_push_u32(prefix, pe_text_rva() + ibuf_get(sorted, i * 3 + 2))
+            i += 1
+        }
+
+        addr_names_off := buf_len(prefix)
+        addr_names_rva := rdata_rva + addr_names_off
+        emit_zeros(prefix, exp_cnt * 4)
+
+        addr_ords_rva := rdata_rva + buf_len(prefix)
+        i = 0
+        while i < exp_cnt {
+            buf_push_u16(prefix, i)
+            i += 1
+        }
+
+        mod_name_rva := rdata_rva + buf_len(prefix)
+        buf_push_str(prefix, "axon_module.dll")
+        buf_push(prefix, 0)
+
+        i = 0
+        while i < exp_cnt {
+            nm_rva := rdata_rva + buf_len(prefix)
+            buf_put_u32(prefix, addr_names_off + i * 4, nm_rva)
+            nsoff := ibuf_get(sorted, i * 3)
+            nslen := ibuf_get(sorted, i * 3 + 1)
+            mut k := 0
+            while k < nslen {
+                buf_push(prefix, buf_get(pool, nsoff + k))
+                k += 1
+            }
+            buf_push(prefix, 0)
+            i += 1
+        }
+
+        buf_put_u32(prefix, edata_start + 12, mod_name_rva)
+        buf_put_u32(prefix, edata_start + 16, 1) // Base ordinal = 1
+        buf_put_u32(prefix, edata_start + 20, exp_cnt)
+        buf_put_u32(prefix, edata_start + 24, exp_cnt)
+        buf_put_u32(prefix, edata_start + 28, addr_fns_rva)
+        buf_put_u32(prefix, edata_start + 32, addr_names_rva)
+        buf_put_u32(prefix, edata_start + 36, addr_ords_rva)
+        edata_size = buf_len(prefix) - edata_start
+        buf_free(move sorted)
+    }
+
+    // 4. `.xdata` Win64 SEH `UNWIND_INFO` (`ENDBR64; PUSH RBP; MOV RBP, RSP`)
     while (buf_len(prefix) & 3) != 0 {
         buf_push(prefix, 0)
     }
@@ -98,8 +372,8 @@ fn prepare_pe_rdata_prefix(rdata_rva: i64, prefix: ByteBuf, info: IntBuf) {
     buf_push(prefix, 0x00)
     buf_push(prefix, 0x00)
 
-    // Reserve 16-byte split-share `(share0, share1)` slot for polymorphic `@shield` MAC
-    while (buf_len(prefix) & 7) != 0 {
+    // 5. Reserve 16-byte split-share `(share0, share1)` slot for polymorphic `@shield` MAC
+    while (buf_len(prefix) & 15) != 0 {
         buf_push(prefix, 0)
     }
     shield_hash_off := buf_len(prefix)
@@ -107,12 +381,18 @@ fn prepare_pe_rdata_prefix(rdata_rva: i64, prefix: ByteBuf, info: IntBuf) {
     buf_push_u64(prefix, 0)
     buf_push_u64(prefix, 0)
 
-    data_start_rva := rdata_rva + buf_len(prefix)
-    ibuf_push(info, rdata_rva)       // [12]
-    ibuf_push(info, unwind_info_rva) // [13]
-    ibuf_push(info, shield_hash_rva) // [14]
-    ibuf_push(info, shield_hash_off) // [15]
-    ibuf_push(info, data_start_rva)  // [16]
+    user_rdata_rva := rdata_rva + buf_len(prefix)
+    ibuf_set(info, 0, rdata_rva)
+    ibuf_set(info, 1, unwind_info_rva)
+    ibuf_set(info, 2, shield_hash_rva)
+    ibuf_set(info, 3, shield_hash_off)
+    ibuf_set(info, 4, user_rdata_rva)
+    ibuf_set(info, 6, rdata_rva + idt_off)
+    ibuf_set(info, 7, idt_bytes)
+    ibuf_set(info, 8, rdata_rva + iat_base_off)
+    ibuf_set(info, 9, total_iat_qwords * 8)
+    ibuf_set(info, 10, edata_rva)
+    ibuf_set(info, 11, edata_size)
 }
 
 fn poly_rotl64(x: i64, k: i64) -> i64 {
@@ -172,19 +452,17 @@ fn append_padded_section(out: ByteBuf, sec_data: ByteBuf, target_raw_size: i64) 
     }
 }
 
-fn build_pe32_executable(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBuf, info: IntBuf, fn_ranges: IntBuf, pe_out: ByteBuf) {
-    mut poly_seed := 0
-    if ibuf_len(info) > 17 {
-        poly_seed = ibuf_get(info, 17)
-    }
+// Emits standalone Win64 PE32+ `.exe` (`is_dll == false`) or `.dll`/`.pyd` (`is_dll == true`)!
+fn build_pe32_binary_v7(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBuf, data_sec: ByteBuf, info: IntBuf, fn_ranges: IntBuf, is_dll: bool, pe_out: ByteBuf) {
+    poly_seed := ibuf_get(info, 12)
     mac := compute_poly_shield_mac(text_code, shield_len, poly_seed)
     mask := (poly_seed *% 0xBF58476D1CE4E5B9) ^ 0x55AA55AA33CC33CC
-    sh_off := ibuf_get(info, 15)
+    sh_off := ibuf_get(info, 3)
     buf_put_u64(rdata_full, sh_off, mac ^ mask)
     buf_put_u64(rdata_full, sh_off + 8, mask)
 
-    unwind_rva := ibuf_get(info, 13)
-    pdata := buf_new(4096)
+    unwind_rva := ibuf_get(info, 1)
+    pdata := buf_new(8192)
     rcnt := ibuf_len(fn_ranges) / 2
     if rcnt == 0 {
         buf_push_u32(pdata, pe_text_rva())
@@ -209,7 +487,7 @@ fn build_pe32_executable(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBu
 
     file_align := 0x200
     sect_align := 0x1000
-    headers_size := 0x200
+    headers_size := 0x400
 
     text_vsize := buf_len(text_code)
     mut text_v_nz := text_vsize
@@ -217,15 +495,25 @@ fn build_pe32_executable(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBu
     text_raw_size := align_up(text_v_nz, file_align)
     text_raw_ptr := headers_size
 
-    rdata_rva := ibuf_get(info, 12)
+    rdata_rva := ibuf_get(info, 0)
     rdata_vsize := buf_len(rdata_full)
     rdata_raw_size := align_up(rdata_vsize, file_align)
     rdata_raw_ptr := text_raw_ptr + text_raw_size
 
-    pdata_rva := rdata_rva + align_up(rdata_vsize, sect_align)
+    data_rva := ibuf_get(info, 5)
+    mut data_vsize := 0x1000
+    if buf_len(data_sec) > data_vsize {
+        data_vsize = buf_len(data_sec)
+    }
+    mut data_raw_len := buf_len(data_sec)
+    if data_raw_len < 64 { data_raw_len = 64 }
+    data_raw_size := align_up(data_raw_len, file_align)
+    data_raw_ptr := rdata_raw_ptr + rdata_raw_size
+
+    pdata_rva := data_rva + align_up(data_vsize, sect_align)
     pdata_vsize := buf_len(pdata)
     pdata_raw_size := align_up(pdata_vsize, file_align)
-    pdata_raw_ptr := rdata_raw_ptr + rdata_raw_size
+    pdata_raw_ptr := data_raw_ptr + data_raw_size
 
     reloc_rva := pdata_rva + align_up(pdata_vsize, sect_align)
     reloc_vsize := buf_len(reloc)
@@ -240,29 +528,37 @@ fn build_pe32_executable(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBu
     emit_zeros(pe_out, 0x3A)
     buf_push_u32(pe_out, 0x40)
 
-    // PE Signature + COFF File Header
+    // PE Signature + COFF File Header (5 sections: `.text`, `.rdata`, `.data`, `.pdata`, `.reloc`)
     buf_push(pe_out, 80)
     buf_push(pe_out, 69)
     buf_push(pe_out, 0)
     buf_push(pe_out, 0)
     buf_push_u16(pe_out, 0x8664)
-    buf_push_u16(pe_out, 4)
+    buf_push_u16(pe_out, 5)
     buf_push_u32(pe_out, 0x67350000)
     buf_push_u32(pe_out, 0)
     buf_push_u32(pe_out, 0)
     buf_push_u16(pe_out, 240)
-    buf_push_u16(pe_out, 0x0022)
+    if is_dll {
+        buf_push_u16(pe_out, 0x2022)
+    } else {
+        buf_push_u16(pe_out, 0x0022)
+    }
 
     // PE32+ Optional Header
     buf_push_u16(pe_out, 0x020B)
-    buf_push(pe_out, 6)
+    buf_push(pe_out, 7)
     buf_push(pe_out, 0)
     buf_push_u32(pe_out, text_raw_size)
-    buf_push_u32(pe_out, rdata_raw_size + pdata_raw_size + reloc_raw_size)
+    buf_push_u32(pe_out, rdata_raw_size + data_raw_size + pdata_raw_size + reloc_raw_size)
     buf_push_u32(pe_out, 0)
     buf_push_u32(pe_out, pe_text_rva())
     buf_push_u32(pe_out, pe_text_rva())
-    buf_push_u64(pe_out, 0x140000000)
+    if is_dll {
+        buf_push_u64(pe_out, 0x180000000)
+    } else {
+        buf_push_u64(pe_out, 0x140000000)
+    }
     buf_push_u32(pe_out, sect_align)
     buf_push_u32(pe_out, file_align)
     buf_push_u16(pe_out, 6)
@@ -276,7 +572,7 @@ fn build_pe32_executable(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBu
     buf_push_u32(pe_out, headers_size)
     buf_push_u32(pe_out, 0)
     buf_push_u16(pe_out, 3)
-    buf_push_u16(pe_out, 0x8160)
+    buf_push_u16(pe_out, 0x8160) // High-Entropy ASLR + DYNAMIC_BASE + NX_COMPAT
     buf_push_u64(pe_out, 0x00400000)
     buf_push_u64(pe_out, 0x00040000)
     buf_push_u64(pe_out, 0x00100000)
@@ -284,27 +580,37 @@ fn build_pe32_executable(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBu
     buf_push_u32(pe_out, 0)
     buf_push_u32(pe_out, 16)
 
-    idt_rva := rdata_rva + (iat_total_count() + 1) * 16
-    iat_size := (iat_total_count() + 1) * 8
+    // Data Directories [0..15]
+    // [0] Export Table
+    buf_push_u32(pe_out, ibuf_get(info, 10))
+    buf_push_u32(pe_out, ibuf_get(info, 11))
+    // [1] Import Table
+    buf_push_u32(pe_out, ibuf_get(info, 6))
+    buf_push_u32(pe_out, ibuf_get(info, 7))
+    // [2] Resource
     buf_push_u64(pe_out, 0)
-    buf_push_u32(pe_out, idt_rva)
-    buf_push_u32(pe_out, 40)
-    buf_push_u64(pe_out, 0)
+    // [3] Exception (`.pdata`)
     buf_push_u32(pe_out, pdata_rva)
     buf_push_u32(pe_out, pdata_vsize)
+    // [4] Certificate
     buf_push_u64(pe_out, 0)
+    // [5] Base Relocation (`.reloc`)
     buf_push_u32(pe_out, reloc_rva)
     buf_push_u32(pe_out, reloc_vsize)
+    // [6..11]
     emit_zeros(pe_out, 6 * 8)
-    buf_push_u32(pe_out, rdata_rva)
-    buf_push_u32(pe_out, iat_size)
+    // [12] IAT
+    buf_push_u32(pe_out, ibuf_get(info, 8))
+    buf_push_u32(pe_out, ibuf_get(info, 9))
+    // [13..15]
     emit_zeros(pe_out, 3 * 8)
 
-    // Strict W^X Section Headers (`.text` RX, `.rdata`/`.pdata`/`.reloc` RO)
-    emit_section_header(pe_out, ".text", text_vsize, pe_text_rva(), text_raw_size, text_raw_ptr, 0x60000020)
-    emit_section_header(pe_out, ".rdata", rdata_vsize, rdata_rva, rdata_raw_size, rdata_raw_ptr, 0x40000040)
-    emit_section_header(pe_out, ".pdata", pdata_vsize, pdata_rva, pdata_raw_size, pdata_raw_ptr, 0x40000040)
-    emit_section_header(pe_out, ".reloc", reloc_vsize, reloc_rva, reloc_raw_size, reloc_raw_ptr, 0x42000040)
+    // Strict W^X Section Headers (`.text` RX, `.rdata`/`.pdata`/`.reloc` RO, `.data` RW NX!)
+    emit_section_header(pe_out, ".text",  text_vsize,  pe_text_rva(), text_raw_size,  text_raw_ptr,  0x60000020)
+    emit_section_header(pe_out, ".rdata", rdata_vsize, rdata_rva,     rdata_raw_size, rdata_raw_ptr, 0x40000040)
+    emit_section_header(pe_out, ".data",  data_vsize,  data_rva,      data_raw_size,  data_raw_ptr,  0xC0000040)
+    emit_section_header(pe_out, ".pdata", pdata_vsize, pdata_rva,     pdata_raw_size, pdata_raw_ptr, 0x40000040)
+    emit_section_header(pe_out, ".reloc", reloc_vsize, reloc_rva,     reloc_raw_size, reloc_raw_ptr, 0x42000040)
 
     if buf_len(pe_out) < headers_size {
         emit_zeros(pe_out, headers_size - buf_len(pe_out))
@@ -312,9 +618,274 @@ fn build_pe32_executable(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBu
 
     append_padded_section(pe_out, text_code, text_raw_size)
     append_padded_section(pe_out, rdata_full, rdata_raw_size)
+    append_padded_section(pe_out, data_sec, data_raw_size)
     append_padded_section(pe_out, pdata, pdata_raw_size)
     append_padded_section(pe_out, reloc, reloc_raw_size)
 
     buf_free(move pdata)
     buf_free(move reloc)
+}
+
+// --- Direct Win64 COFF `.obj` and `!<arch>\n` `.lib` Static Linker (`--link-lib`) ---
+fn coff_read_u16(b: ByteBuf, off: i64) -> i64 {
+    return buf_get(b, off) | (buf_get(b, off + 1) << 8)
+}
+
+fn coff_read_i16(b: ByteBuf, off: i64) -> i64 {
+    v := coff_read_u16(b, off)
+    if v >= 32768 {
+        return v - 65536
+    }
+    return v
+}
+
+fn coff_read_u32(b: ByteBuf, off: i64) -> i64 {
+    return buf_get(b, off) | (buf_get(b, off + 1) << 8) | (buf_get(b, off + 2) << 16) | (buf_get(b, off + 3) << 24)
+}
+
+// Merges a single Win64 COFF `.obj` slice `[obj_off .. obj_end]` into `code`, `rdata`, `fixups`, and `coff_syms`!
+// `coff_syms`: 4 words per symbol `[name_soff, name_slen, sec_kind (1=code, 2=rdata), merged_off]`.
+fn coff_merge_single_obj(pool: ByteBuf, raw: ByteBuf, obj_off: i64, obj_end: i64, code: ByteBuf, rdata: ByteBuf, fixups: IntBuf, coff_syms: IntBuf) -> bool {
+    if obj_off + 20 > obj_end {
+        return false
+    }
+    mach := coff_read_u16(raw, obj_off)
+    nsec := coff_read_u16(raw, obj_off + 2)
+    // Skip short import library headers (`0x0000, 0xFFFF`) or non-x64 objects
+    if mach != 0x8664 or nsec == 0xFFFF or nsec == 0 {
+        return false
+    }
+    sym_ptr := coff_read_u32(raw, obj_off + 8)
+    nsyms := coff_read_u32(raw, obj_off + 12)
+    opt_sz := coff_read_u16(raw, obj_off + 16)
+    sec_hdr_base := obj_off + 20 + opt_sz
+    if sec_hdr_base + nsec * 40 > obj_end {
+        return false
+    }
+
+    // `sec_map`: 2 words per 1-based section `[sec_kind (0=skip, 1=code, 2=rdata), base_off]`
+    sec_map := ibuf_new((nsec + 2) * 2)
+    ibuf_push(sec_map, 0)
+    ibuf_push(sec_map, 0)
+
+    mut s := 0
+    while s < nsec {
+        sh := sec_hdr_base + s * 40
+        raw_sz := coff_read_u32(raw, sh + 16)
+        raw_ptr := coff_read_u32(raw, sh + 20)
+        chars := coff_read_u32(raw, sh + 36)
+        // Skip debug / metadata / discardable / `.pdata` / `.xdata` sections
+        // `IMAGE_SCN_MEM_EXECUTE = 0x20000000`, `IMAGE_SCN_CNT_CODE = 0x20`, `MEM_DISCARDABLE = 0x02000000`
+        n0 := buf_get(raw, sh)
+        n1 := buf_get(raw, sh + 1)
+        mut skind := 0
+        mut base_o := 0
+        if (chars & 0x02000000) == 0 and not (n0 == 46 and (n1 == 112 or n1 == 120 or n1 == 100)) {
+            if (chars & 0x20000020) != 0 {
+                while (buf_len(code) & 15) != 0 {
+                    buf_push(code, 0xCC)
+                }
+                skind = 1
+                base_o = buf_len(code)
+                if raw_ptr > 0 and obj_off + raw_ptr + raw_sz <= obj_end {
+                    mut bi := 0
+                    while bi < raw_sz {
+                        buf_push(code, buf_get(raw, obj_off + raw_ptr + bi))
+                        bi += 1
+                    }
+                }
+            } else if (chars & 0x000000C0) != 0 {
+                while (buf_len(rdata) & 15) != 0 {
+                    buf_push(rdata, 0)
+                }
+                skind = 2
+                base_o = buf_len(rdata)
+                if raw_ptr > 0 and obj_off + raw_ptr + raw_sz <= obj_end {
+                    mut bi := 0
+                    while bi < raw_sz {
+                        buf_push(rdata, buf_get(raw, obj_off + raw_ptr + bi))
+                        bi += 1
+                    }
+                } else {
+                    emit_zeros(rdata, raw_sz)
+                }
+            }
+        }
+        ibuf_push(sec_map, skind)
+        ibuf_push(sec_map, base_o)
+        s += 1
+    }
+
+    // Parse COFF Symbol Table (`18` bytes per symbol) + String Table
+    str_tbl_base := obj_off + sym_ptr + nsyms * 18
+    // `local_syms`: 4 words per COFF symbol index `[skind, merged_off, name_soff, name_slen]`
+    local_syms := ibuf_new(nsyms * 4 + 8)
+    mut si := 0
+    while si < nsyms {
+        local_syms_pad := si * 4
+        ibuf_push(local_syms, 0)
+        ibuf_push(local_syms, 0)
+        ibuf_push(local_syms, 0)
+        ibuf_push(local_syms, 0)
+        if local_syms_pad < 0 { break }
+        si += 1
+    }
+
+    si = 0
+    while si < nsyms {
+        sb := obj_off + sym_ptr + si * 18
+        if sb + 18 > obj_end {
+            break
+        }
+        mut nsoff := buf_len(pool)
+        mut nslen := 0
+        if coff_read_u32(raw, sb) == 0 {
+            stroff := coff_read_u32(raw, sb + 4)
+            mut p := str_tbl_base + stroff
+            while p < obj_end and buf_get(raw, p) != 0 {
+                buf_push(pool, buf_get(raw, p))
+                nslen += 1
+                p += 1
+            }
+        } else {
+            mut k := 0
+            while k < 8 and buf_get(raw, sb + k) != 0 {
+                buf_push(pool, buf_get(raw, sb + k))
+                nslen += 1
+                k += 1
+            }
+        }
+        val := coff_read_u32(raw, sb + 8)
+        sec_num := coff_read_i16(raw, sb + 12)
+        sclass := buf_get(raw, sb + 16)
+        naux := buf_get(raw, sb + 17)
+
+        mut sk := 0
+        mut moff := 0
+        if sec_num >= 1 and sec_num <= nsec {
+            sk = ibuf_get(sec_map, sec_num * 2)
+            moff = ibuf_get(sec_map, sec_num * 2 + 1) + val
+        }
+        lb := si * 4
+        ibuf_set(local_syms, lb, sk)
+        ibuf_set(local_syms, lb + 1, moff)
+        ibuf_set(local_syms, lb + 2, nsoff)
+        ibuf_set(local_syms, lb + 3, nslen)
+
+        if sclass == 2 and sk > 0 and nslen > 0 {
+            ibuf_push(coff_syms, nsoff)
+            ibuf_push(coff_syms, nslen)
+            ibuf_push(coff_syms, sk)
+            ibuf_push(coff_syms, moff)
+        }
+        si += 1 + naux
+    }
+
+    // Apply COFF `.text` relocations (`IMAGE_REL_AMD64_REL32 = 4`, `REL32_1..5 = 5..9`)
+    s = 0
+    while s < nsec {
+        if ibuf_get(sec_map, (s + 1) * 2) == 1 {
+            cbase := ibuf_get(sec_map, (s + 1) * 2 + 1)
+            sh := sec_hdr_base + s * 40
+            rel_ptr := coff_read_u32(raw, sh + 24)
+            nrel := coff_read_u16(raw, sh + 32)
+            mut ri := 0
+            while ri < nrel {
+                rb := obj_off + rel_ptr + ri * 10
+                if rb + 10 <= obj_end {
+                    vaddr := coff_read_u32(raw, rb)
+                    sym_i := coff_read_u32(raw, rb + 4)
+                    rtype := coff_read_u16(raw, rb + 8)
+                    if rtype >= 4 and rtype <= 9 and sym_i < nsyms {
+                        extra_disp := rtype - 4
+                        disp_pos := cbase + vaddr
+                        next_rip := disp_pos + 4 + extra_disp
+                        existing_addend := coff_read_u32(raw, obj_off + coff_read_u32(raw, sh + 20) + vaddr)
+                        mut addend := existing_addend
+                        if addend >= 0x80000000 { addend = addend - 0x100000000 }
+
+                        mut t_sk := ibuf_get(local_syms, sym_i * 4)
+                        mut t_off := ibuf_get(local_syms, sym_i * 4 + 1)
+                        if t_sk == 0 {
+                            // Cross-object symbol lookup in `coff_syms`
+                            un_soff := ibuf_get(local_syms, sym_i * 4 + 2)
+                            un_slen := ibuf_get(local_syms, sym_i * 4 + 3)
+                            mut ci := 0
+                            while ci < ibuf_len(coff_syms) / 4 {
+                                cb := ci * 4
+                                if ibuf_get(coff_syms, cb + 1) == un_slen and pool_str_eq2(pool, ibuf_get(coff_syms, cb), un_slen, un_soff) {
+                                    t_sk = ibuf_get(coff_syms, cb + 2)
+                                    t_off = ibuf_get(coff_syms, cb + 3)
+                                    break
+                                }
+                                ci += 1
+                            }
+                        }
+                        if t_sk == 1 {
+                            buf_put_u32(code, disp_pos, (t_off + addend) - next_rip)
+                        } else if t_sk == 2 {
+                            // Record `fx_rdata()` (`2`) fixup!
+                            ibuf_push(fixups, disp_pos)
+                            ibuf_push(fixups, next_rip)
+                            ibuf_push(fixups, 2)
+                            ibuf_push(fixups, t_off + addend)
+                        }
+                    }
+                }
+                ri += 1
+            }
+        }
+        s += 1
+    }
+
+    buf_free(move local_syms)
+    buf_free(move sec_map)
+    return true
+}
+
+// Links either a standalone Win64 `.obj` OR an `!<arch>\n` `.lib` static library!
+fn coff_link_archive_or_obj(pool: ByteBuf, raw: ByteBuf, code: ByteBuf, rdata: ByteBuf, fixups: IntBuf, coff_syms: IntBuf) -> i64 {
+    n := buf_len(raw)
+    if n < 20 {
+        return 0
+    }
+    // Check `!<arch>\n` (`33, 60, 97, 114, 99, 104, 62, 10`)
+    if buf_get(raw, 0) == 33 and buf_get(raw, 1) == 60 and buf_get(raw, 2) == 97 and buf_get(raw, 7) == 10 {
+        mut merged := 0
+        mut pos := 8
+        while pos + 60 <= n {
+            if (pos & 1) != 0 {
+                pos += 1
+            }
+            if pos + 60 > n {
+                break
+            }
+            // Parse decimal size at `pos + 48 .. pos + 58`
+            mut msize := 0
+            mut k := 48
+            while k < 58 {
+                ch := buf_get(raw, pos + k)
+                if ch >= 48 and ch <= 57 {
+                    msize = msize * 10 + (ch - 48)
+                }
+                k += 1
+            }
+            body_off := pos + 60
+            body_end := body_off + msize
+            if body_end > n {
+                break
+            }
+            if msize >= 20 and coff_read_u16(raw, body_off) == 0x8664 and coff_read_u16(raw, body_off + 2) != 0xFFFF {
+                if coff_merge_single_obj(pool, raw, body_off, body_end, code, rdata, fixups, coff_syms) {
+                    merged += 1
+                }
+            }
+            pos = body_end
+        }
+        return merged
+    }
+    if coff_merge_single_obj(pool, raw, 0, n, code, rdata, fixups, coff_syms) {
+        return 1
+    }
+    return 0
 }

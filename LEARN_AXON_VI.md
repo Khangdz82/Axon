@@ -1,14 +1,14 @@
-# Giáo Trình Ngôn Ngữ Lập Trình Axon v6.0 (Từ Cơ Bản Đến Làm Chủ Hệ Thống)
+# Giáo Trình Ngôn Ngữ Lập Trình Axon v7.0 (Từ Cơ Bản Đến Làm Chủ Đa Hệ Điều Hành, AI & Hệ Thống Lớn)
 
-Tài liệu này là hướng dẫn chính thức của **Axon v6.0 (`.ax`)**: ngôn ngữ lập trình hệ thống tự thân (self-hosted) kết hợp **cú pháp tự nhiên, dễ học của Python/Go** với **tốc độ phần cứng vượt xa C++/Rust/Go/Java/Python**, **bộ cài đặt chỉ ~550 KB cùng tệp thực thi độc lập 3.5 KB - 5.5 KB**, **độ ổn định 0 rò rỉ bộ nhớ cho hệ thống chạy dài ngày**, và **bảo mật chống dịch ngược đa hình ngay từ trình biên dịch**.
+Tài liệu này là hướng dẫn chính thức của **Axon v7.0 (`.ax`)**: ngôn ngữ lập trình hệ thống tự thân (self-hosted) đa hệ điều hành kết hợp **cú pháp tự nhiên, dễ học của Python/Go** với **tốc độ phần cứng vượt xa C++/Rust/Go/Java/Python**, **biên dịch chéo trực tiếp 11 đích phần cứng/OS và GPU không cần LLVM/GCC/Linker ngoài**, **độ ổn định 0 rò rỉ bộ nhớ cho hệ thống chạy dài ngày**, và **6 đột phá cốt lõi cho AI/LLM, Game 3D, Tài chính HFT và An ninh mạng**.
 
-Mọi đoạn mã trong giáo trình này đều tương thích trực tiếp và được kiểm thử tự động trên trình biên dịch [`bin/axc.exe`](bin/axc.exe) và [`bin/axc0.exe`](bin/axc0.exe).
+Mọi đoạn mã trong giáo trình này đều tương thích trực tiếp và được kiểm thử tự động trên trình biên dịch [`bin/axc.exe`](bin/axc.exe).
 
 ---
 
 ## Mục Lục
 
-1. [Bắt đầu với Axon v6.0 trong 2 phút](#chương-1-bắt-đầu-với-axon-v60-trong-2-phút)
+1. [Bắt đầu với Axon trong 2 phút](#chương-1-bắt-đầu-với-axon-v60-trong-2-phút)
 2. [Biến, Kiểu Dữ Liệu & Cú Pháp Phong Cách Python](#chương-2-biến-kiểu-dữ-liệu--cú-pháp-phong-cách-python)
 3. [Hàm, Tham Số Đặt Tên, Mặc Định & Đường Ống `|>`](#chương-3-hàm-tham-số-đặt-tên-mặc-định--đường-ống-)
 4. [Luồng Điều Khiển & Tinh Chỉnh Biên Mảng `where`](#chương-4-luồng-điều-khiển--tinh-chỉnh-biên-mảng-where)
@@ -21,6 +21,9 @@ Mọi đoạn mã trong giáo trình này đều tương thích trực tiếp v�
 11. [Đa Luồng An Toàn `spawn` & Cấu Trúc Phân Tán `CRDT`](#chương-11-đa-luồng-an-toàn-spawn--cấu-trúc-phân-tán-crdt)
 12. [Bảo Mật Năng Lực, `@shield` Đa Hình v2 & Nhị Phân Sạch Antivirus](#chương-12-bảo-mật-năng-lực-shield-đa-hình-v2--nhị-phân-sạch-antivirus)
 13. [Kiến Trúc Self-Hosting, Hàm Nội Tại & Bảng Mã Lỗi Đầy Đủ](#chương-13-kiến-trúc-self-hosting-hàm-nội-tại--bảng-mã-lỗi-đầy-đủ)
+14. [`comptime`, Nhập Trực Tiếp Header C (`@cImport`) & Biên Dịch Chéo 11 Hệ Điều Hành](#chương-14-comptime-nhập-trực-tiếp-header-c-cimport--biên-dịch-chéo-11-hệ-điều-hành)
+15. [Đa Phiên Bản CPUID, Đa Nhân `par_for`, `IOCP` Async, Game 3D, HFT `@no_alloc` & `tainted[str]`](#chương-15-đa-phiên-bản-cpuid-đa-nhân-par_for-iocp-async-game-3d-hft-no_alloc--taintedstr)
+16. [6 Đột Phá AI/LLM (`PagedKvCache`, Chiều Ký Hiệu, `@gpu_kernel`, `DLPack`, `@nan_guard`) & `axc mcp`](#chương-16-6-đột-phá-aillm-pagedkvcache-chiều-ký-hiệu-gpu_kernel-dlpack-nan_guard--axc-mcp)
 
 ---
 
@@ -568,11 +571,11 @@ Trình liên kết PE32+ của Axon v6.0 tuân thủ nghiêm ngặt chuẩn trì
 ## Chương 13: Kiến Trúc Self-Hosting, Hàm Nội Tại & Bảng Mã Lỗi Đầy Đủ
 
 ### 13.1. Quy trình tự biên dịch 3 vòng xác định (3-Stage Bootstrap)
-Trình biên dịch chính thức [`bin/axc.exe`](bin/axc.exe) (**533.50 KB**, `546,304 bytes`) được viết hoàn toàn bằng Axon (9,194 dòng trong [`compiler_ax/`](compiler_ax/)):
+Trình biên dịch chính thức [`bin/axc.exe`](bin/axc.exe) (**1.27 MB**, `1,333,760 bytes`, tích hợp đủ 11 đích phần cứng/OS, `comptime` VM, `@cImport`, `axpm` và `axc mcp`) được viết hoàn toàn bằng Axon (17 module, 19,858 dòng trong [`compiler_ax/`](compiler_ax/)):
 - **Vòng 1:** `axc0.exe` biên dịch `compiler_ax/main.ax` $\rightarrow$ `axc_stage1.exe`.
-- **Vòng 2:** `axc_stage1.exe` tự biên dịch `compiler_ax/main.ax` $\rightarrow$ `axc_stage2.exe` (~215 ms).
-- **Vòng 3:** `axc_stage2.exe` tự biên dịch lại `compiler_ax/main.ax` $\rightarrow$ `axc_stage3.exe` (~211 ms).
-- **Chứng minh hội tụ bit-exact:** `SHA256(axc_stage2.exe) == SHA256(axc_stage3.exe) == 15AB01D09E0835EB750ADAA202981D8FB893E761A6882561A60696169B587AF3`.
+- **Vòng 2:** `axc_stage1.exe` tự biên dịch `compiler_ax/main.ax` $\rightarrow$ `axc_stage2.exe` (~609 ms).
+- **Vòng 3:** `axc_stage2.exe` tự biên dịch lại `compiler_ax/main.ax` $\rightarrow$ `axc_stage3.exe` (~619 ms).
+- **Chứng minh hội tụ bit-exact:** `SHA256(axc_stage2.exe) == SHA256(axc_stage3.exe) == F06DFC7F4DF44F9905E1B8F38A169D4506059F99C837F06EF766FF93A0F976F9`.
 
 ### 13.2. Bảng tra cứu hàm nội tại (Built-in Intrinsics)
 
@@ -604,3 +607,109 @@ Trình biên dịch chính thức [`bin/axc.exe`](bin/axc.exe) (**533.50 KB**, `
 | **`E0406`** | Phép chia (`/`) hoặc chia lấy dư (`%`) cho hằng số `0` ngay trong mã nguồn | Kiểm tra mẫu số khác `0` trước khi thực hiện phép chia |
 | **`E0407`** | Đặt lệnh `break` hoặc `continue` bên ngoài vòng lặp `while` / `for` | Chỉ dùng `break` / `continue` bên trong thân vòng lặp hoặc dùng `return` để thoát hàm |
 | **`E0501`** | Gọi hàm hệ thống đặc quyền mà không nắm giữ thẻ năng lực (`RootCap`/`FsCap`/`NetCap`) | Truyền thẻ năng lực đã thu hẹp quyền từ `std::cap` vào hàm |
+| **`E0204`** | Đột biến biến ngoài không nguyên tử ở bên trong vòng lặp đa nhân `par_for` | Chỉ ghi vào cột độc lập của hàng hiện tại trong `Table[T]` hoặc dùng phép nguyên tử |
+| **`E0502`** | Đưa chuỗi nhiễm bẩn `tainted[str]` chưa lọc vào hàm nhạy cảm (`sql_exec`, `shell_exec`, `html_render`) | Lọc sạch trước qua `sanitize_sql`, `sanitize_html` hoặc `sanitize_shell` trong `std::taint` |
+| **`E0601`** | Cấp phát bộ nhớ Heap ở bên trong hàm gắn nhãn `@no_alloc` (HFT / Kernel / Audio) | Sử dụng `FrameArena`, `SpscRing` cấp phát sẵn hoặc kiểu giá trị trên thanh ghi/ngăn xếp |
+| **`E0602`** | Lệch chiều Tensor ký hiệu lúc nhân ma trận `tensor_matmul` (ví dụ `[B, 16] x [32, 8]`) | Khớp chiều trong `K` giữa hai Tensor (`[B, K] x [K, N] -> [B, N]`) |
+| **`E0603`** | Lỗi thực thi hoặc vượt ngân sách bước trong máy ảo biên dịch `comptime` | Kiểm tra điều kiện dừng vòng lặp hoặc chỉ số mảng trong hàm `comptime` |
+| **`E0604`** | Khẳng định lúc biên dịch `comptime_assert(cond, msg)` thất bại | Sửa hằng số cấu hình, câu truy vấn SQL hoặc kích thước bảng tra cứu lúc biên dịch |
+| **`E0605`** | Không tìm thấy tệp Header C được khai báo trong `@cImport("...")` | Kiểm tra đường dẫn tương đối của tệp `.h` trong dự án |
+
+---
+
+## Chương 14: `comptime`, Nhập Trực Tiếp Header C (`@cImport`) & Biên Dịch Chéo 11 Hệ Điều Hành
+
+### 14.1. Thực thi lúc biên dịch (`comptime`) và `to_json` 0-Reflection
+Thay vì hệ thống macro phức tạp khó gỡ lỗi, Axon v7.0 cho phép chạy chính hàm Axon ngay trong giai đoạn phân tích ngữ nghĩa (`compiler_ax/comptime.ax`) để tạo sẵn bảng tra cứu tĩnh trong `.rdata`, kiểm tra câu lệnh SQL lúc biên dịch và sinh bộ tuần tự hóa `to_json(struct_val)` không tốn chi phí reflection:
+
+```axon
+comptime fn is_valid_sql(q: str) -> bool {
+    return str_len(q) > 10 and str_slice(q, 0, 7) == "SELECT "
+}
+
+comptime {
+    comptime_assert(is_valid_sql("SELECT id, balance FROM accounts"), "Invalid SQL")
+}
+
+struct OrderEvent {
+    id: i64
+    symbol: str
+    active: bool
+}
+
+fn main() -> i32 {
+    ev := OrderEvent(id = 42, symbol = "AXON", active = true)
+    println(to_json(ev))
+    return 0
+}
+```
+
+### 14.2. Đọc trực tiếp Header C (`@cImport`) & Linker Tĩnh COFF `.obj`/`.lib`
+Axon v7.0 tích hợp bộ phân tích cú pháp C trực tiếp (`compiler_ax/c_import.ax`) cùng bộ nạp Multi-DLL `.idata` và Linker tĩnh COFF (`--link-lib`), cho phép gọi thẳng hệ sinh thái C/Win32/SQLite/Vulkan/Rust với tốc độ 0-overhead:
+
+```axon
+@cImport("tests/pass/c_demo_header.h", link = "msvcrt.dll")
+
+fn main() -> i32 {
+    win := CWindowDesc(width = 1920, height = 1080)
+    n := strlen("AxonNativeFFI")
+    println(f"Port={C_MAGIC_PORT}, Win={win.width}x{win.height}, len={n}, abs={abs(-99)}")
+    return 0
+}
+```
+
+### 14.3. Biên dịch chéo 1 dòng lệnh cho 11 đích phần cứng & Quản lý gói `axpm`
+Không cần cài đặt Docker, LLVM hay cross-linker bên ngoài:
+- `axc targets`: Liệt kê toàn bộ 11 đích (`win-x64`, `linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`, `wasm32`, `unikernel-x64`, `freestanding-x64`, `freestanding-riscv64`, `spirv`, `ptx`).
+- `axc init my_service`: Khởi tạo dự án chuẩn với `axon.toml` và khóa băm nội dung FNV-64 `axon.lock`.
+- `axc test file.ax`: Tự động phát hiện và chạy toàn bộ các hàm gắn nhãn `@test` cùng `assert(cond)`.
+
+---
+
+## Chương 15: Đa Phiên Bản CPUID, Đa Nhân `par_for`, `IOCP` Async, Game 3D, HFT `@no_alloc` & `tainted[str]`
+
+### 15.1. Tự động chọn tập lệnh CPUID (`SSE2 / AVX2 / AVX-512`) & Đa nhân `par_for`
+Khi khởi động, tệp thực thi Axon tự động kiểm tra thanh ghi phần cứng `CPUID` + `XGETBV` để chọn nhánh lệnh nhanh nhất mà CPU hỗ trợ (`cpu_simd_tier()`), đồng thời `par_for` chia đều các cột `Table[T]` lên toàn bộ nhân CPU vật lý và chặn lỗi Data-Race ngay lúc biên dịch (`E0204`):
+
+```axon
+struct Particle {
+    px: f32
+    vx: f32
+}
+
+fn main() -> i32 {
+    pts := Table[Particle]::with_capacity(65536)
+    table_fill_f32(pts, 0, 1.0)
+    table_fill_f32(pts, 1, 2.0)
+    par_for p in pts {
+        p.px += p.vx * 0.5
+    }
+    println(f"Threads={cpu_threads()}, Tier={cpu_simd_tier()}, p0={table_get_f32(pts, 0, 0)}")
+    return 0
+}
+```
+
+### 15.2. Async I/O gốc hệ điều hành (`IOCP`), Game 3D (`std::math3d`), HFT (`@no_alloc`) & `tainted[str]`
+- **Async I/O (`std::async_io`):** Cơ chế `async fn` / `await` biên dịch thành state machine 0-heap gắn trực tiếp với Windows I/O Completion Ports (`IOCP`).
+- **Toán học 3D SIMD (`std::math3d`):** Kiểu phần cứng 128-bit `vec3`, `vec4`, `quat`, `mat4` và `FrameArena` cấp phát theo khung hình O(1).
+- **Tài chính HFT (`std::decimal`, `std::ringbuf`):** Thuộc tính `@no_alloc` khóa chặt 0 cấp phát Heap (`E0601`), kết hợp `round_half_even` và hàng đợi phi khóa `SpscRing` tách dòng đệm 64-byte chống false-sharing.
+- **Chống SQLi/XSS/Command Injection từ kiểu dữ liệu (`std::taint`):** Dữ liệu bên ngoài mang kiểu `tainted[str]`; nếu truyền thẳng vào `sql_exec` hay `shell_exec` mà chưa qua `sanitize_sql`/`sanitize_shell`, trình biên dịch chặn đứng ngay với lỗi `E0502`.
+
+---
+
+## Chương 16: 6 Đột Phá AI/LLM (`PagedKvCache`, Chiều Ký Hiệu, `@gpu_kernel`, `DLPack`, `@nan_guard`) & `axc mcp`
+
+Mô-đun [`std/ai_engine.ax`](std/ai_engine.ax) cùng trình biên dịch Axon v7.0 giải quyết trực tiếp 6 nút thắt lớn nhất của hạ tầng AI/LLM hiện đại:
+
+1. **Quản lý VRAM 0-GC & `PagedKvCache` kiểu vLLM:** `VramArena` căn chỉnh 64-byte kết hợp bảng trang khối không liền kề `PagedKvCache` giúp mở rộng ngữ cảnh token mà không bao giờ phải `memcpy` lại lịch sử hội thoại.
+2. **Đa hình chiều Tensor ký hiệu (`[sym B, sym S, comptime D: usize]`):** Viết và biên dịch hàm `rmsnorm_2d[sym B, sym S]` đúng **1 lần duy nhất**, chạy mượt với mọi độ dài câu động (`S = 13`, `S = 127`, `S = 4096`) không cần JIT warm-up mà vẫn bắt lỗi lệch chiều ma trận lúc biên dịch (`E0602`).
+3. **Hạt nhân GPU tách lịch trình (`@gpu_kernel`, `@tile`, `@pipeline_stages`):** Xuất trực tiếp mã nhị phân Khronos `SPIR-V 1.6` (`.spv`) và NVIDIA `PTX 8.0` (`.ptx`) qua `--target spirv`, `--target ptx` hoặc `--emit-gpu`.
+4. **Phân tán đa GPU SPMD tuyến tính (`ShardedTensor` + `all_reduce_sum(move ...)`):** Quy tắc sở hữu tuyến tính Perceus buộc tiêu thụ bản phân mảnh cục bộ khi gọi `all_reduce_sum(move shard)`, loại bỏ tận gốc lỗi đọc nhầm gradient chưa đồng bộ.
+5. **Cầu nối Python `DLPack` Zero-Copy (`--shared` + `@py_export`):** Biên dịch trực tiếp ra `.dll`/`.pyd` đọc thẳng con trỏ `DLTensor` từ Python/PyTorch/NumPy với **0 byte sao chép**.
+6. **Bẫy phần cứng `@nan_guard` & Rút gọn tất định `det_sum_f32_ptr`:** Tự động kiểm tra số mũ IEEE-754 `0x7FF` sau mỗi phép toán dấu phẩy động, dừng ngay tại đúng dòng lệnh sinh `NaN`/`Inf` (`exit 254`), và cộng cây từng cặp cố định bất biến theo số luồng.
+
+### Tối ưu tuyệt đối cho AI Coding Agents (`axc check --json` & `axc mcp`)
+- Kiểm tra toàn bộ cú pháp, kiểu, Perceus, Taint, `@no_alloc` và chiều Tensor chỉ trong **~0.44 mili-giây** dưới dạng JSON cấu trúc:
+  `axc check --json app.ax`
+- Khởi chạy máy chủ giao thức chuẩn **Model Context Protocol (JSON-RPC 2.0 qua stdio)** tích hợp sẵn trong `axc` cùng đặc tả ngữ pháp siêu gọn [`AXON_LLM_SPEC.md`](AXON_LLM_SPEC.md):
+  `axc mcp`

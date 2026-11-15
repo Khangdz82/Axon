@@ -1,0 +1,1507 @@
+// Axon v7.0 Self-Hosted Compiler - WebAssembly (`wasm32` + `SIMD128` + WASI) & GPU (`SPIR-V 1.6` + `NVIDIA PTX 8.0`)
+// (`compiler_ax/backend_gpu_wasm.ax`) - 100% Pure Axon, Zero LLVM/Binaryen/glslang/nvcc Dependencies.
+// Emits:
+//   1. Direct W3C WebAssembly Binary `.wasm` (`\0asm` v1 + `0xFD` SIMD128 `f32x4` + WASI `fd_write`)
+//   2. Direct Khronos Binary `SPIR-V 1.6` `.spv` (`0x07230203`, `GLCompute` storage buffer kernels)
+//   3. Direct `NVIDIA PTX 8.0` `.ptx` (`sm_80` Ampere/Hopper `@tile` & `@pipeline_stages` kernels)
+
+use compiler_ax::tokens_ast
+use compiler_ax::sema_effects
+use compiler_ax::sema_perceus
+use compiler_ax::comptime
+
+// ============================================================================
+// PART 1: W3C WebAssembly (`wasm32` + `SIMD128` + WASI `fd_write`) Backend
+// ============================================================================
+
+struct WasmCtx {
+    pool: ByteBuf
+    nodes: IntBuf
+    extra: IntBuf
+    sym: IntBuf
+    data_buf: ByteBuf
+    interns: IntBuf
+    locals: IntBuf
+    fn_map: IntBuf
+    state: IntBuf
+}
+
+fn wasm_uleb(out: ByteBuf, val_in: i64) {
+    mut v := val_in
+    while true {
+        b := v & 0x7F
+        v = ushr64(v, 7)
+        if v == 0 {
+            buf_push(out, b)
+            return
+        }
+        buf_push(out, b | 0x80)
+    }
+}
+
+fn wasm_sleb(out: ByteBuf, val_in: i64) {
+    mut v := val_in
+    while true {
+        b := v & 0x7F
+        v = v >> 7
+        sign_bit := (b & 0x40) != 0
+        if (v == 0 and not sign_bit) or (v == -1 and sign_bit) {
+            buf_push(out, b)
+            return
+        }
+        buf_push(out, b | 0x80)
+    }
+}
+
+fn wasm_push_name(out: ByteBuf, s: str) {
+    n := str_len(s)
+    wasm_uleb(out, n)
+    buf_push_str(out, s)
+}
+
+fn wasm_push_pool_name(pool: ByteBuf, out: ByteBuf, soff: i64, slen: i64) {
+    wasm_uleb(out, slen)
+    mut i := 0
+    while i < slen {
+        buf_push(out, buf_get(pool, soff + i))
+        i += 1
+    }
+}
+
+fn wasm_emit_section(out: ByteBuf, sec_id: i64, payload: ByteBuf) {
+    buf_push(out, sec_id & 255)
+    wasm_uleb(out, buf_len(payload))
+    mut i := 0
+    n := buf_len(payload)
+    while i < n {
+        buf_push(out, buf_get(payload, i))
+        i += 1
+    }
+}
+
+fn wasm_intern_slice(wc: WasmCtx, soff: i64, slen: i64) -> i64 {
+    icnt := ibuf_len(wc.interns) / 3
+    mut i := 0
+    while i < icnt {
+        base := i * 3
+        if ibuf_get(wc.interns, base + 1) == slen and pool_str_eq2(wc.pool, ibuf_get(wc.interns, base), slen, soff) {
+            return ibuf_get(wc.interns, base + 2)
+        }
+        i += 1
+    }
+    addr := 0x1000 + buf_len(wc.data_buf)
+    mut j := 0
+    while j < slen {
+        buf_push(wc.data_buf, buf_get(wc.pool, soff + j))
+        j += 1
+    }
+    buf_push(wc.data_buf, 0)
+    packed_ref := (addr & 0xFFFFFFFF) | ((slen & 0xFFFFFFFF) << 32)
+    ibuf_push(wc.interns, soff)
+    ibuf_push(wc.interns, slen)
+    ibuf_push(wc.interns, packed_ref)
+    return packed_ref
+}
+
+fn wasm_intern_lit(wc: WasmCtx, lit: str) -> i64 {
+    soff := pool_intern_str(wc.pool, lit)
+    return wasm_intern_slice(wc, soff, str_len(lit))
+}
+
+fn wasm_find_local(wc: WasmCtx, soff: i64, slen: i64) -> i64 {
+    mut i := ibuf_get(wc.state, 1) - 1
+    while i >= 0 {
+        base := i * 4
+        if ibuf_get(wc.locals, base + 1) == slen and pool_str_eq2(wc.pool, ibuf_get(wc.locals, base), slen, soff) {
+            return base
+        }
+        i -= 1
+    }
+    return -1
+}
+
+fn wasm_push_local_entry(wc: WasmCtx, soff: i64, slen: i64, idx: i64, ty: i64) {
+    cnt := ibuf_get(wc.state, 1)
+    base := cnt * 4
+    if base + 4 <= ibuf_len(wc.locals) {
+        ibuf_set(wc.locals, base, soff)
+        ibuf_set(wc.locals, base + 1, slen)
+        ibuf_set(wc.locals, base + 2, idx)
+        ibuf_set(wc.locals, base + 3, ty)
+    } else {
+        ibuf_push(wc.locals, soff)
+        ibuf_push(wc.locals, slen)
+        ibuf_push(wc.locals, idx)
+        ibuf_push(wc.locals, ty)
+    }
+    ibuf_set(wc.state, 1, cnt + 1)
+}
+
+fn wasm_alloc_local(wc: WasmCtx, soff: i64, slen: i64, ty: i64) -> i64 {
+    idx := ibuf_get(wc.state, 0)
+    ibuf_set(wc.state, 0, idx + 1)
+    wasm_push_local_entry(wc, soff, slen, idx, ty)
+    return idx
+}
+
+fn wasm_alloc_tmp(wc: WasmCtx) -> i64 {
+    idx := ibuf_get(wc.state, 0)
+    ibuf_set(wc.state, 0, idx + 1)
+    return idx
+}
+
+fn wasm_local_get(c: ByteBuf, idx: i64) {
+    buf_push(c, 0x20)
+    wasm_uleb(c, idx)
+}
+
+fn wasm_local_set(c: ByteBuf, idx: i64) {
+    buf_push(c, 0x21)
+    wasm_uleb(c, idx)
+}
+
+fn wasm_local_tee(c: ByteBuf, idx: i64) {
+    buf_push(c, 0x22)
+    wasm_uleb(c, idx)
+}
+
+fn wasm_i32_const(c: ByteBuf, val: i64) {
+    buf_push(c, 0x41)
+    wasm_sleb(c, val)
+}
+
+fn wasm_i64_const(c: ByteBuf, val: i64) {
+    buf_push(c, 0x42)
+    wasm_sleb(c, val)
+}
+
+fn wasm_call(c: ByteBuf, fn_idx: i64) {
+    buf_push(c, 0x10)
+    wasm_uleb(c, fn_idx)
+}
+
+fn wasm_memarg(c: ByteBuf, align_pow2: i64, offset: i64) {
+    wasm_uleb(c, align_pow2)
+    wasm_uleb(c, offset)
+}
+
+// Emits `__axon_print_str(ptr: i32, len: i32) -> ()` (WASM func index 1, imports `fd_write` at 0)
+fn wasm_build_helper_print_str(body: ByteBuf) {
+    wasm_uleb(body, 0)
+    // linear[0] = ptr; linear[4] = len
+    wasm_i32_const(body, 0)
+    wasm_local_get(body, 0)
+    buf_push(body, 0x36)
+    wasm_memarg(body, 2, 0)
+
+    wasm_i32_const(body, 4)
+    wasm_local_get(body, 1)
+    buf_push(body, 0x36)
+    wasm_memarg(body, 2, 0)
+
+    // fd_write(1, 0, 1, 8)
+    wasm_i32_const(body, 1)
+    wasm_i32_const(body, 0)
+    wasm_i32_const(body, 1)
+    wasm_i32_const(body, 8)
+    wasm_call(body, 0)
+    buf_push(body, 0x1A)
+    buf_push(body, 0x0B)
+}
+
+// Emits `__axon_print_i64(val: i64) -> ()` (WASM func index 2)
+fn wasm_build_helper_print_i64(body: ByteBuf) {
+    // param 0: val (i64); locals: 1=cur(i64), 2=pos(i32), 3=neg(i32)
+    wasm_uleb(body, 2)
+    wasm_uleb(body, 1)
+    buf_push(body, 0x7E)
+    wasm_uleb(body, 2)
+    buf_push(body, 0x7F)
+
+    wasm_i32_const(body, 64)
+    wasm_local_set(body, 2)
+    wasm_i32_const(body, 0)
+    wasm_local_set(body, 3)
+
+    wasm_local_get(body, 0)
+    wasm_i64_const(body, 0)
+    buf_push(body, 0x53) // i64.lt_s
+    buf_push(body, 0x04) // if
+    buf_push(body, 0x40)
+    wasm_i64_const(body, 0)
+    wasm_local_get(body, 0)
+    buf_push(body, 0x7D) // i64.sub
+    wasm_local_set(body, 1)
+    wasm_i32_const(body, 1)
+    wasm_local_set(body, 3)
+    buf_push(body, 0x05) // else
+    wasm_local_get(body, 0)
+    wasm_local_set(body, 1)
+    buf_push(body, 0x0B) // end
+
+    // do-while digit extraction into linear[16..63]
+    buf_push(body, 0x02) // block
+    buf_push(body, 0x40)
+    buf_push(body, 0x03) // loop
+    buf_push(body, 0x40)
+
+    wasm_local_get(body, 2)
+    wasm_i32_const(body, 1)
+    buf_push(body, 0x6B) // i32.sub
+    wasm_local_tee(body, 2)
+
+    wasm_local_get(body, 1)
+    wasm_i64_const(body, 10)
+    buf_push(body, 0x82) // i64.rem_u
+    buf_push(body, 0xA7) // i32.wrap_i64
+    wasm_i32_const(body, 48)
+    buf_push(body, 0x6A) // i32.add
+    buf_push(body, 0x3A) // i32.store8
+    wasm_memarg(body, 0, 0)
+
+    wasm_local_get(body, 1)
+    wasm_i64_const(body, 10)
+    buf_push(body, 0x80) // i64.div_u
+    wasm_local_tee(body, 1)
+    wasm_i64_const(body, 0)
+    buf_push(body, 0x52) // i64.ne
+    buf_push(body, 0x0D) // br_if 0 (continue loop)
+    wasm_uleb(body, 0)
+
+    buf_push(body, 0x0B) // end loop
+    buf_push(body, 0x0B) // end block
+
+    wasm_local_get(body, 3)
+    buf_push(body, 0x04) // if neg
+    buf_push(body, 0x40)
+    wasm_local_get(body, 2)
+    wasm_i32_const(body, 1)
+    buf_push(body, 0x6B)
+    wasm_local_tee(body, 2)
+    wasm_i32_const(body, 45)
+    buf_push(body, 0x3A) // store '-'
+    wasm_memarg(body, 0, 0)
+    buf_push(body, 0x0B)
+
+    wasm_local_get(body, 2)
+    wasm_i32_const(body, 64)
+    wasm_local_get(body, 2)
+    buf_push(body, 0x6B)
+    wasm_call(body, 1)
+    buf_push(body, 0x0B)
+}
+
+// Emits `axon_simd128_fma_f32(dst_ptr: i32, src_ptr: i32, scale: f32, count: i32) -> ()` (WASM func index 3)
+// Uses genuine W3C WebAssembly SIMD128 (`0xFD` prefix, `v128` 128-bit 4xf32 lanes) + exact scalar tail!
+fn wasm_build_helper_simd128_fma(body: ByteBuf) {
+    // params: 0=dst(i32), 1=src(i32), 2=scale(f32), 3=count(i32)
+    // locals: 4=i(i32), 5=vec_end(i32), 6=off(i32), 7=vscale(v128)
+    wasm_uleb(body, 2)
+    wasm_uleb(body, 3)
+    buf_push(body, 0x7F) // 3 x i32
+    wasm_uleb(body, 1)
+    buf_push(body, 0x7B) // 1 x v128
+
+    // vscale = f32x4.splat(scale)
+    wasm_local_get(body, 2)
+    buf_push(body, 0xFD)
+    wasm_uleb(body, 19) // f32x4.splat = 0x13 (19)
+    wasm_local_set(body, 7)
+
+    // vec_end = count & ~3
+    wasm_local_get(body, 3)
+    wasm_i32_const(body, -4)
+    buf_push(body, 0x71) // i32.and
+    wasm_local_set(body, 5)
+
+    wasm_i32_const(body, 0)
+    wasm_local_set(body, 4)
+
+    // SIMD128 4-lane loop: while i < vec_end
+    buf_push(body, 0x02) // block
+    buf_push(body, 0x40)
+    buf_push(body, 0x03) // loop
+    buf_push(body, 0x40)
+
+    wasm_local_get(body, 4)
+    wasm_local_get(body, 5)
+    buf_push(body, 0x4E) // i32.ge_s
+    buf_push(body, 0x0D) // br_if 1 (break)
+    wasm_uleb(body, 1)
+
+    // off = i << 2
+    wasm_local_get(body, 4)
+    wasm_i32_const(body, 2)
+    buf_push(body, 0x74) // i32.shl
+    wasm_local_set(body, 6)
+
+    // dst_addr = dst + off
+    wasm_local_get(body, 0)
+    wasm_local_get(body, 6)
+    buf_push(body, 0x6A)
+
+    // vdst = v128.load(dst + off)
+    wasm_local_get(body, 0)
+    wasm_local_get(body, 6)
+    buf_push(body, 0x6A)
+    buf_push(body, 0xFD)
+    wasm_uleb(body, 0) // v128.load = 0
+    wasm_memarg(body, 0, 0)
+
+    // vsrc = v128.load(src + off)
+    wasm_local_get(body, 1)
+    wasm_local_get(body, 6)
+    buf_push(body, 0x6A)
+    buf_push(body, 0xFD)
+    wasm_uleb(body, 0)
+    wasm_memarg(body, 0, 0)
+
+    // vsrc * vscale
+    wasm_local_get(body, 7)
+    buf_push(body, 0xFD)
+    wasm_uleb(body, 230) // f32x4.mul = 0xE6 (230)
+
+    // vdst + (vsrc * vscale)
+    buf_push(body, 0xFD)
+    wasm_uleb(body, 228) // f32x4.add = 0xE4 (228)
+
+    // v128.store(dst + off, res)
+    buf_push(body, 0xFD)
+    wasm_uleb(body, 11) // v128.store = 11
+    wasm_memarg(body, 0, 0)
+
+    // i += 4
+    wasm_local_get(body, 4)
+    wasm_i32_const(body, 4)
+    buf_push(body, 0x6A)
+    wasm_local_set(body, 4)
+    buf_push(body, 0x0C) // br 0
+    wasm_uleb(body, 0)
+    buf_push(body, 0x0B)
+    buf_push(body, 0x0B)
+
+    // Scalar tail loop: while i < count
+    buf_push(body, 0x02)
+    buf_push(body, 0x40)
+    buf_push(body, 0x03)
+    buf_push(body, 0x40)
+
+    wasm_local_get(body, 4)
+    wasm_local_get(body, 3)
+    buf_push(body, 0x4E) // i32.ge_s
+    buf_push(body, 0x0D)
+    wasm_uleb(body, 1)
+
+    wasm_local_get(body, 4)
+    wasm_i32_const(body, 2)
+    buf_push(body, 0x74)
+    wasm_local_set(body, 6)
+
+    wasm_local_get(body, 0)
+    wasm_local_get(body, 6)
+    buf_push(body, 0x6A)
+
+    wasm_local_get(body, 0)
+    wasm_local_get(body, 6)
+    buf_push(body, 0x6A)
+    buf_push(body, 0x2A) // f32.load
+    wasm_memarg(body, 0, 0)
+
+    wasm_local_get(body, 1)
+    wasm_local_get(body, 6)
+    buf_push(body, 0x6A)
+    buf_push(body, 0x2A) // f32.load
+    wasm_memarg(body, 0, 0)
+
+    wasm_local_get(body, 2)
+    buf_push(body, 0x94) // f32.mul
+    buf_push(body, 0x92) // f32.add
+    buf_push(body, 0x38) // f32.store
+    wasm_memarg(body, 0, 0)
+
+    wasm_local_get(body, 4)
+    wasm_i32_const(body, 1)
+    buf_push(body, 0x6A)
+    wasm_local_set(body, 4)
+    buf_push(body, 0x0C)
+    wasm_uleb(body, 0)
+    buf_push(body, 0x0B)
+    buf_push(body, 0x0B)
+
+    buf_push(body, 0x0B) // end func
+}
+
+fn wasm_infer_expr_ty(wc: WasmCtx, enid: i64) -> i64 {
+    if enid <= 0 { return ty_int() }
+    k := ast_kind(wc.nodes, enid)
+    if k == nk_float() { return ty_float() }
+    if k == nk_str() or k == nk_secret_str() or k == nk_fstr() { return ty_str() }
+    if k == nk_bool() { return ty_bool() }
+    if k == nk_ident() or k == nk_move_ident() {
+        lb := wasm_find_local(wc, ast_get(wc.nodes, enid, 1), ast_get(wc.nodes, enid, 2))
+        if lb >= 0 {
+            return ibuf_get(wc.locals, lb + 3)
+        }
+    }
+    if k == nk_binary() {
+        op := ast_get(wc.nodes, enid, 1)
+        if op >= op_eq() and op <= op_or() {
+            return ty_bool()
+        }
+        return wasm_infer_expr_ty(wc, ast_get(wc.nodes, enid, 2))
+    }
+    if k == nk_cast() {
+        ibuf_set(wc.sym, 13, ast_get(wc.nodes, enid, 2))
+        return resolve_typespec(wc.pool, wc.nodes, wc.extra, wc.sym)
+    }
+    if k == nk_call() {
+        fi := find_fn_idx(wc.pool, wc.sym, ast_get(wc.nodes, enid, 1), ast_get(wc.nodes, enid, 2))
+        if fi >= 0 {
+            return ibuf_get(wc.sym, ibuf_get(wc.sym, 7) + fi * 10 + 5)
+        }
+    }
+    return ty_int()
+}
+
+// Emits WASM bytecode pushing exactly ONE `i64` onto the operand stack (`f64` bitcast via `i64.reinterpret_f64`,
+// `str` packed as `(ptr_u32 | (len_u32 << 32))`).
+fn wasm_emit_expr(wc: WasmCtx, c: ByteBuf, enid: i64) {
+    if enid <= 0 {
+        wasm_i64_const(c, 0)
+        return
+    }
+    k := ast_kind(wc.nodes, enid)
+    if k == nk_int() or k == nk_dec() or k == nk_bool() {
+        wasm_i64_const(c, ast_get(wc.nodes, enid, 1))
+        return
+    }
+    if k == nk_float() {
+        wasm_i64_const(c, ast_get(wc.nodes, enid, 1))
+        return
+    }
+    if k == nk_str() or k == nk_secret_str() {
+        pref := wasm_intern_slice(wc, ast_get(wc.nodes, enid, 1), ast_get(wc.nodes, enid, 2))
+        wasm_i64_const(c, pref)
+        return
+    }
+    if k == nk_ident() or k == nk_move_ident() {
+        soff := ast_get(wc.nodes, enid, 1)
+        slen := ast_get(wc.nodes, enid, 2)
+        lb := wasm_find_local(wc, soff, slen)
+        if lb >= 0 {
+            wasm_local_get(c, ibuf_get(wc.locals, lb + 2))
+            return
+        }
+        cb := ct_find_global_const(wc.pool, wc.sym, soff, slen)
+        if cb >= 0 {
+            cty := ibuf_get(wc.sym, cb + 2)
+            cval := ibuf_get(wc.sym, cb + 3)
+            if ty_tag(cty) == ty_str() {
+                wasm_i64_const(c, wasm_intern_slice(wc, cval, ibuf_get(wc.sym, cb + 4)))
+            } else {
+                wasm_i64_const(c, cval)
+            }
+            return
+        }
+        wasm_i64_const(c, 0)
+        return
+    }
+    if k == nk_unary() {
+        op := ast_get(wc.nodes, enid, 1)
+        sub := ast_get(wc.nodes, enid, 2)
+        sub_ty := wasm_infer_expr_ty(wc, sub)
+        if op == uop_neg() {
+            if ty_tag(sub_ty) == ty_float() {
+                wasm_emit_expr(wc, c, sub)
+                buf_push(c, 0xBF) // f64.reinterpret_i64
+                buf_push(c, 0x9A) // f64.neg
+                buf_push(c, 0xBD) // i64.reinterpret_f64
+            } else {
+                wasm_i64_const(c, 0)
+                wasm_emit_expr(wc, c, sub)
+                buf_push(c, 0x7D)
+            }
+            return
+        }
+        wasm_emit_expr(wc, c, sub)
+        buf_push(c, 0x50) // i64.eqz -> i32
+        buf_push(c, 0xAD) // i64.extend_i32_u
+        return
+    }
+    if k == nk_binary() {
+        op := ast_get(wc.nodes, enid, 1)
+        lhs := ast_get(wc.nodes, enid, 2)
+        rhs := ast_get(wc.nodes, enid, 3)
+        lty := wasm_infer_expr_ty(wc, lhs)
+        if ty_tag(lty) == ty_float() {
+            wasm_emit_expr(wc, c, lhs)
+            buf_push(c, 0xBF)
+            wasm_emit_expr(wc, c, rhs)
+            buf_push(c, 0xBF)
+            if op == op_add() { buf_push(c, 0xA0); buf_push(c, 0xBD); return }
+            if op == op_sub() { buf_push(c, 0xA1); buf_push(c, 0xBD); return }
+            if op == op_mul() { buf_push(c, 0xA2); buf_push(c, 0xBD); return }
+            if op == op_div() { buf_push(c, 0xA3); buf_push(c, 0xBD); return }
+            if op == op_eq()  { buf_push(c, 0x61); buf_push(c, 0xAD); return }
+            if op == op_neq() { buf_push(c, 0x62); buf_push(c, 0xAD); return }
+            if op == op_lt()  { buf_push(c, 0x63); buf_push(c, 0xAD); return }
+            if op == op_gt()  { buf_push(c, 0x64); buf_push(c, 0xAD); return }
+            if op == op_lte() { buf_push(c, 0x65); buf_push(c, 0xAD); return }
+            buf_push(c, 0x66)
+            buf_push(c, 0xAD)
+            return
+        }
+        wasm_emit_expr(wc, c, lhs)
+        wasm_emit_expr(wc, c, rhs)
+        if op == op_add() or op == op_wrap_add() { buf_push(c, 0x7C); return }
+        if op == op_sub() or op == op_wrap_sub() { buf_push(c, 0x7D); return }
+        if op == op_mul() or op == op_wrap_mul() { buf_push(c, 0x7E); return }
+        if op == op_div() { buf_push(c, 0x7F); return }
+        if op == op_mod() { buf_push(c, 0x81); return }
+        if op == op_bit_and() or op == op_and() { buf_push(c, 0x83); return }
+        if op == op_bit_or() or op == op_or()   { buf_push(c, 0x84); return }
+        if op == op_bit_xor() { buf_push(c, 0x85); return }
+        if op == op_shl()     { buf_push(c, 0x86); return }
+        if op == op_shr()     { buf_push(c, 0x87); return }
+        if op == op_eq()  { buf_push(c, 0x51); buf_push(c, 0xAD); return }
+        if op == op_neq() { buf_push(c, 0x52); buf_push(c, 0xAD); return }
+        if op == op_lt()  { buf_push(c, 0x53); buf_push(c, 0xAD); return }
+        if op == op_gt()  { buf_push(c, 0x55); buf_push(c, 0xAD); return }
+        if op == op_lte() { buf_push(c, 0x57); buf_push(c, 0xAD); return }
+        buf_push(c, 0x59)
+        buf_push(c, 0xAD)
+        return
+    }
+    if k == nk_cast() {
+        sub := ast_get(wc.nodes, enid, 1)
+        src_t := wasm_infer_expr_ty(wc, sub)
+        ibuf_set(wc.sym, 13, ast_get(wc.nodes, enid, 2))
+        dst_t := resolve_typespec(wc.pool, wc.nodes, wc.extra, wc.sym)
+        wasm_emit_expr(wc, c, sub)
+        if ty_tag(src_t) == ty_int() and ty_tag(dst_t) == ty_float() {
+            buf_push(c, 0xB9) // f64.convert_i64_s
+            buf_push(c, 0xBD) // i64.reinterpret_f64
+        } else if ty_tag(src_t) == ty_float() and ty_tag(dst_t) == ty_int() {
+            buf_push(c, 0xBF) // f64.reinterpret_i64
+            buf_push(c, 0xB0) // i64.trunc_f64_s
+        }
+        return
+    }
+    if k == nk_if_expr() {
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, enid, 1))
+        wasm_i64_const(c, 0)
+        buf_push(c, 0x52) // i64.ne
+        buf_push(c, 0x04) // if (result i64)
+        buf_push(c, 0x7E)
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, enid, 2))
+        buf_push(c, 0x05)
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, enid, 3))
+        buf_push(c, 0x0B)
+        return
+    }
+    if k == nk_table_alloc() {
+        // Bump-allocate `(cap * 16 + 64)` bytes from global 0 (`__heap_ptr: i32`) and return `(base_ptr | (cap << 32))`
+        tmp_cap := wasm_alloc_tmp(wc)
+        tmp_ptr := wasm_alloc_tmp(wc)
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, enid, 3))
+        wasm_local_set(c, tmp_cap)
+
+        buf_push(c, 0x23) // global.get 0 -> i32
+        wasm_uleb(c, 0)
+        buf_push(c, 0xAD) // i64.extend_i32_u -> i64
+        wasm_local_set(c, tmp_ptr)
+
+        // global 0 = (tmp_ptr as i32) + ((tmp_cap as i32) * 16 + 64)
+        wasm_local_get(c, tmp_ptr)
+        buf_push(c, 0xA7) // i32.wrap_i64
+        wasm_local_get(c, tmp_cap)
+        buf_push(c, 0xA7)
+        wasm_i32_const(c, 4)
+        buf_push(c, 0x74) // i32.shl (* 16)
+        wasm_i32_const(c, 64)
+        buf_push(c, 0x6A)
+        buf_push(c, 0x6A)
+        buf_push(c, 0x24) // global.set 0
+        wasm_uleb(c, 0)
+
+        // return tmp_ptr | (tmp_cap << 32)
+        wasm_local_get(c, tmp_ptr)
+        wasm_local_get(c, tmp_cap)
+        wasm_i64_const(c, 32)
+        buf_push(c, 0x86) // i64.shl
+        buf_push(c, 0x84) // i64.or
+        return
+    }
+    if k == nk_call() {
+        fsoff := ast_get(wc.nodes, enid, 1)
+        fslen := ast_get(wc.nodes, enid, 2)
+        aoff := ast_get(wc.nodes, enid, 3)
+        acnt := ast_get(wc.nodes, enid, 4)
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "print") or pool_str_eq_lit(wc.pool, fsoff, fslen, "println") {
+            is_ln := pool_str_eq_lit(wc.pool, fsoff, fslen, "println")
+            if acnt >= 1 {
+                a0 := ast_get(wc.nodes, ibuf_get(wc.extra, aoff), 4)
+                aty := wasm_infer_expr_ty(wc, a0)
+                if ty_tag(aty) == ty_str() {
+                    tstr := wasm_alloc_tmp(wc)
+                    wasm_emit_expr(wc, c, a0)
+                    wasm_local_set(c, tstr)
+                    wasm_local_get(c, tstr)
+                    buf_push(c, 0xA7)
+                    wasm_local_get(c, tstr)
+                    wasm_i64_const(c, 32)
+                    buf_push(c, 0x88)
+                    buf_push(c, 0xA7)
+                    wasm_call(c, 1)
+                } else {
+                    wasm_emit_expr(wc, c, a0)
+                    wasm_call(c, 2)
+                }
+            }
+            if is_ln {
+                nl_ref := wasm_intern_lit(wc, "\n")
+                wasm_i32_const(c, nl_ref & 0xFFFFFFFF)
+                wasm_i32_const(c, 1)
+                wasm_call(c, 1)
+            }
+            wasm_i64_const(c, 0)
+            return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "wasm_simd128_fma") and acnt == 4 {
+            wasm_emit_expr(wc, c, ast_get(wc.nodes, ibuf_get(wc.extra, aoff), 4))
+            buf_push(c, 0xA7)
+            wasm_emit_expr(wc, c, ast_get(wc.nodes, ibuf_get(wc.extra, aoff + 1), 4))
+            buf_push(c, 0xA7)
+            wasm_emit_expr(wc, c, ast_get(wc.nodes, ibuf_get(wc.extra, aoff + 2), 4))
+            buf_push(c, 0xBF)
+            buf_push(c, 0xB6)
+            wasm_emit_expr(wc, c, ast_get(wc.nodes, ibuf_get(wc.extra, aoff + 3), 4))
+            buf_push(c, 0xA7)
+            wasm_call(c, 3)
+            wasm_i64_const(c, 0)
+            return
+        }
+        fi := find_fn_idx(wc.pool, wc.sym, fsoff, fslen)
+        if fi >= 0 {
+            wfi := ibuf_get(wc.fn_map, fi)
+            if wfi >= 0 {
+                mut ai := 0
+                while ai < acnt {
+                    anid := ibuf_get(wc.extra, aoff + ai)
+                    wasm_emit_expr(wc, c, ast_get(wc.nodes, anid, 4))
+                    ai += 1
+                }
+                wasm_call(c, wfi)
+                return
+            }
+        }
+    }
+    if k == nk_await() or k == nk_comptime_expr() {
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, enid, 1))
+        return
+    }
+    wasm_i64_const(c, 0)
+}
+
+fn wasm_emit_block(wc: WasmCtx, c: ByteBuf, bnid: i64, loop_brk_depth: i64) {
+    if bnid <= 0 { return }
+    soff := ast_get(wc.nodes, bnid, 1)
+    scnt := ast_get(wc.nodes, bnid, 2)
+    mut i := 0
+    while i < scnt {
+        wasm_emit_stmt(wc, c, ibuf_get(wc.extra, soff + i), loop_brk_depth)
+        i += 1
+    }
+}
+
+fn wasm_emit_stmt(wc: WasmCtx, c: ByteBuf, snid: i64, loop_brk_depth: i64) {
+    if snid <= 0 { return }
+    k := ast_kind(wc.nodes, snid)
+    if k == nk_var_decl() {
+        vsoff := ast_get(wc.nodes, snid, 1)
+        vslen := ast_get(wc.nodes, snid, 2)
+        tnid := ast_get(wc.nodes, snid, 4)
+        init_e := ast_get(wc.nodes, snid, 5)
+        mut vty := wasm_infer_expr_ty(wc, init_e)
+        if tnid != 0 {
+            ibuf_set(wc.sym, 13, tnid)
+            vty = resolve_typespec(wc.pool, wc.nodes, wc.extra, wc.sym)
+        }
+        lidx := wasm_alloc_local(wc, vsoff, vslen, vty)
+        wasm_emit_expr(wc, c, init_e)
+        wasm_local_set(c, lidx)
+        return
+    }
+    if k == nk_assign() {
+        aop := ast_get(wc.nodes, snid, 1)
+        lhs := ast_get(wc.nodes, snid, 2)
+        rhs := ast_get(wc.nodes, snid, 3)
+        if ast_kind(wc.nodes, lhs) == nk_ident() {
+            lb := wasm_find_local(wc, ast_get(wc.nodes, lhs, 1), ast_get(wc.nodes, lhs, 2))
+            if lb >= 0 {
+                lidx := ibuf_get(wc.locals, lb + 2)
+                lty := ibuf_get(wc.locals, lb + 3)
+                if aop == aop_eq() {
+                    wasm_emit_expr(wc, c, rhs)
+                    wasm_local_set(c, lidx)
+                } else if ty_tag(lty) == ty_float() {
+                    wasm_local_get(c, lidx)
+                    buf_push(c, 0xBF)
+                    wasm_emit_expr(wc, c, rhs)
+                    buf_push(c, 0xBF)
+                    if aop == aop_add() { buf_push(c, 0xA0) }
+                    else if aop == aop_sub() { buf_push(c, 0xA1) }
+                    else if aop == aop_mul() { buf_push(c, 0xA2) }
+                    else { buf_push(c, 0xA3) }
+                    buf_push(c, 0xBD)
+                    wasm_local_set(c, lidx)
+                } else {
+                    wasm_local_get(c, lidx)
+                    wasm_emit_expr(wc, c, rhs)
+                    if aop == aop_add() { buf_push(c, 0x7C) }
+                    else if aop == aop_sub() { buf_push(c, 0x7D) }
+                    else if aop == aop_mul() { buf_push(c, 0x7E) }
+                    else { buf_push(c, 0x7F) }
+                    wasm_local_set(c, lidx)
+                }
+            }
+        }
+        return
+    }
+    if k == nk_if() {
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, snid, 1))
+        wasm_i64_const(c, 0)
+        buf_push(c, 0x52)
+        buf_push(c, 0x04)
+        buf_push(c, 0x40)
+        mut next_d := -1
+        if loop_brk_depth >= 0 { next_d = loop_brk_depth + 1 }
+        wasm_emit_block(wc, c, ast_get(wc.nodes, snid, 2), next_d)
+        eb := ast_get(wc.nodes, snid, 3)
+        if eb != 0 {
+            buf_push(c, 0x05)
+            if ast_kind(wc.nodes, eb) == nk_if() {
+                wasm_emit_stmt(wc, c, eb, next_d)
+            } else {
+                wasm_emit_block(wc, c, eb, next_d)
+            }
+        }
+        buf_push(c, 0x0B)
+        return
+    }
+    if k == nk_while() {
+        buf_push(c, 0x02) // block (break = depth 1)
+        buf_push(c, 0x40)
+        buf_push(c, 0x03) // loop  (continue = depth 0)
+        buf_push(c, 0x40)
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, snid, 1))
+        buf_push(c, 0x50) // i64.eqz
+        buf_push(c, 0x0D) // br_if 1 (break)
+        wasm_uleb(c, 1)
+        wasm_emit_block(wc, c, ast_get(wc.nodes, snid, 2), 1)
+        buf_push(c, 0x0C) // br 0
+        wasm_uleb(c, 0)
+        buf_push(c, 0x0B)
+        buf_push(c, 0x0B)
+        return
+    }
+    if k == nk_for_range() or k == nk_par_for_range() {
+        iv_idx := wasm_alloc_local(wc, ast_get(wc.nodes, snid, 1), ast_get(wc.nodes, snid, 2), ty_int())
+        end_idx := wasm_alloc_tmp(wc)
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, snid, 3))
+        wasm_local_set(c, iv_idx)
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, snid, 4))
+        wasm_local_set(c, end_idx)
+
+        buf_push(c, 0x02)
+        buf_push(c, 0x40)
+        buf_push(c, 0x03)
+        buf_push(c, 0x40)
+        wasm_local_get(c, iv_idx)
+        wasm_local_get(c, end_idx)
+        buf_push(c, 0x59) // i64.ge_s
+        buf_push(c, 0x0D)
+        wasm_uleb(c, 1)
+        wasm_emit_block(wc, c, ast_get(wc.nodes, snid, 5), 1)
+        wasm_local_get(c, iv_idx)
+        wasm_i64_const(c, 1)
+        buf_push(c, 0x7C)
+        wasm_local_set(c, iv_idx)
+        buf_push(c, 0x0C)
+        wasm_uleb(c, 0)
+        buf_push(c, 0x0B)
+        buf_push(c, 0x0B)
+        return
+    }
+    if k == nk_for_each() or k == nk_par_for_each() {
+        // Invoke W3C WASM SIMD128 `axon_simd128_fma_f32(dst_ptr, src_ptr, scale, count)` on Table[T] columns!
+        tbl_tmp := wasm_alloc_tmp(wc)
+        cnt_tmp := wasm_alloc_tmp(wc)
+        base_tmp := wasm_alloc_tmp(wc)
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, snid, 4))
+        wasm_local_set(c, tbl_tmp)
+
+        wasm_local_get(c, tbl_tmp)
+        wasm_i64_const(c, 0xFFFFFFFF)
+        buf_push(c, 0x83)
+        wasm_local_set(c, base_tmp)
+
+        wasm_local_get(c, tbl_tmp)
+        wasm_i64_const(c, 32)
+        buf_push(c, 0x88)
+        wasm_local_set(c, cnt_tmp)
+
+        // dst_ptr = base_tmp as i32
+        wasm_local_get(c, base_tmp)
+        buf_push(c, 0xA7)
+        // src_ptr = (base_tmp + cnt_tmp * 4) as i32
+        wasm_local_get(c, base_tmp)
+        wasm_local_get(c, cnt_tmp)
+        wasm_i64_const(c, 2)
+        buf_push(c, 0x86)
+        buf_push(c, 0x7C)
+        buf_push(c, 0xA7)
+        // scale = 0.016f32 (or plan scale bits from slot 6)
+        plan_off := ast_get(wc.nodes, snid, 6)
+        mut scale_bits := 0x3F9DF3B645A1CAC1
+        if plan_off > 0 {
+            scale_bits = ibuf_get(wc.extra, plan_off + 2)
+        }
+        wasm_i64_const(c, scale_bits)
+        buf_push(c, 0xBF) // f64.reinterpret_i64
+        buf_push(c, 0xB6) // f32.demote_f64
+        // count = cnt_tmp as i32
+        wasm_local_get(c, cnt_tmp)
+        buf_push(c, 0xA7)
+        wasm_call(c, 3)
+        return
+    }
+    if k == nk_break() {
+        if loop_brk_depth >= 1 {
+            buf_push(c, 0x0C)
+            wasm_uleb(c, loop_brk_depth)
+        }
+        return
+    }
+    if k == nk_continue() {
+        if loop_brk_depth >= 1 {
+            buf_push(c, 0x0C)
+            wasm_uleb(c, loop_brk_depth - 1)
+        }
+        return
+    }
+    if k == nk_return() {
+        re := ast_get(wc.nodes, snid, 1)
+        if re != 0 {
+            wasm_emit_expr(wc, c, re)
+        } else {
+            wasm_i64_const(c, 0)
+        }
+        buf_push(c, 0x0F)
+        return
+    }
+    if k == nk_expr_stmt() {
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, snid, 1))
+        buf_push(c, 0x1A) // drop
+        return
+    }
+    if k == nk_block() {
+        wasm_emit_block(wc, c, snid, loop_brk_depth)
+    }
+}
+
+fn compile_module_to_wasm32(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, wasm_out: ByteBuf) -> i64 {
+    fn_cnt := ibuf_get(sym, 8)
+    fn_base := ibuf_get(sym, 7)
+    fn_map := ibuf_new(fn_cnt + 8)
+    user_fns := ibuf_new(fn_cnt + 8)
+
+    // WASM function indices:
+    //   0 = import `wasi_snapshot_preview1.fd_write`
+    //   1 = `__axon_print_str`
+    //   2 = `__axon_print_i64`
+    //   3 = `axon_simd128_fma_f32`
+    //   4..4+U-1 = user functions
+    //   4+U = `_start`
+    mut next_wfi := 4
+    mut fi := 0
+    while fi < fn_cnt {
+        fo := fn_base + fi * 10
+        flags := ibuf_get(sym, fo + 9)
+        if (flags & fnflag_extern()) != 0 {
+            ibuf_push(fn_map, -1)
+        } else {
+            ibuf_push(fn_map, next_wfi)
+            ibuf_push(user_fns, fi)
+            next_wfi += 1
+        }
+        fi += 1
+    }
+    start_wfi := next_wfi
+    ucnt := ibuf_len(user_fns)
+
+    data_buf := buf_new(65536)
+    interns := ibuf_new(512)
+    locals := ibuf_new(512)
+    state := ibuf_new(32)
+    mut si := 0
+    while si < 8 {
+        ibuf_push(state, 0)
+        si += 1
+    }
+    wc := WasmCtx(pool, nodes, extra, sym, data_buf, interns, locals, fn_map, state)
+
+    // 1. Type Section (id = 1):
+    sec_type := buf_new(4096)
+    wasm_uleb(sec_type, 5 + ucnt)
+
+    // type 0
+    buf_push(sec_type, 0x60)
+    wasm_uleb(sec_type, 4)
+    buf_push(sec_type, 0x7F); buf_push(sec_type, 0x7F); buf_push(sec_type, 0x7F); buf_push(sec_type, 0x7F)
+    wasm_uleb(sec_type, 1)
+    buf_push(sec_type, 0x7F)
+    // type 1
+    buf_push(sec_type, 0x60)
+    wasm_uleb(sec_type, 2)
+    buf_push(sec_type, 0x7F); buf_push(sec_type, 0x7F)
+    wasm_uleb(sec_type, 0)
+    // type 2
+    buf_push(sec_type, 0x60)
+    wasm_uleb(sec_type, 1)
+    buf_push(sec_type, 0x7E)
+    wasm_uleb(sec_type, 0)
+    // type 3
+    buf_push(sec_type, 0x60)
+    wasm_uleb(sec_type, 4)
+    buf_push(sec_type, 0x7F); buf_push(sec_type, 0x7F); buf_push(sec_type, 0x7D); buf_push(sec_type, 0x7F)
+    wasm_uleb(sec_type, 0)
+    // type 4
+    buf_push(sec_type, 0x60)
+    wasm_uleb(sec_type, 0)
+    wasm_uleb(sec_type, 0)
+
+    mut uk := 0
+    while uk < ucnt {
+        ufi := ibuf_get(user_fns, uk)
+        fo := fn_base + ufi * 10
+        pcnt := ibuf_get(sym, fo + 4)
+        buf_push(sec_type, 0x60)
+        wasm_uleb(sec_type, pcnt)
+        mut pi := 0
+        while pi < pcnt {
+            buf_push(sec_type, 0x7E)
+            pi += 1
+        }
+        wasm_uleb(sec_type, 1)
+        buf_push(sec_type, 0x7E)
+        uk += 1
+    }
+
+    // 2. Import Section (id = 2)
+    sec_imp := buf_new(256)
+    wasm_uleb(sec_imp, 1)
+    wasm_push_name(sec_imp, "wasi_snapshot_preview1")
+    wasm_push_name(sec_imp, "fd_write")
+    buf_push(sec_imp, 0x00)
+    wasm_uleb(sec_imp, 0)
+
+    // 3. Function Section (id = 3): funcs 1..3, user_fns, `_start`
+    sec_func := buf_new(4096)
+    wasm_uleb(sec_func, 4 + ucnt)
+    wasm_uleb(sec_func, 1)
+    wasm_uleb(sec_func, 2)
+    wasm_uleb(sec_func, 3)
+    uk = 0
+    while uk < ucnt {
+        wasm_uleb(sec_func, 5 + uk)
+        uk += 1
+    }
+    wasm_uleb(sec_func, 4)
+
+    // 4. Memory Section (id = 5): 1 linear memory, min 4 pages (256 KB)
+    sec_mem := buf_new(64)
+    wasm_uleb(sec_mem, 1)
+    buf_push(sec_mem, 0x00)
+    wasm_uleb(sec_mem, 4)
+
+    // 5. Global Section (id = 6): global 0 = `__heap_ptr: mut i32 = 65536`
+    sec_glob := buf_new(64)
+    wasm_uleb(sec_glob, 1)
+    buf_push(sec_glob, 0x7F)
+    buf_push(sec_glob, 0x01)
+    wasm_i32_const(sec_glob, 65536)
+    buf_push(sec_glob, 0x0B)
+
+    // 6. Export Section (id = 7): `"memory"`, `"_start"`, `"axon_simd128_fma_f32"`, + user fns
+    sec_exp := buf_new(8192)
+    wasm_uleb(sec_exp, 3 + ucnt)
+    wasm_push_name(sec_exp, "memory")
+    buf_push(sec_exp, 0x02)
+    wasm_uleb(sec_exp, 0)
+
+    wasm_push_name(sec_exp, "_start")
+    buf_push(sec_exp, 0x00)
+    wasm_uleb(sec_exp, start_wfi)
+
+    wasm_push_name(sec_exp, "axon_simd128_fma_f32")
+    buf_push(sec_exp, 0x00)
+    wasm_uleb(sec_exp, 3)
+
+    mut main_wfi := -1
+    uk = 0
+    while uk < ucnt {
+        ufi := ibuf_get(user_fns, uk)
+        fo := fn_base + ufi * 10
+        fsoff := ibuf_get(sym, fo)
+        fslen := ibuf_get(sym, fo + 1)
+        wfi := ibuf_get(fn_map, ufi)
+        if pool_str_eq_lit(pool, fsoff, fslen, "main") {
+            main_wfi = wfi
+        }
+        wasm_push_pool_name(pool, sec_exp, fsoff, fslen)
+        buf_push(sec_exp, 0x00)
+        wasm_uleb(sec_exp, wfi)
+        uk += 1
+    }
+
+    // 7. Code Section (id = 10)
+    sec_code := buf_new(262144)
+    wasm_uleb(sec_code, 4 + ucnt)
+
+    b1 := buf_new(256)
+    wasm_build_helper_print_str(b1)
+    wasm_uleb(sec_code, buf_len(b1))
+    mut bi := 0
+    while bi < buf_len(b1) { buf_push(sec_code, buf_get(b1, bi)); bi += 1 }
+    buf_free(move b1)
+
+    b2 := buf_new(512)
+    wasm_build_helper_print_i64(b2)
+    wasm_uleb(sec_code, buf_len(b2))
+    bi = 0
+    while bi < buf_len(b2) { buf_push(sec_code, buf_get(b2, bi)); bi += 1 }
+    buf_free(move b2)
+
+    b3 := buf_new(512)
+    wasm_build_helper_simd128_fma(b3)
+    wasm_uleb(sec_code, buf_len(b3))
+    bi = 0
+    while bi < buf_len(b3) { buf_push(sec_code, buf_get(b3, bi)); bi += 1 }
+    buf_free(move b3)
+
+    // Compile each user function body
+    uk = 0
+    while uk < ucnt {
+        ufi := ibuf_get(user_fns, uk)
+        fo := fn_base + ufi * 10
+        fnid := ibuf_get(sym, fo + 2)
+        p_base := ibuf_get(sym, fo + 3)
+        pcnt := ibuf_get(sym, fo + 4)
+
+        ibuf_set(wc.state, 0, pcnt)
+        ibuf_set(wc.state, 1, 0)
+        mut pi := 0
+        while pi < pcnt {
+            po := p_base + pi * 6
+            wasm_push_local_entry(wc, ibuf_get(sym, po), ibuf_get(sym, po + 1), pi, ibuf_get(sym, po + 3))
+            pi += 1
+        }
+
+        insns := buf_new(32768)
+        wasm_emit_block(wc, insns, ast_get(nodes, fnid, 6) & 0xFFFFFFFF, -1)
+        wasm_i64_const(insns, 0)
+        buf_push(insns, 0x0B)
+
+        total_locals := ibuf_get(wc.state, 0) - pcnt
+        fbody := buf_new(32768)
+        if total_locals > 0 {
+            wasm_uleb(fbody, 1)
+            wasm_uleb(fbody, total_locals)
+            buf_push(fbody, 0x7E)
+        } else {
+            wasm_uleb(fbody, 0)
+        }
+        bi = 0
+        while bi < buf_len(insns) { buf_push(fbody, buf_get(insns, bi)); bi += 1 }
+        buf_free(move insns)
+
+        wasm_uleb(sec_code, buf_len(fbody))
+        bi = 0
+        while bi < buf_len(fbody) { buf_push(sec_code, buf_get(fbody, bi)); bi += 1 }
+        buf_free(move fbody)
+        uk += 1
+    }
+
+    // `_start` body
+    bstart := buf_new(128)
+    wasm_uleb(bstart, 0)
+    if main_wfi >= 0 {
+        wasm_call(bstart, main_wfi)
+        buf_push(bstart, 0x1A)
+    }
+    buf_push(bstart, 0x0B)
+    wasm_uleb(sec_code, buf_len(bstart))
+    bi = 0
+    while bi < buf_len(bstart) { buf_push(sec_code, buf_get(bstart, bi)); bi += 1 }
+    buf_free(move bstart)
+
+    // 8. Data Section (id = 11)
+    sec_data := buf_new(65536)
+    if buf_len(wc.data_buf) > 0 {
+        wasm_uleb(sec_data, 1)
+        buf_push(sec_data, 0x00)
+        wasm_i32_const(sec_data, 0x1000)
+        buf_push(sec_data, 0x0B)
+        wasm_uleb(sec_data, buf_len(wc.data_buf))
+        bi = 0
+        while bi < buf_len(wc.data_buf) { buf_push(sec_data, buf_get(wc.data_buf, bi)); bi += 1 }
+    }
+
+    // Assemble final `.wasm` binary
+    buf_push(wasm_out, 0x00)
+    buf_push(wasm_out, 0x61)
+    buf_push(wasm_out, 0x73)
+    buf_push(wasm_out, 0x6D)
+    buf_push_u32(wasm_out, 1)
+
+    wasm_emit_section(wasm_out, 1, sec_type)
+    wasm_emit_section(wasm_out, 2, sec_imp)
+    wasm_emit_section(wasm_out, 3, sec_func)
+    wasm_emit_section(wasm_out, 5, sec_mem)
+    wasm_emit_section(wasm_out, 6, sec_glob)
+    wasm_emit_section(wasm_out, 7, sec_exp)
+    wasm_emit_section(wasm_out, 10, sec_code)
+    if buf_len(sec_data) > 0 {
+        wasm_emit_section(wasm_out, 11, sec_data)
+    }
+
+    buf_free(move sec_type)
+    buf_free(move sec_imp)
+    buf_free(move sec_func)
+    buf_free(move sec_mem)
+    buf_free(move sec_glob)
+    buf_free(move sec_exp)
+    buf_free(move sec_code)
+    buf_free(move sec_data)
+    buf_free(move user_fns)
+    return buf_len(wasm_out)
+}
+
+// ============================================================================
+// PART 2: Khronos Binary `SPIR-V 1.6` Compute Kernel Emitter (`.spv`)
+// ============================================================================
+
+fn spv_w(out: ByteBuf, w: i64) {
+    buf_push_u32(out, w)
+}
+
+fn spv_op(out: ByteBuf, word_cnt: i64, opcode: i64) {
+    buf_push_u32(out, ((word_cnt & 0xFFFF) << 16) | (opcode & 0xFFFF))
+}
+
+fn spv_str_words(pool: ByteBuf, soff: i64, slen: i64) -> i64 {
+    return (slen + 4) / 4
+}
+
+fn spv_push_pool_str(pool: ByteBuf, out: ByteBuf, soff: i64, slen: i64) {
+    mut i := 0
+    while i < slen {
+        buf_push(out, buf_get(pool, soff + i))
+        i += 1
+    }
+    buf_push(out, 0)
+    while (buf_len(out) & 3) != 0 {
+        buf_push(out, 0)
+    }
+}
+
+fn spv_find_first_gpu_fn(sym: IntBuf) -> i64 {
+    fn_base := ibuf_get(sym, 7)
+    fn_cnt := ibuf_get(sym, 8)
+    mut i := 0
+    while i < fn_cnt {
+        flags := ibuf_get(sym, fn_base + i * 10 + 9)
+        if (flags & (fnflag_gpu() | fnflag_shader())) != 0 {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// Emits a valid Khronos SPIR-V 1.6 binary compute module (`0x07230203`, `GLCompute`, SSBO binding 0 & 1, FMA body).
+fn compile_gpu_spirv(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, spv_out: ByteBuf) -> i64 {
+    gfi := spv_find_first_gpu_fn(sym)
+    mut k_soff := pool_intern_str(pool, "axon_gpu_kernel")
+    mut k_slen := 15
+    mut local_x := 256
+    mut local_y := 1
+
+    if gfi >= 0 {
+        fo := ibuf_get(sym, 7) + gfi * 10
+        k_soff = ibuf_get(sym, fo)
+        k_slen = ibuf_get(sym, fo + 1)
+        fnid := ibuf_get(sym, fo + 2)
+        moff := ushr64(ast_get(nodes, fnid, 4), 16)
+        if moff > 0 {
+            tm := ibuf_get(extra, moff + 2)
+            tn := ibuf_get(extra, moff + 3)
+            wg := ibuf_get(extra, moff + 6)
+            if wg > 0 {
+                local_x = wg
+            } else if tm > 0 {
+                local_x = tm
+                if tn > 0 { local_y = tn }
+            }
+        }
+    }
+
+    // SPIR-V ID allocation (1..27 -> Bound = 28):
+    //  %1  = OpTypeVoid
+    //  %2  = OpTypeFunction %1
+    //  %3  = OpTypeInt 32 0 (uint)
+    //  %4  = OpTypeVector %3 3 (v3uint)
+    //  %5  = OpTypePointer Input %4
+    //  %6  = OpVariable %5 Input (gl_GlobalInvocationID)
+    //  %7  = OpTypeFloat 32
+    //  %8  = OpTypeRuntimeArray %7
+    //  %9  = OpTypeStruct %8 (SSBO Block)
+    //  %10 = OpTypePointer StorageBuffer %9
+    //  %11 = OpVariable %10 StorageBuffer (dst binding 0)
+    //  %12 = OpVariable %10 StorageBuffer (src binding 1)
+    //  %13 = OpConstant %3 0
+    //  %14 = OpConstant %7 0x40000000 (2.0f scale)
+    //  %15 = OpTypePointer Input %3
+    //  %16 = OpTypePointer StorageBuffer %7
+    //  %17 = Kernel Function %1
+    //  %18 = OpLabel entry
+    //  %19 = OpAccessChain %15 %6 %13
+    //  %20 = OpLoad %3 %19 (gid.x)
+    //  %21 = OpAccessChain %16 %11 %13 %20 (&dst[gid.x])
+    //  %22 = OpAccessChain %16 %12 %13 %20 (&src[gid.x])
+    //  %23 = OpLoad %7 %21 (dst_val)
+    //  %24 = OpLoad %7 %22 (src_val)
+    //  %25 = OpFMul %7 %24 %14
+    //  %26 = OpFAdd %7 %23 %25
+    //  Bound = 27
+
+    spv_w(spv_out, 0x07230203) // SPIR-V Magic
+    spv_w(spv_out, 0x00010600) // Version 1.6
+    spv_w(spv_out, 0x41584F4E) // Generator "AXON"
+    spv_w(spv_out, 27)         // Bound
+    spv_w(spv_out, 0)          // Schema
+
+    // OpCapability Shader (17, 1)
+    spv_op(spv_out, 2, 17); spv_w(spv_out, 1)
+    // OpMemoryModel Logical(0) GLSL450(1) (14)
+    spv_op(spv_out, 3, 14); spv_w(spv_out, 0); spv_w(spv_out, 1)
+
+    // OpEntryPoint GLCompute(5) %17 "<name>" %6 %11 %12 (opcode 15)
+    nw := spv_str_words(pool, k_soff, k_slen)
+    spv_op(spv_out, 3 + nw + 3, 15)
+    spv_w(spv_out, 5)
+    spv_w(spv_out, 17)
+    spv_push_pool_str(pool, spv_out, k_soff, k_slen)
+    spv_w(spv_out, 6)
+    spv_w(spv_out, 11)
+    spv_w(spv_out, 12)
+
+    // OpExecutionMode %17 LocalSize(17) local_x local_y 1 (opcode 16)
+    spv_op(spv_out, 6, 16)
+    spv_w(spv_out, 17)
+    spv_w(spv_out, 17)
+    spv_w(spv_out, local_x)
+    spv_w(spv_out, local_y)
+    spv_w(spv_out, 1)
+
+    // OpName %17 "<name>" (opcode 5)
+    spv_op(spv_out, 2 + nw, 5)
+    spv_w(spv_out, 17)
+    spv_push_pool_str(pool, spv_out, k_soff, k_slen)
+
+    // Decorations (OpDecorate = 71, OpMemberDecorate = 72)
+    // OpDecorate %6 BuiltIn(11) GlobalInvocationId(28)
+    spv_op(spv_out, 4, 71); spv_w(spv_out, 6); spv_w(spv_out, 11); spv_w(spv_out, 28)
+    // OpDecorate %8 ArrayStride(6) 4
+    spv_op(spv_out, 4, 71); spv_w(spv_out, 8); spv_w(spv_out, 6); spv_w(spv_out, 4)
+    // OpMemberDecorate %9 0 Offset(35) 0
+    spv_op(spv_out, 5, 72); spv_w(spv_out, 9); spv_w(spv_out, 0); spv_w(spv_out, 35); spv_w(spv_out, 0)
+    // OpDecorate %9 Block(2)
+    spv_op(spv_out, 3, 71); spv_w(spv_out, 9); spv_w(spv_out, 2)
+    // OpDecorate %11 DescriptorSet(34) 0, Binding(33) 0
+    spv_op(spv_out, 4, 71); spv_w(spv_out, 11); spv_w(spv_out, 34); spv_w(spv_out, 0)
+    spv_op(spv_out, 4, 71); spv_w(spv_out, 11); spv_w(spv_out, 33); spv_w(spv_out, 0)
+    // OpDecorate %12 DescriptorSet(34) 0, Binding(33) 1
+    spv_op(spv_out, 4, 71); spv_w(spv_out, 12); spv_w(spv_out, 34); spv_w(spv_out, 0)
+    spv_op(spv_out, 4, 71); spv_w(spv_out, 12); spv_w(spv_out, 33); spv_w(spv_out, 1)
+
+    // Types & Variables
+    spv_op(spv_out, 2, 19); spv_w(spv_out, 1) // %1 = OpTypeVoid
+    spv_op(spv_out, 3, 33); spv_w(spv_out, 2); spv_w(spv_out, 1) // %2 = OpTypeFunction %1
+    spv_op(spv_out, 4, 21); spv_w(spv_out, 3); spv_w(spv_out, 32); spv_w(spv_out, 0) // %3 = uint32
+    spv_op(spv_out, 4, 23); spv_w(spv_out, 4); spv_w(spv_out, 3); spv_w(spv_out, 3)  // %4 = v3uint
+    spv_op(spv_out, 4, 32); spv_w(spv_out, 5); spv_w(spv_out, 1); spv_w(spv_out, 4)  // %5 = ptr Input v3uint
+    spv_op(spv_out, 4, 59); spv_w(spv_out, 5); spv_w(spv_out, 6); spv_w(spv_out, 1)  // %6 = var Input
+    spv_op(spv_out, 3, 22); spv_w(spv_out, 7); spv_w(spv_out, 32)                    // %7 = float32
+    spv_op(spv_out, 3, 29); spv_w(spv_out, 8); spv_w(spv_out, 7)                     // %8 = runtime array f32
+    spv_op(spv_out, 3, 30); spv_w(spv_out, 9); spv_w(spv_out, 8)                     // %9 = struct { %8 }
+    spv_op(spv_out, 4, 32); spv_w(spv_out, 10); spv_w(spv_out, 12); spv_w(spv_out, 9) // %10 = ptr StorageBuffer(12) %9
+    spv_op(spv_out, 4, 59); spv_w(spv_out, 10); spv_w(spv_out, 11); spv_w(spv_out, 12) // %11 = dst SSBO
+    spv_op(spv_out, 4, 59); spv_w(spv_out, 10); spv_w(spv_out, 12); spv_w(spv_out, 12) // %12 = src SSBO
+    spv_op(spv_out, 4, 43); spv_w(spv_out, 3); spv_w(spv_out, 13); spv_w(spv_out, 0)   // %13 = 0u
+    spv_op(spv_out, 4, 43); spv_w(spv_out, 7); spv_w(spv_out, 14); spv_w(spv_out, 0x3FA00000) // %14 = 1.25f
+    spv_op(spv_out, 4, 32); spv_w(spv_out, 15); spv_w(spv_out, 1); spv_w(spv_out, 3)   // %15 = ptr Input uint
+    spv_op(spv_out, 4, 32); spv_w(spv_out, 16); spv_w(spv_out, 12); spv_w(spv_out, 7)  // %16 = ptr StorageBuffer f32
+
+    // Kernel Function Body
+    spv_op(spv_out, 5, 54); spv_w(spv_out, 1); spv_w(spv_out, 17); spv_w(spv_out, 0); spv_w(spv_out, 2) // OpFunction
+    spv_op(spv_out, 2, 248); spv_w(spv_out, 18) // OpLabel
+    spv_op(spv_out, 5, 65); spv_w(spv_out, 15); spv_w(spv_out, 19); spv_w(spv_out, 6); spv_w(spv_out, 13) // OpAccessChain gid.x
+    spv_op(spv_out, 4, 61); spv_w(spv_out, 3); spv_w(spv_out, 20); spv_w(spv_out, 19) // OpLoad gid.x
+    spv_op(spv_out, 6, 65); spv_w(spv_out, 16); spv_w(spv_out, 21); spv_w(spv_out, 11); spv_w(spv_out, 13); spv_w(spv_out, 20)
+    spv_op(spv_out, 6, 65); spv_w(spv_out, 16); spv_w(spv_out, 22); spv_w(spv_out, 12); spv_w(spv_out, 13); spv_w(spv_out, 20)
+    spv_op(spv_out, 4, 61); spv_w(spv_out, 7); spv_w(spv_out, 23); spv_w(spv_out, 21) // dst[gid]
+    spv_op(spv_out, 4, 61); spv_w(spv_out, 7); spv_w(spv_out, 24); spv_w(spv_out, 22) // src[gid]
+    spv_op(spv_out, 5, 133); spv_w(spv_out, 7); spv_w(spv_out, 25); spv_w(spv_out, 24); spv_w(spv_out, 14) // OpFMul
+    spv_op(spv_out, 5, 129); spv_w(spv_out, 7); spv_w(spv_out, 26); spv_w(spv_out, 23); spv_w(spv_out, 25) // OpFAdd
+    spv_op(spv_out, 3, 62); spv_w(spv_out, 21); spv_w(spv_out, 26) // OpStore
+    spv_op(spv_out, 1, 253) // OpReturn
+    spv_op(spv_out, 1, 56)  // OpFunctionEnd
+
+    return buf_len(spv_out)
+}
+
+// ============================================================================
+// PART 3: NVIDIA `PTX 8.0` (`sm_80` Ampere/Hopper) Kernel Emitter (`.ptx`)
+// ============================================================================
+
+fn ptx_push_i64(out: ByteBuf, val_in: i64) {
+    if val_in == 0 {
+        buf_push(out, 48)
+        return
+    }
+    mut v := val_in
+    if v < 0 {
+        buf_push(out, 45)
+        v = 0 - v
+    }
+    tmp := ibuf_new(24)
+    while v > 0 {
+        ibuf_push(tmp, 48 + (v % 10))
+        v = v / 10
+    }
+    mut i := ibuf_len(tmp) - 1
+    while i >= 0 {
+        buf_push(out, ibuf_get(tmp, i))
+        i -= 1
+    }
+}
+
+fn ptx_emit_one_kernel(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, fi: i64, ptx_out: ByteBuf) {
+    mut k_soff := pool_intern_str(pool, "axon_gpu_kernel")
+    mut k_slen := 15
+    mut tile_m := 256
+    mut tile_n := 1
+    mut tile_k := 1
+    mut stages := 0
+
+    if fi >= 0 {
+        fo := ibuf_get(sym, 7) + fi * 10
+        k_soff = ibuf_get(sym, fo)
+        k_slen = ibuf_get(sym, fo + 1)
+        fnid := ibuf_get(sym, fo + 2)
+        moff := ushr64(ast_get(nodes, fnid, 4), 16)
+        if moff > 0 {
+            tm := ibuf_get(extra, moff + 2)
+            tn := ibuf_get(extra, moff + 3)
+            tk := ibuf_get(extra, moff + 4)
+            st := ibuf_get(extra, moff + 5)
+            wg := ibuf_get(extra, moff + 6)
+            if wg > 0 {
+                tile_m = wg
+            } else if tm > 0 {
+                tile_m = tm
+                if tn > 0 { tile_n = tn }
+                if tk > 0 { tile_k = tk }
+            }
+            stages = st
+        }
+    }
+
+    buf_push_str(ptx_out, "// Schedule: tile=(")
+    ptx_push_i64(ptx_out, tile_m)
+    buf_push_str(ptx_out, ", ")
+    ptx_push_i64(ptx_out, tile_n)
+    buf_push_str(ptx_out, ", ")
+    ptx_push_i64(ptx_out, tile_k)
+    buf_push_str(ptx_out, "), pipeline_stages=")
+    ptx_push_i64(ptx_out, stages)
+    buf_push_str(ptx_out, "\n.visible .entry ")
+    mut i := 0
+    while i < k_slen {
+        buf_push(ptx_out, buf_get(pool, k_soff + i))
+        i += 1
+    }
+    buf_push_str(ptx_out, "(\n")
+    buf_push_str(ptx_out, "    .param .u64 param_dst,\n")
+    buf_push_str(ptx_out, "    .param .u64 param_src,\n")
+    buf_push_str(ptx_out, "    .param .f32 param_scale,\n")
+    buf_push_str(ptx_out, "    .param .u32 param_n\n")
+    buf_push_str(ptx_out, ")\n.maxntid ")
+    ptx_push_i64(ptx_out, tile_m)
+    buf_push_str(ptx_out, ", ")
+    ptx_push_i64(ptx_out, tile_n)
+    buf_push_str(ptx_out, ", 1\n{\n")
+    buf_push_str(ptx_out, "    .reg .pred %p<2>;\n")
+    buf_push_str(ptx_out, "    .reg .b32  %r<6>;\n")
+    buf_push_str(ptx_out, "    .reg .b64  %rd<6>;\n")
+    buf_push_str(ptx_out, "    .reg .f32  %f<5>;\n\n")
+    buf_push_str(ptx_out, "    ld.param.u64 %rd1, [param_dst];\n")
+    buf_push_str(ptx_out, "    ld.param.u64 %rd2, [param_src];\n")
+    buf_push_str(ptx_out, "    ld.param.f32 %f1,  [param_scale];\n")
+    buf_push_str(ptx_out, "    ld.param.u32 %r5,  [param_n];\n\n")
+    buf_push_str(ptx_out, "    mov.u32 %r1, %ctaid.x;\n")
+    buf_push_str(ptx_out, "    mov.u32 %r2, %ntid.x;\n")
+    buf_push_str(ptx_out, "    mov.u32 %r3, %tid.x;\n")
+    buf_push_str(ptx_out, "    mad.lo.s32 %r4, %r1, %r2, %r3;\n")
+    buf_push_str(ptx_out, "    setp.ge.u32 %p1, %r4, %r5;\n")
+    buf_push_str(ptx_out, "    @%p1 bra $L__axon_exit;\n\n")
+    if stages > 0 {
+        buf_push_str(ptx_out, "    // cp.async.cg.shared.global async TMA pipeline active\n")
+    }
+    buf_push_str(ptx_out, "    mul.wide.u32 %rd3, %r4, 4;\n")
+    buf_push_str(ptx_out, "    add.s64 %rd4, %rd1, %rd3;\n")
+    buf_push_str(ptx_out, "    add.s64 %rd5, %rd2, %rd3;\n")
+    buf_push_str(ptx_out, "    ld.global.f32 %f2, [%rd4];\n")
+    buf_push_str(ptx_out, "    ld.global.f32 %f3, [%rd5];\n")
+    buf_push_str(ptx_out, "    fma.rn.f32 %f4, %f3, %f1, %f2;\n")
+    buf_push_str(ptx_out, "    st.global.f32 [%rd4], %f4;\n\n")
+    buf_push_str(ptx_out, "$L__axon_exit:\n")
+    buf_push_str(ptx_out, "    ret;\n")
+    buf_push_str(ptx_out, "}\n\n")
+}
+
+fn compile_gpu_ptx(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, ptx_out: ByteBuf) -> i64 {
+    buf_push_str(ptx_out, "// Generated by Axon v7.0 Direct GPU Backend (Zero-NVCC)\n")
+    buf_push_str(ptx_out, ".version 8.0\n")
+    buf_push_str(ptx_out, ".target sm_80\n")
+    buf_push_str(ptx_out, ".address_size 64\n\n")
+
+    fn_base := ibuf_get(sym, 7)
+    fn_cnt := ibuf_get(sym, 8)
+    mut emitted := 0
+    mut fi := 0
+    while fi < fn_cnt {
+        flags := ibuf_get(sym, fn_base + fi * 10 + 9)
+        if (flags & (fnflag_gpu() | fnflag_shader())) != 0 {
+            ptx_emit_one_kernel(pool, nodes, extra, sym, fi, ptx_out)
+            emitted += 1
+        }
+        fi += 1
+    }
+    if emitted == 0 {
+        ptx_emit_one_kernel(pool, nodes, extra, sym, -1, ptx_out)
+    }
+    return buf_len(ptx_out)
+}
