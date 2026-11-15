@@ -504,6 +504,31 @@ fn emit_writeback_mut_params_ax(cg: CodegenCtx, vars: IntBuf) {
 fn emit_return_from_slot_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, val_slot: i64, val_ty: i64) {
     c := cg.code
     emit_perceus_drops_ax(cg, drops)
+
+    iret_slot := ibuf_get(cg.state, 22)
+    if iret_slot > 0 {
+        rslots := ibuf_get(cg.state, 24)
+        mut copy_n := type_slots(cg.sym, val_ty)
+        if copy_n > rslots { copy_n = rslots }
+        mut s := 0
+        while s < copy_n {
+            mc_load_rax(c, val_slot, s)
+            mc_store_rax(c, iret_slot, s)
+            s += 1
+        }
+        emit_wipe_secrets_ax(cg, drops)
+        depth_i := ibuf_get(cg.state, 25) - 1
+        jpos := mc_jmp32(c)
+        if depth_i >= 0 and depth_i < 4 {
+            jcnt := ibuf_get(cg.state, 30 + depth_i)
+            if jcnt < 16 {
+                ibuf_set(cg.state, 34 + depth_i * 16 + jcnt, jpos)
+                ibuf_set(cg.state, 30 + depth_i, jcnt + 1)
+            }
+        }
+        return
+    }
+
     emit_writeback_mut_params_ax(cg, vars)
 
     rslots := ibuf_get(cg.state, 8)
@@ -1367,13 +1392,23 @@ fn emit_soa_simd_foreach_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks:
             scale_slot = er_slot(sr)
         }
 
+        is_fma := okind == 1 or okind == 3 or okind == 4 or okind == 5
         mc_b2(c, 0x56, 0x57) // PUSH RSI; PUSH RDI
         if scale_slot > 0 {
             mc_load_rax(c, scale_slot, 0)
             mc_b4(c, 0x66, 0x48, 0x0F, 0x6E); mc_b1(c, 0xC0)
             mc_b4(c, 0xF2, 0x0F, 0x5A, 0xC0) // XMM0.x = scale_f32 (pure SSE2!)
+            if okind == 4 {
+                mc_b4(c, 0x66, 0x0F, 0x7E, 0xC0) // MOVD EAX, XMM0
+                mc_b1(c, 0x35); mc_u32(c, 0x80000000) // XOR EAX, signbit
+                mc_b4(c, 0x66, 0x0F, 0x6E, 0xC0) // MOVD XMM0, EAX
+            }
         } else {
-            mc_b1(c, 0xB8); mc_u32(c, 0x3F800000)
+            if okind == 5 {
+                mc_b1(c, 0xB8); mc_u32(c, 0xBF800000) // -1.0f32
+            } else {
+                mc_b1(c, 0xB8); mc_u32(c, 0x3F800000) // +1.0f32
+            }
             mc_b4(c, 0x66, 0x0F, 0x6E, 0xC0)
         }
 
@@ -1381,7 +1416,7 @@ fn emit_soa_simd_foreach_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks:
         mc_load_rcx(c, tbl_slot, 1)
         mc_b4(c, 0x48, 0xC1, 0xE1, 0x02) // RCX = total_bytes (cap * 4)
 
-        if okind == 1 or okind == 3 {
+        if is_fma {
             mc_b3(c, 0x48, 0x89, 0xC8)
             mc_b3(c, 0x48, 0x69, 0xC0); mc_u32(c, src_col)
             mc_b3(c, 0x4C, 0x01, 0xC0)
@@ -1412,7 +1447,7 @@ fn emit_soa_simd_foreach_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks:
         ja_z512_done := mc_jcc8(c, 0x77)
         // `VMOVUPS ZMM2, [RDI + RAX]` (`62 F1 7C 48 10 14 07`)
         mc_b4(c, 0x62, 0xF1, 0x7C, 0x48); mc_b3(c, 0x10, 0x14, 0x07)
-        if okind == 1 or okind == 3 {
+        if is_fma {
             // `VMOVUPS ZMM1, [RSI + RAX]` (`62 F1 7C 48 10 0C 06`)
             mc_b4(c, 0x62, 0xF1, 0x7C, 0x48); mc_b3(c, 0x10, 0x0C, 0x06)
             // `VFMADD231PS ZMM2, ZMM1, ZMM0` (`62 F2 75 48 B8 D0`)
@@ -1436,7 +1471,7 @@ fn emit_soa_simd_foreach_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks:
         jb_scalar := mc_jcc32(c, 0x82)
 
         mc_b4(c, 0xC4, 0xE2, 0x7D, 0x18); mc_b1(c, 0xC0) // VBROADCASTSS YMM0, XMM0
-        if okind == 1 or okind == 3 {
+        if is_fma {
             u4_top := buf_len(c)
             mc_b3(c, 0x48, 0x8D, 0x90); mc_u32(c, 128) // LEA RDX, [RAX + 128]
             mc_b3(c, 0x48, 0x39, 0xCA)
@@ -1499,7 +1534,7 @@ fn emit_soa_simd_foreach_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks:
         mc_b3(c, 0x48, 0x39, 0xC8)
         jae_sc_done := mc_jcc8(c, 0x73)
         mc_b4(c, 0xF3, 0x0F, 0x10, 0x14); mc_b1(c, 0x07) // MOVSS XMM2, [RDI+RAX]
-        if okind == 1 or okind == 3 {
+        if is_fma {
             mc_b4(c, 0xF3, 0x0F, 0x10, 0x0C); mc_b1(c, 0x06) // MOVSS XMM1, [RSI+RAX]
             mc_b4(c, 0xF3, 0x0F, 0x59, 0xC8)                 // MULSS XMM1, XMM0
             mc_b4(c, 0xF3, 0x0F, 0x58, 0xD1)                 // ADDSS XMM2, XMM1
@@ -1585,13 +1620,22 @@ fn emit_par_soa_foreach_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
 
         if scale_slot > 0 {
             mc_f64_slot_to_f32_eax(c, scale_slot)
+            if okind == 4 {
+                mc_b1(c, 0x35); mc_u32(c, 0x80000000)
+            }
         } else {
-            mc_b1(c, 0xB8); mc_u32(c, 0x3F800000)
+            if okind == 5 {
+                mc_b1(c, 0xB8); mc_u32(c, 0xBF800000)
+            } else {
+                mc_b1(c, 0xB8); mc_u32(c, 0x3F800000)
+            }
         }
         mc_b3(c, 0x48, 0x89, 0xC1) // RCX = scale_f32_bits
         cg_lea_rax_data(cg, 0)
         mc_b4(c, 0x48, 0x89, 0x48, 0x50) // [.data + 0x50] = scale_f32_bits
-        mc_mov_rax_imm(c, okind)
+        mut eff_okind := okind
+        if okind == 4 or okind == 5 { eff_okind = 1 }
+        mc_mov_rax_imm(c, eff_okind)
         mc_b3(c, 0x48, 0x89, 0xC1)
         cg_lea_rax_data(cg, 0)
         mc_b4(c, 0x48, 0x89, 0x48, 0x58) // [.data + 0x58] = okind
@@ -2441,6 +2485,10 @@ fn compile_single_fn_ax(cg: CodegenCtx, fidx: i64) {
     ibuf_set(cg.state, 13, 0)
     ibuf_set(cg.state, 14, 0)
     ibuf_set(cg.state, 18, fn_flags)
+    ibuf_set(cg.state, 22, 0)
+    ibuf_set(cg.state, 23, 0)
+    ibuf_set(cg.state, 24, 0)
+    ibuf_set(cg.state, 25, 0)
 
     pl_off := ast_get(cg.nodes, fnid, 3)
     mut rpi := 0
@@ -3208,7 +3256,7 @@ fn compile_module_x86_64_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
     } else if os_mode == 2 {
         // Linux x86_64 `ELF64`
         lay := ibuf_new(8)
-        elf64_compute_layout(buf_len(cg.code), buf_len(cg.rdata), lay)
+        elf64_compute_layout_aligned(buf_len(cg.code), buf_len(cg.rdata), 0x1000, lay)
         text_va := ibuf_get(lay, 0)
         rdata_va := ibuf_get(lay, 1)
         data_va := ibuf_get(lay, 2)
@@ -3301,11 +3349,4 @@ fn compile_module_x86_64_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
     buf_free(move rdata)
     buf_free(move code)
     return emitted_fns
-}
-
-fn compile_module_to_pe_ax(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, force_shield: bool, pe_out: ByteBuf) -> i64 {
-    empty_libs := ibuf_new(4)
-    res := compile_module_x86_64_v7(pool, nodes, extra, sym, tgt_win_x64(), false, false, force_shield, -1, empty_libs, pe_out)
-    buf_free(move empty_libs)
-    return res
 }

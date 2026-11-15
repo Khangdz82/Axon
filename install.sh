@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Axon v0.9.1 Self-Hosted Multi-OS Native Toolchain Installer (Linux & macOS)
+# Axon v1.0.0 Self-Hosted Multi-OS Native Toolchain Installer (Linux & macOS)
 set -euo pipefail
 
-AXON_VERSION="0.9.1"
+AXON_VERSION="1.0.0"
 AXON_ROOT="${HOME}/.axon"
 INSTALL_BIN="${AXON_ROOT}/bin"
 INSTALL_STD="${AXON_ROOT}/std"

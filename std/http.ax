@@ -1,4 +1,4 @@
-// Axon v0.9.1 Production HTTP/1.1 Parser, Router, Security Headers & SSE (`std/http.ax`)
+// Axon v1.0.0 Production HTTP/1.1 Parser, Router, Security Headers & SSE (`std/http.ax`)
 // Enforces CRLF header-injection & NUL-byte (CWE-93/CWE-113/CWE-158) sanitization on all headers.
 
 use std::os
@@ -18,10 +18,105 @@ fn http_is_safe_header_val(v: str) -> bool {
     mut i := 0
     while i < n {
         b := str_byte(v, i)
-        if b == 0 or b == 10 or b == 13 {
+        if b == 0 or b == 10 or b == 13 or (b < 32 and b != 9) or b == 127 {
             return false
         }
         i += 1
+    }
+    return true
+}
+
+fn http_is_valid_hdr_name(name: str) -> bool {
+    n := str_len(name)
+    if n <= 0 {
+        return false
+    }
+    mut i := 0
+    while i < n {
+        b := str_byte(name, i)
+        if b <= 32 or b >= 127 or b == 58 {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+fn http_is_safe_path(p: str) -> bool {
+    n := str_len(p)
+    if n <= 0 {
+        return false
+    }
+    mut i := 0
+    while i < n {
+        b := str_byte(p, i)
+        if b < 32 or b == 127 or b == 92 {
+            return false
+        }
+        if b == 46 and i + 1 < n and str_byte(p, i + 1) == 46 {
+            prev_sep := i == 0 or str_byte(p, i - 1) == 47
+            next_sep := i + 2 == n or str_byte(p, i + 2) == 47
+            if prev_sep or next_sep {
+                return false
+            }
+        }
+        if b == 37 and i + 2 < n {
+            h := str_byte(p, i + 1)
+            l := str_byte(p, i + 2)
+            if h == 48 and (l == 48 or l == 65 or l == 97 or l == 68 or l == 100) {
+                return false
+            }
+            if h == 53 and (l == 67 or l == 99) {
+                return false
+            }
+            if h == 50 and (l == 69 or l == 101) {
+                return false
+            }
+        }
+        i += 1
+    }
+    return true
+}
+
+fn http_are_safe_extra_headers(ex: str) -> bool {
+    n := str_len(ex)
+    if n <= 0 {
+        return false
+    }
+    mut pos := 0
+    while pos < n {
+        nl := str_find_byte(ex, 10, pos)
+        mut line_end := nl
+        if line_end < 0 {
+            line_end = n
+        } else {
+            if line_end <= pos or str_byte(ex, line_end - 1) != 13 {
+                return false
+            }
+            line_end -= 1
+        }
+        if line_end > pos {
+            line := str_slice(ex, pos, line_end)
+            colon := str_find_byte(line, 58, 0)
+            if colon <= 0 {
+                return false
+            }
+            if not http_is_valid_hdr_name(str_slice(line, 0, colon)) {
+                return false
+            }
+            if not http_is_safe_header_val(str_slice(line, colon + 1, str_len(line))) {
+                return false
+            }
+        } else if nl < 0 {
+            break
+        } else {
+            // Blank CRLF line inside extra_headers would terminate header section early (response splitting!)
+            return false
+        }
+        if nl < 0 {
+            break
+        }
+        pos = nl + 1
     }
     return true
 }
@@ -149,16 +244,60 @@ fn http_parse_request(raw: str) -> HttpRequest ! i64 {
         query = str_slice(target, qpos + 1, str_len(target))
     }
 
-    // Reject path control bytes or NUL smuggling
-    if not http_is_safe_header_val(path) {
+    // Reject path control bytes, NUL smuggling, or `%00`/`%0a`/`%0d` encoded splitting
+    if not http_is_safe_path(path) or not http_is_safe_header_val(query) {
         return err(400)
     }
 
+    // Single-pass header security audit: block duplicate Content-Length, Transfer-Encoding smuggling,
+    // obs-fold continuation, bare CR, NUL bytes, and invalid header syntax.
+    mut cl_cnt := 0
+    mut cl_str := ""
+    if line_end < hdr_end {
+        mut hpos := line_end + 1
+        while hpos < hdr_end {
+            mut hnl := str_find_byte(raw, 10, hpos)
+            if hnl < 0 or hnl > hdr_end {
+                hnl = hdr_end
+            }
+            mut hend := hnl
+            if hend > hpos and str_byte(raw, hend - 1) == 13 {
+                hend -= 1
+            }
+            if hend > hpos {
+                fb := str_byte(raw, hpos)
+                if fb == 32 or fb == 9 {
+                    return err(400)
+                }
+                hline := str_slice(raw, hpos, hend)
+                hcol := str_find_byte(hline, 58, 0)
+                if hcol <= 0 {
+                    return err(400)
+                }
+                hname := str_slice(hline, 0, hcol)
+                hval := str_slice(hline, hcol + 1, str_len(hline))
+                if not http_is_valid_hdr_name(hname) or not http_is_safe_header_val(hval) {
+                    return err(400)
+                }
+                if str_eq_ignore_case(hname, "Transfer-Encoding") {
+                    return err(400)
+                }
+                if str_eq_ignore_case(hname, "Content-Length") {
+                    cl_cnt += 1
+                    if cl_cnt > 1 {
+                        return err(400)
+                    }
+                    cl_str = str_trim(hval)
+                }
+            }
+            hpos = hnl + 1
+        }
+    }
+
     mut clen := n - body_start
-    cl_res := http_get_header(raw, "Content-Length") or ""
-    if str_len(cl_res) > 0 {
-        parsed_cl := parse_i64(cl_res) or -1
-        if parsed_cl < 0 or body_start + parsed_cl > n {
+    if cl_cnt == 1 {
+        parsed_cl := parse_i64(cl_str) or -1
+        if parsed_cl < 0 or parsed_cl > n - body_start {
             return err(400)
         }
         clen = parsed_cl
@@ -172,11 +311,13 @@ fn http_query_param(query: str, key: str) -> str ! i64 {
     if qlen == 0 or str_len(key) == 0 {
         return err(404)
     }
-    pairs := str_split_ranges(query, 38) // '&'
-    cnt := str_split_count(pairs)
-    mut i := 0
-    while i < cnt {
-        pair := str_split_at(query, pairs, i)
+    mut cur := 0
+    while cur <= qlen {
+        mut amp := str_find_byte(query, 38, cur) // '&'
+        if amp < 0 {
+            amp = qlen
+        }
+        pair := str_slice(query, cur, amp)
         eq := str_find_byte(pair, 61, 0) // '='
         if eq >= 0 {
             raw_k := str_slice(pair, 0, eq)
@@ -184,77 +325,93 @@ fn http_query_param(query: str, key: str) -> str ! i64 {
             if str_eq(dec_k, key) {
                 raw_v := str_slice(pair, eq + 1, str_len(pair))
                 dec_v := url_decode(raw_v) or raw_v
-                buf_free(move pairs)
                 return ok(dec_v)
             }
         }
-        i += 1
+        if amp >= qlen {
+            break
+        }
+        cur = amp + 1
     }
-    buf_free(move pairs)
     return err(404)
 }
 
 fn http_route_match(pattern: str, req_path: str) -> bool {
-    pr := str_split_ranges(pattern, 47) // '/'
-    rr := str_split_ranges(req_path, 47)
-    pc := str_split_count(pr)
-    rc := str_split_count(rr)
-    if pc != rc {
-        buf_free(move pr)
-        buf_free(move rr)
-        return false
-    }
-    mut i := 0
-    while i < pc {
-        ps := str_split_at(pattern, pr, i)
-        rs := str_split_at(req_path, rr, i)
-        if str_len(ps) > 0 and str_byte(ps, 0) == 58 { // ':param'
-            if str_len(rs) == 0 {
-                buf_free(move pr)
-                buf_free(move rr)
+    pn := str_len(pattern)
+    rn := str_len(req_path)
+    mut pi := 0
+    mut ri := 0
+    while true {
+        mut pe := str_find_byte(pattern, 47, pi)
+        if pe < 0 { pe = pn }
+        mut re := str_find_byte(req_path, 47, ri)
+        if re < 0 { re = rn }
+        plen := pe - pi
+        rlen := re - ri
+        if plen > 0 and str_byte(pattern, pi) == 58 { // ':param'
+            if rlen <= 0 {
                 return false
             }
-        } else if not str_eq(ps, rs) {
-            buf_free(move pr)
-            buf_free(move rr)
+        } else {
+            if plen != rlen or not str_eq(str_slice(pattern, pi, pe), str_slice(req_path, ri, re)) {
+                return false
+            }
+        }
+        p_at_end := pe >= pn
+        r_at_end := re >= rn
+        if p_at_end != r_at_end {
             return false
         }
-        i += 1
+        if p_at_end {
+            return true
+        }
+        pi = pe + 1
+        ri = re + 1
     }
-    buf_free(move pr)
-    buf_free(move rr)
-    return true
+    return false
 }
 
 fn http_route_param(pattern: str, req_path: str, param_name: str) -> str ! i64 {
-    pr := str_split_ranges(pattern, 47)
-    rr := str_split_ranges(req_path, 47)
-    pc := str_split_count(pr)
-    rc := str_split_count(rr)
-    if pc != rc {
-        buf_free(move pr)
-        buf_free(move rr)
-        return err(404)
-    }
-    mut i := 0
-    while i < pc {
-        ps := str_split_at(pattern, pr, i)
-        rs := str_split_at(req_path, rr, i)
-        if str_len(ps) > 1 and str_byte(ps, 0) == 58 {
-            if str_eq(str_slice(ps, 1, str_len(ps)), param_name) {
-                buf_free(move pr)
-                buf_free(move rr)
-                return ok(rs)
+    pn := str_len(pattern)
+    rn := str_len(req_path)
+    mut pi := 0
+    mut ri := 0
+    mut found := false
+    mut found_val := ""
+    while true {
+        mut pe := str_find_byte(pattern, 47, pi)
+        if pe < 0 { pe = pn }
+        mut re := str_find_byte(req_path, 47, ri)
+        if re < 0 { re = rn }
+        plen := pe - pi
+        rlen := re - ri
+        if plen > 0 and str_byte(pattern, pi) == 58 {
+            if rlen <= 0 {
+                return err(404)
             }
-        } else if not str_eq(ps, rs) {
-            buf_free(move pr)
-            buf_free(move rr)
+            if not found and plen > 1 and str_eq(str_slice(pattern, pi + 1, pe), param_name) {
+                found = true
+                found_val = str_slice(req_path, ri, re)
+            }
+        } else {
+            if plen != rlen or not str_eq(str_slice(pattern, pi, pe), str_slice(req_path, ri, re)) {
+                return err(404)
+            }
+        }
+        p_at_end := pe >= pn
+        r_at_end := re >= rn
+        if p_at_end != r_at_end {
             return err(404)
         }
-        i += 1
+        if p_at_end {
+            if found {
+                return ok(found_val)
+            }
+            return err(404)
+        }
+        pi = pe + 1
+        ri = re + 1
     }
-    buf_free(move pr)
-    buf_free(move rr)
     return err(404)
 }
 
@@ -266,16 +423,22 @@ fn http_build_response(status_code: i64, content_type: str, body: str, extra_hea
     }
     blen := str_len(body)
     sec := "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n"
-    head := f"HTTP/1.1 {status_code} {reason}\r\nContent-Type: {safe_ct}\r\nContent-Length: {blen}\r\nConnection: keep-alive\r\n{sec}"
-    // Extra headers allow intentional multi-line `Key: Val\r\n` if free of NUL and bare `\r`/`\n` smuggling?
-    // Verify no NUL byte and reject lines without `: ` or lone `\r`/`\n` splitting attacks via single-header API or clean passthrough only if valid
     mut ex := ""
-    if str_len(extra_headers) > 0 and str_find_byte(extra_headers, 0, 0) < 0 {
+    if http_are_safe_extra_headers(extra_headers) {
         ex = extra_headers
     }
-    total_cap := str_len(head) + str_len(ex) + blen + 8
+    total_cap := 160 + str_len(reason) + str_len(safe_ct) + str_len(sec) + str_len(ex) + blen
     out := buf_new(total_cap)
-    buf_push_str(out, head)
+    buf_push_str(out, "HTTP/1.1 ")
+    buf_append_i64(out, status_code)
+    buf_push(out, 32)
+    buf_push_str(out, reason)
+    buf_push_str(out, "\r\nContent-Type: ")
+    buf_push_str(out, safe_ct)
+    buf_push_str(out, "\r\nContent-Length: ")
+    buf_append_i64(out, blen)
+    buf_push_str(out, "\r\nConnection: keep-alive\r\n")
+    buf_push_str(out, sec)
     if str_len(ex) > 0 {
         buf_push_str(out, ex)
         if not str_ends_with(ex, "\n") {

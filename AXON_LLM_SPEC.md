@@ -1,4 +1,4 @@
-# Axon v7.0 Compact Language Specification for AI Coding Agents (`AXON_LLM_SPEC.md`)
+# Axon v1.0.0 Compact Language Specification for AI Coding Agents (`AXON_LLM_SPEC.md`)
 
 Axon (`.ax`) is a zero-GC, zero-lifetime-annotation (`0 'a`), self-hosted native systems language with sub-millisecond static verification (`axc check --json <file.ax>`) and an embedded JSON-RPC 2.0 MCP server (`axc mcp`).
 

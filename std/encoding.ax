@@ -1,0 +1,247 @@
+// Axon v1.0.0 Portable Encoding, Checksums & Sanitization (`std/encoding.ax`)
+// Provides IEEE CRC-32, RFC-4648 Base64URL (no-pad), XSS HTML escaping, and CSV line/col counters.
+// Works natively (`win-x64`, `linux-x64`, `macos-arm64`) and on `--target wasm32`.
+
+use std::os
+use std::str
+
+// Standard IEEE 802.3 CRC-32 (`0xEDB88320`), returns unsigned 32-bit value in [0, 0xFFFFFFFF].
+fn crc32_byte_step(crc_in: i64, byte_val: i64) -> i64 {
+    mut crc := (crc_in ^ (byte_val & 255)) & 0xFFFFFFFF
+    mut k := 0
+    while k < 8 {
+        if (crc & 1) != 0 {
+            crc = ushr64(crc, 1) ^ 0xEDB88320
+        } else {
+            crc = ushr64(crc, 1)
+        }
+        k += 1
+    }
+    return crc & 0xFFFFFFFF
+}
+
+fn crc32_bytes(b: ByteBuf) -> i64 {
+    n := buf_len(b)
+    mut crc := 0xFFFFFFFF
+    mut i := 0
+    while i < n {
+        crc = crc32_byte_step(crc, buf_get(b, i))
+        i += 1
+    }
+    return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+}
+
+fn crc32_str(s: str) -> i64 {
+    n := str_len(s)
+    mut crc := 0xFFFFFFFF
+    mut i := 0
+    while i < n {
+        crc = crc32_byte_step(crc, str_byte(s, i))
+        i += 1
+    }
+    return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+}
+
+fn b64url_enc_char(v: i64) -> i64 {
+    if v < 26 { return 65 + v }
+    if v < 52 { return 97 + (v - 26) }
+    if v < 62 { return 48 + (v - 52) }
+    if v == 62 { return 45 } // '-'
+    return 95                // '_'
+}
+
+fn b64url_dec_val(ch: i64) -> i64 {
+    if ch >= 65 and ch <= 90 { return ch - 65 }
+    if ch >= 97 and ch <= 122 { return ch - 97 + 26 }
+    if ch >= 48 and ch <= 57 { return ch - 48 + 52 }
+    if ch == 45 { return 62 }
+    if ch == 95 { return 63 }
+    return -1
+}
+
+// RFC 4648 Section 5 Base64URL encoding without '=' padding (JWT / OAuth / PKCE standard).
+fn base64url_encode(data: str) -> str {
+    n := str_len(data)
+    if n == 0 { return "" }
+    out := buf_new(((n + 2) / 3) * 4 + 4)
+    mut i := 0
+    while i + 2 < n {
+        b0 := str_byte(data, i)
+        b1 := str_byte(data, i + 1)
+        b2 := str_byte(data, i + 2)
+        v := (b0 << 16) | (b1 << 8) | b2
+        buf_push(out, b64url_enc_char((v >> 18) & 63))
+        buf_push(out, b64url_enc_char((v >> 12) & 63))
+        buf_push(out, b64url_enc_char((v >> 6) & 63))
+        buf_push(out, b64url_enc_char(v & 63))
+        i += 3
+    }
+    rem := n - i
+    if rem == 1 {
+        b0 := str_byte(data, i)
+        v := b0 << 16
+        buf_push(out, b64url_enc_char((v >> 18) & 63))
+        buf_push(out, b64url_enc_char((v >> 12) & 63))
+    } else if rem == 2 {
+        b0 := str_byte(data, i)
+        b1 := str_byte(data, i + 1)
+        v := (b0 << 16) | (b1 << 8)
+        buf_push(out, b64url_enc_char((v >> 18) & 63))
+        buf_push(out, b64url_enc_char((v >> 12) & 63))
+        buf_push(out, b64url_enc_char((v >> 6) & 63))
+    }
+    return buf_to_owned_str(move out)
+}
+
+fn base64url_decode(b64u: str) -> str ! i64 {
+    mut n := str_len(b64u)
+    // Accept optional trailing '=' padding cleanly
+    while n > 0 and str_byte(b64u, n - 1) == 61 {
+        n -= 1
+    }
+    if n == 0 { return ok("") }
+    if (n & 3) == 1 { return err(400) }
+    out := buf_new((n * 3) / 4 + 4)
+    mut i := 0
+    while i + 3 < n {
+        v0 := b64url_dec_val(str_byte(b64u, i))
+        v1 := b64url_dec_val(str_byte(b64u, i + 1))
+        v2 := b64url_dec_val(str_byte(b64u, i + 2))
+        v3 := b64url_dec_val(str_byte(b64u, i + 3))
+        if v0 < 0 or v1 < 0 or v2 < 0 or v3 < 0 {
+            buf_free(move out)
+            return err(400)
+        }
+        v := (v0 << 18) | (v1 << 12) | (v2 << 6) | v3
+        buf_push(out, (v >> 16) & 255)
+        buf_push(out, (v >> 8) & 255)
+        buf_push(out, v & 255)
+        i += 4
+    }
+    rem := n - i
+    if rem == 2 {
+        v0 := b64url_dec_val(str_byte(b64u, i))
+        v1 := b64url_dec_val(str_byte(b64u, i + 1))
+        if v0 < 0 or v1 < 0 { buf_free(move out); return err(400) }
+        v := (v0 << 6) | v1
+        buf_push(out, (v >> 4) & 255)
+    } else if rem == 3 {
+        v0 := b64url_dec_val(str_byte(b64u, i))
+        v1 := b64url_dec_val(str_byte(b64u, i + 1))
+        v2 := b64url_dec_val(str_byte(b64u, i + 2))
+        if v0 < 0 or v1 < 0 or v2 < 0 { buf_free(move out); return err(400) }
+        v := (v0 << 12) | (v1 << 6) | v2
+        buf_push(out, (v >> 10) & 255)
+        buf_push(out, (v >> 2) & 255)
+    }
+    return ok(buf_to_owned_str(move out))
+}
+
+// XSS CWE-79 HTML attribute & body escaping for &, <, >, ", '
+fn html_escape(s: str) -> str {
+    n := str_len(s)
+    mut needs := false
+    mut i := 0
+    while i < n {
+        c := str_byte(s, i)
+        if c == 38 or c == 60 or c == 62 or c == 34 or c == 39 {
+            needs = true
+            break
+        }
+        i += 1
+    }
+    if not needs { return s }
+    out := buf_new(n * 6 + 8)
+    i = 0
+    while i < n {
+        c := str_byte(s, i)
+        if c == 38 { buf_push_str(out, "&amp;") }
+        else if c == 60 { buf_push_str(out, "&lt;") }
+        else if c == 62 { buf_push_str(out, "&gt;") }
+        else if c == 34 { buf_push_str(out, "&quot;") }
+        else if c == 39 { buf_push_str(out, "&#39;") }
+        else { buf_push(out, c) }
+        i += 1
+    }
+    return buf_to_owned_str(move out)
+}
+
+fn csv_col_count(line: str) -> i64 {
+    n := str_len(line)
+    if n == 0 { return 0 }
+    mut cols := 1
+    mut in_q := false
+    mut i := 0
+    while i < n {
+        c := str_byte(line, i)
+        if c == 34 {
+            if in_q and i + 1 < n and str_byte(line, i + 1) == 34 {
+                i += 1
+            } else {
+                in_q = not in_q
+            }
+        } else if not in_q and c == 44 {
+            cols += 1
+        }
+        i += 1
+    }
+    return cols
+}
+
+fn csv_line_count(text: str) -> i64 {
+    n := str_len(text)
+    if n == 0 { return 0 }
+    mut lines := 0
+    mut in_q := false
+    mut has_row_chars := false
+    mut i := 0
+    while i < n {
+        c := str_byte(text, i)
+        if c == 34 {
+            has_row_chars = true
+            if in_q and i + 1 < n and str_byte(text, i + 1) == 34 {
+                i += 1
+            } else {
+                in_q = not in_q
+            }
+        } else if not in_q and c == 10 {
+            lines += 1
+            has_row_chars = false
+        } else if c != 13 {
+            has_row_chars = true
+        }
+        i += 1
+    }
+    if has_row_chars { lines += 1 }
+    return lines
+}
+
+// Unsigned 64-bit LEB128 varint encoder (values >= 0, W3C/Protobuf wire format)
+fn uleb128_push(out: ByteBuf, val: i64) -> i64 ! i64 {
+    if val < 0 { return err(400) }
+    mut v := val
+    while true {
+        mut byte_v := v & 127
+        v = v >> 7
+        if v != 0 { byte_v = byte_v | 128 }
+        buf_push(out, byte_v)
+        if v == 0 { break }
+    }
+    return ok(buf_len(out))
+}
+
+fn uleb128_decode_val(b: ByteBuf, off: i64) -> i64 ! i64 {
+    n := buf_len(b)
+    if off < 0 or off >= n { return err(400) }
+    mut res := 0
+    mut shift := 0
+    mut i := off
+    while i < n and shift < 63 {
+        bv := buf_get(b, i)
+        res = res | ((bv & 127) << shift)
+        if (bv & 128) == 0 { return ok(res) }
+        shift += 7
+        i += 1
+    }
+    return err(400)
+}

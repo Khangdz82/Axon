@@ -11,8 +11,13 @@ use compiler_ax::sema_perceus
 use compiler_ax::comptime
 
 // ============================================================================
-// PART 1: W3C WebAssembly (`wasm32` + `SIMD128` + WASI `fd_write`) Backend
+// PART 1: W3C WebAssembly (`wasm32` + `0xFD` SIMD128 + WASI `preview1`) Backend
 // ============================================================================
+// Pure zero-SDK WASM emitter with:
+//   - Whole-program reachability tree-shaking from `main` / `@export`
+//   - Dynamic `memory.grow` 16B-aligned bump allocator
+//   - Full WASI (`fd_write`, `proc_exit`, `clock_time_get`)
+//   - Full Axon feature parity (`f"..."`, `str`, default/named args, `struct`, `ByteBuf`/`IntBuf`, `ok`/`err`/`or`, `Table[T]` SoA + `0xFD` SIMD128)
 
 struct WasmCtx {
     pool: ByteBuf
@@ -25,6 +30,28 @@ struct WasmCtx {
     fn_map: IntBuf
     state: IntBuf
 }
+
+// Fixed WASI Imports (func 0..2) & Runtime Helpers (func 3..17)
+fn wfn_fd_write() -> i64       { return 0 }
+fn wfn_proc_exit() -> i64      { return 1 }
+fn wfn_clock_time_get() -> i64 { return 2 }
+fn wfn_alloc() -> i64          { return 3 }
+fn wfn_print_str() -> i64      { return 4 }
+fn wfn_print_i64() -> i64      { return 5 }
+fn wfn_simd128_fma() -> i64    { return 6 }
+fn wfn_simd128_mul() -> i64    { return 7 }
+fn wfn_clock_ns() -> i64       { return 8 }
+fn wfn_buf_new() -> i64        { return 9 }
+fn wfn_buf_push_w() -> i64     { return 10 }
+fn wfn_ibuf_push() -> i64      { return 11 }
+fn wfn_buf_push_bytes() -> i64 { return 12 }
+fn wfn_buf_push_i64() -> i64   { return 13 }
+fn wfn_str_eq() -> i64         { return 14 }
+fn wfn_str_concat() -> i64     { return 15 }
+fn wfn_table_fill_f32() -> i64 { return 16 }
+fn wfn_print_dec() -> i64      { return 17 }
+fn wfn_buf_push_dec() -> i64   { return 18 }
+fn wfn_user_base() -> i64      { return 19 }
 
 fn wasm_uleb(out: ByteBuf, val_in: i64) {
     mut v := val_in
@@ -76,6 +103,16 @@ fn wasm_emit_section(out: ByteBuf, sec_id: i64, payload: ByteBuf) {
     while i < n {
         buf_push(out, buf_get(payload, i))
         i += 1
+    }
+}
+
+fn wasm_append_code_body(sec_code: ByteBuf, body: ByteBuf) {
+    wasm_uleb(sec_code, buf_len(body))
+    mut bi := 0
+    n := buf_len(body)
+    while bi < n {
+        buf_push(sec_code, buf_get(body, bi))
+        bi += 1
     }
 }
 
@@ -185,303 +222,935 @@ fn wasm_memarg(c: ByteBuf, align_pow2: i64, offset: i64) {
     wasm_uleb(c, offset)
 }
 
-// Emits `__axon_print_str(ptr: i32, len: i32) -> ()` (WASM func index 1, imports `fd_write` at 0)
+fn wasm_op2(c: ByteBuf, a: i64, b: i64) {
+    buf_push(c, a); buf_push(c, b)
+}
+
+fn wasm_op3(c: ByteBuf, a: i64, b: i64, d: i64) {
+    buf_push(c, a); buf_push(c, b); buf_push(c, d)
+}
+
+fn wasm_op4(c: ByteBuf, a: i64, b: i64, d: i64, e: i64) {
+    buf_push(c, a); buf_push(c, b); buf_push(c, d); buf_push(c, e)
+}
+
+fn wasm_get_wrap(c: ByteBuf, idx: i64) {
+    wasm_local_get(c, idx); buf_push(c, 0xA7)
+}
+
+fn wasm_mem_op(c: ByteBuf, op: i64, align_pow2: i64, offset: i64) {
+    buf_push(c, op); wasm_memarg(c, align_pow2, offset)
+}
+
+fn wasm_get_mem(c: ByteBuf, idx: i64, op: i64, align_pow2: i64, offset: i64) {
+    wasm_local_get(c, idx); buf_push(c, op); wasm_memarg(c, align_pow2, offset)
+}
+
+fn wasm_wrap_mem(c: ByteBuf, idx: i64, op: i64, align_pow2: i64, offset: i64) {
+    wasm_get_wrap(c, idx); buf_push(c, op); wasm_memarg(c, align_pow2, offset)
+}
+
+fn wasm_emit_ptr_field_load(c: ByteBuf, ptmp: i64, off_bytes: i64) {
+    wasm_local_tee(c, ptmp)
+    wasm_op3(c, 0x50, 0x04, 0x7E)
+    wasm_i64_const(c, 0); buf_push(c, 0x05)
+    wasm_wrap_mem(c, ptmp, 0x29, 3, off_bytes)
+    buf_push(c, 0x0B)
+}
+
+fn wasm_emit_float_to_dec(c: ByteBuf) {
+    buf_push(c, 0xBF) // f64.reinterpret_i64
+    wasm_i64_const(c, 0x40C3880000000000) // 10000.0
+    wasm_op3(c, 0xBF, 0xA2, 0xB0) // f64.reinterpret, mul, trunc_f64_s
+}
+
+fn wasm_arg_nid(wc: WasmCtx, aoff: i64, idx: i64) -> i64 {
+    return ast_get(wc.nodes, ibuf_get(wc.extra, aoff + idx), 4)
+}
+
+fn wasm_arg_expr(wc: WasmCtx, c: ByteBuf, aoff: i64, idx: i64) {
+    wasm_emit_expr(wc, c, wasm_arg_nid(wc, aoff, idx))
+}
+
+fn wasm_arg_set(wc: WasmCtx, c: ByteBuf, aoff: i64, idx: i64, tmp: i64) {
+    wasm_emit_expr(wc, c, wasm_arg_nid(wc, aoff, idx))
+    wasm_local_set(c, tmp)
+}
+
+fn wasm_emit_col_ptr(c: ByteBuf, base_tmp: i64, cnt_tmp: i64, col_idx: i64) {
+    wasm_local_get(c, base_tmp)
+    wasm_i64_const(c, col_idx); wasm_local_get(c, cnt_tmp); buf_push(c, 0x7E)
+    wasm_i64_const(c, 2); wasm_op3(c, 0x86, 0x7C, 0xA7)
+}
+
+fn wasm_trap_ge_u(c: ByteBuf) {
+    wasm_op4(c, 0x5A, 0x04, 0x40, 0x00); buf_push(c, 0x0B)
+}
+
+fn wasm_loop_hdr(c: ByteBuf) {
+    wasm_op4(c, 0x02, 0x40, 0x03, 0x40)
+}
+
+fn wasm_loop_end(c: ByteBuf) {
+    wasm_op4(c, 0x0C, 0x00, 0x0B, 0x0B)
+}
+
+fn wasm_simd_op(c: ByteBuf, op: i64) {
+    buf_push(c, 0xFD); wasm_uleb(c, op)
+}
+
+fn wasm_emit_aop(c: ByteBuf, aop: i64, is_f64: i64) {
+    if is_f64 != 0 {
+        if aop == aop_add() { wasm_op2(c, 0xA0, 0xBD) }
+        else if aop == aop_sub() { wasm_op2(c, 0xA1, 0xBD) }
+        else if aop == aop_mul() { wasm_op2(c, 0xA2, 0xBD) }
+        else { wasm_op2(c, 0xA3, 0xBD) }
+        return
+    }
+    if aop == aop_add() { buf_push(c, 0x7C) }
+    else if aop == aop_sub() { buf_push(c, 0x7D) }
+    else if aop == aop_mul() { buf_push(c, 0x7E) }
+    else { buf_push(c, 0x7F) }
+}
+
+fn wasm_emit_bin_num_op(c: ByteBuf, op: i64, is_f64: i64) {
+    if is_f64 != 0 {
+        if op == op_add() { wasm_op2(c, 0xA0, 0xBD); return }
+        if op == op_sub() { wasm_op2(c, 0xA1, 0xBD); return }
+        if op == op_mul() { wasm_op2(c, 0xA2, 0xBD); return }
+        if op == op_div() { wasm_op2(c, 0xA3, 0xBD); return }
+        mut cmp := 0x66
+        if op == op_eq() { cmp = 0x61 } else if op == op_neq() { cmp = 0x62 }
+        else if op == op_lt() { cmp = 0x63 } else if op == op_gt() { cmp = 0x64 }
+        else if op == op_lte() { cmp = 0x65 }
+        wasm_op2(c, cmp, 0xAD)
+        return
+    }
+    if op == op_add() or op == op_wrap_add() { buf_push(c, 0x7C); return }
+    if op == op_sub() or op == op_wrap_sub() { buf_push(c, 0x7D); return }
+    if op == op_mul() or op == op_wrap_mul() { buf_push(c, 0x7E); return }
+    if op == op_div() { buf_push(c, 0x7F); return }
+    if op == op_mod() { buf_push(c, 0x81); return }
+    if op == op_bit_and() { buf_push(c, 0x83); return }
+    if op == op_bit_or() { buf_push(c, 0x84); return }
+    if op == op_bit_xor() { buf_push(c, 0x85); return }
+    if op == op_shl() { buf_push(c, 0x86); return }
+    if op == op_shr() { buf_push(c, 0x87); return }
+    mut cmp := 0x59
+    if op == op_eq() { cmp = 0x51 } else if op == op_neq() { cmp = 0x52 }
+    else if op == op_lt() { cmp = 0x53 } else if op == op_gt() { cmp = 0x55 }
+    else if op == op_lte() { cmp = 0x57 }
+    wasm_op2(c, cmp, 0xAD)
+}
+
+// --- Runtime Helper Body Emitters ---
+
+// `wfn_alloc(bytes: i32) -> i32`: 16-byte aligned linear bump allocator with `memory.grow`
+fn wasm_build_helper_alloc(body: ByteBuf) {
+    // param 0=bytes(i32); locals: 1=sz(i32), 2=ptr(i32), 3=end(i32), 4=cur(i32)
+    wasm_op3(body, 1, 4, 0x7F)
+
+    wasm_local_get(body, 0); wasm_i32_const(body, 16)
+    wasm_op3(body, 0x48, 0x04, 0x40)
+    wasm_i32_const(body, 16); wasm_local_set(body, 1)
+    buf_push(body, 0x05)
+    wasm_local_get(body, 0); wasm_i32_const(body, 15); buf_push(body, 0x6A)
+    wasm_i32_const(body, -16); buf_push(body, 0x71); wasm_local_set(body, 1)
+    buf_push(body, 0x0B)
+
+    wasm_op2(body, 0x23, 0) // global.get 0
+    wasm_local_tee(body, 2); wasm_local_get(body, 1); buf_push(body, 0x6A); wasm_local_set(body, 3)
+
+    // Guard i32 wraparound
+    wasm_local_get(body, 3); wasm_local_get(body, 2); wasm_op4(body, 0x49, 0x04, 0x40, 0x00); buf_push(body, 0x0B)
+
+    wasm_op2(body, 0x3F, 0x00) // memory.size
+    wasm_i32_const(body, 16); buf_push(body, 0x74); wasm_local_set(body, 4)
+
+    wasm_local_get(body, 3); wasm_local_get(body, 4); wasm_op3(body, 0x4B, 0x04, 0x40)
+    wasm_local_get(body, 3); wasm_local_get(body, 4); buf_push(body, 0x6B)
+    wasm_i32_const(body, 65535); buf_push(body, 0x6A)
+    wasm_i32_const(body, 16); wasm_op3(body, 0x76, 0x40, 0x00) // memory.grow
+    wasm_i32_const(body, -1); wasm_op4(body, 0x46, 0x04, 0x40, 0x00)
+    wasm_op2(body, 0x0B, 0x0B)
+
+    wasm_local_get(body, 3); wasm_op2(body, 0x24, 0) // global.set 0
+    wasm_local_get(body, 2); buf_push(body, 0x0B)
+}
+
+// `wfn_print_str(ptr: i32, len: i32) -> ()`
 fn wasm_build_helper_print_str(body: ByteBuf) {
-    wasm_uleb(body, 0)
-    // linear[0] = ptr; linear[4] = len
-    wasm_i32_const(body, 0)
-    wasm_local_get(body, 0)
-    buf_push(body, 0x36)
-    wasm_memarg(body, 2, 0)
+    buf_push(body, 0)
+    wasm_i32_const(body, 0); wasm_local_get(body, 0); wasm_mem_op(body, 0x36, 2, 0)
+    wasm_i32_const(body, 4); wasm_local_get(body, 1); wasm_mem_op(body, 0x36, 2, 0)
+    wasm_i32_const(body, 1); wasm_i32_const(body, 0); wasm_i32_const(body, 1); wasm_i32_const(body, 8)
+    wasm_call(body, wfn_fd_write())
+    wasm_op2(body, 0x1A, 0x0B)
+}
 
-    wasm_i32_const(body, 4)
-    wasm_local_get(body, 1)
-    buf_push(body, 0x36)
-    wasm_memarg(body, 2, 0)
+// Formats signed `i64` into `[16..63]` leaving starting `pos: i32` and ending at `64`
+fn wasm_emit_format_i64_scratch(body: ByteBuf, val_loc: i64, cur_loc: i64, pos_loc: i64, neg_loc: i64) {
+    wasm_i32_const(body, 64); wasm_local_set(body, pos_loc)
+    wasm_i32_const(body, 0); wasm_local_set(body, neg_loc)
 
-    // fd_write(1, 0, 1, 8)
-    wasm_i32_const(body, 1)
-    wasm_i32_const(body, 0)
-    wasm_i32_const(body, 1)
-    wasm_i32_const(body, 8)
-    wasm_call(body, 0)
-    buf_push(body, 0x1A)
+    wasm_local_get(body, val_loc); wasm_i64_const(body, 0); wasm_op3(body, 0x53, 0x04, 0x40)
+    wasm_i64_const(body, 0); wasm_local_get(body, val_loc); buf_push(body, 0x7D); wasm_local_set(body, cur_loc)
+    wasm_i32_const(body, 1); wasm_local_set(body, neg_loc)
+    buf_push(body, 0x05)
+    wasm_local_get(body, val_loc); wasm_local_set(body, cur_loc)
+    buf_push(body, 0x0B)
+
+    wasm_loop_hdr(body)
+    wasm_local_get(body, pos_loc); wasm_i32_const(body, 1); buf_push(body, 0x6B); wasm_local_tee(body, pos_loc)
+    wasm_local_get(body, cur_loc); wasm_i64_const(body, 10); wasm_op2(body, 0x82, 0xA7)
+    wasm_i32_const(body, 48); buf_push(body, 0x6A); wasm_mem_op(body, 0x3A, 0, 0)
+    wasm_local_get(body, cur_loc); wasm_i64_const(body, 10); buf_push(body, 0x80); wasm_local_tee(body, cur_loc)
+    wasm_i64_const(body, 0); wasm_op3(body, 0x52, 0x0D, 0x00)
+    wasm_op2(body, 0x0B, 0x0B)
+
+    wasm_local_get(body, neg_loc); wasm_op2(body, 0x04, 0x40)
+    wasm_local_get(body, pos_loc); wasm_i32_const(body, 1); buf_push(body, 0x6B); wasm_local_tee(body, pos_loc)
+    wasm_i32_const(body, 45); wasm_mem_op(body, 0x3A, 0, 0)
     buf_push(body, 0x0B)
 }
 
-// Emits `__axon_print_i64(val: i64) -> ()` (WASM func index 2)
+// Formats 4-decimal `dec` (`val_loc`) into `[16..63]` leaving starting `pos_loc` and ending at `64`
+fn wasm_emit_format_dec_scratch(body: ByteBuf, val_loc: i64, cur_loc: i64, whole_loc: i64, frac_loc: i64, pos_loc: i64, neg_loc: i64, i_loc: i64) {
+    wasm_i32_const(body, 64); wasm_local_set(body, pos_loc)
+    wasm_i32_const(body, 0); wasm_local_set(body, neg_loc)
+    wasm_local_get(body, val_loc); wasm_i64_const(body, 0); wasm_op3(body, 0x53, 0x04, 0x40)
+    wasm_i64_const(body, 0); wasm_local_get(body, val_loc); buf_push(body, 0x7D); wasm_local_set(body, cur_loc)
+    wasm_i32_const(body, 1); wasm_local_set(body, neg_loc)
+    buf_push(body, 0x05)
+    wasm_local_get(body, val_loc); wasm_local_set(body, cur_loc)
+    buf_push(body, 0x0B)
+
+    wasm_local_get(body, cur_loc); wasm_i64_const(body, 10000); buf_push(body, 0x82); wasm_local_set(body, frac_loc)
+    wasm_local_get(body, cur_loc); wasm_i64_const(body, 10000); buf_push(body, 0x80); wasm_local_set(body, whole_loc)
+
+    wasm_i32_const(body, 0); wasm_local_set(body, i_loc)
+    wasm_loop_hdr(body)
+    wasm_local_get(body, i_loc); wasm_i32_const(body, 4); wasm_op3(body, 0x4E, 0x0D, 0x01)
+    wasm_local_get(body, pos_loc); wasm_i32_const(body, 1); buf_push(body, 0x6B); wasm_local_tee(body, pos_loc)
+    wasm_local_get(body, frac_loc); wasm_i64_const(body, 10); wasm_op2(body, 0x82, 0xA7); wasm_i32_const(body, 48); buf_push(body, 0x6A)
+    wasm_mem_op(body, 0x3A, 0, 0)
+    wasm_local_get(body, frac_loc); wasm_i64_const(body, 10); buf_push(body, 0x80); wasm_local_set(body, frac_loc)
+    wasm_local_get(body, i_loc); wasm_i32_const(body, 1); buf_push(body, 0x6A); wasm_local_set(body, i_loc)
+    wasm_loop_end(body)
+
+    wasm_local_get(body, pos_loc); wasm_i32_const(body, 1); buf_push(body, 0x6B); wasm_local_tee(body, pos_loc)
+    wasm_i32_const(body, 46); wasm_mem_op(body, 0x3A, 0, 0) // '.'
+
+    wasm_loop_hdr(body)
+    wasm_local_get(body, pos_loc); wasm_i32_const(body, 1); buf_push(body, 0x6B); wasm_local_tee(body, pos_loc)
+    wasm_local_get(body, whole_loc); wasm_i64_const(body, 10); wasm_op2(body, 0x82, 0xA7); wasm_i32_const(body, 48); buf_push(body, 0x6A)
+    wasm_mem_op(body, 0x3A, 0, 0)
+    wasm_local_get(body, whole_loc); wasm_i64_const(body, 10); buf_push(body, 0x80); wasm_local_tee(body, whole_loc)
+    wasm_i64_const(body, 0); wasm_op3(body, 0x52, 0x0D, 0x00)
+    wasm_op2(body, 0x0B, 0x0B)
+
+    wasm_local_get(body, neg_loc); wasm_op2(body, 0x04, 0x40)
+    wasm_local_get(body, pos_loc); wasm_i32_const(body, 1); buf_push(body, 0x6B); wasm_local_tee(body, pos_loc)
+    wasm_i32_const(body, 45); wasm_mem_op(body, 0x3A, 0, 0)
+    buf_push(body, 0x0B)
+}
+
+// `wfn_print_i64(val: i64) -> ()`
 fn wasm_build_helper_print_i64(body: ByteBuf) {
-    // param 0: val (i64); locals: 1=cur(i64), 2=pos(i32), 3=neg(i32)
-    wasm_uleb(body, 2)
-    wasm_uleb(body, 1)
-    buf_push(body, 0x7E)
-    wasm_uleb(body, 2)
-    buf_push(body, 0x7F)
-
-    wasm_i32_const(body, 64)
-    wasm_local_set(body, 2)
-    wasm_i32_const(body, 0)
-    wasm_local_set(body, 3)
-
-    wasm_local_get(body, 0)
-    wasm_i64_const(body, 0)
-    buf_push(body, 0x53) // i64.lt_s
-    buf_push(body, 0x04) // if
-    buf_push(body, 0x40)
-    wasm_i64_const(body, 0)
-    wasm_local_get(body, 0)
-    buf_push(body, 0x7D) // i64.sub
-    wasm_local_set(body, 1)
-    wasm_i32_const(body, 1)
-    wasm_local_set(body, 3)
-    buf_push(body, 0x05) // else
-    wasm_local_get(body, 0)
-    wasm_local_set(body, 1)
-    buf_push(body, 0x0B) // end
-
-    // do-while digit extraction into linear[16..63]
-    buf_push(body, 0x02) // block
-    buf_push(body, 0x40)
-    buf_push(body, 0x03) // loop
-    buf_push(body, 0x40)
-
-    wasm_local_get(body, 2)
-    wasm_i32_const(body, 1)
-    buf_push(body, 0x6B) // i32.sub
-    wasm_local_tee(body, 2)
-
-    wasm_local_get(body, 1)
-    wasm_i64_const(body, 10)
-    buf_push(body, 0x82) // i64.rem_u
-    buf_push(body, 0xA7) // i32.wrap_i64
-    wasm_i32_const(body, 48)
-    buf_push(body, 0x6A) // i32.add
-    buf_push(body, 0x3A) // i32.store8
-    wasm_memarg(body, 0, 0)
-
-    wasm_local_get(body, 1)
-    wasm_i64_const(body, 10)
-    buf_push(body, 0x80) // i64.div_u
-    wasm_local_tee(body, 1)
-    wasm_i64_const(body, 0)
-    buf_push(body, 0x52) // i64.ne
-    buf_push(body, 0x0D) // br_if 0 (continue loop)
-    wasm_uleb(body, 0)
-
-    buf_push(body, 0x0B) // end loop
-    buf_push(body, 0x0B) // end block
-
-    wasm_local_get(body, 3)
-    buf_push(body, 0x04) // if neg
-    buf_push(body, 0x40)
-    wasm_local_get(body, 2)
-    wasm_i32_const(body, 1)
-    buf_push(body, 0x6B)
-    wasm_local_tee(body, 2)
-    wasm_i32_const(body, 45)
-    buf_push(body, 0x3A) // store '-'
-    wasm_memarg(body, 0, 0)
-    buf_push(body, 0x0B)
-
-    wasm_local_get(body, 2)
-    wasm_i32_const(body, 64)
-    wasm_local_get(body, 2)
-    buf_push(body, 0x6B)
-    wasm_call(body, 1)
+    wasm_op2(body, 2, 1); buf_push(body, 0x7E)
+    wasm_op2(body, 2, 0x7F)
+    wasm_emit_format_i64_scratch(body, 0, 1, 2, 3)
+    wasm_local_get(body, 2); wasm_i32_const(body, 64); wasm_local_get(body, 2); buf_push(body, 0x6B)
+    wasm_call(body, wfn_print_str())
     buf_push(body, 0x0B)
 }
 
-// Emits `axon_simd128_fma_f32(dst_ptr: i32, src_ptr: i32, scale: f32, count: i32) -> ()` (WASM func index 3)
-// Uses genuine W3C WebAssembly SIMD128 (`0xFD` prefix, `v128` 128-bit 4xf32 lanes) + exact scalar tail!
+// `wfn_print_dec(val: i64) -> ()`
+fn wasm_build_helper_print_dec(body: ByteBuf) {
+    // param 0=val(i64); locals: 1=cur(i64), 2=whole(i64), 3=frac(i64), 4=pos(i32), 5=neg(i32), 6=i(i32)
+    wasm_op3(body, 2, 3, 0x7E)
+    wasm_op2(body, 3, 0x7F)
+    wasm_emit_format_dec_scratch(body, 0, 1, 2, 3, 4, 5, 6)
+    wasm_local_get(body, 4); wasm_i32_const(body, 64); wasm_local_get(body, 4); buf_push(body, 0x6B)
+    wasm_call(body, wfn_print_str())
+    buf_push(body, 0x0B)
+}
+
+// `wfn_simd128_fma(dst_ptr: i32, src_ptr: i32, scale: f32, count: i32) -> ()`
+// Genuine W3C WASM SIMD128 (`0xFD` prefix, `v128` 128-bit 4xf32 lanes) + scalar tail
 fn wasm_build_helper_simd128_fma(body: ByteBuf) {
-    // params: 0=dst(i32), 1=src(i32), 2=scale(f32), 3=count(i32)
-    // locals: 4=i(i32), 5=vec_end(i32), 6=off(i32), 7=vscale(v128)
-    wasm_uleb(body, 2)
-    wasm_uleb(body, 3)
-    buf_push(body, 0x7F) // 3 x i32
-    wasm_uleb(body, 1)
-    buf_push(body, 0x7B) // 1 x v128
+    // params: 0=dst(i32), 1=src(i32), 2=scale(f32), 3=count(i32); locals: 4=i, 5=vec_end, 6=off, 7=vscale(v128)
+    wasm_op3(body, 2, 3, 0x7F)
+    wasm_op2(body, 1, 0x7B)
 
-    // vscale = f32x4.splat(scale)
-    wasm_local_get(body, 2)
-    buf_push(body, 0xFD)
-    wasm_uleb(body, 19) // f32x4.splat = 0x13 (19)
-    wasm_local_set(body, 7)
+    wasm_local_get(body, 2); wasm_simd_op(body, 19); wasm_local_set(body, 7) // f32x4.splat
+    wasm_local_get(body, 3); wasm_i32_const(body, -4); buf_push(body, 0x71); wasm_local_set(body, 5)
+    wasm_i32_const(body, 0); wasm_local_set(body, 4)
 
-    // vec_end = count & ~3
-    wasm_local_get(body, 3)
-    wasm_i32_const(body, -4)
-    buf_push(body, 0x71) // i32.and
-    wasm_local_set(body, 5)
+    wasm_loop_hdr(body)
+    wasm_local_get(body, 4); wasm_local_get(body, 5); wasm_op3(body, 0x4E, 0x0D, 0x01)
+    wasm_local_get(body, 4); wasm_i32_const(body, 2); buf_push(body, 0x74); wasm_local_set(body, 6)
+    wasm_local_get(body, 0); wasm_local_get(body, 6); buf_push(body, 0x6A)
+    wasm_local_get(body, 0); wasm_local_get(body, 6); buf_push(body, 0x6A)
+    wasm_simd_op(body, 0); wasm_memarg(body, 0, 0)
 
-    wasm_i32_const(body, 0)
-    wasm_local_set(body, 4)
-
-    // SIMD128 4-lane loop: while i < vec_end
-    buf_push(body, 0x02) // block
-    buf_push(body, 0x40)
-    buf_push(body, 0x03) // loop
-    buf_push(body, 0x40)
-
-    wasm_local_get(body, 4)
-    wasm_local_get(body, 5)
-    buf_push(body, 0x4E) // i32.ge_s
-    buf_push(body, 0x0D) // br_if 1 (break)
-    wasm_uleb(body, 1)
-
-    // off = i << 2
-    wasm_local_get(body, 4)
-    wasm_i32_const(body, 2)
-    buf_push(body, 0x74) // i32.shl
-    wasm_local_set(body, 6)
-
-    // dst_addr = dst + off
-    wasm_local_get(body, 0)
-    wasm_local_get(body, 6)
-    buf_push(body, 0x6A)
-
-    // vdst = v128.load(dst + off)
-    wasm_local_get(body, 0)
-    wasm_local_get(body, 6)
-    buf_push(body, 0x6A)
-    buf_push(body, 0xFD)
-    wasm_uleb(body, 0) // v128.load = 0
-    wasm_memarg(body, 0, 0)
-
-    // vsrc = v128.load(src + off)
-    wasm_local_get(body, 1)
-    wasm_local_get(body, 6)
-    buf_push(body, 0x6A)
-    buf_push(body, 0xFD)
-    wasm_uleb(body, 0)
-    wasm_memarg(body, 0, 0)
-
-    // vsrc * vscale
+    wasm_local_get(body, 1); wasm_local_get(body, 6); buf_push(body, 0x6A)
+    wasm_simd_op(body, 0); wasm_memarg(body, 0, 0)
     wasm_local_get(body, 7)
-    buf_push(body, 0xFD)
-    wasm_uleb(body, 230) // f32x4.mul = 0xE6 (230)
+    wasm_simd_op(body, 230) // f32x4.mul
+    wasm_simd_op(body, 228) // f32x4.add
+    wasm_simd_op(body, 11); wasm_memarg(body, 0, 0) // v128.store
 
-    // vdst + (vsrc * vscale)
-    buf_push(body, 0xFD)
-    wasm_uleb(body, 228) // f32x4.add = 0xE4 (228)
+    wasm_local_get(body, 4); wasm_i32_const(body, 4); buf_push(body, 0x6A); wasm_local_set(body, 4)
+    wasm_loop_end(body)
 
-    // v128.store(dst + off, res)
-    buf_push(body, 0xFD)
-    wasm_uleb(body, 11) // v128.store = 11
-    wasm_memarg(body, 0, 0)
+    wasm_loop_hdr(body)
+    wasm_local_get(body, 4); wasm_local_get(body, 3); wasm_op3(body, 0x4E, 0x0D, 0x01)
 
-    // i += 4
-    wasm_local_get(body, 4)
-    wasm_i32_const(body, 4)
-    buf_push(body, 0x6A)
-    wasm_local_set(body, 4)
-    buf_push(body, 0x0C) // br 0
-    wasm_uleb(body, 0)
+    wasm_local_get(body, 4); wasm_i32_const(body, 2); buf_push(body, 0x74); wasm_local_set(body, 6)
+    wasm_local_get(body, 0); wasm_local_get(body, 6); buf_push(body, 0x6A)
+    wasm_local_get(body, 0); wasm_local_get(body, 6); buf_push(body, 0x6A); wasm_mem_op(body, 0x2A, 0, 0)
+    wasm_local_get(body, 1); wasm_local_get(body, 6); buf_push(body, 0x6A); wasm_mem_op(body, 0x2A, 0, 0)
+    wasm_local_get(body, 2); wasm_op3(body, 0x94, 0x92, 0x38); wasm_memarg(body, 0, 0)
+
+    wasm_local_get(body, 4); wasm_i32_const(body, 1); buf_push(body, 0x6A); wasm_local_set(body, 4)
+    wasm_loop_end(body)
     buf_push(body, 0x0B)
-    buf_push(body, 0x0B)
-
-    // Scalar tail loop: while i < count
-    buf_push(body, 0x02)
-    buf_push(body, 0x40)
-    buf_push(body, 0x03)
-    buf_push(body, 0x40)
-
-    wasm_local_get(body, 4)
-    wasm_local_get(body, 3)
-    buf_push(body, 0x4E) // i32.ge_s
-    buf_push(body, 0x0D)
-    wasm_uleb(body, 1)
-
-    wasm_local_get(body, 4)
-    wasm_i32_const(body, 2)
-    buf_push(body, 0x74)
-    wasm_local_set(body, 6)
-
-    wasm_local_get(body, 0)
-    wasm_local_get(body, 6)
-    buf_push(body, 0x6A)
-
-    wasm_local_get(body, 0)
-    wasm_local_get(body, 6)
-    buf_push(body, 0x6A)
-    buf_push(body, 0x2A) // f32.load
-    wasm_memarg(body, 0, 0)
-
-    wasm_local_get(body, 1)
-    wasm_local_get(body, 6)
-    buf_push(body, 0x6A)
-    buf_push(body, 0x2A) // f32.load
-    wasm_memarg(body, 0, 0)
-
-    wasm_local_get(body, 2)
-    buf_push(body, 0x94) // f32.mul
-    buf_push(body, 0x92) // f32.add
-    buf_push(body, 0x38) // f32.store
-    wasm_memarg(body, 0, 0)
-
-    wasm_local_get(body, 4)
-    wasm_i32_const(body, 1)
-    buf_push(body, 0x6A)
-    wasm_local_set(body, 4)
-    buf_push(body, 0x0C)
-    wasm_uleb(body, 0)
-    buf_push(body, 0x0B)
-    buf_push(body, 0x0B)
-
-    buf_push(body, 0x0B) // end func
 }
+
+// `wfn_simd128_mul(dst_ptr: i32, scale: f32, count: i32) -> ()`
+fn wasm_build_helper_simd128_mul(body: ByteBuf) {
+    // params: 0=dst(i32), 1=scale(f32), 2=count(i32); locals: 3=i, 4=vec_end, 5=off, 6=vscale(v128)
+    wasm_op3(body, 2, 3, 0x7F)
+    wasm_op2(body, 1, 0x7B)
+
+    wasm_local_get(body, 1); wasm_simd_op(body, 19); wasm_local_set(body, 6)
+    wasm_local_get(body, 2); wasm_i32_const(body, -4); buf_push(body, 0x71); wasm_local_set(body, 4)
+    wasm_i32_const(body, 0); wasm_local_set(body, 3)
+
+    wasm_loop_hdr(body)
+    wasm_local_get(body, 3); wasm_local_get(body, 4); wasm_op3(body, 0x4E, 0x0D, 0x01)
+    wasm_local_get(body, 3); wasm_i32_const(body, 2); buf_push(body, 0x74); wasm_local_set(body, 5)
+    wasm_local_get(body, 0); wasm_local_get(body, 5); buf_push(body, 0x6A)
+    wasm_local_get(body, 0); wasm_local_get(body, 5); buf_push(body, 0x6A)
+    wasm_simd_op(body, 0); wasm_memarg(body, 0, 0)
+    wasm_local_get(body, 6)
+    wasm_simd_op(body, 230) // f32x4.mul
+    wasm_simd_op(body, 11); wasm_memarg(body, 0, 0)
+    wasm_local_get(body, 3); wasm_i32_const(body, 4); buf_push(body, 0x6A); wasm_local_set(body, 3)
+    wasm_loop_end(body)
+
+    wasm_loop_hdr(body)
+    wasm_local_get(body, 3); wasm_local_get(body, 2); wasm_op3(body, 0x4E, 0x0D, 0x01)
+    wasm_local_get(body, 3); wasm_i32_const(body, 2); buf_push(body, 0x74); wasm_local_set(body, 5)
+    wasm_local_get(body, 0); wasm_local_get(body, 5); buf_push(body, 0x6A)
+    wasm_local_get(body, 0); wasm_local_get(body, 5); buf_push(body, 0x6A); wasm_mem_op(body, 0x2A, 0, 0)
+    wasm_local_get(body, 1); wasm_op2(body, 0x94, 0x38); wasm_memarg(body, 0, 0)
+    wasm_local_get(body, 3); wasm_i32_const(body, 1); buf_push(body, 0x6A); wasm_local_set(body, 3)
+    wasm_loop_end(body)
+    buf_push(body, 0x0B)
+}
+
+// `wfn_clock_ns() -> i64`
+fn wasm_build_helper_clock_ns(body: ByteBuf) {
+    buf_push(body, 0)
+    wasm_i32_const(body, 1); wasm_i64_const(body, 0); wasm_i32_const(body, 128)
+    wasm_call(body, wfn_clock_time_get())
+    buf_push(body, 0x1A)
+    wasm_i32_const(body, 128); wasm_mem_op(body, 0x29, 3, 0)
+    buf_push(body, 0x0B)
+}
+
+// `wfn_buf_new(cap: i64, elem_sz: i32) -> i64`
+fn wasm_build_helper_buf_new(body: ByteBuf) {
+    // params: 0=cap(i64), 1=elem_sz(i32); locals: 2=c32(i32), 3=hdr(i32), 4=data(i32)
+    wasm_op3(body, 1, 3, 0x7F)
+
+    wasm_get_wrap(body, 0); wasm_local_set(body, 2)
+    wasm_local_get(body, 2); wasm_i32_const(body, 16); wasm_op3(body, 0x48, 0x04, 0x40)
+    wasm_i32_const(body, 16); wasm_local_set(body, 2); buf_push(body, 0x0B)
+
+    wasm_i32_const(body, 24); wasm_call(body, wfn_alloc()); wasm_local_set(body, 3)
+    wasm_local_get(body, 2); wasm_local_get(body, 1); buf_push(body, 0x6C); wasm_call(body, wfn_alloc()); wasm_local_set(body, 4)
+
+    wasm_local_get(body, 3); wasm_i64_const(body, 0); wasm_mem_op(body, 0x37, 3, 0)
+    wasm_local_get(body, 3); wasm_local_get(body, 2); wasm_op2(body, 0xAD, 0x37); wasm_memarg(body, 3, 8)
+    wasm_local_get(body, 3); wasm_local_get(body, 4); wasm_mem_op(body, 0x36, 2, 16)
+
+    wasm_local_get(body, 3); wasm_op2(body, 0xAD, 0x0B)
+}
+
+// Emits ByteBuf load `[len, cap, data]` and capacity growth if `len + add > cap`
+fn wasm_emit_buf_grow_bytes(body: ByteBuf, hdr: i64, add: i64, len: i64, cap: i64, data: i64, ncap: i64, ndata: i64, idx: i64) {
+    wasm_get_mem(body, hdr, 0x28, 2, 0); wasm_local_set(body, len)
+    wasm_get_mem(body, hdr, 0x28, 2, 8); wasm_local_set(body, cap)
+    wasm_get_mem(body, hdr, 0x28, 2, 16); wasm_local_set(body, data)
+
+    wasm_local_get(body, len); wasm_local_get(body, add); buf_push(body, 0x6A)
+    wasm_local_get(body, cap); wasm_op3(body, 0x4B, 0x04, 0x40)
+    wasm_local_get(body, cap); wasm_i32_const(body, 2); buf_push(body, 0x6C); wasm_local_set(body, ncap)
+    wasm_local_get(body, ncap); wasm_local_get(body, len); wasm_local_get(body, add); wasm_op4(body, 0x6A, 0x49, 0x04, 0x40)
+    wasm_local_get(body, len); wasm_local_get(body, add); buf_push(body, 0x6A); wasm_i32_const(body, 16); buf_push(body, 0x6A); wasm_local_set(body, ncap)
+    buf_push(body, 0x0B)
+    wasm_local_get(body, ncap); wasm_call(body, wfn_alloc()); wasm_local_set(body, ndata)
+    wasm_i32_const(body, 0); wasm_local_set(body, idx)
+    wasm_loop_hdr(body)
+    wasm_local_get(body, idx); wasm_local_get(body, len); wasm_op3(body, 0x4F, 0x0D, 0x01)
+    wasm_local_get(body, ndata); wasm_local_get(body, idx); buf_push(body, 0x6A)
+    wasm_local_get(body, data); wasm_local_get(body, idx); buf_push(body, 0x6A)
+    wasm_mem_op(body, 0x2D, 0, 0); wasm_mem_op(body, 0x3A, 0, 0)
+    wasm_local_get(body, idx); wasm_i32_const(body, 1); buf_push(body, 0x6A); wasm_local_set(body, idx)
+    wasm_loop_end(body)
+    wasm_local_get(body, hdr); wasm_local_get(body, ncap); wasm_op2(body, 0xAD, 0x37); wasm_memarg(body, 3, 8)
+    wasm_local_get(body, hdr); wasm_local_get(body, ndata); wasm_mem_op(body, 0x36, 2, 16)
+    wasm_local_get(body, ndata); wasm_local_set(body, data)
+    buf_push(body, 0x0B)
+}
+
+// `wfn_buf_push_w(hdr: i32, val: i64, w: i32) -> ()`
+fn wasm_build_helper_buf_push_w(body: ByteBuf) {
+    // params: 0=hdr(i32), 1=val(i64), 2=w(i32); locals: 3=len, 4=cap, 5=data, 6=ncap, 7=ndata, 8=i
+    wasm_op3(body, 1, 6, 0x7F)
+    wasm_emit_buf_grow_bytes(body, 0, 2, 3, 4, 5, 6, 7, 8)
+
+    // Write w bytes at data + len
+    wasm_local_get(body, 2); wasm_i32_const(body, 1); wasm_op3(body, 0x46, 0x04, 0x40)
+    wasm_local_get(body, 5); wasm_local_get(body, 3); buf_push(body, 0x6A); wasm_local_get(body, 1); wasm_mem_op(body, 0x3C, 0, 0)
+    buf_push(body, 0x05)
+    wasm_local_get(body, 2); wasm_i32_const(body, 2); wasm_op3(body, 0x46, 0x04, 0x40)
+    wasm_local_get(body, 5); wasm_local_get(body, 3); buf_push(body, 0x6A); wasm_local_get(body, 1); wasm_mem_op(body, 0x3D, 0, 0)
+    buf_push(body, 0x05)
+    wasm_local_get(body, 2); wasm_i32_const(body, 4); wasm_op3(body, 0x46, 0x04, 0x40)
+    wasm_local_get(body, 5); wasm_local_get(body, 3); buf_push(body, 0x6A); wasm_local_get(body, 1); wasm_mem_op(body, 0x3E, 0, 0)
+    buf_push(body, 0x05)
+    wasm_local_get(body, 5); wasm_local_get(body, 3); buf_push(body, 0x6A); wasm_local_get(body, 1); wasm_mem_op(body, 0x37, 0, 0)
+    wasm_op3(body, 0x0B, 0x0B, 0x0B)
+
+    wasm_local_get(body, 0)
+    wasm_local_get(body, 3); wasm_local_get(body, 2); wasm_op3(body, 0x6A, 0xAD, 0x37); wasm_memarg(body, 3, 0)
+    buf_push(body, 0x0B)
+}
+
+// `wfn_ibuf_push(hdr: i32, val: i64) -> ()`
+fn wasm_build_helper_ibuf_push(body: ByteBuf) {
+    // params: 0=hdr(i32), 1=val(i64); locals: 2=len, 3=cap, 4=data, 5=ncap, 6=ndata, 7=i
+    wasm_op3(body, 1, 6, 0x7F)
+
+    wasm_get_mem(body, 0, 0x28, 2, 0); wasm_local_set(body, 2)
+    wasm_get_mem(body, 0, 0x28, 2, 8); wasm_local_set(body, 3)
+    wasm_get_mem(body, 0, 0x28, 2, 16); wasm_local_set(body, 4)
+
+    wasm_local_get(body, 2); wasm_local_get(body, 3); wasm_op3(body, 0x4F, 0x04, 0x40)
+    wasm_local_get(body, 3); wasm_i32_const(body, 2); buf_push(body, 0x6C); wasm_local_set(body, 5)
+    wasm_local_get(body, 5); wasm_i32_const(body, 3); buf_push(body, 0x74); wasm_call(body, wfn_alloc()); wasm_local_set(body, 6)
+    wasm_i32_const(body, 0); wasm_local_set(body, 7)
+    wasm_loop_hdr(body)
+    wasm_local_get(body, 7); wasm_local_get(body, 2); wasm_op3(body, 0x4F, 0x0D, 0x01)
+    wasm_local_get(body, 6); wasm_local_get(body, 7); wasm_i32_const(body, 3); wasm_op2(body, 0x74, 0x6A)
+    wasm_local_get(body, 4); wasm_local_get(body, 7); wasm_i32_const(body, 3); wasm_op2(body, 0x74, 0x6A)
+    wasm_mem_op(body, 0x29, 3, 0); wasm_mem_op(body, 0x37, 3, 0)
+    wasm_local_get(body, 7); wasm_i32_const(body, 1); buf_push(body, 0x6A); wasm_local_set(body, 7)
+    wasm_loop_end(body)
+    wasm_local_get(body, 0); wasm_local_get(body, 5); wasm_op2(body, 0xAD, 0x37); wasm_memarg(body, 3, 8)
+    wasm_local_get(body, 0); wasm_local_get(body, 6); wasm_mem_op(body, 0x36, 2, 16)
+    wasm_local_get(body, 6); wasm_local_set(body, 4)
+    buf_push(body, 0x0B)
+
+    wasm_local_get(body, 4); wasm_local_get(body, 2); wasm_i32_const(body, 3); wasm_op2(body, 0x74, 0x6A)
+    wasm_local_get(body, 1); wasm_mem_op(body, 0x37, 3, 0)
+    wasm_local_get(body, 0); wasm_local_get(body, 2); wasm_i32_const(body, 1); wasm_op3(body, 0x6A, 0xAD, 0x37); wasm_memarg(body, 3, 0)
+    buf_push(body, 0x0B)
+}
+
+// `wfn_buf_push_bytes(hdr: i32, src: i32, slen: i32) -> ()`
+fn wasm_build_helper_buf_push_bytes(body: ByteBuf) {
+    // params: 0=hdr(i32), 1=src(i32), 2=slen(i32); locals: 3=len, 4=cap, 5=data, 6=ncap, 7=ndata, 8=i
+    wasm_op3(body, 1, 6, 0x7F)
+
+    wasm_local_get(body, 2); wasm_i32_const(body, 0); wasm_op4(body, 0x4C, 0x04, 0x40, 0x0F); buf_push(body, 0x0B)
+    wasm_emit_buf_grow_bytes(body, 0, 2, 3, 4, 5, 6, 7, 8)
+
+    wasm_i32_const(body, 0); wasm_local_set(body, 8)
+    wasm_loop_hdr(body)
+    wasm_local_get(body, 8); wasm_local_get(body, 2); wasm_op3(body, 0x4F, 0x0D, 0x01)
+    wasm_local_get(body, 5); wasm_local_get(body, 3); buf_push(body, 0x6A); wasm_local_get(body, 8); buf_push(body, 0x6A)
+    wasm_local_get(body, 1); wasm_local_get(body, 8); buf_push(body, 0x6A)
+    wasm_mem_op(body, 0x2D, 0, 0); wasm_mem_op(body, 0x3A, 0, 0)
+    wasm_local_get(body, 8); wasm_i32_const(body, 1); buf_push(body, 0x6A); wasm_local_set(body, 8)
+    wasm_loop_end(body)
+
+    wasm_local_get(body, 0); wasm_local_get(body, 3); wasm_local_get(body, 2); wasm_op3(body, 0x6A, 0xAD, 0x37); wasm_memarg(body, 3, 0)
+    buf_push(body, 0x0B)
+}
+
+// `wfn_buf_push_i64(hdr: i32, val: i64) -> ()`
+fn wasm_build_helper_buf_push_i64(body: ByteBuf) {
+    wasm_op3(body, 2, 1, 0x7E); wasm_op2(body, 2, 0x7F)
+    wasm_emit_format_i64_scratch(body, 1, 2, 3, 4)
+    wasm_local_get(body, 0); wasm_local_get(body, 3)
+    wasm_i32_const(body, 64); wasm_local_get(body, 3); buf_push(body, 0x6B)
+    wasm_call(body, wfn_buf_push_bytes())
+    buf_push(body, 0x0B)
+}
+
+// `wfn_buf_push_dec(hdr: i32, val: i64) -> ()`
+fn wasm_build_helper_buf_push_dec(body: ByteBuf) {
+    wasm_op3(body, 2, 3, 0x7E); wasm_op2(body, 3, 0x7F)
+    wasm_emit_format_dec_scratch(body, 1, 2, 3, 4, 5, 6, 7)
+    wasm_local_get(body, 0); wasm_local_get(body, 5)
+    wasm_i32_const(body, 64); wasm_local_get(body, 5); buf_push(body, 0x6B)
+    wasm_call(body, wfn_buf_push_bytes())
+    buf_push(body, 0x0B)
+}
+
+// `wfn_str_eq(a: i64, b: i64) -> i64`
+fn wasm_build_helper_str_eq(body: ByteBuf) {
+    // params: 0=a(i64), 1=b(i64); locals: 2=pa(i32), 3=la(i32), 4=pb(i32), 5=i(i32)
+    wasm_op3(body, 1, 4, 0x7F)
+
+    wasm_local_get(body, 0); wasm_i64_const(body, 32); wasm_op2(body, 0x88, 0xA7); wasm_local_set(body, 3)
+    wasm_local_get(body, 3); wasm_local_get(body, 1); wasm_i64_const(body, 32); wasm_op2(body, 0x88, 0xA7)
+    wasm_op3(body, 0x47, 0x04, 0x40); wasm_i64_const(body, 0); wasm_op2(body, 0x0F, 0x0B)
+
+    wasm_get_wrap(body, 0); wasm_local_set(body, 2)
+    wasm_get_wrap(body, 1); wasm_local_set(body, 4)
+    wasm_i32_const(body, 0); wasm_local_set(body, 5)
+
+    wasm_loop_hdr(body)
+    wasm_local_get(body, 5); wasm_local_get(body, 3); wasm_op3(body, 0x4F, 0x0D, 0x01)
+    wasm_local_get(body, 2); wasm_local_get(body, 5); buf_push(body, 0x6A); wasm_mem_op(body, 0x2D, 0, 0)
+    wasm_local_get(body, 4); wasm_local_get(body, 5); buf_push(body, 0x6A); wasm_mem_op(body, 0x2D, 0, 0)
+    wasm_op3(body, 0x47, 0x04, 0x40); wasm_i64_const(body, 0); wasm_op2(body, 0x0F, 0x0B)
+    wasm_local_get(body, 5); wasm_i32_const(body, 1); buf_push(body, 0x6A); wasm_local_set(body, 5)
+    wasm_loop_end(body)
+
+    wasm_i64_const(body, 1); buf_push(body, 0x0B)
+}
+
+// `wfn_str_concat(a: i64, b: i64) -> i64`
+fn wasm_build_helper_str_concat(body: ByteBuf) {
+    // params: 0=a(i64), 1=b(i64); locals: 2=pa, 3=la, 4=pb, 5=lb, 6=dst, 7=i
+    wasm_op3(body, 1, 6, 0x7F)
+
+    wasm_get_wrap(body, 0); wasm_local_set(body, 2)
+    wasm_local_get(body, 0); wasm_i64_const(body, 32); wasm_op2(body, 0x88, 0xA7); wasm_local_set(body, 3)
+    wasm_get_wrap(body, 1); wasm_local_set(body, 4)
+    wasm_local_get(body, 1); wasm_i64_const(body, 32); wasm_op2(body, 0x88, 0xA7); wasm_local_set(body, 5)
+
+    wasm_local_get(body, 3); wasm_local_get(body, 5); buf_push(body, 0x6A); wasm_i32_const(body, 1); buf_push(body, 0x6A)
+    wasm_call(body, wfn_alloc()); wasm_local_set(body, 6)
+
+    wasm_i32_const(body, 0); wasm_local_set(body, 7)
+    wasm_loop_hdr(body)
+    wasm_local_get(body, 7); wasm_local_get(body, 3); wasm_op3(body, 0x4F, 0x0D, 0x01)
+    wasm_local_get(body, 6); wasm_local_get(body, 7); buf_push(body, 0x6A)
+    wasm_local_get(body, 2); wasm_local_get(body, 7); buf_push(body, 0x6A)
+    wasm_mem_op(body, 0x2D, 0, 0); wasm_mem_op(body, 0x3A, 0, 0)
+    wasm_local_get(body, 7); wasm_i32_const(body, 1); buf_push(body, 0x6A); wasm_local_set(body, 7)
+    wasm_loop_end(body)
+
+    wasm_i32_const(body, 0); wasm_local_set(body, 7)
+    wasm_loop_hdr(body)
+    wasm_local_get(body, 7); wasm_local_get(body, 5); wasm_op3(body, 0x4F, 0x0D, 0x01)
+    wasm_local_get(body, 6); wasm_local_get(body, 3); buf_push(body, 0x6A); wasm_local_get(body, 7); buf_push(body, 0x6A)
+    wasm_local_get(body, 4); wasm_local_get(body, 7); buf_push(body, 0x6A)
+    wasm_mem_op(body, 0x2D, 0, 0); wasm_mem_op(body, 0x3A, 0, 0)
+    wasm_local_get(body, 7); wasm_i32_const(body, 1); buf_push(body, 0x6A); wasm_local_set(body, 7)
+    wasm_loop_end(body)
+
+    wasm_local_get(body, 6); wasm_local_get(body, 3); buf_push(body, 0x6A); wasm_local_get(body, 5); buf_push(body, 0x6A)
+    wasm_i32_const(body, 0); wasm_mem_op(body, 0x3A, 0, 0)
+
+    wasm_local_get(body, 6); buf_push(body, 0xAD)
+    wasm_local_get(body, 3); wasm_local_get(body, 5); wasm_op2(body, 0x6A, 0xAD)
+    wasm_i64_const(body, 32); wasm_op3(body, 0x86, 0x84, 0x0B)
+}
+
+// `wfn_table_fill_f32(ptr: i32, cnt: i32, val_bits: i64) -> ()` (SIMD128 `v128.store` + scalar tail)
+fn wasm_build_helper_table_fill_f32(body: ByteBuf) {
+    // params: 0=ptr(i32), 1=cnt(i32), 2=val_bits(i64); locals: 3=i, 4=vec_end, 5=vf(f32), 6=vs(v128)
+    wasm_op3(body, 3, 2, 0x7F); wasm_op2(body, 1, 0x7D); wasm_op2(body, 1, 0x7B)
+
+    wasm_local_get(body, 2); wasm_op2(body, 0xBF, 0xB6); wasm_local_tee(body, 5)
+    wasm_simd_op(body, 19); wasm_local_set(body, 6) // f32x4.splat
+
+    wasm_local_get(body, 1); wasm_i32_const(body, -4); buf_push(body, 0x71); wasm_local_set(body, 4)
+    wasm_i32_const(body, 0); wasm_local_set(body, 3)
+
+    wasm_loop_hdr(body)
+    wasm_local_get(body, 3); wasm_local_get(body, 4); wasm_op3(body, 0x4E, 0x0D, 0x01)
+    wasm_local_get(body, 0); wasm_local_get(body, 3); wasm_i32_const(body, 2); wasm_op2(body, 0x74, 0x6A)
+    wasm_local_get(body, 6); wasm_simd_op(body, 11); wasm_memarg(body, 0, 0)
+    wasm_local_get(body, 3); wasm_i32_const(body, 4); buf_push(body, 0x6A); wasm_local_set(body, 3)
+    wasm_loop_end(body)
+
+    wasm_loop_hdr(body)
+    wasm_local_get(body, 3); wasm_local_get(body, 1); wasm_op3(body, 0x4E, 0x0D, 0x01)
+    wasm_local_get(body, 0); wasm_local_get(body, 3); wasm_i32_const(body, 2); wasm_op2(body, 0x74, 0x6A)
+    wasm_local_get(body, 5); wasm_mem_op(body, 0x38, 0, 0)
+    wasm_local_get(body, 3); wasm_i32_const(body, 1); buf_push(body, 0x6A); wasm_local_set(body, 3)
+    wasm_loop_end(body)
+    buf_push(body, 0x0B)
+}
+
+// --- Type Inference ---
 
 fn wasm_infer_expr_ty(wc: WasmCtx, enid: i64) -> i64 {
     if enid <= 0 { return ty_int() }
     k := ast_kind(wc.nodes, enid)
     if k == nk_float() { return ty_float() }
+    if k == nk_dec() { return ty_dec() }
     if k == nk_str() or k == nk_secret_str() or k == nk_fstr() { return ty_str() }
     if k == nk_bool() { return ty_bool() }
     if k == nk_ident() or k == nk_move_ident() {
-        lb := wasm_find_local(wc, ast_get(wc.nodes, enid, 1), ast_get(wc.nodes, enid, 2))
+        soff := ast_get(wc.nodes, enid, 1)
+        slen := ast_get(wc.nodes, enid, 2)
+        lb := wasm_find_local(wc, soff, slen)
         if lb >= 0 {
             return ibuf_get(wc.locals, lb + 3)
         }
+        cb := ct_find_global_const(wc.pool, wc.sym, soff, slen)
+        if cb >= 0 {
+            return ibuf_get(wc.sym, cb + 2)
+        }
+    }
+    if k == nk_unary() {
+        if ast_get(wc.nodes, enid, 1) == uop_neg() {
+            return wasm_infer_expr_ty(wc, ast_get(wc.nodes, enid, 2))
+        }
+        return ty_bool()
     }
     if k == nk_binary() {
         op := ast_get(wc.nodes, enid, 1)
+        lty := wasm_infer_expr_ty(wc, ast_get(wc.nodes, enid, 2))
+        if op == op_or() and ty_tag(lty) == 13 {
+            return ty_pay(lty)
+        }
         if op >= op_eq() and op <= op_or() {
             return ty_bool()
         }
-        return wasm_infer_expr_ty(wc, ast_get(wc.nodes, enid, 2))
+        rty := wasm_infer_expr_ty(wc, ast_get(wc.nodes, enid, 3))
+        if ty_tag(lty) == ty_str() or ty_tag(rty) == ty_str() { return ty_str() }
+        if ty_tag(lty) == ty_float() or ty_tag(rty) == ty_float() { return ty_float() }
+        if ty_tag(lty) == ty_dec() or ty_tag(rty) == ty_dec() { return ty_dec() }
+        return lty
+    }
+    if k == nk_or_return() {
+        lty := wasm_infer_expr_ty(wc, ast_get(wc.nodes, enid, 1))
+        if ty_tag(lty) == 13 {
+            return ty_pay(lty)
+        }
+        return lty
     }
     if k == nk_cast() {
         ibuf_set(wc.sym, 13, ast_get(wc.nodes, enid, 2))
         return resolve_typespec(wc.pool, wc.nodes, wc.extra, wc.sym)
     }
+    if k == nk_if_expr() {
+        tb := ast_get(wc.nodes, enid, 2)
+        if tb > 0 {
+            return wasm_infer_expr_ty(wc, ast_get(wc.nodes, tb, 3))
+        }
+    }
+    if k == nk_field() {
+        bty := wasm_infer_expr_ty(wc, ast_get(wc.nodes, enid, 1))
+        fsoff := ast_get(wc.nodes, enid, 2)
+        fslen := ast_get(wc.nodes, enid, 3)
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "len") and (ty_tag(bty) == 5 or ty_tag(bty) == 12) {
+            return ty_int()
+        }
+        if ty_tag(bty) == 10 {
+            fo := find_struct_field(wc.pool, wc.sym, ty_pay(bty), fsoff | (fslen << 32))
+            if fo >= 0 {
+                return ibuf_get(wc.sym, fo + 3)
+            }
+        }
+    }
+    if k == nk_table_alloc() {
+        esoff := ast_get(wc.nodes, enid, 1)
+        eslen := ast_get(wc.nodes, enid, 2)
+        sidx := find_struct_idx(wc.pool, wc.sym, esoff, eslen)
+        if sidx >= 0 { return ty_make(12, sidx) }
+        return ty_make(12, 60001)
+    }
     if k == nk_call() {
-        fi := find_fn_idx(wc.pool, wc.sym, ast_get(wc.nodes, enid, 1), ast_get(wc.nodes, enid, 2))
+        csoff := ast_get(wc.nodes, enid, 1)
+        cslen := ast_get(wc.nodes, enid, 2)
+        aoff := ast_get(wc.nodes, enid, 3)
+        acnt := ast_get(wc.nodes, enid, 4)
+        sidx := find_struct_idx(wc.pool, wc.sym, csoff, cslen)
+        if sidx >= 0 { return ty_make(10, sidx) }
+        if pool_str_eq_lit(wc.pool, csoff, cslen, "table_get_f32") or pool_str_eq_lit(wc.pool, csoff, cslen, "sqrt_f64") or pool_str_eq_lit(wc.pool, csoff, cslen, "abs_f64") {
+            return ty_float()
+        }
+        if pool_str_eq_lit(wc.pool, csoff, cslen, "buf_slice_str") or pool_str_eq_lit(wc.pool, csoff, cslen, "str_slice") {
+            return ty_str()
+        }
+        if pool_str_eq_lit(wc.pool, csoff, cslen, "buf_new") { return ty_bytebuf() }
+        if pool_str_eq_lit(wc.pool, csoff, cslen, "ibuf_new") { return ty_intbuf() }
+        if pool_str_eq_lit(wc.pool, csoff, cslen, "ok") and acnt >= 1 {
+            return ty_make(13, wasm_infer_expr_ty(wc, ast_get(wc.nodes, ibuf_get(wc.extra, aoff), 4)))
+        }
+        if pool_str_eq_lit(wc.pool, csoff, cslen, "err") { return ty_make(13, ty_int()) }
+        fi := find_fn_idx(wc.pool, wc.sym, csoff, cslen)
         if fi >= 0 {
             return ibuf_get(wc.sym, ibuf_get(wc.sym, 7) + fi * 10 + 5)
         }
     }
+    if k == nk_method_call() {
+        msoff := ast_get(wc.nodes, enid, 2)
+        mslen := ast_get(wc.nodes, enid, 3)
+        fi := find_fn_idx(wc.pool, wc.sym, msoff, mslen)
+        if fi >= 0 {
+            return ibuf_get(wc.sym, ibuf_get(wc.sym, 7) + fi * 10 + 5)
+        }
+    }
+    if k == nk_await() or k == nk_comptime_expr() {
+        return wasm_infer_expr_ty(wc, ast_get(wc.nodes, enid, 1))
+    }
     return ty_int()
 }
 
-// Emits WASM bytecode pushing exactly ONE `i64` onto the operand stack (`f64` bitcast via `i64.reinterpret_f64`,
-// `str` packed as `(ptr_u32 | (len_u32 << 32))`).
+// Prints expression value (`val_nid`) cleanly matching native `emit_print_value`
+fn wasm_emit_print_val(wc: WasmCtx, c: ByteBuf, val_nid: i64) {
+    vty := wasm_infer_expr_ty(wc, val_nid)
+    mut tg := ty_tag(vty)
+    if tg == 16 or tg == 22 { tg = ty_tag(ty_pay(vty)) }
+    if tg == ty_str() {
+        tstr := wasm_alloc_tmp(wc)
+        wasm_emit_expr(wc, c, val_nid)
+        wasm_local_set(c, tstr)
+        wasm_local_get(c, tstr); buf_push(c, 0xA7)
+        wasm_local_get(c, tstr); wasm_i64_const(c, 32); buf_push(c, 0x88); buf_push(c, 0xA7)
+        wasm_call(c, wfn_print_str())
+    } else if tg == ty_dec() {
+        wasm_emit_expr(wc, c, val_nid)
+        wasm_call(c, wfn_print_dec())
+    } else if tg == ty_float() {
+        wasm_emit_expr(wc, c, val_nid)
+        wasm_emit_float_to_dec(c)
+        wasm_call(c, wfn_print_dec())
+    } else if tg == ty_bool() {
+        tref := wasm_intern_lit(wc, "true")
+        fref := wasm_intern_lit(wc, "false")
+        wasm_emit_expr(wc, c, val_nid)
+        wasm_i64_const(c, 0); wasm_op3(c, 0x52, 0x04, 0x40)
+        wasm_i32_const(c, tref & 0xFFFFFFFF); wasm_i32_const(c, 4); wasm_call(c, wfn_print_str())
+        buf_push(c, 0x05)
+        wasm_i32_const(c, fref & 0xFFFFFFFF); wasm_i32_const(c, 5); wasm_call(c, wfn_print_str())
+        buf_push(c, 0x0B)
+    } else {
+        wasm_emit_expr(wc, c, val_nid)
+        wasm_call(c, wfn_print_i64())
+    }
+}
+
+fn wasm_emit_fstr_expr(wc: WasmCtx, c: ByteBuf, enid: i64) {
+    poff := ast_get(wc.nodes, enid, 1)
+    pcnt := ast_get(wc.nodes, enid, 2)
+    jb_tmp := wasm_alloc_tmp(wc)
+    t_str := wasm_alloc_tmp(wc)
+    wasm_i64_const(c, 64)
+    wasm_i32_const(c, 1)
+    wasm_call(c, wfn_buf_new())
+    wasm_local_set(c, jb_tmp)
+
+    mut pi := 0
+    while pi < pcnt {
+        pe := ibuf_get(wc.extra, poff + pi)
+        if ast_kind(wc.nodes, pe) == nk_str() {
+            ls_off := ast_get(wc.nodes, pe, 1)
+            ls_len := ast_get(wc.nodes, pe, 2)
+            if ls_len > 0 {
+                pref := wasm_intern_slice(wc, ls_off, ls_len)
+                wasm_get_wrap(c, jb_tmp)
+                wasm_i32_const(c, pref & 0xFFFFFFFF)
+                wasm_i32_const(c, ls_len)
+                wasm_call(c, wfn_buf_push_bytes())
+            }
+        } else {
+            mut pty := wasm_infer_expr_ty(wc, pe)
+            if ty_tag(pty) == 16 or ty_tag(pty) == 22 { pty = ty_pay(pty) }
+            ptg := ty_tag(pty)
+            if ptg == ty_str() {
+                wasm_emit_expr(wc, c, pe)
+                wasm_local_set(c, t_str)
+                wasm_get_wrap(c, jb_tmp)
+                wasm_get_wrap(c, t_str)
+                wasm_local_get(c, t_str); wasm_i64_const(c, 32); wasm_op2(c, 0x88, 0xA7)
+                wasm_call(c, wfn_buf_push_bytes())
+            } else if ptg == ty_dec() {
+                wasm_get_wrap(c, jb_tmp)
+                wasm_emit_expr(wc, c, pe)
+                wasm_call(c, wfn_buf_push_dec())
+            } else if ptg == ty_float() {
+                wasm_get_wrap(c, jb_tmp)
+                wasm_emit_expr(wc, c, pe)
+                wasm_emit_float_to_dec(c)
+                wasm_call(c, wfn_buf_push_dec())
+            } else if ptg == ty_bool() {
+                tref := wasm_intern_lit(wc, "true")
+                fref := wasm_intern_lit(wc, "false")
+                wasm_emit_expr(wc, c, pe)
+                wasm_i64_const(c, 0); wasm_op3(c, 0x52, 0x04, 0x40)
+                wasm_get_wrap(c, jb_tmp); wasm_i32_const(c, tref & 0xFFFFFFFF); wasm_i32_const(c, 4); wasm_call(c, wfn_buf_push_bytes())
+                buf_push(c, 0x05)
+                wasm_get_wrap(c, jb_tmp); wasm_i32_const(c, fref & 0xFFFFFFFF); wasm_i32_const(c, 5); wasm_call(c, wfn_buf_push_bytes())
+                buf_push(c, 0x0B)
+            } else {
+                wasm_get_wrap(c, jb_tmp)
+                wasm_emit_expr(wc, c, pe)
+                wasm_call(c, wfn_buf_push_i64())
+            }
+        }
+        pi += 1
+    }
+
+    // Pack `[hdr + 16]` (data_ptr) | (`[hdr + 0]` (len) << 32)
+    wasm_wrap_mem(c, jb_tmp, 0x28, 2, 16)
+    buf_push(c, 0xAD)
+    wasm_wrap_mem(c, jb_tmp, 0x29, 3, 0)
+    wasm_i64_const(c, 32); buf_push(c, 0x86); buf_push(c, 0x84)
+}
+
+fn wasm_emit_user_call_with_recv(wc: WasmCtx, c: ByteBuf, fi: i64, recv_nid: i64, aoff: i64, acnt: i64) {
+    wfi := ibuf_get(wc.fn_map, fi)
+    if wfi < 0 {
+        wasm_i64_const(c, 0)
+        return
+    }
+    fo := ibuf_get(wc.sym, 7) + fi * 10
+    p_base := ibuf_get(wc.sym, fo + 3)
+    p_cnt := ibuf_get(wc.sym, fo + 4)
+
+    mut pi := 0
+    while pi < p_cnt {
+        if pi == 0 and recv_nid > 0 {
+            wasm_emit_expr(wc, c, recv_nid)
+        } else {
+            po := p_base + pi * 6
+            pn_soff := ibuf_get(wc.sym, po)
+            pn_slen := ibuf_get(wc.sym, po + 1)
+            def_nid := ibuf_get(wc.sym, po + 5)
+            mut pos_slot := pi
+            if recv_nid > 0 { pos_slot = pi - 1 }
+
+            mut matched_ca := 0
+            mut ai := 0
+            while ai < acnt {
+                ca := ibuf_get(wc.extra, aoff + ai)
+                an_soff := ast_get(wc.nodes, ca, 2)
+                an_slen := ast_get(wc.nodes, ca, 3)
+                if an_soff >= 0 and an_slen == pn_slen and pool_str_eq2(wc.pool, an_soff, pn_slen, pn_soff) {
+                    matched_ca = ca
+                    break
+                }
+                ai += 1
+            }
+            if matched_ca == 0 and pos_slot >= 0 and pos_slot < acnt {
+                cand := ibuf_get(wc.extra, aoff + pos_slot)
+                if ast_get(wc.nodes, cand, 2) < 0 {
+                    matched_ca = cand
+                }
+            }
+
+            if matched_ca > 0 {
+                wasm_emit_expr(wc, c, ast_get(wc.nodes, matched_ca, 4))
+            } else if def_nid > 0 {
+                wasm_emit_expr(wc, c, def_nid)
+            } else {
+                wasm_i64_const(c, 0)
+            }
+        }
+        pi += 1
+    }
+    wasm_call(c, wfi)
+}
+
+fn wasm_emit_table_col_offset(wc: WasmCtx, c: ByteBuf, tbl_nid: i64, col_nid: i64, cnt_tmp: i64) {
+    tty := wasm_infer_expr_ty(wc, tbl_nid)
+    mut remapped_col := -1
+    if ty_tag(tty) == 12 {
+        tpay := ty_pay(tty)
+        if tpay >= 0 and tpay < 60000 and is_const_int_expr(wc.pool, wc.nodes, wc.sym, col_nid) {
+            remapped_col = soa_remap_col(wc.sym, tpay, eval_const_int_val(wc.pool, wc.nodes, wc.sym, col_nid))
+        }
+    }
+    if remapped_col >= 0 {
+        wasm_i64_const(c, remapped_col)
+    } else {
+        wasm_emit_expr(wc, c, col_nid)
+    }
+    wasm_local_get(c, cnt_tmp)
+    buf_push(c, 0x7E) // col * cnt
+    wasm_i64_const(c, 2); buf_push(c, 0x86) // * 4 bytes
+}
+
+// Emits bounds-checked ByteBuf/IntBuf element read or write leaving `i64` result on stack
+fn wasm_emit_buf_elem_op(wc: WasmCtx, c: ByteBuf, aoff: i64, is_set: i64, is_ibuf: i64) {
+    btmp := wasm_alloc_tmp(wc)
+    itmp := wasm_alloc_tmp(wc)
+    wasm_arg_set(wc, c, aoff, 0, btmp)
+    wasm_arg_set(wc, c, aoff, 1, itmp)
+    mut vtmp := 0
+    if is_set != 0 {
+        vtmp = wasm_alloc_tmp(wc)
+        wasm_arg_set(wc, c, aoff, 2, vtmp)
+    }
+    wasm_local_get(c, itmp); wasm_wrap_mem(c, btmp, 0x29, 3, 0); wasm_trap_ge_u(c)
+    wasm_wrap_mem(c, btmp, 0x28, 2, 16); wasm_get_wrap(c, itmp)
+    if is_ibuf != 0 { wasm_i32_const(c, 3); buf_push(c, 0x74) }
+    buf_push(c, 0x6A)
+    if is_set != 0 {
+        wasm_local_get(c, vtmp)
+        if is_ibuf != 0 { wasm_mem_op(c, 0x37, 3, 0) } else { wasm_mem_op(c, 0x3C, 0, 0) }
+        wasm_i64_const(c, 0)
+    } else {
+        if is_ibuf != 0 { wasm_mem_op(c, 0x29, 3, 0) } else { wasm_mem_op(c, 0x31, 0, 0) }
+    }
+}
+
+// Emits Result heap box `[tag: i64, payload: i64]` (`tag==0` for ok, non-zero for err)
+fn wasm_emit_ok_or_err(wc: WasmCtx, c: ByteBuf, val_nid: i64, is_err: i64) {
+    vtmp := wasm_alloc_tmp(wc)
+    rptr := wasm_alloc_tmp(wc)
+    wasm_emit_expr(wc, c, val_nid)
+    if is_err != 0 {
+        wasm_local_tee(c, vtmp)
+        wasm_op3(c, 0x50, 0x04, 0x40)
+        wasm_i64_const(c, 1); wasm_local_set(c, vtmp)
+        buf_push(c, 0x0B)
+    } else {
+        wasm_local_set(c, vtmp)
+    }
+    wasm_i32_const(c, 16); wasm_call(c, wfn_alloc()); buf_push(c, 0xAD); wasm_local_set(c, rptr)
+    wasm_get_wrap(c, rptr)
+    if is_err != 0 { wasm_local_get(c, vtmp) } else { wasm_i64_const(c, 0) }
+    wasm_mem_op(c, 0x37, 3, 0)
+    wasm_get_wrap(c, rptr)
+    if is_err != 0 { wasm_i64_const(c, 0) } else { wasm_local_get(c, vtmp) }
+    wasm_mem_op(c, 0x37, 3, 8)
+    wasm_local_get(c, rptr)
+}
+
+// Emits WASM bytecode pushing exactly ONE `i64` onto the operand stack.
 fn wasm_emit_expr(wc: WasmCtx, c: ByteBuf, enid: i64) {
     if enid <= 0 {
         wasm_i64_const(c, 0)
         return
     }
     k := ast_kind(wc.nodes, enid)
-    if k == nk_int() or k == nk_dec() or k == nk_bool() {
-        wasm_i64_const(c, ast_get(wc.nodes, enid, 1))
-        return
-    }
-    if k == nk_float() {
+    if k == nk_int() or k == nk_dec() or k == nk_bool() or k == nk_float() {
         wasm_i64_const(c, ast_get(wc.nodes, enid, 1))
         return
     }
     if k == nk_str() or k == nk_secret_str() {
         pref := wasm_intern_slice(wc, ast_get(wc.nodes, enid, 1), ast_get(wc.nodes, enid, 2))
         wasm_i64_const(c, pref)
+        return
+    }
+    if k == nk_fstr() {
+        wasm_emit_fstr_expr(wc, c, enid)
         return
     }
     if k == nk_ident() or k == nk_move_ident() {
@@ -506,130 +1175,243 @@ fn wasm_emit_expr(wc: WasmCtx, c: ByteBuf, enid: i64) {
         wasm_i64_const(c, 0)
         return
     }
+    if k == nk_tuple() {
+        eoff := ast_get(wc.nodes, enid, 1)
+        ecnt := ast_get(wc.nodes, enid, 2)
+        mut bytes := ecnt * 8
+        if bytes < 16 { bytes = 16 }
+        tptr := wasm_alloc_tmp(wc)
+        wasm_i32_const(c, bytes); wasm_call(c, wfn_alloc()); buf_push(c, 0xAD)
+        wasm_local_set(c, tptr)
+        mut i := 0
+        while i < ecnt {
+            wasm_local_get(c, tptr); buf_push(c, 0xA7)
+            wasm_emit_expr(wc, c, ibuf_get(wc.extra, eoff + i))
+            buf_push(c, 0x37); wasm_memarg(c, 3, i * 8)
+            i += 1
+        }
+        wasm_local_get(c, tptr)
+        return
+    }
+    if k == nk_tuple_idx() {
+        tptr := wasm_alloc_tmp(wc)
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, enid, 1))
+        wasm_emit_ptr_field_load(c, tptr, ast_get(wc.nodes, enid, 2) * 8)
+        return
+    }
+    if k == nk_field() {
+        base_e := ast_get(wc.nodes, enid, 1)
+        fsoff := ast_get(wc.nodes, enid, 2)
+        fslen := ast_get(wc.nodes, enid, 3)
+        bty := wasm_infer_expr_ty(wc, base_e)
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "len") and (ty_tag(bty) == 5 or ty_tag(bty) == 12) {
+            wasm_emit_expr(wc, c, base_e)
+            wasm_i64_const(c, 32)
+            buf_push(c, 0x88)
+            return
+        }
+        if ty_tag(bty) == 10 {
+            fo := find_struct_field(wc.pool, wc.sym, ty_pay(bty), fsoff | (fslen << 32))
+            if fo >= 0 {
+                sptr := wasm_alloc_tmp(wc)
+                wasm_emit_expr(wc, c, base_e)
+                wasm_emit_ptr_field_load(c, sptr, ibuf_get(wc.sym, fo + 2) * 8)
+                return
+            }
+        }
+        wasm_emit_expr(wc, c, base_e)
+        return
+    }
+    if k == nk_index() {
+        te := ast_get(wc.nodes, enid, 1)
+        ie := ast_get(wc.nodes, enid, 2)
+        tty := wasm_infer_expr_ty(wc, te)
+        ttmp := wasm_alloc_tmp(wc)
+        itmp := wasm_alloc_tmp(wc)
+        wasm_emit_expr(wc, c, te); wasm_local_set(c, ttmp)
+        wasm_emit_expr(wc, c, ie); wasm_local_set(c, itmp)
+        if tty == ty_str() {
+            wasm_local_get(c, itmp)
+            wasm_local_get(c, ttmp); wasm_i64_const(c, 32); buf_push(c, 0x88)
+            buf_push(c, 0x5A) // i64.ge_u
+            wasm_trap_ge_u(c)
+            wasm_get_wrap(c, ttmp); wasm_get_wrap(c, itmp); buf_push(c, 0x6A)
+            wasm_mem_op(c, 0x31, 0, 0) // i64.load8_u
+            return
+        }
+        // IntBuf / ByteBuf indexed read with bounds trap
+        wasm_local_get(c, ttmp); wasm_op4(c, 0x50, 0x04, 0x40, 0x00); buf_push(c, 0x0B)
+        wasm_local_get(c, itmp); wasm_wrap_mem(c, ttmp, 0x29, 3, 0); wasm_trap_ge_u(c)
+        wasm_wrap_mem(c, ttmp, 0x28, 2, 16); wasm_get_wrap(c, itmp)
+        if tty == ty_intbuf() {
+            wasm_i32_const(c, 3); wasm_op2(c, 0x74, 0x6A); wasm_mem_op(c, 0x29, 3, 0)
+        } else {
+            buf_push(c, 0x6A); wasm_mem_op(c, 0x31, 0, 0)
+        }
+        return
+    }
     if k == nk_unary() {
-        op := ast_get(wc.nodes, enid, 1)
-        sub := ast_get(wc.nodes, enid, 2)
-        sub_ty := wasm_infer_expr_ty(wc, sub)
+        op := ast_get(wc.nodes, enid, 1); sub := ast_get(wc.nodes, enid, 2)
         if op == uop_neg() {
-            if ty_tag(sub_ty) == ty_float() {
-                wasm_emit_expr(wc, c, sub)
-                buf_push(c, 0xBF) // f64.reinterpret_i64
-                buf_push(c, 0x9A) // f64.neg
-                buf_push(c, 0xBD) // i64.reinterpret_f64
+            if ty_tag(wasm_infer_expr_ty(wc, sub)) == ty_float() {
+                wasm_emit_expr(wc, c, sub); wasm_op3(c, 0xBF, 0x9A, 0xBD)
             } else {
-                wasm_i64_const(c, 0)
-                wasm_emit_expr(wc, c, sub)
-                buf_push(c, 0x7D)
+                wasm_i64_const(c, 0); wasm_emit_expr(wc, c, sub); buf_push(c, 0x7D)
             }
             return
         }
-        wasm_emit_expr(wc, c, sub)
-        buf_push(c, 0x50) // i64.eqz -> i32
-        buf_push(c, 0xAD) // i64.extend_i32_u
-        return
+        wasm_emit_expr(wc, c, sub); wasm_op2(c, 0x50, 0xAD); return
     }
     if k == nk_binary() {
-        op := ast_get(wc.nodes, enid, 1)
-        lhs := ast_get(wc.nodes, enid, 2)
-        rhs := ast_get(wc.nodes, enid, 3)
+        op := ast_get(wc.nodes, enid, 1); lhs := ast_get(wc.nodes, enid, 2); rhs := ast_get(wc.nodes, enid, 3)
         lty := wasm_infer_expr_ty(wc, lhs)
-        if ty_tag(lty) == ty_float() {
-            wasm_emit_expr(wc, c, lhs)
-            buf_push(c, 0xBF)
-            wasm_emit_expr(wc, c, rhs)
-            buf_push(c, 0xBF)
-            if op == op_add() { buf_push(c, 0xA0); buf_push(c, 0xBD); return }
-            if op == op_sub() { buf_push(c, 0xA1); buf_push(c, 0xBD); return }
-            if op == op_mul() { buf_push(c, 0xA2); buf_push(c, 0xBD); return }
-            if op == op_div() { buf_push(c, 0xA3); buf_push(c, 0xBD); return }
-            if op == op_eq()  { buf_push(c, 0x61); buf_push(c, 0xAD); return }
-            if op == op_neq() { buf_push(c, 0x62); buf_push(c, 0xAD); return }
-            if op == op_lt()  { buf_push(c, 0x63); buf_push(c, 0xAD); return }
-            if op == op_gt()  { buf_push(c, 0x64); buf_push(c, 0xAD); return }
-            if op == op_lte() { buf_push(c, 0x65); buf_push(c, 0xAD); return }
-            buf_push(c, 0x66)
-            buf_push(c, 0xAD)
-            return
+
+        // Result fallback: `res or default`
+        if op == op_or() and ty_tag(lty) == 13 {
+            rtmp := wasm_alloc_tmp(wc)
+            wasm_emit_expr(wc, c, lhs); wasm_local_tee(c, rtmp)
+            buf_push(c, 0xA7); wasm_mem_op(c, 0x29, 3, 0)
+            wasm_op3(c, 0x50, 0x04, 0x7E)
+            wasm_wrap_mem(c, rtmp, 0x29, 3, 8)
+            buf_push(c, 0x05); wasm_emit_expr(wc, c, rhs); buf_push(c, 0x0B); return
         }
-        wasm_emit_expr(wc, c, lhs)
-        wasm_emit_expr(wc, c, rhs)
-        if op == op_add() or op == op_wrap_add() { buf_push(c, 0x7C); return }
-        if op == op_sub() or op == op_wrap_sub() { buf_push(c, 0x7D); return }
-        if op == op_mul() or op == op_wrap_mul() { buf_push(c, 0x7E); return }
-        if op == op_div() { buf_push(c, 0x7F); return }
-        if op == op_mod() { buf_push(c, 0x81); return }
-        if op == op_bit_and() or op == op_and() { buf_push(c, 0x83); return }
-        if op == op_bit_or() or op == op_or()   { buf_push(c, 0x84); return }
-        if op == op_bit_xor() { buf_push(c, 0x85); return }
-        if op == op_shl()     { buf_push(c, 0x86); return }
-        if op == op_shr()     { buf_push(c, 0x87); return }
-        if op == op_eq()  { buf_push(c, 0x51); buf_push(c, 0xAD); return }
-        if op == op_neq() { buf_push(c, 0x52); buf_push(c, 0xAD); return }
-        if op == op_lt()  { buf_push(c, 0x53); buf_push(c, 0xAD); return }
-        if op == op_gt()  { buf_push(c, 0x55); buf_push(c, 0xAD); return }
-        if op == op_lte() { buf_push(c, 0x57); buf_push(c, 0xAD); return }
-        buf_push(c, 0x59)
-        buf_push(c, 0xAD)
-        return
+        // Short-circuit `and` / `or`
+        if op == op_and() {
+            wasm_emit_expr(wc, c, lhs); wasm_i64_const(c, 0); wasm_op3(c, 0x52, 0x04, 0x7E)
+            wasm_emit_expr(wc, c, rhs); wasm_i64_const(c, 0); wasm_op2(c, 0x52, 0xAD)
+            buf_push(c, 0x05); wasm_i64_const(c, 0); buf_push(c, 0x0B); return
+        }
+        if op == op_or() {
+            wasm_emit_expr(wc, c, lhs); wasm_i64_const(c, 0); wasm_op3(c, 0x52, 0x04, 0x7E)
+            wasm_i64_const(c, 1); buf_push(c, 0x05)
+            wasm_emit_expr(wc, c, rhs); wasm_i64_const(c, 0); wasm_op2(c, 0x52, 0xAD)
+            buf_push(c, 0x0B); return
+        }
+
+        rty := wasm_infer_expr_ty(wc, rhs)
+        mut base_l := lty
+        if ty_tag(base_l) == 16 or ty_tag(base_l) == 22 { base_l = ty_pay(base_l) }
+        mut base_r := rty
+        if ty_tag(base_r) == 16 or ty_tag(base_r) == 22 { base_r = ty_pay(base_r) }
+
+        if ty_tag(base_l) == ty_str() and ty_tag(base_r) == ty_str() {
+            wasm_emit_expr(wc, c, lhs); wasm_emit_expr(wc, c, rhs)
+            if op == op_add() { wasm_call(c, wfn_str_concat()); return }
+            if op == op_eq() { wasm_call(c, wfn_str_eq()); return }
+            if op == op_neq() { wasm_call(c, wfn_str_eq()); wasm_op2(c, 0x50, 0xAD); return }
+            wasm_op2(c, 0x1A, 0x1A); wasm_i64_const(c, 0); return
+        }
+
+        if ty_tag(base_l) == ty_float() or ty_tag(base_r) == ty_float() {
+            wasm_emit_expr(wc, c, lhs)
+            if ty_tag(base_l) == ty_float() { buf_push(c, 0xBF) } else { buf_push(c, 0xB9) }
+            wasm_emit_expr(wc, c, rhs)
+            if ty_tag(base_r) == ty_float() { buf_push(c, 0xBF) } else { buf_push(c, 0xB9) }
+            wasm_emit_bin_num_op(c, op, 1); return
+        }
+        wasm_emit_expr(wc, c, lhs); wasm_emit_expr(wc, c, rhs)
+        wasm_emit_bin_num_op(c, op, 0); return
+    }
+    if k == nk_or_return() {
+        le := ast_get(wc.nodes, enid, 1); rv_nid := ast_get(wc.nodes, enid, 2)
+        if ty_tag(wasm_infer_expr_ty(wc, le)) == 13 {
+            rtmp := wasm_alloc_tmp(wc)
+            wasm_emit_expr(wc, c, le); wasm_local_tee(c, rtmp)
+            buf_push(c, 0xA7); wasm_mem_op(c, 0x29, 3, 0)
+            wasm_i64_const(c, 0); wasm_op3(c, 0x52, 0x04, 0x40)
+            if rv_nid > 0 { wasm_emit_expr(wc, c, rv_nid) } else { wasm_local_get(c, rtmp) }
+            wasm_op2(c, 0x0F, 0x0B)
+            wasm_wrap_mem(c, rtmp, 0x29, 3, 8); return
+        }
+        wasm_emit_expr(wc, c, le); return
     }
     if k == nk_cast() {
-        sub := ast_get(wc.nodes, enid, 1)
-        src_t := wasm_infer_expr_ty(wc, sub)
+        sub := ast_get(wc.nodes, enid, 1); src_t := wasm_infer_expr_ty(wc, sub)
         ibuf_set(wc.sym, 13, ast_get(wc.nodes, enid, 2))
         dst_t := resolve_typespec(wc.pool, wc.nodes, wc.extra, wc.sym)
         wasm_emit_expr(wc, c, sub)
-        if ty_tag(src_t) == ty_int() and ty_tag(dst_t) == ty_float() {
-            buf_push(c, 0xB9) // f64.convert_i64_s
-            buf_push(c, 0xBD) // i64.reinterpret_f64
-        } else if ty_tag(src_t) == ty_float() and ty_tag(dst_t) == ty_int() {
-            buf_push(c, 0xBF) // f64.reinterpret_i64
-            buf_push(c, 0xB0) // i64.trunc_f64_s
-        }
+        if ty_tag(src_t) != ty_float() and ty_tag(dst_t) == ty_float() { wasm_op2(c, 0xB9, 0xBD) }
+        else if ty_tag(src_t) == ty_float() and ty_tag(dst_t) != ty_float() { wasm_op2(c, 0xBF, 0xB0) }
         return
     }
     if k == nk_if_expr() {
+        tb := ast_get(wc.nodes, enid, 2); eb := ast_get(wc.nodes, enid, 3)
         wasm_emit_expr(wc, c, ast_get(wc.nodes, enid, 1))
-        wasm_i64_const(c, 0)
-        buf_push(c, 0x52) // i64.ne
-        buf_push(c, 0x04) // if (result i64)
-        buf_push(c, 0x7E)
-        wasm_emit_expr(wc, c, ast_get(wc.nodes, enid, 2))
+        wasm_i64_const(c, 0); wasm_op3(c, 0x52, 0x04, 0x7E)
+        if tb > 0 {
+            wasm_emit_block(wc, c, tb, -1, -1)
+            re := ast_get(wc.nodes, tb, 3)
+            if re > 0 { wasm_emit_expr(wc, c, re) } else { wasm_i64_const(c, 0) }
+        } else { wasm_i64_const(c, 0) }
         buf_push(c, 0x05)
-        wasm_emit_expr(wc, c, ast_get(wc.nodes, enid, 3))
-        buf_push(c, 0x0B)
-        return
+        if eb > 0 {
+            if ast_kind(wc.nodes, eb) == nk_if_expr() { wasm_emit_expr(wc, c, eb) }
+            else {
+                wasm_emit_block(wc, c, eb, -1, -1)
+                re := ast_get(wc.nodes, eb, 3)
+                if re > 0 { wasm_emit_expr(wc, c, re) } else { wasm_i64_const(c, 0) }
+            }
+        } else { wasm_i64_const(c, 0) }
+        buf_push(c, 0x0B); return
     }
     if k == nk_table_alloc() {
-        // Bump-allocate `(cap * 16 + 64)` bytes from global 0 (`__heap_ptr: i32`) and return `(base_ptr | (cap << 32))`
-        tmp_cap := wasm_alloc_tmp(wc)
-        tmp_ptr := wasm_alloc_tmp(wc)
-        wasm_emit_expr(wc, c, ast_get(wc.nodes, enid, 3))
-        wasm_local_set(c, tmp_cap)
-
-        buf_push(c, 0x23) // global.get 0 -> i32
-        wasm_uleb(c, 0)
-        buf_push(c, 0xAD) // i64.extend_i32_u -> i64
-        wasm_local_set(c, tmp_ptr)
-
-        // global 0 = (tmp_ptr as i32) + ((tmp_cap as i32) * 16 + 64)
-        wasm_local_get(c, tmp_ptr)
-        buf_push(c, 0xA7) // i32.wrap_i64
-        wasm_local_get(c, tmp_cap)
-        buf_push(c, 0xA7)
-        wasm_i32_const(c, 4)
-        buf_push(c, 0x74) // i32.shl (* 16)
-        wasm_i32_const(c, 64)
-        buf_push(c, 0x6A)
-        buf_push(c, 0x6A)
-        buf_push(c, 0x24) // global.set 0
-        wasm_uleb(c, 0)
-
-        // return tmp_ptr | (tmp_cap << 32)
-        wasm_local_get(c, tmp_ptr)
-        wasm_local_get(c, tmp_cap)
-        wasm_i64_const(c, 32)
-        buf_push(c, 0x86) // i64.shl
-        buf_push(c, 0x84) // i64.or
+        esoff := ast_get(wc.nodes, enid, 1); eslen := ast_get(wc.nodes, enid, 2)
+        mut col_cnt := 1; mut elem_bytes := 4
+        if pool_str_eq_lit(wc.pool, esoff, eslen, "i64") or pool_str_eq_lit(wc.pool, esoff, eslen, "usize") or pool_str_eq_lit(wc.pool, esoff, eslen, "f64") {
+            elem_bytes = 8
+        } else if not pool_str_eq_lit(wc.pool, esoff, eslen, "f32") {
+            sidx := find_struct_idx(wc.pool, wc.sym, esoff, eslen)
+            if sidx >= 0 { col_cnt = soa_active_col_count(wc.sym, sidx) }
+        }
+        stride := col_cnt * elem_bytes
+        tmp_cap := wasm_alloc_tmp(wc); tmp_ptr := wasm_alloc_tmp(wc)
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, enid, 3)); wasm_local_set(c, tmp_cap)
+        wasm_get_wrap(c, tmp_cap); wasm_i32_const(c, stride); buf_push(c, 0x6C)
+        wasm_i32_const(c, 256); buf_push(c, 0x6A); wasm_call(c, wfn_alloc())
+        buf_push(c, 0xAD); wasm_local_set(c, tmp_ptr)
+        wasm_local_get(c, tmp_ptr); wasm_local_get(c, tmp_cap)
+        wasm_i64_const(c, 32); wasm_op2(c, 0x86, 0x84); return
+    }
+    if k == nk_method_call() {
+        recv_e := ast_get(wc.nodes, enid, 1)
+        msoff := ast_get(wc.nodes, enid, 2)
+        mslen := ast_get(wc.nodes, enid, 3)
+        aoff := ast_get(wc.nodes, enid, 4)
+        acnt := ast_get(wc.nodes, enid, 5)
+        if pool_str_eq_lit(wc.pool, msoff, mslen, "join") {
+            wasm_emit_expr(wc, c, recv_e)
+            return
+        }
+        fi := find_fn_idx(wc.pool, wc.sym, msoff, mslen)
+        if fi >= 0 {
+            wasm_emit_user_call_with_recv(wc, c, fi, recv_e, aoff, acnt)
+            return
+        }
+        wasm_i64_const(c, 0)
+        return
+    }
+    if k == nk_spawn() {
+        blk := ast_get(wc.nodes, enid, 1)
+        b_off := ast_get(wc.nodes, blk, 1)
+        b_cnt := ast_get(wc.nodes, blk, 2)
+        res_tmp := wasm_alloc_tmp(wc)
+        wasm_i64_const(c, 0); wasm_local_set(c, res_tmp)
+        mut i := 0
+        while i < b_cnt {
+            st := ibuf_get(wc.extra, b_off + i)
+            if ast_kind(wc.nodes, st) == nk_return() {
+                rv := ast_get(wc.nodes, st, 1)
+                if rv > 0 {
+                    wasm_emit_expr(wc, c, rv)
+                    wasm_local_set(c, res_tmp)
+                }
+                break
+            } else {
+                wasm_emit_stmt(wc, c, st, -1, -1)
+            }
+            i += 1
+        }
+        wasm_local_get(c, res_tmp)
         return
     }
     if k == nk_call() {
@@ -637,63 +1419,297 @@ fn wasm_emit_expr(wc: WasmCtx, c: ByteBuf, enid: i64) {
         fslen := ast_get(wc.nodes, enid, 2)
         aoff := ast_get(wc.nodes, enid, 3)
         acnt := ast_get(wc.nodes, enid, 4)
+
         if pool_str_eq_lit(wc.pool, fsoff, fslen, "print") or pool_str_eq_lit(wc.pool, fsoff, fslen, "println") {
-            is_ln := pool_str_eq_lit(wc.pool, fsoff, fslen, "println")
-            if acnt >= 1 {
-                a0 := ast_get(wc.nodes, ibuf_get(wc.extra, aoff), 4)
-                aty := wasm_infer_expr_ty(wc, a0)
-                if ty_tag(aty) == ty_str() {
-                    tstr := wasm_alloc_tmp(wc)
-                    wasm_emit_expr(wc, c, a0)
-                    wasm_local_set(c, tstr)
-                    wasm_local_get(c, tstr)
-                    buf_push(c, 0xA7)
-                    wasm_local_get(c, tstr)
-                    wasm_i64_const(c, 32)
-                    buf_push(c, 0x88)
-                    buf_push(c, 0xA7)
-                    wasm_call(c, 1)
+            mut ai := 0
+            while ai < acnt {
+                ae := ast_get(wc.nodes, ibuf_get(wc.extra, aoff + ai), 4)
+                if ast_kind(wc.nodes, ae) == nk_fstr() {
+                    poff := ast_get(wc.nodes, ae, 1)
+                    pcnt := ast_get(wc.nodes, ae, 2)
+                    mut pi := 0
+                    while pi < pcnt {
+                        pe := ibuf_get(wc.extra, poff + pi)
+                        if ast_kind(wc.nodes, pe) == nk_str() {
+                            ls_off := ast_get(wc.nodes, pe, 1)
+                            ls_len := ast_get(wc.nodes, pe, 2)
+                            if ls_len > 0 {
+                                lref := wasm_intern_slice(wc, ls_off, ls_len)
+                                wasm_i32_const(c, lref & 0xFFFFFFFF)
+                                wasm_i32_const(c, ls_len)
+                                wasm_call(c, wfn_print_str())
+                            }
+                        } else {
+                            wasm_emit_print_val(wc, c, pe)
+                        }
+                        pi += 1
+                    }
                 } else {
-                    wasm_emit_expr(wc, c, a0)
-                    wasm_call(c, 2)
+                    wasm_emit_print_val(wc, c, ae)
                 }
+                ai += 1
             }
-            if is_ln {
+            if pool_str_eq_lit(wc.pool, fsoff, fslen, "println") {
                 nl_ref := wasm_intern_lit(wc, "\n")
                 wasm_i32_const(c, nl_ref & 0xFFFFFFFF)
                 wasm_i32_const(c, 1)
-                wasm_call(c, 1)
+                wasm_call(c, wfn_print_str())
             }
             wasm_i64_const(c, 0)
+            return
+        }
+        if (pool_str_eq_lit(wc.pool, fsoff, fslen, "clock_ns") or pool_str_eq_lit(wc.pool, fsoff, fslen, "time_ns")) {
+            wasm_call(c, wfn_clock_ns())
             return
         }
         if pool_str_eq_lit(wc.pool, fsoff, fslen, "wasm_simd128_fma") and acnt == 4 {
-            wasm_emit_expr(wc, c, ast_get(wc.nodes, ibuf_get(wc.extra, aoff), 4))
-            buf_push(c, 0xA7)
-            wasm_emit_expr(wc, c, ast_get(wc.nodes, ibuf_get(wc.extra, aoff + 1), 4))
-            buf_push(c, 0xA7)
-            wasm_emit_expr(wc, c, ast_get(wc.nodes, ibuf_get(wc.extra, aoff + 2), 4))
-            buf_push(c, 0xBF)
-            buf_push(c, 0xB6)
-            wasm_emit_expr(wc, c, ast_get(wc.nodes, ibuf_get(wc.extra, aoff + 3), 4))
-            buf_push(c, 0xA7)
-            wasm_call(c, 3)
+            wasm_arg_expr(wc, c, aoff, 0); buf_push(c, 0xA7)
+            wasm_arg_expr(wc, c, aoff, 1); buf_push(c, 0xA7)
+            wasm_arg_expr(wc, c, aoff, 2); wasm_op2(c, 0xBF, 0xB6)
+            wasm_arg_expr(wc, c, aoff, 3); buf_push(c, 0xA7)
+            wasm_call(c, wfn_simd128_fma())
             wasm_i64_const(c, 0)
             return
         }
-        fi := find_fn_idx(wc.pool, wc.sym, fsoff, fslen)
-        if fi >= 0 {
-            wfi := ibuf_get(wc.fn_map, fi)
-            if wfi >= 0 {
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "table_fill_f32") and acnt == 3 {
+            e0 := wasm_arg_nid(wc, aoff, 0); e1 := wasm_arg_nid(wc, aoff, 1); e2 := wasm_arg_nid(wc, aoff, 2)
+            tbl_tmp := wasm_alloc_tmp(wc); cnt_tmp := wasm_alloc_tmp(wc)
+            wasm_emit_expr(wc, c, e0); wasm_local_set(c, tbl_tmp)
+            wasm_local_get(c, tbl_tmp); wasm_i64_const(c, 32); buf_push(c, 0x88); wasm_local_set(c, cnt_tmp)
+            wasm_local_get(c, tbl_tmp); wasm_i64_const(c, 0xFFFFFFFF); buf_push(c, 0x83)
+            wasm_emit_table_col_offset(wc, c, e0, e1, cnt_tmp)
+            wasm_op2(c, 0x7C, 0xA7)
+            wasm_get_wrap(c, cnt_tmp)
+            wasm_emit_expr(wc, c, e2)
+            wasm_call(c, wfn_table_fill_f32())
+            wasm_i64_const(c, 0); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "table_get_f32") and acnt == 3 {
+            e0 := wasm_arg_nid(wc, aoff, 0); e1 := wasm_arg_nid(wc, aoff, 1); e2 := wasm_arg_nid(wc, aoff, 2)
+            tbl_tmp := wasm_alloc_tmp(wc); cnt_tmp := wasm_alloc_tmp(wc); row_tmp := wasm_alloc_tmp(wc)
+            wasm_emit_expr(wc, c, e0); wasm_local_set(c, tbl_tmp)
+            wasm_local_get(c, tbl_tmp); wasm_i64_const(c, 32); buf_push(c, 0x88); wasm_local_set(c, cnt_tmp)
+            wasm_emit_expr(wc, c, e2); wasm_local_tee(c, row_tmp)
+            wasm_local_get(c, cnt_tmp); wasm_trap_ge_u(c)
+            wasm_local_get(c, tbl_tmp); wasm_i64_const(c, 0xFFFFFFFF); buf_push(c, 0x83)
+            wasm_emit_table_col_offset(wc, c, e0, e1, cnt_tmp)
+            buf_push(c, 0x7C)
+            wasm_local_get(c, row_tmp); wasm_i64_const(c, 2); wasm_op3(c, 0x86, 0x7C, 0xA7)
+            wasm_mem_op(c, 0x2A, 0, 0); wasm_op2(c, 0xBB, 0xBD); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_new") and acnt == 1 {
+            wasm_arg_expr(wc, c, aoff, 0); wasm_i32_const(c, 1); wasm_call(c, wfn_buf_new()); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "ibuf_new") and acnt == 1 {
+            wasm_arg_expr(wc, c, aoff, 0); wasm_i32_const(c, 8); wasm_call(c, wfn_buf_new()); return
+        }
+        if (pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_len") or pool_str_eq_lit(wc.pool, fsoff, fslen, "ibuf_len")) and acnt == 1 {
+            btmp := wasm_alloc_tmp(wc)
+            wasm_arg_expr(wc, c, aoff, 0)
+            wasm_local_tee(c, btmp); wasm_op3(c, 0x50, 0x04, 0x7E)
+            wasm_i64_const(c, 0); buf_push(c, 0x05)
+            wasm_wrap_mem(c, btmp, 0x29, 3, 0)
+            buf_push(c, 0x0B); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_get") and acnt == 2 {
+            wasm_emit_buf_elem_op(wc, c, aoff, 0, 0); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_set") and acnt == 3 {
+            wasm_emit_buf_elem_op(wc, c, aoff, 1, 0); return
+        }
+        if (pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_put_u32") or pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_put_u64")) and acnt == 3 {
+            mut w := 8
+            if pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_put_u32") { w = 4 }
+            btmp := wasm_alloc_tmp(wc); itmp := wasm_alloc_tmp(wc); vtmp := wasm_alloc_tmp(wc)
+            wasm_arg_set(wc, c, aoff, 0, btmp)
+            wasm_arg_set(wc, c, aoff, 1, itmp)
+            wasm_arg_set(wc, c, aoff, 2, vtmp)
+            wasm_local_get(c, itmp); wasm_wrap_mem(c, btmp, 0x29, 3, 0); wasm_trap_ge_u(c)
+            wasm_local_get(c, itmp); wasm_i64_const(c, w); buf_push(c, 0x7C)
+            wasm_wrap_mem(c, btmp, 0x29, 3, 0); wasm_op4(c, 0x56, 0x04, 0x40, 0x00); buf_push(c, 0x0B)
+            wasm_wrap_mem(c, btmp, 0x28, 2, 16); wasm_get_wrap(c, itmp); buf_push(c, 0x6A)
+            wasm_local_get(c, vtmp)
+            if w == 4 { wasm_mem_op(c, 0x3E, 0, 0) } else { wasm_mem_op(c, 0x37, 0, 0) }
+            wasm_i64_const(c, 0); return
+        }
+        if (pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_push") or pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_push_u16") or pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_push_u32") or pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_push_u64")) and acnt == 2 {
+            mut w := 1
+            if pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_push_u16") { w = 2 }
+            else if pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_push_u32") { w = 4 }
+            else if pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_push_u64") { w = 8 }
+            wasm_arg_expr(wc, c, aoff, 0); buf_push(c, 0xA7)
+            wasm_arg_expr(wc, c, aoff, 1)
+            wasm_i32_const(c, w); wasm_call(c, wfn_buf_push_w())
+            wasm_i64_const(c, 0); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_push_str") and acnt == 2 {
+            stmp := wasm_alloc_tmp(wc)
+            wasm_arg_expr(wc, c, aoff, 0); buf_push(c, 0xA7)
+            wasm_arg_expr(wc, c, aoff, 1); wasm_local_tee(c, stmp); buf_push(c, 0xA7)
+            wasm_local_get(c, stmp); wasm_i64_const(c, 32); wasm_op2(c, 0x88, 0xA7)
+            wasm_call(c, wfn_buf_push_bytes()); wasm_i64_const(c, 0); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_slice_str") and acnt == 3 {
+            btmp := wasm_alloc_tmp(wc); st := wasm_alloc_tmp(wc); en := wasm_alloc_tmp(wc)
+            slen := wasm_alloc_tmp(wc); dst := wasm_alloc_tmp(wc); dp := wasm_alloc_tmp(wc); idx := wasm_alloc_tmp(wc)
+            wasm_arg_set(wc, c, aoff, 0, btmp)
+            wasm_arg_set(wc, c, aoff, 1, st)
+            wasm_arg_set(wc, c, aoff, 2, en)
+            wasm_local_get(c, st); wasm_local_get(c, en); wasm_op4(c, 0x56, 0x04, 0x40, 0x00); buf_push(c, 0x0B)
+            wasm_local_get(c, en); wasm_wrap_mem(c, btmp, 0x29, 3, 0); wasm_op4(c, 0x56, 0x04, 0x40, 0x00); buf_push(c, 0x0B)
+            wasm_local_get(c, en); wasm_local_get(c, st); buf_push(c, 0x7D); wasm_local_tee(c, slen)
+            wasm_i64_const(c, 1); wasm_op2(c, 0x7C, 0xA7); wasm_call(c, wfn_alloc()); buf_push(c, 0xAD); wasm_local_set(c, dst)
+            wasm_wrap_mem(c, btmp, 0x28, 2, 16); buf_push(c, 0xAD); wasm_local_set(c, dp)
+            wasm_i64_const(c, 0); wasm_local_set(c, idx)
+            wasm_loop_hdr(c)
+            wasm_local_get(c, idx); wasm_local_get(c, slen); wasm_op3(c, 0x59, 0x0D, 0x01)
+            wasm_local_get(c, dst); wasm_local_get(c, idx); wasm_op2(c, 0x7C, 0xA7)
+            wasm_local_get(c, dp); wasm_local_get(c, st); buf_push(c, 0x7C); wasm_local_get(c, idx); wasm_op2(c, 0x7C, 0xA7)
+            wasm_mem_op(c, 0x2D, 0, 0); wasm_mem_op(c, 0x3A, 0, 0)
+            wasm_local_get(c, idx); wasm_i64_const(c, 1); buf_push(c, 0x7C); wasm_local_set(c, idx)
+            wasm_loop_end(c)
+            wasm_local_get(c, dst); wasm_local_get(c, slen); wasm_op2(c, 0x7C, 0xA7)
+            wasm_i32_const(c, 0); wasm_mem_op(c, 0x3A, 0, 0)
+            wasm_local_get(c, dst); wasm_local_get(c, slen); wasm_i64_const(c, 32); wasm_op2(c, 0x86, 0x84)
+            return
+        }
+        if (pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_truncate") or pool_str_eq_lit(wc.pool, fsoff, fslen, "ibuf_truncate")) and acnt == 2 {
+            btmp := wasm_alloc_tmp(wc); ntmp := wasm_alloc_tmp(wc)
+            wasm_arg_set(wc, c, aoff, 0, btmp)
+            wasm_arg_set(wc, c, aoff, 1, ntmp)
+            wasm_local_get(c, ntmp); wasm_wrap_mem(c, btmp, 0x29, 3, 0); wasm_op3(c, 0x54, 0x04, 0x40)
+            wasm_get_wrap(c, btmp); wasm_local_get(c, ntmp); wasm_mem_op(c, 0x37, 3, 0)
+            buf_push(c, 0x0B); wasm_i64_const(c, 0); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "buf_free") and acnt == 1 {
+            wasm_arg_expr(wc, c, aoff, 0); buf_push(c, 0x1A)
+            wasm_i64_const(c, 0); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "ibuf_push") and acnt == 2 {
+            wasm_arg_expr(wc, c, aoff, 0); buf_push(c, 0xA7)
+            wasm_arg_expr(wc, c, aoff, 1)
+            wasm_call(c, wfn_ibuf_push()); wasm_i64_const(c, 0); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "ibuf_get") and acnt == 2 {
+            wasm_emit_buf_elem_op(wc, c, aoff, 0, 1); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "ibuf_set") and acnt == 3 {
+            wasm_emit_buf_elem_op(wc, c, aoff, 1, 1); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "str_len") and acnt == 1 {
+            wasm_arg_expr(wc, c, aoff, 0)
+            wasm_i64_const(c, 32); buf_push(c, 0x88); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "str_byte") and acnt == 2 {
+            stmp := wasm_alloc_tmp(wc); itmp := wasm_alloc_tmp(wc)
+            wasm_arg_set(wc, c, aoff, 0, stmp)
+            wasm_arg_set(wc, c, aoff, 1, itmp)
+            wasm_local_get(c, itmp); wasm_local_get(c, stmp); wasm_i64_const(c, 32); buf_push(c, 0x88); wasm_trap_ge_u(c)
+            wasm_get_wrap(c, stmp); wasm_get_wrap(c, itmp); buf_push(c, 0x6A)
+            wasm_mem_op(c, 0x31, 0, 0); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "str_slice") and acnt == 3 {
+            stmp := wasm_alloc_tmp(wc); st := wasm_alloc_tmp(wc); en := wasm_alloc_tmp(wc)
+            wasm_arg_set(wc, c, aoff, 0, stmp)
+            wasm_arg_set(wc, c, aoff, 1, st)
+            wasm_arg_set(wc, c, aoff, 2, en)
+            wasm_local_get(c, st); wasm_local_get(c, en); wasm_op4(c, 0x56, 0x04, 0x40, 0x00); buf_push(c, 0x0B)
+            wasm_local_get(c, en); wasm_local_get(c, stmp); wasm_i64_const(c, 32); buf_push(c, 0x88); wasm_op4(c, 0x56, 0x04, 0x40, 0x00); buf_push(c, 0x0B)
+            wasm_get_wrap(c, stmp); wasm_get_wrap(c, st); wasm_op2(c, 0x6A, 0xAD)
+            wasm_local_get(c, en); wasm_local_get(c, st); buf_push(c, 0x7D)
+            wasm_i64_const(c, 32); wasm_op2(c, 0x86, 0x84); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "str_eq") and acnt == 2 {
+            wasm_arg_expr(wc, c, aoff, 0)
+            wasm_arg_expr(wc, c, aoff, 1)
+            wasm_call(c, wfn_str_eq()); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "ok") and acnt == 1 {
+            wasm_emit_ok_or_err(wc, c, wasm_arg_nid(wc, aoff, 0), 0); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "err") and acnt == 1 {
+            wasm_emit_ok_or_err(wc, c, wasm_arg_nid(wc, aoff, 0), 1); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "ushr64") and acnt == 2 {
+            xtmp := wasm_alloc_tmp(wc); ktmp := wasm_alloc_tmp(wc)
+            wasm_arg_set(wc, c, aoff, 0, xtmp)
+            wasm_arg_expr(wc, c, aoff, 1); wasm_local_tee(c, ktmp)
+            wasm_i64_const(c, 64); wasm_op3(c, 0x5A, 0x04, 0x7E)
+            wasm_i64_const(c, 0); buf_push(c, 0x05)
+            wasm_local_get(c, xtmp); wasm_local_get(c, ktmp); wasm_op2(c, 0x88, 0x0B); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "abs_f64") and acnt == 1 {
+            wasm_arg_expr(wc, c, aoff, 0)
+            wasm_op3(c, 0xBF, 0x99, 0xBD); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "sqrt_f64") and acnt == 1 {
+            wasm_arg_expr(wc, c, aoff, 0)
+            wasm_op3(c, 0xBF, 0x9F, 0xBD); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "exit_process") and acnt == 1 {
+            wasm_arg_expr(wc, c, aoff, 0); buf_push(c, 0xA7)
+            wasm_call(c, wfn_proc_exit()); wasm_i64_const(c, 0); return
+        }
+        if pool_str_eq_lit(wc.pool, fsoff, fslen, "assert") and acnt >= 1 {
+            wasm_arg_expr(wc, c, aoff, 0)
+            wasm_op3(c, 0x50, 0x04, 0x40)
+            wasm_i32_const(c, 1); wasm_call(c, wfn_proc_exit())
+            buf_push(c, 0x0B); wasm_i64_const(c, 0); return
+        }
+        if (pool_str_eq_lit(wc.pool, fsoff, fslen, "trusted_str_unwrap") or pool_str_eq_lit(wc.pool, fsoff, fslen, "taint_str") or pool_str_eq_lit(wc.pool, fsoff, fslen, "env_input_tainted") or pool_str_eq_lit(wc.pool, fsoff, fslen, "tainted_raw_str")) and acnt == 1 {
+            wasm_arg_expr(wc, c, aoff, 0)
+            return
+        }
+
+        // Struct Constructor `StructName(args...)` (Positional + Named Field Args!)
+        sidx := find_struct_idx(wc.pool, wc.sym, fsoff, fslen)
+        if sidx >= 0 {
+            s_off := ibuf_get(wc.sym, 3) + sidx * 6
+            mut tot_slots := ibuf_get(wc.sym, s_off + 2)
+            if tot_slots < 1 { tot_slots = 1 }
+            f_base := ibuf_get(wc.sym, s_off + 3)
+            f_cnt := ibuf_get(wc.sym, s_off + 4)
+            sptr := wasm_alloc_tmp(wc)
+            wasm_i32_const(c, tot_slots * 8); wasm_call(c, wfn_alloc()); buf_push(c, 0xAD); wasm_local_set(c, sptr)
+            mut sfi := 0
+            while sfi < f_cnt {
+                sfo := f_base + sfi * 4
+                fn_soff := ibuf_get(wc.sym, sfo)
+                fn_slen := ibuf_get(wc.sym, sfo + 1)
+                f_slot_off := ibuf_get(wc.sym, sfo + 2)
+                mut matched_ca := 0
                 mut ai := 0
                 while ai < acnt {
-                    anid := ibuf_get(wc.extra, aoff + ai)
-                    wasm_emit_expr(wc, c, ast_get(wc.nodes, anid, 4))
+                    ca := ibuf_get(wc.extra, aoff + ai)
+                    an_soff := ast_get(wc.nodes, ca, 2)
+                    an_slen := ast_get(wc.nodes, ca, 3)
+                    if an_soff >= 0 and an_slen == fn_slen and pool_str_eq2(wc.pool, an_soff, fn_slen, fn_soff) {
+                        matched_ca = ca; break
+                    }
                     ai += 1
                 }
-                wasm_call(c, wfi)
-                return
+                if matched_ca == 0 and sfi < acnt {
+                    cand := ibuf_get(wc.extra, aoff + sfi)
+                    if ast_get(wc.nodes, cand, 2) < 0 { matched_ca = cand }
+                }
+                wasm_local_get(c, sptr); buf_push(c, 0xA7)
+                if matched_ca > 0 {
+                    wasm_emit_expr(wc, c, ast_get(wc.nodes, matched_ca, 4))
+                } else {
+                    wasm_i64_const(c, 0)
+                }
+                buf_push(c, 0x37); wasm_memarg(c, 3, f_slot_off * 8)
+                sfi += 1
             }
+            wasm_local_get(c, sptr)
+            return
+        }
+
+        // User / Stdlib Function Call (Positional + Named + Default Params)
+        fi := find_fn_idx(wc.pool, wc.sym, fsoff, fslen)
+        if fi >= 0 {
+            wasm_emit_user_call_with_recv(wc, c, fi, 0, aoff, acnt)
+            return
         }
     }
     if k == nk_await() or k == nk_comptime_expr() {
@@ -703,18 +1719,32 @@ fn wasm_emit_expr(wc: WasmCtx, c: ByteBuf, enid: i64) {
     wasm_i64_const(c, 0)
 }
 
-fn wasm_emit_block(wc: WasmCtx, c: ByteBuf, bnid: i64, loop_brk_depth: i64) {
+fn wasm_emit_block(wc: WasmCtx, c: ByteBuf, bnid: i64, brk_d: i64, cont_d: i64) {
     if bnid <= 0 { return }
+    saved_lcnt := ibuf_get(wc.state, 1)
     soff := ast_get(wc.nodes, bnid, 1)
     scnt := ast_get(wc.nodes, bnid, 2)
     mut i := 0
     while i < scnt {
-        wasm_emit_stmt(wc, c, ibuf_get(wc.extra, soff + i), loop_brk_depth)
+        wasm_emit_stmt(wc, c, ibuf_get(wc.extra, soff + i), brk_d, cont_d)
         i += 1
+    }
+    ibuf_set(wc.state, 1, saved_lcnt)
+}
+
+fn wasm_emit_compound_rhs(wc: WasmCtx, c: ByteBuf, lhs_ty: i64, aop: i64, rhs: i64) {
+    if ty_tag(lhs_ty) == ty_float() {
+        buf_push(c, 0xBF)
+        wasm_emit_expr(wc, c, rhs)
+        if ty_tag(wasm_infer_expr_ty(wc, rhs)) == ty_float() { buf_push(c, 0xBF) } else { buf_push(c, 0xB9) }
+        wasm_emit_aop(c, aop, 1)
+    } else {
+        wasm_emit_expr(wc, c, rhs)
+        wasm_emit_aop(c, aop, 0)
     }
 }
 
-fn wasm_emit_stmt(wc: WasmCtx, c: ByteBuf, snid: i64, loop_brk_depth: i64) {
+fn wasm_emit_stmt(wc: WasmCtx, c: ByteBuf, snid: i64, brk_d: i64, cont_d: i64) {
     if snid <= 0 { return }
     k := ast_kind(wc.nodes, snid)
     if k == nk_var_decl() {
@@ -732,37 +1762,54 @@ fn wasm_emit_stmt(wc: WasmCtx, c: ByteBuf, snid: i64, loop_brk_depth: i64) {
         wasm_local_set(c, lidx)
         return
     }
+    if k == nk_tuple_destruct() {
+        noff := ast_get(wc.nodes, snid, 1)
+        ncnt := ast_get(wc.nodes, snid, 2)
+        init_e := ast_get(wc.nodes, snid, 3)
+        tty := wasm_infer_expr_ty(wc, init_e)
+        tptr := wasm_alloc_tmp(wc)
+        wasm_emit_expr(wc, c, init_e)
+        wasm_local_set(c, tptr)
+        mut i := 0
+        while i < ncnt {
+            nsoff := ibuf_get(wc.extra, noff + i * 2)
+            nslen := ibuf_get(wc.extra, noff + i * 2 + 1)
+            mut ety := ty_int()
+            if ty_tag(tty) == 14 {
+                doff := ty_pay(tty)
+                if i < ibuf_get(wc.sym, doff) {
+                    ety = ibuf_get(wc.sym, doff + 1 + i)
+                }
+            }
+            vidx := wasm_alloc_local(wc, nsoff, nslen, ety)
+            wasm_wrap_mem(c, tptr, 0x29, 3, i * 8); wasm_local_set(c, vidx)
+            i += 1
+        }
+        return
+    }
     if k == nk_assign() {
-        aop := ast_get(wc.nodes, snid, 1)
-        lhs := ast_get(wc.nodes, snid, 2)
-        rhs := ast_get(wc.nodes, snid, 3)
-        if ast_kind(wc.nodes, lhs) == nk_ident() {
+        aop := ast_get(wc.nodes, snid, 1); lhs := ast_get(wc.nodes, snid, 2); rhs := ast_get(wc.nodes, snid, 3)
+        lk := ast_kind(wc.nodes, lhs)
+        if lk == nk_ident() {
             lb := wasm_find_local(wc, ast_get(wc.nodes, lhs, 1), ast_get(wc.nodes, lhs, 2))
             if lb >= 0 {
-                lidx := ibuf_get(wc.locals, lb + 2)
-                lty := ibuf_get(wc.locals, lb + 3)
-                if aop == aop_eq() {
-                    wasm_emit_expr(wc, c, rhs)
-                    wasm_local_set(c, lidx)
-                } else if ty_tag(lty) == ty_float() {
-                    wasm_local_get(c, lidx)
-                    buf_push(c, 0xBF)
-                    wasm_emit_expr(wc, c, rhs)
-                    buf_push(c, 0xBF)
-                    if aop == aop_add() { buf_push(c, 0xA0) }
-                    else if aop == aop_sub() { buf_push(c, 0xA1) }
-                    else if aop == aop_mul() { buf_push(c, 0xA2) }
-                    else { buf_push(c, 0xA3) }
-                    buf_push(c, 0xBD)
-                    wasm_local_set(c, lidx)
-                } else {
-                    wasm_local_get(c, lidx)
-                    wasm_emit_expr(wc, c, rhs)
-                    if aop == aop_add() { buf_push(c, 0x7C) }
-                    else if aop == aop_sub() { buf_push(c, 0x7D) }
-                    else if aop == aop_mul() { buf_push(c, 0x7E) }
-                    else { buf_push(c, 0x7F) }
-                    wasm_local_set(c, lidx)
+                lidx := ibuf_get(wc.locals, lb + 2); lty := ibuf_get(wc.locals, lb + 3)
+                if aop == aop_eq() { wasm_emit_expr(wc, c, rhs) }
+                else { wasm_local_get(c, lidx); wasm_emit_compound_rhs(wc, c, lty, aop, rhs) }
+                wasm_local_set(c, lidx)
+            }
+        } else if lk == nk_field() {
+            base_e := ast_get(wc.nodes, lhs, 1); bty := wasm_infer_expr_ty(wc, base_e)
+            if ty_tag(bty) == 10 {
+                fo := find_struct_field(wc.pool, wc.sym, ty_pay(bty), ast_get(wc.nodes, lhs, 2) | (ast_get(wc.nodes, lhs, 3) << 32))
+                if fo >= 0 {
+                    f_off := ibuf_get(wc.sym, fo + 2); f_ty := ibuf_get(wc.sym, fo + 3)
+                    sptr := wasm_alloc_tmp(wc)
+                    wasm_emit_expr(wc, c, base_e); wasm_local_set(c, sptr)
+                    wasm_get_wrap(c, sptr)
+                    if aop == aop_eq() { wasm_emit_expr(wc, c, rhs) }
+                    else { wasm_wrap_mem(c, sptr, 0x29, 3, f_off * 8); wasm_emit_compound_rhs(wc, c, f_ty, aop, rhs) }
+                    wasm_mem_op(c, 0x37, 3, f_off * 8)
                 }
             }
         }
@@ -770,173 +1817,324 @@ fn wasm_emit_stmt(wc: WasmCtx, c: ByteBuf, snid: i64, loop_brk_depth: i64) {
     }
     if k == nk_if() {
         wasm_emit_expr(wc, c, ast_get(wc.nodes, snid, 1))
-        wasm_i64_const(c, 0)
-        buf_push(c, 0x52)
-        buf_push(c, 0x04)
-        buf_push(c, 0x40)
-        mut next_d := -1
-        if loop_brk_depth >= 0 { next_d = loop_brk_depth + 1 }
-        wasm_emit_block(wc, c, ast_get(wc.nodes, snid, 2), next_d)
+        wasm_i64_const(c, 0); wasm_op3(c, 0x52, 0x04, 0x40)
+        mut nb := -1; if brk_d >= 0 { nb = brk_d + 1 }
+        mut nc := -1; if cont_d >= 0 { nc = cont_d + 1 }
+        wasm_emit_block(wc, c, ast_get(wc.nodes, snid, 2), nb, nc)
         eb := ast_get(wc.nodes, snid, 3)
         if eb != 0 {
             buf_push(c, 0x05)
-            if ast_kind(wc.nodes, eb) == nk_if() {
-                wasm_emit_stmt(wc, c, eb, next_d)
-            } else {
-                wasm_emit_block(wc, c, eb, next_d)
-            }
+            if ast_kind(wc.nodes, eb) == nk_if() { wasm_emit_stmt(wc, c, eb, nb, nc) }
+            else { wasm_emit_block(wc, c, eb, nb, nc) }
         }
-        buf_push(c, 0x0B)
-        return
+        buf_push(c, 0x0B); return
     }
     if k == nk_while() {
-        buf_push(c, 0x02) // block (break = depth 1)
-        buf_push(c, 0x40)
-        buf_push(c, 0x03) // loop  (continue = depth 0)
-        buf_push(c, 0x40)
+        wasm_loop_hdr(c)
         wasm_emit_expr(wc, c, ast_get(wc.nodes, snid, 1))
-        buf_push(c, 0x50) // i64.eqz
-        buf_push(c, 0x0D) // br_if 1 (break)
-        wasm_uleb(c, 1)
-        wasm_emit_block(wc, c, ast_get(wc.nodes, snid, 2), 1)
-        buf_push(c, 0x0C) // br 0
-        wasm_uleb(c, 0)
-        buf_push(c, 0x0B)
-        buf_push(c, 0x0B)
-        return
+        wasm_op3(c, 0x50, 0x0D, 0x01)
+        wasm_emit_block(wc, c, ast_get(wc.nodes, snid, 2), 1, 0)
+        wasm_loop_end(c); return
     }
     if k == nk_for_range() or k == nk_par_for_range() {
         iv_idx := wasm_alloc_local(wc, ast_get(wc.nodes, snid, 1), ast_get(wc.nodes, snid, 2), ty_int())
         end_idx := wasm_alloc_tmp(wc)
-        wasm_emit_expr(wc, c, ast_get(wc.nodes, snid, 3))
-        wasm_local_set(c, iv_idx)
-        wasm_emit_expr(wc, c, ast_get(wc.nodes, snid, 4))
-        wasm_local_set(c, end_idx)
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, snid, 3)); wasm_local_set(c, iv_idx)
+        wasm_emit_expr(wc, c, ast_get(wc.nodes, snid, 4)); wasm_local_set(c, end_idx)
 
-        buf_push(c, 0x02)
-        buf_push(c, 0x40)
-        buf_push(c, 0x03)
-        buf_push(c, 0x40)
-        wasm_local_get(c, iv_idx)
-        wasm_local_get(c, end_idx)
-        buf_push(c, 0x59) // i64.ge_s
-        buf_push(c, 0x0D)
-        wasm_uleb(c, 1)
-        wasm_emit_block(wc, c, ast_get(wc.nodes, snid, 5), 1)
-        wasm_local_get(c, iv_idx)
-        wasm_i64_const(c, 1)
-        buf_push(c, 0x7C)
-        wasm_local_set(c, iv_idx)
-        buf_push(c, 0x0C)
-        wasm_uleb(c, 0)
+        wasm_loop_hdr(c)
+        wasm_local_get(c, iv_idx); wasm_local_get(c, end_idx); wasm_op3(c, 0x59, 0x0D, 0x01)
+        wasm_op2(c, 0x02, 0x40) // cont = 0 -> lands at increment!
+        wasm_emit_block(wc, c, ast_get(wc.nodes, snid, 5), 2, 0)
         buf_push(c, 0x0B)
-        buf_push(c, 0x0B)
+        wasm_local_get(c, iv_idx); wasm_i64_const(c, 1); buf_push(c, 0x7C); wasm_local_set(c, iv_idx)
+        buf_push(c, 0x0C); wasm_uleb(c, 0)
+        buf_push(c, 0x0B); buf_push(c, 0x0B)
         return
     }
     if k == nk_for_each() or k == nk_par_for_each() {
-        // Invoke W3C WASM SIMD128 `axon_simd128_fma_f32(dst_ptr, src_ptr, scale, count)` on Table[T] columns!
+        tbl_e := ast_get(wc.nodes, snid, 3)
+        plan_off := ast_get(wc.nodes, snid, 5)
+        if plan_off <= 0 { return }
+        ops_cnt := ibuf_get(wc.extra, plan_off + 1)
+        if ops_cnt <= 0 { return }
+
         tbl_tmp := wasm_alloc_tmp(wc)
         cnt_tmp := wasm_alloc_tmp(wc)
         base_tmp := wasm_alloc_tmp(wc)
-        wasm_emit_expr(wc, c, ast_get(wc.nodes, snid, 4))
-        wasm_local_set(c, tbl_tmp)
+        wasm_emit_expr(wc, c, tbl_e); wasm_local_set(c, tbl_tmp)
+        wasm_local_get(c, tbl_tmp); wasm_i64_const(c, 0xFFFFFFFF); buf_push(c, 0x83); wasm_local_set(c, base_tmp)
+        wasm_local_get(c, tbl_tmp); wasm_i64_const(c, 32); buf_push(c, 0x88); wasm_local_set(c, cnt_tmp)
 
-        wasm_local_get(c, tbl_tmp)
-        wasm_i64_const(c, 0xFFFFFFFF)
-        buf_push(c, 0x83)
-        wasm_local_set(c, base_tmp)
+        mut oi := 0
+        while oi < ops_cnt {
+            obase := plan_off + 2 + oi * 4
+            okind := ibuf_get(wc.extra, obase)
+            dst_col := ibuf_get(wc.extra, obase + 1)
+            src_col := ibuf_get(wc.extra, obase + 2)
+            scale_e := ibuf_get(wc.extra, obase + 3)
 
-        wasm_local_get(c, tbl_tmp)
-        wasm_i64_const(c, 32)
-        buf_push(c, 0x88)
-        wasm_local_set(c, cnt_tmp)
+            // dst_ptr
+            wasm_emit_col_ptr(c, base_tmp, cnt_tmp, dst_col)
 
-        // dst_ptr = base_tmp as i32
-        wasm_local_get(c, base_tmp)
-        buf_push(c, 0xA7)
-        // src_ptr = (base_tmp + cnt_tmp * 4) as i32
-        wasm_local_get(c, base_tmp)
-        wasm_local_get(c, cnt_tmp)
-        wasm_i64_const(c, 2)
-        buf_push(c, 0x86)
-        buf_push(c, 0x7C)
-        buf_push(c, 0xA7)
-        // scale = 0.016f32 (or plan scale bits from slot 6)
-        plan_off := ast_get(wc.nodes, snid, 6)
-        mut scale_bits := 0x3F9DF3B645A1CAC1
-        if plan_off > 0 {
-            scale_bits = ibuf_get(wc.extra, plan_off + 2)
+            is_fma := okind == 1 or okind == 3 or okind == 4 or okind == 5
+            if is_fma {
+                // src_ptr
+                wasm_emit_col_ptr(c, base_tmp, cnt_tmp, src_col)
+            }
+
+            if scale_e > 0 {
+                wasm_emit_expr(wc, c, scale_e)
+                if ty_tag(wasm_infer_expr_ty(wc, scale_e)) != ty_float() { buf_push(c, 0xB9) } else { buf_push(c, 0xBF) }
+                buf_push(c, 0xB6) // f32.demote_f64
+                if okind == 4 { buf_push(c, 0x8C) } // f32.neg
+            } else {
+                if okind == 5 {
+                    wasm_i64_const(c, -4616189618054758400) // -1.0f64 (0xBFF0000000000000)
+                } else {
+                    wasm_i64_const(c, 0x3FF0000000000000) // 1.0f64
+                }
+                buf_push(c, 0xBF); buf_push(c, 0xB6)
+            }
+
+            wasm_local_get(c, cnt_tmp); buf_push(c, 0xA7)
+            if is_fma {
+                wasm_call(c, wfn_simd128_fma())
+            } else {
+                wasm_call(c, wfn_simd128_mul())
+            }
+            oi += 1
         }
-        wasm_i64_const(c, scale_bits)
-        buf_push(c, 0xBF) // f64.reinterpret_i64
-        buf_push(c, 0xB6) // f32.demote_f64
-        // count = cnt_tmp as i32
-        wasm_local_get(c, cnt_tmp)
-        buf_push(c, 0xA7)
-        wasm_call(c, 3)
         return
     }
     if k == nk_break() {
-        if loop_brk_depth >= 1 {
-            buf_push(c, 0x0C)
-            wasm_uleb(c, loop_brk_depth)
-        }
+        if brk_d >= 0 { buf_push(c, 0x0C); wasm_uleb(c, brk_d) }
         return
     }
     if k == nk_continue() {
-        if loop_brk_depth >= 1 {
-            buf_push(c, 0x0C)
-            wasm_uleb(c, loop_brk_depth - 1)
-        }
+        if cont_d >= 0 { buf_push(c, 0x0C); wasm_uleb(c, cont_d) }
         return
     }
     if k == nk_return() {
         re := ast_get(wc.nodes, snid, 1)
-        if re != 0 {
-            wasm_emit_expr(wc, c, re)
-        } else {
-            wasm_i64_const(c, 0)
-        }
+        if re != 0 { wasm_emit_expr(wc, c, re) } else { wasm_i64_const(c, 0) }
         buf_push(c, 0x0F)
         return
     }
     if k == nk_expr_stmt() {
         wasm_emit_expr(wc, c, ast_get(wc.nodes, snid, 1))
-        buf_push(c, 0x1A) // drop
+        buf_push(c, 0x1A)
         return
     }
     if k == nk_block() {
-        wasm_emit_block(wc, c, snid, loop_brk_depth)
+        wasm_emit_block(wc, c, snid, brk_d, cont_d)
     }
+}
+
+// --- Whole-Program Reachability Tree-Shaking for WASM32 ---
+
+fn wasm_enqueue_fn(live: IntBuf, queue: IntBuf, fi: i64) {
+    if fi >= 0 and fi < ibuf_len(live) and ibuf_get(live, fi) == 0 {
+        ibuf_set(live, fi, 1)
+        ibuf_push(queue, fi)
+    }
+}
+
+fn wasm_scan_expr(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, live: IntBuf, queue: IntBuf, enid: i64) {
+    if enid <= 0 { return }
+    k := ast_kind(nodes, enid)
+    if k == nk_call() {
+        fsoff := ast_get(nodes, enid, 1); fslen := ast_get(nodes, enid, 2)
+        fi := find_fn_idx(pool, sym, fsoff, fslen)
+        if fi >= 0 { wasm_enqueue_fn(live, queue, fi) }
+        aoff := ast_get(nodes, enid, 3); acnt := ast_get(nodes, enid, 4)
+        mut ai := 0
+        while ai < acnt {
+            wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, ibuf_get(extra, aoff + ai), 4))
+            ai += 1
+        }
+        return
+    }
+    if k == nk_method_call() {
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, enid, 1))
+        fi := find_fn_idx(pool, sym, ast_get(nodes, enid, 2), ast_get(nodes, enid, 3))
+        if fi >= 0 { wasm_enqueue_fn(live, queue, fi) }
+        aoff := ast_get(nodes, enid, 4); acnt := ast_get(nodes, enid, 5)
+        mut ai := 0
+        while ai < acnt {
+            wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, ibuf_get(extra, aoff + ai), 4))
+            ai += 1
+        }
+        return
+    }
+    if k == nk_fstr() or k == nk_tuple() {
+        poff := ast_get(nodes, enid, 1); pcnt := ast_get(nodes, enid, 2)
+        mut pi := 0
+        while pi < pcnt {
+            wasm_scan_expr(pool, nodes, extra, sym, live, queue, ibuf_get(extra, poff + pi))
+            pi += 1
+        }
+        return
+    }
+    if k == nk_binary() or k == nk_or_return() or k == nk_index() {
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, enid, 2))
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, enid, 3))
+        if k == nk_index() or k == nk_or_return() {
+            wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, enid, 1))
+        }
+        return
+    }
+    if k == nk_unary() {
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, enid, 2)); return
+    }
+    if k == nk_cast() or k == nk_field() or k == nk_tuple_idx() or k == nk_await() or k == nk_comptime_expr() {
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, enid, 1)); return
+    }
+    if k == nk_table_alloc() {
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, enid, 3)); return
+    }
+    if k == nk_if_expr() {
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, enid, 1))
+        wasm_scan_block(pool, nodes, extra, sym, live, queue, ast_get(nodes, enid, 2))
+        eb := ast_get(nodes, enid, 3)
+        if ast_kind(nodes, eb) == nk_if_expr() { wasm_scan_expr(pool, nodes, extra, sym, live, queue, eb) }
+        else { wasm_scan_block(pool, nodes, extra, sym, live, queue, eb) }
+        return
+    }
+    if k == nk_spawn() {
+        wasm_scan_block(pool, nodes, extra, sym, live, queue, ast_get(nodes, enid, 1))
+    }
+}
+
+fn wasm_scan_stmt(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, live: IntBuf, queue: IntBuf, st: i64) {
+    if st <= 0 { return }
+    sk := ast_kind(nodes, st)
+    if sk == nk_var_decl() { wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, st, 5)) }
+    else if sk == nk_tuple_destruct() { wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, st, 3)) }
+    else if sk == nk_assign() {
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, st, 2))
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, st, 3))
+    } else if sk == nk_if() {
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, st, 1))
+        wasm_scan_block(pool, nodes, extra, sym, live, queue, ast_get(nodes, st, 2))
+        eb := ast_get(nodes, st, 3)
+        if ast_kind(nodes, eb) == nk_if() { wasm_scan_stmt(pool, nodes, extra, sym, live, queue, eb) }
+        else { wasm_scan_block(pool, nodes, extra, sym, live, queue, eb) }
+    } else if sk == nk_while() {
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, st, 1))
+        wasm_scan_block(pool, nodes, extra, sym, live, queue, ast_get(nodes, st, 2))
+    } else if sk == nk_for_range() or sk == nk_par_for_range() {
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, st, 3))
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, st, 4))
+        wasm_scan_block(pool, nodes, extra, sym, live, queue, ast_get(nodes, st, 5))
+    } else if sk == nk_for_each() or sk == nk_par_for_each() {
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, st, 3))
+        plan_off := ast_get(nodes, st, 5)
+        if plan_off > 0 {
+            ocnt := ibuf_get(extra, plan_off + 1)
+            mut oi := 0
+            while oi < ocnt {
+                wasm_scan_expr(pool, nodes, extra, sym, live, queue, ibuf_get(extra, plan_off + 2 + oi * 4 + 3))
+                oi += 1
+            }
+        }
+        wasm_scan_block(pool, nodes, extra, sym, live, queue, ast_get(nodes, st, 4))
+    } else if sk == nk_return() or sk == nk_expr_stmt() {
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, st, 1))
+    } else if sk == nk_block() {
+        wasm_scan_block(pool, nodes, extra, sym, live, queue, st)
+    }
+}
+
+fn wasm_scan_block(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, live: IntBuf, queue: IntBuf, bnid: i64) {
+    if bnid <= 0 { return }
+    soff := ast_get(nodes, bnid, 1); scnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < scnt {
+        wasm_scan_stmt(pool, nodes, extra, sym, live, queue, ibuf_get(extra, soff + i))
+        i += 1
+    }
+    if ast_kind(nodes, bnid) == nk_block() and ast_get(nodes, bnid, 3) > 0 {
+        wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, bnid, 3))
+    }
+}
+
+fn wasm_mark_reachable(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, live: IntBuf) {
+    f_base := ibuf_get(sym, 7)
+    f_cnt := ibuf_get(sym, 8)
+    queue := ibuf_new(f_cnt + 8)
+    mut main_idx := -1
+    mut i := 0
+    while i < f_cnt {
+        ibuf_push(live, 0)
+        fo := f_base + i * 10
+        flags := ibuf_get(sym, fo + 9)
+        if pool_str_eq_lit(pool, ibuf_get(sym, fo), ibuf_get(sym, fo + 1), "main") { main_idx = i }
+        if (flags & fnflag_export()) != 0 { wasm_enqueue_fn(live, queue, i) }
+        i += 1
+    }
+    if main_idx >= 0 {
+        wasm_enqueue_fn(live, queue, main_idx)
+    } else if ibuf_len(queue) == 0 {
+        i = 0
+        while i < f_cnt {
+            if (ibuf_get(sym, f_base + i * 10 + 9) & fnflag_comptime()) == 0 { wasm_enqueue_fn(live, queue, i) }
+            i += 1
+        }
+    }
+    mut qi := 0
+    while qi < ibuf_len(queue) {
+        fidx := ibuf_get(queue, qi); qi += 1
+        fo := f_base + fidx * 10
+        fnid := ibuf_get(sym, fo + 2)
+        flags := ibuf_get(sym, fo + 9)
+        if (flags & fnflag_extern()) == 0 {
+            pl_off := ast_get(nodes, fnid, 3)
+            pcnt := ast_get(nodes, fnid, 4) & 0xFFFF
+            mut pi := 0
+            while pi < pcnt {
+                pn := ibuf_get(extra, pl_off + pi)
+                wasm_scan_expr(pool, nodes, extra, sym, live, queue, ast_get(nodes, pn, 5))
+                pi += 1
+            }
+            wasm_scan_block(pool, nodes, extra, sym, live, queue, ast_get(nodes, fnid, 6) & 0xFFFFFFFF)
+        }
+    }
+    buf_free(move queue)
+}
+
+fn wasm_push_type_sig(sec: ByteBuf, ptypes: IntBuf, nparams: i64, rty: i64) {
+    buf_push(sec, 0x60)
+    wasm_uleb(sec, nparams)
+    mut i := 0
+    while i < nparams { buf_push(sec, ibuf_get(ptypes, i)); i += 1 }
+    if rty != 0 { wasm_uleb(sec, 1); buf_push(sec, rty) }
+    else { wasm_uleb(sec, 0) }
 }
 
 fn compile_module_to_wasm32(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, wasm_out: ByteBuf) -> i64 {
     fn_cnt := ibuf_get(sym, 8)
     fn_base := ibuf_get(sym, 7)
+    live := ibuf_new(fn_cnt + 8)
+    wasm_mark_reachable(pool, nodes, extra, sym, live)
+
     fn_map := ibuf_new(fn_cnt + 8)
     user_fns := ibuf_new(fn_cnt + 8)
-
-    // WASM function indices:
-    //   0 = import `wasi_snapshot_preview1.fd_write`
-    //   1 = `__axon_print_str`
-    //   2 = `__axon_print_i64`
-    //   3 = `axon_simd128_fma_f32`
-    //   4..4+U-1 = user functions
-    //   4+U = `_start`
-    mut next_wfi := 4
+    mut next_wfi := wfn_user_base()
     mut fi := 0
     while fi < fn_cnt {
         fo := fn_base + fi * 10
         flags := ibuf_get(sym, fo + 9)
-        if (flags & fnflag_extern()) != 0 {
-            ibuf_push(fn_map, -1)
-        } else {
+        if ibuf_get(live, fi) == 1 and (flags & fnflag_extern()) == 0 {
             ibuf_push(fn_map, next_wfi)
             ibuf_push(user_fns, fi)
             next_wfi += 1
+        } else {
+            ibuf_push(fn_map, -1)
         }
         fi += 1
     }
+    buf_free(move live)
     start_wfi := next_wfi
     ucnt := ibuf_len(user_fns)
 
@@ -945,152 +2143,140 @@ fn compile_module_to_wasm32(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
     locals := ibuf_new(512)
     state := ibuf_new(32)
     mut si := 0
-    while si < 8 {
-        ibuf_push(state, 0)
-        si += 1
-    }
+    while si < 8 { ibuf_push(state, 0); si += 1 }
     wc := WasmCtx(pool, nodes, extra, sym, data_buf, interns, locals, fn_map, state)
 
-    // 1. Type Section (id = 1):
+    // 1. Type Section (16 fixed types + ucnt user function types)
     sec_type := buf_new(4096)
-    wasm_uleb(sec_type, 5 + ucnt)
+    wasm_uleb(sec_type, 16 + ucnt)
+    pt := ibuf_new(8)
 
-    // type 0
-    buf_push(sec_type, 0x60)
-    wasm_uleb(sec_type, 4)
-    buf_push(sec_type, 0x7F); buf_push(sec_type, 0x7F); buf_push(sec_type, 0x7F); buf_push(sec_type, 0x7F)
-    wasm_uleb(sec_type, 1)
-    buf_push(sec_type, 0x7F)
-    // type 1
-    buf_push(sec_type, 0x60)
-    wasm_uleb(sec_type, 2)
-    buf_push(sec_type, 0x7F); buf_push(sec_type, 0x7F)
-    wasm_uleb(sec_type, 0)
-    // type 2
-    buf_push(sec_type, 0x60)
-    wasm_uleb(sec_type, 1)
-    buf_push(sec_type, 0x7E)
-    wasm_uleb(sec_type, 0)
-    // type 3
-    buf_push(sec_type, 0x60)
-    wasm_uleb(sec_type, 4)
-    buf_push(sec_type, 0x7F); buf_push(sec_type, 0x7F); buf_push(sec_type, 0x7D); buf_push(sec_type, 0x7F)
-    wasm_uleb(sec_type, 0)
-    // type 4
-    buf_push(sec_type, 0x60)
-    wasm_uleb(sec_type, 0)
-    wasm_uleb(sec_type, 0)
+    // Type 0: (i32, i32, i32, i32) -> i32 (fd_write)
+    ibuf_push(pt, 0x7F); ibuf_push(pt, 0x7F); ibuf_push(pt, 0x7F); ibuf_push(pt, 0x7F)
+    wasm_push_type_sig(sec_type, pt, 4, 0x7F); ibuf_truncate(pt, 0)
+    // Type 1: (i32) -> () (proc_exit)
+    ibuf_push(pt, 0x7F); wasm_push_type_sig(sec_type, pt, 1, 0); ibuf_truncate(pt, 0)
+    // Type 2: (i32, i64, i32) -> i32 (clock_time_get)
+    ibuf_push(pt, 0x7F); ibuf_push(pt, 0x7E); ibuf_push(pt, 0x7F)
+    wasm_push_type_sig(sec_type, pt, 3, 0x7F); ibuf_truncate(pt, 0)
+    // Type 3: (i32) -> i32 (__wasm_alloc)
+    ibuf_push(pt, 0x7F); wasm_push_type_sig(sec_type, pt, 1, 0x7F); ibuf_truncate(pt, 0)
+    // Type 4: (i32, i32) -> () (__axon_print_str)
+    ibuf_push(pt, 0x7F); ibuf_push(pt, 0x7F); wasm_push_type_sig(sec_type, pt, 2, 0); ibuf_truncate(pt, 0)
+    // Type 5: (i64) -> () (__axon_print_i64, __axon_print_dec)
+    ibuf_push(pt, 0x7E); wasm_push_type_sig(sec_type, pt, 1, 0); ibuf_truncate(pt, 0)
+    // Type 6: (i32, i32, f32, i32) -> () (axon_simd128_fma_f32)
+    ibuf_push(pt, 0x7F); ibuf_push(pt, 0x7F); ibuf_push(pt, 0x7D); ibuf_push(pt, 0x7F)
+    wasm_push_type_sig(sec_type, pt, 4, 0); ibuf_truncate(pt, 0)
+    // Type 7: (i32, f32, i32) -> () (__axon_simd128_mul_f32)
+    ibuf_push(pt, 0x7F); ibuf_push(pt, 0x7D); ibuf_push(pt, 0x7F)
+    wasm_push_type_sig(sec_type, pt, 3, 0); ibuf_truncate(pt, 0)
+    // Type 8: () -> i64 (__axon_clock_ns)
+    wasm_push_type_sig(sec_type, pt, 0, 0x7E)
+    // Type 9: (i64, i32) -> i64 (__axon_buf_new)
+    ibuf_push(pt, 0x7E); ibuf_push(pt, 0x7F); wasm_push_type_sig(sec_type, pt, 2, 0x7E); ibuf_truncate(pt, 0)
+    // Type 10: (i32, i64, i32) -> () (__axon_buf_push_w)
+    ibuf_push(pt, 0x7F); ibuf_push(pt, 0x7E); ibuf_push(pt, 0x7F)
+    wasm_push_type_sig(sec_type, pt, 3, 0); ibuf_truncate(pt, 0)
+    // Type 11: (i32, i64) -> () (__axon_ibuf_push, __axon_buf_push_i64, __axon_buf_push_dec)
+    ibuf_push(pt, 0x7F); ibuf_push(pt, 0x7E); wasm_push_type_sig(sec_type, pt, 2, 0); ibuf_truncate(pt, 0)
+    // Type 12: (i32, i32, i32) -> () (__axon_buf_push_bytes)
+    ibuf_push(pt, 0x7F); ibuf_push(pt, 0x7F); ibuf_push(pt, 0x7F)
+    wasm_push_type_sig(sec_type, pt, 3, 0); ibuf_truncate(pt, 0)
+    // Type 13: (i64, i64) -> i64 (__axon_str_eq, __axon_str_concat)
+    ibuf_push(pt, 0x7E); ibuf_push(pt, 0x7E); wasm_push_type_sig(sec_type, pt, 2, 0x7E); ibuf_truncate(pt, 0)
+    // Type 14: (i32, i32, i64) -> () (__axon_table_fill_f32)
+    ibuf_push(pt, 0x7F); ibuf_push(pt, 0x7F); ibuf_push(pt, 0x7E)
+    wasm_push_type_sig(sec_type, pt, 3, 0); ibuf_truncate(pt, 0)
+    // Type 15: () -> () (_start)
+    wasm_push_type_sig(sec_type, pt, 0, 0)
+    buf_free(move pt)
 
     mut uk := 0
     while uk < ucnt {
         ufi := ibuf_get(user_fns, uk)
-        fo := fn_base + ufi * 10
-        pcnt := ibuf_get(sym, fo + 4)
+        pcnt := ibuf_get(sym, fn_base + ufi * 10 + 4)
         buf_push(sec_type, 0x60)
         wasm_uleb(sec_type, pcnt)
         mut pi := 0
-        while pi < pcnt {
-            buf_push(sec_type, 0x7E)
-            pi += 1
-        }
-        wasm_uleb(sec_type, 1)
-        buf_push(sec_type, 0x7E)
+        while pi < pcnt { buf_push(sec_type, 0x7E); pi += 1 }
+        wasm_uleb(sec_type, 1); buf_push(sec_type, 0x7E)
         uk += 1
     }
 
-    // 2. Import Section (id = 2)
+    // 2. Import Section (fd_write, proc_exit, clock_time_get)
     sec_imp := buf_new(256)
-    wasm_uleb(sec_imp, 1)
-    wasm_push_name(sec_imp, "wasi_snapshot_preview1")
-    wasm_push_name(sec_imp, "fd_write")
-    buf_push(sec_imp, 0x00)
-    wasm_uleb(sec_imp, 0)
+    wasm_uleb(sec_imp, 3)
+    wasm_push_name(sec_imp, "wasi_snapshot_preview1"); wasm_push_name(sec_imp, "fd_write"); buf_push(sec_imp, 0x00); wasm_uleb(sec_imp, 0)
+    wasm_push_name(sec_imp, "wasi_snapshot_preview1"); wasm_push_name(sec_imp, "proc_exit"); buf_push(sec_imp, 0x00); wasm_uleb(sec_imp, 1)
+    wasm_push_name(sec_imp, "wasi_snapshot_preview1"); wasm_push_name(sec_imp, "clock_time_get"); buf_push(sec_imp, 0x00); wasm_uleb(sec_imp, 2)
 
-    // 3. Function Section (id = 3): funcs 1..3, user_fns, `_start`
+    // 3. Function Section (16 helpers + ucnt user fns + _start)
     sec_func := buf_new(4096)
-    wasm_uleb(sec_func, 4 + ucnt)
-    wasm_uleb(sec_func, 1)
-    wasm_uleb(sec_func, 2)
-    wasm_uleb(sec_func, 3)
+    wasm_uleb(sec_func, 17 + ucnt)
+    wasm_uleb(sec_func, 3)  // 3: alloc
+    wasm_uleb(sec_func, 4)  // 4: print_str
+    wasm_uleb(sec_func, 5)  // 5: print_i64
+    wasm_uleb(sec_func, 6)  // 6: simd128_fma
+    wasm_uleb(sec_func, 7)  // 7: simd128_mul
+    wasm_uleb(sec_func, 8)  // 8: clock_ns
+    wasm_uleb(sec_func, 9)  // 9: buf_new
+    wasm_uleb(sec_func, 10) // 10: buf_push_w
+    wasm_uleb(sec_func, 11) // 11: ibuf_push
+    wasm_uleb(sec_func, 12) // 12: buf_push_bytes
+    wasm_uleb(sec_func, 11) // 13: buf_push_i64
+    wasm_uleb(sec_func, 13) // 14: str_eq
+    wasm_uleb(sec_func, 13) // 15: str_concat
+    wasm_uleb(sec_func, 14) // 16: table_fill_f32
+    wasm_uleb(sec_func, 5)  // 17: print_dec
+    wasm_uleb(sec_func, 11) // 18: buf_push_dec
     uk = 0
-    while uk < ucnt {
-        wasm_uleb(sec_func, 5 + uk)
-        uk += 1
-    }
-    wasm_uleb(sec_func, 4)
+    while uk < ucnt { wasm_uleb(sec_func, 16 + uk); uk += 1 }
+    wasm_uleb(sec_func, 15) // _start
 
-    // 4. Memory Section (id = 5): 1 linear memory, min 4 pages (256 KB)
-    sec_mem := buf_new(64)
-    wasm_uleb(sec_mem, 1)
-    buf_push(sec_mem, 0x00)
-    wasm_uleb(sec_mem, 4)
-
-    // 5. Global Section (id = 6): global 0 = `__heap_ptr: mut i32 = 65536`
-    sec_glob := buf_new(64)
-    wasm_uleb(sec_glob, 1)
-    buf_push(sec_glob, 0x7F)
-    buf_push(sec_glob, 0x01)
-    wasm_i32_const(sec_glob, 65536)
-    buf_push(sec_glob, 0x0B)
-
-    // 6. Export Section (id = 7): `"memory"`, `"_start"`, `"axon_simd128_fma_f32"`, + user fns
+    // 4. Build Export Section (`"memory"`, `"_start"`, `"axon_simd128_fma_f32"`, + live user fns)
     sec_exp := buf_new(8192)
     wasm_uleb(sec_exp, 3 + ucnt)
-    wasm_push_name(sec_exp, "memory")
-    buf_push(sec_exp, 0x02)
-    wasm_uleb(sec_exp, 0)
-
-    wasm_push_name(sec_exp, "_start")
-    buf_push(sec_exp, 0x00)
-    wasm_uleb(sec_exp, start_wfi)
-
-    wasm_push_name(sec_exp, "axon_simd128_fma_f32")
-    buf_push(sec_exp, 0x00)
-    wasm_uleb(sec_exp, 3)
+    wasm_push_name(sec_exp, "memory"); buf_push(sec_exp, 0x02); wasm_uleb(sec_exp, 0)
+    wasm_push_name(sec_exp, "_start"); buf_push(sec_exp, 0x00); wasm_uleb(sec_exp, start_wfi)
+    wasm_push_name(sec_exp, "axon_simd128_fma_f32"); buf_push(sec_exp, 0x00); wasm_uleb(sec_exp, wfn_simd128_fma())
 
     mut main_wfi := -1
     uk = 0
     while uk < ucnt {
         ufi := ibuf_get(user_fns, uk)
         fo := fn_base + ufi * 10
-        fsoff := ibuf_get(sym, fo)
-        fslen := ibuf_get(sym, fo + 1)
+        fsoff := ibuf_get(sym, fo); fslen := ibuf_get(sym, fo + 1)
         wfi := ibuf_get(fn_map, ufi)
-        if pool_str_eq_lit(pool, fsoff, fslen, "main") {
-            main_wfi = wfi
-        }
+        if pool_str_eq_lit(pool, fsoff, fslen, "main") { main_wfi = wfi }
         wasm_push_pool_name(pool, sec_exp, fsoff, fslen)
-        buf_push(sec_exp, 0x00)
-        wasm_uleb(sec_exp, wfi)
+        buf_push(sec_exp, 0x00); wasm_uleb(sec_exp, wfi)
         uk += 1
     }
 
-    // 7. Code Section (id = 10)
+    // 5. Build Code Section FIRST (so `wc.data_buf` is finalized before setting `__heap_ptr` and initial pages)
     sec_code := buf_new(262144)
-    wasm_uleb(sec_code, 4 + ucnt)
+    wasm_uleb(sec_code, 17 + ucnt)
 
-    b1 := buf_new(256)
-    wasm_build_helper_print_str(b1)
-    wasm_uleb(sec_code, buf_len(b1))
-    mut bi := 0
-    while bi < buf_len(b1) { buf_push(sec_code, buf_get(b1, bi)); bi += 1 }
-    buf_free(move b1)
+    hb := buf_new(1024)
+    wasm_build_helper_alloc(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_print_str(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_print_i64(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_simd128_fma(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_simd128_mul(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_clock_ns(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_buf_new(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_buf_push_w(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_ibuf_push(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_buf_push_bytes(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_buf_push_i64(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_str_eq(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_str_concat(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_table_fill_f32(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_print_dec(hb); wasm_append_code_body(sec_code, hb); buf_truncate(hb, 0)
+    wasm_build_helper_buf_push_dec(hb); wasm_append_code_body(sec_code, hb)
+    buf_free(move hb)
 
-    b2 := buf_new(512)
-    wasm_build_helper_print_i64(b2)
-    wasm_uleb(sec_code, buf_len(b2))
-    bi = 0
-    while bi < buf_len(b2) { buf_push(sec_code, buf_get(b2, bi)); bi += 1 }
-    buf_free(move b2)
-
-    b3 := buf_new(512)
-    wasm_build_helper_simd128_fma(b3)
-    wasm_uleb(sec_code, buf_len(b3))
-    bi = 0
-    while bi < buf_len(b3) { buf_push(sec_code, buf_get(b3, bi)); bi += 1 }
-    buf_free(move b3)
-
-    // Compile each user function body
     uk = 0
     while uk < ucnt {
         ufi := ibuf_get(user_fns, uk)
@@ -1109,7 +2295,7 @@ fn compile_module_to_wasm32(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
         }
 
         insns := buf_new(32768)
-        wasm_emit_block(wc, insns, ast_get(nodes, fnid, 6) & 0xFFFFFFFF, -1)
+        wasm_emit_block(wc, insns, ast_get(nodes, fnid, 6) & 0xFFFFFFFF, -1, -1)
         wasm_i64_const(insns, 0)
         buf_push(insns, 0x0B)
 
@@ -1122,47 +2308,57 @@ fn compile_module_to_wasm32(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
         } else {
             wasm_uleb(fbody, 0)
         }
-        bi = 0
+        mut bi := 0
         while bi < buf_len(insns) { buf_push(fbody, buf_get(insns, bi)); bi += 1 }
         buf_free(move insns)
 
-        wasm_uleb(sec_code, buf_len(fbody))
-        bi = 0
-        while bi < buf_len(fbody) { buf_push(sec_code, buf_get(fbody, bi)); bi += 1 }
+        wasm_append_code_body(sec_code, fbody)
         buf_free(move fbody)
         uk += 1
     }
 
-    // `_start` body
+    // `_start` body: calls `main`, exits with `proc_exit(code)` when `code != 0`
     bstart := buf_new(128)
-    wasm_uleb(bstart, 0)
     if main_wfi >= 0 {
+        wasm_uleb(bstart, 1); wasm_uleb(bstart, 1); buf_push(bstart, 0x7F)
         wasm_call(bstart, main_wfi)
-        buf_push(bstart, 0x1A)
+        buf_push(bstart, 0xA7)
+        wasm_local_tee(bstart, 0)
+        buf_push(bstart, 0x04); buf_push(bstart, 0x40)
+        wasm_local_get(bstart, 0)
+        wasm_call(bstart, wfn_proc_exit())
+        buf_push(bstart, 0x0B)
+    } else {
+        wasm_uleb(bstart, 0)
     }
     buf_push(bstart, 0x0B)
-    wasm_uleb(sec_code, buf_len(bstart))
-    bi = 0
-    while bi < buf_len(bstart) { buf_push(sec_code, buf_get(bstart, bi)); bi += 1 }
+    wasm_append_code_body(sec_code, bstart)
     buf_free(move bstart)
 
-    // 8. Data Section (id = 11)
+    // 6. Compute exact heap base above static data section and build Memory / Global / Data Sections
+    mut heap_start := align_up(0x1000 + buf_len(wc.data_buf) + 4096, 65536)
+    if heap_start < 65536 { heap_start = 65536 }
+    mut init_pages := heap_start / 65536
+    if init_pages < 4 { init_pages = 4 }
+
+    sec_mem := buf_new(64)
+    wasm_uleb(sec_mem, 1); buf_push(sec_mem, 0x00); wasm_uleb(sec_mem, init_pages)
+
+    sec_glob := buf_new(64)
+    wasm_uleb(sec_glob, 1); buf_push(sec_glob, 0x7F); buf_push(sec_glob, 0x01)
+    wasm_i32_const(sec_glob, heap_start); buf_push(sec_glob, 0x0B)
+
     sec_data := buf_new(65536)
     if buf_len(wc.data_buf) > 0 {
-        wasm_uleb(sec_data, 1)
-        buf_push(sec_data, 0x00)
-        wasm_i32_const(sec_data, 0x1000)
-        buf_push(sec_data, 0x0B)
+        wasm_uleb(sec_data, 1); buf_push(sec_data, 0x00)
+        wasm_i32_const(sec_data, 0x1000); buf_push(sec_data, 0x0B)
         wasm_uleb(sec_data, buf_len(wc.data_buf))
-        bi = 0
-        while bi < buf_len(wc.data_buf) { buf_push(sec_data, buf_get(wc.data_buf, bi)); bi += 1 }
+        mut di := 0
+        while di < buf_len(wc.data_buf) { buf_push(sec_data, buf_get(wc.data_buf, di)); di += 1 }
     }
 
-    // Assemble final `.wasm` binary
-    buf_push(wasm_out, 0x00)
-    buf_push(wasm_out, 0x61)
-    buf_push(wasm_out, 0x73)
-    buf_push(wasm_out, 0x6D)
+    // 7. Assemble final `.wasm` binary (`\0asm` v1)
+    buf_push(wasm_out, 0x00); buf_push(wasm_out, 0x61); buf_push(wasm_out, 0x73); buf_push(wasm_out, 0x6D)
     buf_push_u32(wasm_out, 1)
 
     wasm_emit_section(wasm_out, 1, sec_type)
@@ -1176,17 +2372,12 @@ fn compile_module_to_wasm32(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
         wasm_emit_section(wasm_out, 11, sec_data)
     }
 
-    buf_free(move sec_type)
-    buf_free(move sec_imp)
-    buf_free(move sec_func)
-    buf_free(move sec_mem)
-    buf_free(move sec_glob)
-    buf_free(move sec_exp)
-    buf_free(move sec_code)
-    buf_free(move sec_data)
-    buf_free(move user_fns)
+    buf_free(move sec_type); buf_free(move sec_imp); buf_free(move sec_func)
+    buf_free(move sec_mem); buf_free(move sec_glob); buf_free(move sec_exp)
+    buf_free(move sec_code); buf_free(move sec_data); buf_free(move user_fns)
     return buf_len(wasm_out)
 }
+
 
 // ============================================================================
 // PART 2: Khronos Binary `SPIR-V 1.6` Compute Kernel Emitter (`.spv`)

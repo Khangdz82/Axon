@@ -637,6 +637,32 @@ fn try_emit_v7_domain_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, bre
         zs := cg_alloc_slots(cg, 1)
         return er_pack(zs, ty_unit())
     }
+    if pool_str_eq_lit(p, csoff, cslen, "atomic_store_rel_i64") and acnt == 3 {
+        // Release store on x86_64 TSO: atomic aligned 64-bit MOV with zero LOCK barrier!
+        e0 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4)
+        e1 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4)
+        e2 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4)
+        br := emit_expr_ax(cg, vars, drops, breaks, e0)
+        s1 := emit_fast_val_arg(cg, vars, drops, breaks, e1)
+        vr := emit_expr_ax(cg, vars, drops, breaks, e2)
+        mc_load_rcx(c, er_slot(br), 0)
+        mc_load_rax(c, er_slot(vr), 0)
+        if s1 < 0 {
+            idx := eval_const_int_val(p, cg.nodes, cg.sym, e1)
+            if idx == 0 {
+                mc_b3(c, 0x48, 0x89, 0x01) // MOV [RCX], RAX
+            } else if idx >= -15 and idx <= 15 {
+                mc_b4(c, 0x48, 0x89, 0x41, (idx * 8) & 255) // MOV [RCX + disp8], RAX
+            } else {
+                mc_mov_reg_imm(c, 1, idx)
+                mc_b4(c, 0x48, 0x89, 0x04, 0xD1)
+            }
+        } else {
+            mc_load_rdx(c, s1, 0)
+            mc_b4(c, 0x48, 0x89, 0x04, 0xD1) // MOV [RCX + RDX*8], RAX
+        }
+        return er_pack(cg_unit_slot(cg), ty_unit())
+    }
     if pool_str_eq_lit(p, csoff, cslen, "atomic_add_i64") and acnt == 3 {
         br := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
         ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
@@ -757,23 +783,80 @@ fn try_emit_v7_domain_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, bre
         ar := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
         br := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
         nr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
-        mc_load_r8(c, er_slot(ar), 0)  // R8 = ptr_a
-        mc_load_r9(c, er_slot(br), 0)  // R9 = ptr_b
-        mc_load_rcx(c, er_slot(nr), 0) // RCX = count
-        mc_b3(c, 0x0F, 0x57, 0xC0)     // XORPS XMM0, XMM0 (accumulator f64!)
-        mc_b2(c, 0x31, 0xC0)           // RAX = 0
-        dl_top := buf_len(c)
-        mc_b3(c, 0x48, 0x39, 0xC8)
-        jae_dl := mc_jcc8(c, 0x73)
-        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x0C, 0x80) // MOVSS XMM1, [R8 + RAX*4]
-        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x14, 0x81) // MOVSS XMM2, [R9 + RAX*4]
-        mc_b4(c, 0xF3, 0x0F, 0x59, 0xCA)                       // MULSS XMM1, XMM2
-        mc_b4(c, 0xF3, 0x0F, 0x5A, 0xC9)                       // CVTSS2SD XMM1, XMM1
-        mc_b4(c, 0xF2, 0x0F, 0x58, 0xC1)                       // ADDSD XMM0, XMM1
-        mc_b3(c, 0x48, 0xFF, 0xC0)
-        jmp_dl := mc_jcc8(c, 0xEB)
-        mc_patch_jcc8(c, jmp_dl, dl_top)
-        mc_patch_jcc8(c, jae_dl, buf_len(c))
+        mc_load_rcx(c, er_slot(ar), 0) // RCX = ptr_a
+        mc_load_rdx(c, er_slot(br), 0) // RDX = ptr_b
+        mc_load_rax(c, er_slot(nr), 0) // RAX = count
+        mc_b3(c, 0x0F, 0x57, 0xC0)     // XORPS XMM0, XMM0
+        mc_b3(c, 0x48, 0x85, 0xC0)     // TEST RAX, RAX
+        jle_dl_end := mc_jcc32(c, 0x8E)
+        mc_b4(c, 0x48, 0xC1, 0xE0, 0x02) // SHL RAX, 2
+        mc_b4(c, 0x4C, 0x8D, 0x04, 0x01) // LEA R8, [RCX + RAX] (a_end)
+
+        cg_mov_rax_data(cg, data_off_simd_tier())
+        mc_b3(c, 0x48, 0x85, 0xC0)
+        jz_dl_scalar := mc_jcc32(c, 0x84)
+
+        // AVX2 + FMA3 4-accumulator (32 floats / iter) vector dot product
+        mc_b4(c, 0xC5, 0xFC, 0x57, 0xC0) // VXORPS YMM0, YMM0, YMM0
+        mc_b4(c, 0xC5, 0xF4, 0x57, 0xC9) // VXORPS YMM1, YMM1, YMM1
+        mc_b4(c, 0xC5, 0xEC, 0x57, 0xD2) // VXORPS YMM2, YMM2, YMM2
+        mc_b4(c, 0xC5, 0xE4, 0x57, 0xDB) // VXORPS YMM3, YMM3, YMM3
+
+        dl32_top := buf_len(c)
+        mc_b3(c, 0x48, 0x8D, 0x81); mc_u32(c, 128) // LEA RAX, [RCX + 128]
+        mc_b3(c, 0x4C, 0x39, 0xC0)                 // CMP RAX, R8
+        ja_dl8 := mc_jcc32(c, 0x87)
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x21)                 // VMOVUPS YMM4, [RCX]
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x69); mc_b1(c, 0x20) // VMOVUPS YMM5, [RCX + 32]
+        mc_b4(c, 0xC4, 0xE2, 0x5D, 0xB8); mc_b1(c, 0x02) // VFMADD231PS YMM0, YMM4, [RDX]
+        mc_b4(c, 0xC4, 0xE2, 0x55, 0xB8); mc_b2(c, 0x4A, 0x20) // VFMADD231PS YMM1, YMM5, [RDX + 32]
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x61); mc_b1(c, 0x40) // VMOVUPS YMM4, [RCX + 64]
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x69); mc_b1(c, 0x60) // VMOVUPS YMM5, [RCX + 96]
+        mc_b4(c, 0xC4, 0xE2, 0x5D, 0xB8); mc_b2(c, 0x52, 0x40) // VFMADD231PS YMM2, YMM4, [RDX + 64]
+        mc_b4(c, 0xC4, 0xE2, 0x55, 0xB8); mc_b2(c, 0x5A, 0x60) // VFMADD231PS YMM3, YMM5, [RDX + 96]
+        mc_b3(c, 0x48, 0x81, 0xC1); mc_u32(c, 128) // ADD RCX, 128
+        mc_b3(c, 0x48, 0x81, 0xC2); mc_u32(c, 128) // ADD RDX, 128
+        jmp_dl32 := mc_jmp32(c); mc_patch_rel32(c, jmp_dl32, dl32_top)
+
+        mc_patch_rel32(c, ja_dl8, buf_len(c))
+        dl8_top := buf_len(c)
+        mc_b4(c, 0x48, 0x8D, 0x41, 0x20) // LEA RAX, [RCX + 32]
+        mc_b3(c, 0x4C, 0x39, 0xC0)       // CMP RAX, R8
+        ja_dlred := mc_jcc8(c, 0x77)
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x21)                 // VMOVUPS YMM4, [RCX]
+        mc_b4(c, 0xC4, 0xE2, 0x5D, 0xB8); mc_b1(c, 0x02) // VFMADD231PS YMM0, YMM4, [RDX]
+        mc_b4(c, 0x48, 0x83, 0xC1, 0x20)
+        mc_b4(c, 0x48, 0x83, 0xC2, 0x20)
+        jmp_dl8 := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_dl8, dl8_top)
+
+        mc_patch_jcc8(c, ja_dlred, buf_len(c))
+        mc_b4(c, 0xC5, 0xFC, 0x58, 0xC1) // VADDPS YMM0, YMM0, YMM1
+        mc_b4(c, 0xC5, 0xEC, 0x58, 0xD3) // VADDPS YMM2, YMM2, YMM3
+        mc_b4(c, 0xC5, 0xFC, 0x58, 0xC2) // VADDPS YMM0, YMM0, YMM2
+        mc_b4(c, 0xC4, 0xE3, 0x7D, 0x19); mc_b2(c, 0xC1, 0x01) // VEXTRACTF128 XMM1, YMM0, 1
+        mc_b4(c, 0xC5, 0xF8, 0x58, 0xC1) // VADDPS XMM0, XMM0, XMM1
+        mc_b4(c, 0xC5, 0xF8, 0x12, 0xC8) // VMOVHLPS XMM1, XMM0, XMM0
+        mc_b4(c, 0xC5, 0xF8, 0x58, 0xC1) // VADDPS XMM0, XMM0, XMM1
+        mc_b4(c, 0xC5, 0xF8, 0xC6, 0xC8); mc_b1(c, 0x01) // VSHUFPS XMM1, XMM0, XMM0, 1
+        mc_b4(c, 0xC5, 0xFA, 0x58, 0xC1) // VADDSS XMM0, XMM0, XMM1
+        mc_b4(c, 0xC5, 0xFA, 0x5A, 0xC0) // VCVTSS2SD XMM0, XMM0, XMM0
+        mc_b3(c, 0xC5, 0xF8, 0x77)       // VZEROUPPER
+
+        dl_sc_top := buf_len(c)
+        mc_patch_rel32(c, jz_dl_scalar, dl_sc_top)
+        mc_b3(c, 0x4C, 0x39, 0xC1) // CMP RCX, R8
+        jae_dl_sc := mc_jcc8(c, 0x73)
+        mc_b4(c, 0xF3, 0x0F, 0x10, 0x09) // MOVSS XMM1, [RCX]
+        mc_b4(c, 0xF3, 0x0F, 0x10, 0x12) // MOVSS XMM2, [RDX]
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xCA) // MULSS XMM1, XMM2
+        mc_b4(c, 0xF3, 0x0F, 0x5A, 0xC9) // CVTSS2SD XMM1, XMM1
+        mc_b4(c, 0xF2, 0x0F, 0x58, 0xC1) // ADDSD XMM0, XMM1
+        mc_b4(c, 0x48, 0x83, 0xC1, 0x04)
+        mc_b4(c, 0x48, 0x83, 0xC2, 0x04)
+        jmp_dl_sc := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_dl_sc, dl_sc_top)
+
+        mc_patch_jcc8(c, jae_dl_sc, buf_len(c))
+        mc_patch_rel32(c, jle_dl_end, buf_len(c))
         mc_b4(c, 0x66, 0x48, 0x0F, 0x7E); mc_b1(c, 0xC0)
         dst := cg_alloc_slots(cg, 1)
         mc_store_rax(c, dst, 0)
@@ -785,25 +868,69 @@ fn try_emit_v7_domain_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, bre
         kr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
         nr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 3), 4))
         mc_f64_slot_to_f32_eax(c, er_slot(kr)) // XMM0 = scale_f32
-        mc_load_r8(c, er_slot(dr), 0)
-        mc_load_r9(c, er_slot(sr), 0)
-        mc_load_rcx(c, er_slot(nr), 0)
-        mc_b2(c, 0x31, 0xC0)
-        sa_top := buf_len(c)
-        mc_b3(c, 0x48, 0x39, 0xC8)
-        jae_sa := mc_jcc8(c, 0x73)
-        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x0C, 0x81) // MOVSS XMM1, [R9 + RAX*4]
-        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x14, 0x80) // MOVSS XMM2, [R8 + RAX*4]
-        mc_b4(c, 0xF3, 0x0F, 0x59, 0xC8)                       // MULSS XMM1, XMM0
-        mc_b4(c, 0xF3, 0x0F, 0x58, 0xD1)                       // ADDSS XMM2, XMM1
-        mc_b4(c, 0xF3, 0x41, 0x0F, 0x11); mc_b2(c, 0x14, 0x80) // MOVSS [R8 + RAX*4], XMM2
-        mc_b3(c, 0x48, 0xFF, 0xC0)
-        jmp_sa := mc_jcc8(c, 0xEB)
-        mc_patch_jcc8(c, jmp_sa, sa_top)
-        mc_patch_jcc8(c, jae_sa, buf_len(c))
-        dst := cg_alloc_slots(cg, 1)
-        mc_store_rax(c, dst, 0)
-        return er_pack(dst, ty_int())
+        mc_load_rcx(c, er_slot(dr), 0)        // RCX = dst_ptr
+        mc_load_rdx(c, er_slot(sr), 0)        // RDX = src_ptr
+        mc_load_rax(c, er_slot(nr), 0)        // RAX = count
+        mc_b3(c, 0x48, 0x85, 0xC0)
+        jle_sa_end := mc_jcc32(c, 0x8E)
+        mc_b4(c, 0x48, 0xC1, 0xE0, 0x02) // SHL RAX, 2
+        mc_b4(c, 0x4C, 0x8D, 0x04, 0x01) // LEA R8, [RCX + RAX]
+
+        cg_mov_rax_data(cg, data_off_simd_tier())
+        mc_b3(c, 0x48, 0x85, 0xC0)
+        jz_sa_scalar := mc_jcc32(c, 0x84)
+
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0x18); mc_b1(c, 0xC0) // VBROADCASTSS YMM0, XMM0
+        sa32_top := buf_len(c)
+        mc_b3(c, 0x48, 0x8D, 0x81); mc_u32(c, 128)
+        mc_b3(c, 0x4C, 0x39, 0xC0)
+        ja_sa8 := mc_jcc32(c, 0x87)
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x09)                 // VMOVUPS YMM1, [RCX]
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x51); mc_b1(c, 0x20) // VMOVUPS YMM2, [RCX + 32]
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x59); mc_b1(c, 0x40) // VMOVUPS YMM3, [RCX + 64]
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x61); mc_b1(c, 0x60) // VMOVUPS YMM4, [RCX + 96]
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0xB8); mc_b1(c, 0x0A)       // VFMADD231PS YMM1, YMM0, [RDX]
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0xB8); mc_b2(c, 0x52, 0x20) // VFMADD231PS YMM2, YMM0, [RDX + 32]
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0xB8); mc_b2(c, 0x5A, 0x40) // VFMADD231PS YMM3, YMM0, [RDX + 64]
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0xB8); mc_b2(c, 0x62, 0x60) // VFMADD231PS YMM4, YMM0, [RDX + 96]
+        mc_b4(c, 0xC5, 0xFC, 0x11, 0x09)                 // VMOVUPS [RCX], YMM1
+        mc_b4(c, 0xC5, 0xFC, 0x11, 0x51); mc_b1(c, 0x20) // VMOVUPS [RCX + 32], YMM2
+        mc_b4(c, 0xC5, 0xFC, 0x11, 0x59); mc_b1(c, 0x40) // VMOVUPS [RCX + 64], YMM3
+        mc_b4(c, 0xC5, 0xFC, 0x11, 0x61); mc_b1(c, 0x60) // VMOVUPS [RCX + 96], YMM4
+        mc_b3(c, 0x48, 0x81, 0xC1); mc_u32(c, 128)
+        mc_b3(c, 0x48, 0x81, 0xC2); mc_u32(c, 128)
+        jmp_sa32 := mc_jmp32(c); mc_patch_rel32(c, jmp_sa32, sa32_top)
+
+        mc_patch_rel32(c, ja_sa8, buf_len(c))
+        sa8_top := buf_len(c)
+        mc_b4(c, 0x48, 0x8D, 0x41, 0x20)
+        mc_b3(c, 0x4C, 0x39, 0xC0)
+        ja_sa_vzu := mc_jcc8(c, 0x77)
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x09)
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0xB8); mc_b1(c, 0x0A)
+        mc_b4(c, 0xC5, 0xFC, 0x11, 0x09)
+        mc_b4(c, 0x48, 0x83, 0xC1, 0x20)
+        mc_b4(c, 0x48, 0x83, 0xC2, 0x20)
+        jmp_sa8 := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_sa8, sa8_top)
+
+        mc_patch_jcc8(c, ja_sa_vzu, buf_len(c))
+        mc_b3(c, 0xC5, 0xF8, 0x77) // VZEROUPPER
+
+        sa_sc_top := buf_len(c)
+        mc_patch_rel32(c, jz_sa_scalar, sa_sc_top)
+        mc_b3(c, 0x4C, 0x39, 0xC1)
+        jae_sa_sc := mc_jcc8(c, 0x73)
+        mc_b4(c, 0xF3, 0x0F, 0x10, 0x0A) // MOVSS XMM1, [RDX]
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xC8) // MULSS XMM1, XMM0
+        mc_b4(c, 0xF3, 0x0F, 0x58, 0x09) // ADDSS XMM1, [RCX]
+        mc_b4(c, 0xF3, 0x0F, 0x11, 0x09) // MOVSS [RCX], XMM1
+        mc_b4(c, 0x48, 0x83, 0xC1, 0x04)
+        mc_b4(c, 0x48, 0x83, 0xC2, 0x04)
+        jmp_sa_sc := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_sa_sc, sa_sc_top)
+
+        mc_patch_jcc8(c, jae_sa_sc, buf_len(c))
+        mc_patch_rel32(c, jle_sa_end, buf_len(c))
+        return er_pack(cg_unit_slot(cg), ty_int())
     }
     if pool_str_eq_lit(p, csoff, cslen, "det_sum_f32_ptr") and acnt == 2 {
         // Deterministic IEEE-754 pairwise lane-4 reduction (invariant under thread count!)
@@ -1437,48 +1564,99 @@ fn try_emit_v7_math_tensor(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
         mc_b2(c, 0x48, 0xB9); mc_u64(c, 1 << 40); mc_b3(c, 0x48, 0x09, 0xC8)
         mc_store_rax(c, dst, 1)
 
-        // Hardware SSE dot-product matmul loop `i in 0..M`, `j in 0..N`, `p in 0..K`
-        i_s := cg_alloc_slots(cg, 1); j_s := cg_alloc_slots(cg, 1)
+        // Cache-friendly `i -> k -> j` AVX2+FMA3 32-col/iter MatMul (with SSE2 tail/fallback)
+        n_bytes_s := cg_alloc_slots(cg, 1)
+        k_bytes_s := cg_alloc_slots(cg, 1)
+        a_row_s := cg_alloc_slots(cg, 1)
+        b_row_s := cg_alloc_slots(cg, 1)
+        c_row_s := cg_alloc_slots(cg, 1)
+        i_s := cg_alloc_slots(cg, 1)
+        k_s := cg_alloc_slots(cg, 1)
+
+        mc_load_rax(c, n_slot, 0); mc_b4(c, 0x48, 0xC1, 0xE0, 0x02); mc_store_rax(c, n_bytes_s, 0)
+        mc_load_rax(c, k_slot, 0); mc_b4(c, 0x48, 0xC1, 0xE0, 0x02); mc_store_rax(c, k_bytes_s, 0)
+        mc_load_rax(c, aslot, 0); mc_store_rax(c, a_row_s, 0)
+        mc_load_rax(c, dst, 0); mc_store_rax(c, c_row_s, 0)
+
         mc_mov_rax_imm(c, 0); mc_store_rax(c, i_s, 0)
         mi_top := buf_len(c)
         mc_load_rax(c, i_s, 0); mc_cmp_rax_slot(c, m_slot, 0)
         jge_mi := mc_jcc32(c, 0x8D)
-        mc_mov_rax_imm(c, 0); mc_store_rax(c, j_s, 0)
-        mj_top := buf_len(c)
-        mc_load_rax(c, j_s, 0); mc_cmp_rax_slot(c, n_slot, 0)
-        jge_mj := mc_jcc32(c, 0x8D)
 
-        // XMM0 = 0.0f; R8 = a_ptr + i*K*4; R9 = b_ptr + j*4; R10 = N*4; RCX = K; RAX = 0
-        mc_b3(c, 0x0F, 0x57, 0xC0)
-        mc_load_rax(c, i_s, 0); mc_load_rcx(c, k_slot, 0); mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1); mc_b4(c, 0x48, 0xC1, 0xE0, 0x02)
-        mc_load_r8(c, aslot, 0); mc_b3(c, 0x49, 0x01, 0xC0)
-        mc_load_rax(c, j_s, 0); mc_b4(c, 0x48, 0xC1, 0xE0, 0x02)
-        mc_load_r9(c, bslot, 0); mc_b3(c, 0x49, 0x01, 0xC1)
-        mc_load_rax(c, n_slot, 0); mc_b4(c, 0x48, 0xC1, 0xE0, 0x02); mc_b3(c, 0x49, 0x89, 0xC2)
-        mc_load_rcx(c, k_slot, 0)
-        mc_b2(c, 0x31, 0xC0)
+        mc_load_rax(c, bslot, 0); mc_store_rax(c, b_row_s, 0)
+        mc_mov_rax_imm(c, 0); mc_store_rax(c, k_s, 0)
         mk_top := buf_len(c)
-        mc_b3(c, 0x48, 0x39, 0xC8)
-        jae_mk := mc_jcc8(c, 0x73)
-        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x0C, 0x80) // MOVSS XMM1, [R8 + RAX*4]
-        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b1(c, 0x11)       // MOVSS XMM2, [R9]
-        mc_b4(c, 0xF3, 0x0F, 0x59, 0xCA)                       // MULSS XMM1, XMM2
-        mc_b4(c, 0xF3, 0x0F, 0x58, 0xC1)                       // ADDSS XMM0, XMM1
-        mc_b3(c, 0x4D, 0x01, 0xD1)                             // ADD R9, R10 (stride N*4)
-        mc_b3(c, 0x48, 0xFF, 0xC0)
-        jmp_mk := mc_jcc8(c, 0xEB)
-        mc_patch_jcc8(c, jmp_mk, mk_top)
-        mc_patch_jcc8(c, jae_mk, buf_len(c))
+        mc_load_rax(c, k_s, 0); mc_cmp_rax_slot(c, k_slot, 0)
+        jge_mk := mc_jcc32(c, 0x8D)
 
-        // Store `XMM0` into `C[i * N + j]`
-        mc_load_rax(c, i_s, 0); mc_load_rcx(c, n_slot, 0); mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1)
-        mc_load_rcx(c, j_s, 0); mc_b3(c, 0x48, 0x01, 0xC8)
-        mc_load_r8(c, dst, 0)
-        mc_b4(c, 0xF3, 0x41, 0x0F, 0x11); mc_b2(c, 0x04, 0x80)
+        // XMM0 = A[i, k] (`[a_row_s + k*4]`)
+        mc_load_r9(c, a_row_s, 0)
+        mc_b4(c, 0xF3, 0x41, 0x0F, 0x10); mc_b2(c, 0x04, 0x81) // MOVSS XMM0, [R9 + RAX*4]
+        mc_load_rcx(c, c_row_s, 0)
+        mc_load_rdx(c, b_row_s, 0)
+        mc_load_r8(c, n_bytes_s, 0)
+        mc_b3(c, 0x49, 0x01, 0xC8) // R8 = c_row_s + N*4
 
-        mc_load_rax(c, j_s, 0); mc_b3(c, 0x48, 0xFF, 0xC0); mc_store_rax(c, j_s, 0)
-        jmp_mj := mc_jmp32(c); mc_patch_rel32(c, jmp_mj, mj_top)
-        mc_patch_rel32(c, jge_mj, buf_len(c))
+        cg_mov_rax_data(cg, data_off_simd_tier())
+        mc_b3(c, 0x48, 0x85, 0xC0)
+        jz_mm_scalar := mc_jcc32(c, 0x84)
+
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0x18); mc_b1(c, 0xC0) // VBROADCASTSS YMM0, XMM0
+        mj32_top := buf_len(c)
+        mc_b3(c, 0x48, 0x8D, 0x81); mc_u32(c, 128)
+        mc_b3(c, 0x4C, 0x39, 0xC0)
+        ja_mj8 := mc_jcc32(c, 0x87)
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x09)
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x51); mc_b1(c, 0x20)
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x59); mc_b1(c, 0x40)
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x61); mc_b1(c, 0x60)
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0xB8); mc_b1(c, 0x0A)
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0xB8); mc_b2(c, 0x52, 0x20)
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0xB8); mc_b2(c, 0x5A, 0x40)
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0xB8); mc_b2(c, 0x62, 0x60)
+        mc_b4(c, 0xC5, 0xFC, 0x11, 0x09)
+        mc_b4(c, 0xC5, 0xFC, 0x11, 0x51); mc_b1(c, 0x20)
+        mc_b4(c, 0xC5, 0xFC, 0x11, 0x59); mc_b1(c, 0x40)
+        mc_b4(c, 0xC5, 0xFC, 0x11, 0x61); mc_b1(c, 0x60)
+        mc_b3(c, 0x48, 0x81, 0xC1); mc_u32(c, 128)
+        mc_b3(c, 0x48, 0x81, 0xC2); mc_u32(c, 128)
+        jmp_mj32 := mc_jmp32(c); mc_patch_rel32(c, jmp_mj32, mj32_top)
+
+        mc_patch_rel32(c, ja_mj8, buf_len(c))
+        mj8_top := buf_len(c)
+        mc_b4(c, 0x48, 0x8D, 0x41, 0x20)
+        mc_b3(c, 0x4C, 0x39, 0xC0)
+        ja_mj_vzu := mc_jcc8(c, 0x77)
+        mc_b4(c, 0xC5, 0xFC, 0x10, 0x09)
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0xB8); mc_b1(c, 0x0A)
+        mc_b4(c, 0xC5, 0xFC, 0x11, 0x09)
+        mc_b4(c, 0x48, 0x83, 0xC1, 0x20)
+        mc_b4(c, 0x48, 0x83, 0xC2, 0x20)
+        jmp_mj8 := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_mj8, mj8_top)
+
+        mc_patch_jcc8(c, ja_mj_vzu, buf_len(c))
+        mc_b3(c, 0xC5, 0xF8, 0x77) // VZEROUPPER
+
+        mm_sc_top := buf_len(c)
+        mc_patch_rel32(c, jz_mm_scalar, mm_sc_top)
+        mc_b3(c, 0x4C, 0x39, 0xC1)
+        jae_mm_sc := mc_jcc8(c, 0x73)
+        mc_b4(c, 0xF3, 0x0F, 0x10, 0x0A)
+        mc_b4(c, 0xF3, 0x0F, 0x59, 0xC8)
+        mc_b4(c, 0xF3, 0x0F, 0x58, 0x09)
+        mc_b4(c, 0xF3, 0x0F, 0x11, 0x09)
+        mc_b4(c, 0x48, 0x83, 0xC1, 0x04)
+        mc_b4(c, 0x48, 0x83, 0xC2, 0x04)
+        jmp_mm_sc := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_mm_sc, mm_sc_top)
+
+        mc_patch_jcc8(c, jae_mm_sc, buf_len(c))
+        mc_load_rax(c, b_row_s, 0); mc_load_rcx(c, n_bytes_s, 0); mc_b3(c, 0x48, 0x01, 0xC8); mc_store_rax(c, b_row_s, 0)
+        mc_load_rax(c, k_s, 0); mc_b3(c, 0x48, 0xFF, 0xC0); mc_store_rax(c, k_s, 0)
+        jmp_mk := mc_jmp32(c); mc_patch_rel32(c, jmp_mk, mk_top)
+
+        mc_patch_rel32(c, jge_mk, buf_len(c))
+        mc_load_rax(c, a_row_s, 0); mc_load_rcx(c, k_bytes_s, 0); mc_b3(c, 0x48, 0x01, 0xC8); mc_store_rax(c, a_row_s, 0)
+        mc_load_rax(c, c_row_s, 0); mc_load_rcx(c, n_bytes_s, 0); mc_b3(c, 0x48, 0x01, 0xC8); mc_store_rax(c, c_row_s, 0)
         mc_load_rax(c, i_s, 0); mc_b3(c, 0x48, 0xFF, 0xC0); mc_store_rax(c, i_s, 0)
         jmp_mi := mc_jmp32(c); mc_patch_rel32(c, jmp_mi, mi_top)
         mc_patch_rel32(c, jge_mi, buf_len(c))
@@ -1741,8 +1919,25 @@ fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBu
         br := emit_expr_ax(cg, vars, drops, breaks, e0)
         s1 := emit_fast_val_arg(cg, vars, drops, breaks, e1)
         mc_load_rcx(c, er_slot(br), 0)
-        emit_load_or_imm_reg(cg, s1, e1, 1)
-        cg_call_fn(cg, h_buf_get())
+        mc_b3(c, 0x48, 0x85, 0xC9); cg_jmp_fn(cg, 0x84, h_sec_trap())
+        mut done_bg := false
+        if s1 < 0 {
+            idx := eval_const_int_val(p, cg.nodes, cg.sym, e1)
+            if idx >= 0 and idx <= 111 {
+                mc_b4(c, 0x48, 0x83, 0x39, idx); cg_jmp_fn(cg, 0x86, h_sec_trap())
+                mc_b4(c, 0x0F, 0xB6, 0x41, 16 + idx)
+                done_bg = true
+            } else if idx >= 112 and idx < 0x7FFFFFF0 {
+                mc_b3(c, 0x48, 0x81, 0x39); mc_u32(c, idx); cg_jmp_fn(cg, 0x86, h_sec_trap())
+                mc_b3(c, 0x0F, 0xB6, 0x81); mc_u32(c, 16 + idx)
+                done_bg = true
+            }
+        }
+        if not done_bg {
+            emit_load_or_imm_reg(cg, s1, e1, 1)
+            mc_b3(c, 0x48, 0x3B, 0x11); cg_jmp_fn(cg, 0x83, h_sec_trap())
+            mc_b4(c, 0x0F, 0xB6, 0x44, 0x11); mc_b1(c, 0x10)
+        }
         dst := cg_alloc_slots(cg, 1)
         mc_store_rax(c, dst, 0)
         return er_pack(dst, ty_int())
@@ -1756,9 +1951,22 @@ fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBu
         s1 := emit_fast_val_arg(cg, vars, drops, breaks, e1)
         s2 := emit_fast_val_arg(cg, vars, drops, breaks, e2)
         mc_load_rcx(c, er_slot(br), 0)
-        emit_load_or_imm_reg(cg, s1, e1, 1)
+        mc_b3(c, 0x48, 0x85, 0xC9); cg_jmp_fn(cg, 0x84, h_sec_trap())
         emit_load_or_imm_reg(cg, s2, e2, 2)
-        cg_call_fn(cg, h_buf_set())
+        mut done_bs := false
+        if s1 < 0 {
+            idx := eval_const_int_val(p, cg.nodes, cg.sym, e1)
+            if idx >= 0 and idx <= 111 {
+                mc_b4(c, 0x48, 0x83, 0x39, idx); cg_jmp_fn(cg, 0x86, h_sec_trap())
+                mc_b4(c, 0x44, 0x88, 0x41, 16 + idx)
+                done_bs = true
+            }
+        }
+        if not done_bs {
+            emit_load_or_imm_reg(cg, s1, e1, 1)
+            mc_b3(c, 0x48, 0x3B, 0x11); cg_jmp_fn(cg, 0x83, h_sec_trap())
+            mc_b4(c, 0x44, 0x88, 0x44, 0x11); mc_b1(c, 0x10)
+        }
         return er_pack(cg_unit_slot(cg), ty_unit())
     }
 
@@ -1868,8 +2076,25 @@ fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBu
         br := emit_expr_ax(cg, vars, drops, breaks, e0)
         s1 := emit_fast_val_arg(cg, vars, drops, breaks, e1)
         mc_load_rcx(c, er_slot(br), 0)
-        emit_load_or_imm_reg(cg, s1, e1, 1)
-        cg_call_fn(cg, h_ibuf_get())
+        mc_b3(c, 0x48, 0x85, 0xC9); cg_jmp_fn(cg, 0x84, h_sec_trap())
+        mut done_ig := false
+        if s1 < 0 {
+            idx := eval_const_int_val(p, cg.nodes, cg.sym, e1)
+            if idx >= 0 and idx <= 13 {
+                mc_b4(c, 0x48, 0x83, 0x39, idx); cg_jmp_fn(cg, 0x86, h_sec_trap())
+                mc_b4(c, 0x48, 0x8B, 0x41, 16 + idx * 8)
+                done_ig = true
+            } else if idx >= 14 and idx <= 127 {
+                mc_b4(c, 0x48, 0x83, 0x39, idx); cg_jmp_fn(cg, 0x86, h_sec_trap())
+                mc_b3(c, 0x48, 0x8B, 0x81); mc_u32(c, 16 + idx * 8)
+                done_ig = true
+            }
+        }
+        if not done_ig {
+            emit_load_or_imm_reg(cg, s1, e1, 1)
+            mc_b3(c, 0x48, 0x3B, 0x11); cg_jmp_fn(cg, 0x83, h_sec_trap())
+            mc_b4(c, 0x48, 0x8B, 0x44, 0xD1); mc_b1(c, 0x10)
+        }
         dst := cg_alloc_slots(cg, 1)
         mc_store_rax(c, dst, 0)
         return er_pack(dst, ty_int())
@@ -1883,9 +2108,22 @@ fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBu
         s1 := emit_fast_val_arg(cg, vars, drops, breaks, e1)
         s2 := emit_fast_val_arg(cg, vars, drops, breaks, e2)
         mc_load_rcx(c, er_slot(br), 0)
-        emit_load_or_imm_reg(cg, s1, e1, 1)
+        mc_b3(c, 0x48, 0x85, 0xC9); cg_jmp_fn(cg, 0x84, h_sec_trap())
         emit_load_or_imm_reg(cg, s2, e2, 2)
-        cg_call_fn(cg, h_ibuf_set())
+        mut done_is := false
+        if s1 < 0 {
+            idx := eval_const_int_val(p, cg.nodes, cg.sym, e1)
+            if idx >= 0 and idx <= 13 {
+                mc_b4(c, 0x48, 0x83, 0x39, idx); cg_jmp_fn(cg, 0x86, h_sec_trap())
+                mc_b4(c, 0x4C, 0x89, 0x41, 16 + idx * 8)
+                done_is = true
+            }
+        }
+        if not done_is {
+            emit_load_or_imm_reg(cg, s1, e1, 1)
+            mc_b3(c, 0x48, 0x3B, 0x11); cg_jmp_fn(cg, 0x83, h_sec_trap())
+            mc_b4(c, 0x4C, 0x89, 0x44, 0xD1); mc_b1(c, 0x10)
+        }
         return er_pack(cg_unit_slot(cg), ty_unit())
     }
 
@@ -1898,12 +2136,31 @@ fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBu
     }
 
     if pool_str_eq_lit(p, csoff, cslen, "str_byte") and acnt == 2 {
-        sr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
-        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        e0 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4)
+        e1 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4)
+        sr := emit_expr_ax(cg, vars, drops, breaks, e0)
+        s1 := emit_fast_val_arg(cg, vars, drops, breaks, e1)
         mc_load_rcx(c, er_slot(sr), 0)
+        mc_b3(c, 0x48, 0x85, 0xC9); cg_jmp_fn(cg, 0x84, h_sec_trap())
         mc_load_rdx(c, er_slot(sr), 1)
-        mc_load_r8(c, er_slot(ir), 0)
-        cg_call_fn(cg, h_str_byte())
+        mut done_sb := false
+        if s1 < 0 {
+            idx := eval_const_int_val(p, cg.nodes, cg.sym, e1)
+            if idx == 0 {
+                mc_b4(c, 0x48, 0x83, 0xFA, 0); cg_jmp_fn(cg, 0x86, h_sec_trap())
+                mc_b3(c, 0x0F, 0xB6, 0x01)
+                done_sb = true
+            } else if idx > 0 and idx <= 127 {
+                mc_b4(c, 0x48, 0x83, 0xFA, idx); cg_jmp_fn(cg, 0x86, h_sec_trap())
+                mc_b4(c, 0x0F, 0xB6, 0x41, idx)
+                done_sb = true
+            }
+        }
+        if not done_sb {
+            emit_load_or_imm_reg(cg, s1, e1, 2)
+            mc_b3(c, 0x49, 0x39, 0xD0); cg_jmp_fn(cg, 0x83, h_sec_trap())
+            mc_b4(c, 0x42, 0x0F, 0xB6, 0x04); mc_b1(c, 0x01)
+        }
         dst := cg_alloc_slots(cg, 1)
         mc_store_rax(c, dst, 0)
         return er_pack(dst, ty_int())
@@ -2187,6 +2444,220 @@ fn emit_call_or_ctor(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf
     return emit_direct_fn_call(cg, vars, drops, breaks, fidx, aoff, acnt)
 }
 
+fn check_inline_stmt_ax(nodes: IntBuf, extra: IntBuf, snid: i64, stats: IntBuf) {
+    if snid <= 0 or ibuf_get(stats, 2) == 0 {
+        return
+    }
+    cnt := ibuf_get(stats, 0) + 1
+    ibuf_set(stats, 0, cnt)
+    if cnt > 32 {
+        ibuf_set(stats, 2, 0)
+        return
+    }
+    k := ast_kind(nodes, snid)
+    if k == nk_par_for_range() or k == nk_par_for_each() {
+        ibuf_set(stats, 2, 0)
+        return
+    }
+    if k == nk_return() {
+        rcnt := ibuf_get(stats, 1) + 1
+        ibuf_set(stats, 1, rcnt)
+        if rcnt > 14 {
+            ibuf_set(stats, 2, 0)
+        }
+        return
+    }
+    if k == nk_if() {
+        check_inline_block_ax(nodes, extra, ast_get(nodes, snid, 2), stats)
+        check_inline_block_ax(nodes, extra, ast_get(nodes, snid, 3), stats)
+        return
+    }
+    if k == nk_while() {
+        check_inline_block_ax(nodes, extra, ast_get(nodes, snid, 2), stats)
+        return
+    }
+    if k == nk_for_range() {
+        check_inline_block_ax(nodes, extra, ast_get(nodes, snid, 5), stats)
+        return
+    }
+    if k == nk_for_each() {
+        check_inline_block_ax(nodes, extra, ast_get(nodes, snid, 4), stats)
+    }
+}
+
+fn check_inline_block_ax(nodes: IntBuf, extra: IntBuf, bnid: i64, stats: IntBuf) {
+    if bnid <= 0 or ibuf_get(stats, 2) == 0 {
+        return
+    }
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt and ibuf_get(stats, 2) == 1 {
+        check_inline_stmt_ax(nodes, extra, ibuf_get(extra, off + i), stats)
+        i += 1
+    }
+}
+
+fn try_emit_inline_call_ax(cg: CodegenCtx, ev: IntBuf, fidx: i64, ret_dst: i64) -> bool {
+    f_off := ibuf_get(cg.sym, 7) + fidx * 10
+    fnid := ibuf_get(cg.sym, f_off + 2)
+    p_base := ibuf_get(cg.sym, f_off + 3)
+    p_cnt := ibuf_get(cg.sym, f_off + 4)
+    raw_ret_ty := ibuf_get(cg.sym, f_off + 5)
+    ret_slots := ibuf_get(cg.sym, f_off + 6)
+    fast_abi := ibuf_get(cg.sym, f_off + 8)
+    fn_flags := ibuf_get(cg.sym, f_off + 9)
+    body_nid := ast_get(cg.nodes, fnid, 6) & 0xFFFFFFFF
+
+    if (fn_flags & fnflag_inline()) == 0 or body_nid <= 0 {
+        return false
+    }
+    disallowed := fnflag_extern() | fnflag_export() | fnflag_async() | fnflag_shield() | fnflag_whitebox() | fnflag_nan_guard() | fnflag_frame_arena() | fnflag_comptime()
+    if (fn_flags & disallowed) != 0 {
+        return false
+    }
+    moff := ushr64(ast_get(cg.nodes, fnid, 4), 16)
+    if moff > 0 and ibuf_get(cg.extra, moff + 8) > 0 {
+        return false
+    }
+
+    prev_depth := ibuf_get(cg.state, 25)
+    if prev_depth >= 4 or fidx == ibuf_get(cg.state, 3) {
+        return false
+    }
+    mut di := 0
+    while di < prev_depth {
+        if ibuf_get(cg.state, 26 + di) == fidx {
+            return false
+        }
+        di += 1
+    }
+
+    mut pi := 0
+    while pi < p_cnt {
+        po := p_base + pi * 6
+        if ibuf_get(cg.sym, po + 2) != pmode_val() or (ibuf_get(ev, pi * 4) >= 0 and ibuf_get(ev, pi * 4 + 2) != 0) {
+            return false
+        }
+        pi += 1
+    }
+
+    stats := ibuf_new(4)
+    ibuf_push(stats, 0)
+    ibuf_push(stats, 0)
+    ibuf_push(stats, 1)
+    check_inline_block_ax(cg.nodes, cg.extra, body_nid, stats)
+    ok_inl := ibuf_get(stats, 2) == 1
+    buf_free(move stats)
+    if not ok_inl {
+        return false
+    }
+
+    c := cg.code
+    saved_after_ret := ibuf_get(cg.state, 4)
+    prev_fidx := ibuf_get(cg.state, 3)
+    prev_ab := ibuf_get(cg.state, 5)
+    prev_rb := ibuf_get(cg.state, 6)
+    prev_rty := ibuf_get(cg.state, 7)
+    prev_rslots := ibuf_get(cg.state, 8)
+    prev_fast := ibuf_get(cg.state, 9)
+    prev_cont := ibuf_get(cg.state, 10)
+    prev_bmark := ibuf_get(cg.state, 11)
+    prev_el_soff := ibuf_get(cg.state, 12)
+    prev_el_slen := ibuf_get(cg.state, 13)
+    prev_flags := ibuf_get(cg.state, 18)
+    prev_iret := ibuf_get(cg.state, 22)
+    prev_irty := ibuf_get(cg.state, 23)
+    prev_irslots := ibuf_get(cg.state, 24)
+
+    c_vars := ibuf_new(128)
+    c_drops := ibuf_new(64)
+    c_breaks := ibuf_new(32)
+
+    pi = 0
+    while pi < p_cnt {
+        po := p_base + pi * 6
+        pty := ibuf_get(cg.sym, po + 3)
+        pslots := type_slots(cg.sym, pty)
+        aslot := ibuf_get(ev, pi * 4)
+        mut param_slot := aslot
+        if aslot == -1 {
+            param_slot = cg_alloc_slots(cg, 1)
+            mc_mov_rax_imm(c, ibuf_get(ev, pi * 4 + 2))
+            mc_store_rax(c, param_slot, 0)
+        } else if aslot == -2 {
+            param_slot = cg_alloc_slots(cg, 2)
+            cg_lea_rax_rdata(cg, ibuf_get(ev, pi * 4 + 2))
+            mc_store_rax(c, param_slot, 0)
+            mc_mov_rax_imm(c, ibuf_get(ev, pi * 4 + 3))
+            mc_store_rax(c, param_slot, 1)
+        }
+        ibuf_push(c_vars, ibuf_get(cg.sym, po))
+        ibuf_push(c_vars, ibuf_get(cg.sym, po + 1))
+        ibuf_push(c_vars, param_slot)
+        ibuf_push(c_vars, pty)
+        ibuf_push(c_vars, 0)
+        pi += 1
+    }
+
+    ibuf_set(cg.state, 3, fidx)
+    ibuf_set(cg.state, 5, 0)
+    ibuf_set(cg.state, 6, 0)
+    ibuf_set(cg.state, 7, raw_ret_ty)
+    ibuf_set(cg.state, 8, ret_slots)
+    ibuf_set(cg.state, 9, fast_abi)
+    ibuf_set(cg.state, 10, -1)
+    ibuf_set(cg.state, 11, 0)
+    ibuf_set(cg.state, 12, 0)
+    ibuf_set(cg.state, 13, 0)
+    ibuf_set(cg.state, 18, fn_flags)
+    ibuf_set(cg.state, 22, ret_dst)
+    ibuf_set(cg.state, 23, raw_ret_ty)
+    ibuf_set(cg.state, 24, ret_slots)
+    ibuf_set(cg.state, 25, prev_depth + 1)
+    ibuf_set(cg.state, 26 + prev_depth, prev_fidx)
+    ibuf_set(cg.state, 30 + prev_depth, 0)
+
+    emit_block_ax(cg, c_vars, c_drops, c_breaks, body_nid)
+    emit_perceus_drops_ax(cg, c_drops)
+    if has_secret_wipes(c_drops) {
+        emit_wipe_secrets_ax(cg, c_drops)
+    }
+
+    inline_end := buf_len(c)
+    jcnt := ibuf_get(cg.state, 30 + prev_depth)
+    mut ji := 0
+    while ji < jcnt {
+        mc_patch_rel32(c, ibuf_get(cg.state, 34 + prev_depth * 16 + ji), inline_end)
+        ji += 1
+    }
+
+    if ibuf_len(c_drops) == 0 and ibuf_get(cg.state, 4) > saved_after_ret {
+        ibuf_set(cg.state, 4, saved_after_ret)
+    }
+
+    ibuf_set(cg.state, 3, prev_fidx)
+    ibuf_set(cg.state, 5, prev_ab)
+    ibuf_set(cg.state, 6, prev_rb)
+    ibuf_set(cg.state, 7, prev_rty)
+    ibuf_set(cg.state, 8, prev_rslots)
+    ibuf_set(cg.state, 9, prev_fast)
+    ibuf_set(cg.state, 10, prev_cont)
+    ibuf_set(cg.state, 11, prev_bmark)
+    ibuf_set(cg.state, 12, prev_el_soff)
+    ibuf_set(cg.state, 13, prev_el_slen)
+    ibuf_set(cg.state, 18, prev_flags)
+    ibuf_set(cg.state, 22, prev_iret)
+    ibuf_set(cg.state, 23, prev_irty)
+    ibuf_set(cg.state, 24, prev_irslots)
+    ibuf_set(cg.state, 25, prev_depth)
+
+    buf_free(move c_breaks)
+    buf_free(move c_drops)
+    buf_free(move c_vars)
+    return true
+}
+
 fn emit_direct_fn_call(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, fidx: i64, aoff: i64, acnt: i64) -> i64 {
     c := cg.code
     p := cg.pool
@@ -2327,6 +2798,11 @@ fn emit_direct_fn_call(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntB
         ret_dst = cg_unit_slot(cg)
     } else {
         ret_dst = cg_alloc_slots(cg, ret_slots)
+    }
+
+    if try_emit_inline_call_ax(cg, ev, fidx, ret_dst) {
+        buf_free(move ev)
+        return er_pack(ret_dst, ret_ty)
     }
 
     // --- Direct Zero-Overhead Win64 C-ABI Call for `@extern("dll")` & Static COFF `.obj`/`.lib`! ---

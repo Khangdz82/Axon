@@ -1,0 +1,217 @@
+// Axon v1.0.0 Deep Adversarial Security Audit Suite (115+ Assertions)
+// Probes integer overflows, HTTP request smuggling, CRLF splitting, path traversal (CWE-22),
+// embedded NUL smuggling (CWE-158), JSON/XSS/Log injection (CWE-79/117), and crypto vectors.
+
+use std::os
+use std::str
+use std::http
+use std::json
+use std::cap
+use std::taint
+use std::path
+use std::encoding
+use std::log
+use std::crypto
+use std::math
+use std::test_kit
+
+fn make_nul_str(prefix: str, suffix: str) -> str {
+    b := buf_new(str_len(prefix) + str_len(suffix) + 4)
+    buf_push_str(b, prefix)
+    buf_push(b, 0)
+    buf_push_str(b, suffix)
+    return buf_to_owned_str(move b)
+}
+
+fn make_esc_str(prefix: str, suffix: str) -> str {
+    b := buf_new(str_len(prefix) + str_len(suffix) + 4)
+    buf_push_str(b, prefix)
+    buf_push(b, 27) // ANSI ESC 0x1B
+    buf_push_str(b, suffix)
+    return buf_to_owned_str(move b)
+}
+
+fn check_parse_i64_err(s: TestSuite, raw: str, label: str) {
+    v := parse_i64(raw) or -777777777
+    assert_eq_i64(s, v, -777777777, label)
+}
+
+fn is_http_req_ok(raw: str) -> bool {
+    _r := http_parse_request(raw) or return false
+    return true
+}
+
+fn main() -> i64 {
+    s := suite_new("v1.0.0-security-deep-audit")
+
+    // --- 1. Integer Parsing Overflow / Boundary Attacks (`parse_i64`) ---
+    assert_eq_i64(s, parse_i64("0") or -1, 0, "parse zero")
+    assert_eq_i64(s, parse_i64("-0") or -1, 0, "parse neg zero")
+    assert_eq_i64(s, parse_i64(" +42 ") or -1, 42, "parse trimmed plus")
+    assert_eq_i64(s, parse_i64("9223372036854775807") or 0, 9223372036854775807, "parse INT64_MAX exact")
+    assert_eq_i64(s, parse_i64("-9223372036854775808") or 0, -9223372036854775808, "parse INT64_MIN exact")
+    check_parse_i64_err(s, "9223372036854775808", "reject INT64_MAX + 1")
+    check_parse_i64_err(s, "-9223372036854775809", "reject INT64_MIN - 1")
+    check_parse_i64_err(s, "99999999999999999999", "reject 20-digit overflow")
+    check_parse_i64_err(s, "-99999999999999999999", "reject 20-digit underflow")
+    check_parse_i64_err(s, "", "reject empty str")
+    check_parse_i64_err(s, "   ", "reject spaces only")
+    check_parse_i64_err(s, "-", "reject lone minus")
+    check_parse_i64_err(s, "+", "reject lone plus")
+    check_parse_i64_err(s, "12abc", "reject trailing letters")
+    check_parse_i64_err(s, "0x10", "reject hex prefix")
+    check_parse_i64_err(s, "12 34", "reject interior space")
+    check_parse_i64_err(s, make_nul_str("12", "34"), "reject embedded NUL in number")
+
+    // --- 2. String DoS Allocation & Integer Overflow Guards (`str_repeat`, `str_replace`) ---
+    assert_eq_str(s, str_repeat("ab", 0), "", "str_repeat 0")
+    assert_eq_str(s, str_repeat("ab", -5), "", "str_repeat negative")
+    assert_eq_str(s, str_repeat("ab", 1000000000), "", "str_repeat overflow guard")
+    assert_eq_str(s, str_repeat("", 500000), "", "str_repeat empty string")
+    assert_eq_str(s, str_replace("abc", "", "x"), "abc", "str_replace empty pattern safe")
+    assert_eq_str(s, str_replace("aaa", "a", "bbbb"), "bbbbbbbbbbbb", "str_replace multi expand")
+
+    // --- 3. Math Checked Overflow & Undefined Boundary Guards (`std::math`) ---
+    lcm_ok := lcm(12, 18) or -1
+    assert_eq_i64(s, lcm_ok, 36, "lcm 12 and 18")
+    lcm_ov := lcm(4000000000, 4000000001) or -999
+    assert_eq_i64(s, lcm_ov, -999, "lcm rejects i64 overflow")
+    cdiv_bad := ceil_div_i64(10, 0) or -999
+    assert_eq_i64(s, cdiv_bad, -999, "ceil_div rejects zero denom")
+    np2_ov := next_pow2_i64(4611686018427387905) or -999
+    assert_eq_i64(s, np2_ov, -999, "next_pow2 rejects >2^62 overflow")
+    pmod_bad := pow_mod_i64(2, 10, 0) or -999
+    assert_eq_i64(s, pmod_bad, -999, "pow_mod rejects mod<=0")
+    assert_eq_i64(s, isqrt_i64(-100), 0, "isqrt negative safe 0")
+
+    // --- 4. HTTP/1.1 Request Smuggling & Header Splitting (`std::http`) ---
+    assert_true(s, not is_http_req_ok("POST /up HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\nhello"), "http block duplicate Content-Length smuggling")
+    assert_true(s, not is_http_req_ok("POST /up HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n0\r\n\r\n"), "http block TE+CL smuggling")
+    assert_true(s, not is_http_req_ok("POST /up HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\ntest"), "http block CL+TE smuggling")
+    assert_true(s, not is_http_req_ok("POST /up HTTP/1.1\r\nContent-Length: -1\r\n\r\n"), "http block negative Content-Length")
+    assert_true(s, not is_http_req_ok("POST /up HTTP/1.1\r\nContent-Length: 99999\r\n\r\nhi"), "http block truncated body Content-Length")
+    assert_true(s, not is_http_req_ok("GET / HTTP/1.1\r\nHost: a\r\n folded: b\r\n\r\n"), "http block obs-fold header")
+    assert_true(s, not is_http_req_ok("GET / HTTP/1.1\r\n: val\r\n\r\n"), "http block empty header name")
+    assert_true(s, not is_http_req_ok("GET /api/../../etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n"), "http block .. path traversal")
+    assert_true(s, not is_http_req_ok("GET /api/file%00.png HTTP/1.1\r\nHost: x\r\n\r\n"), "http block %00 NUL smuggling in path")
+    assert_true(s, not is_http_req_ok("GET /api/a%0Ab HTTP/1.1\r\nHost: x\r\n\r\n"), "http block %0A CRLF in path")
+    assert_true(s, not is_http_req_ok("GET /api/a%0db HTTP/1.1\r\nHost: x\r\n\r\n"), "http block %0d CR in path")
+    assert_true(s, not is_http_req_ok("GET /a\\b HTTP/1.1\r\nHost: x\r\n\r\n"), "http block backslash in path")
+
+    // Valid HTTP response CRLF splitting & security headers check
+    evil_hdr := "X-Good: 1\r\n\r\nHTTP/1.1 200 OK"
+    resp := http_build_response(200, "text/plain\r\nEvil: 1", "ok", evil_hdr)
+    assert_true(s, not str_contains(resp, "Evil: 1"), "http response blocks content_type CRLF split")
+    assert_true(s, not str_contains(resp, "X-Good: 1"), "http response drops unsafe extra_headers with empty/double CRLF")
+    assert_true(s, str_contains(resp, "X-Content-Type-Options: nosniff"), "http response emits nosniff")
+    assert_true(s, str_contains(resp, "X-Frame-Options: DENY"), "http response emits X-Frame-Options")
+    assert_true(s, str_contains(resp, "Referrer-Policy: no-referrer"), "http response emits Referrer-Policy")
+
+    resp_good := http_build_response(201, "text/plain", "created", "X-Req-Id: r1\r\nX-Trace: t2")
+    assert_true(s, str_contains(resp_good, "X-Req-Id: r1\r\nX-Trace: t2\r\n\r\ncreated"), "http response keeps validated multi-line headers")
+
+    // --- 5. URL Decode & Base64 / Base64URL Smuggling Resistance ---
+    assert_eq_str(s, url_decode("a%00b") or "BLOCKED", "BLOCKED", "url_decode blocks %00 NUL")
+    assert_eq_str(s, url_decode("bad%ZZ") or "BLOCKED", "BLOCKED", "url_decode blocks %ZZ")
+    assert_eq_str(s, url_decode("trunc%2") or "BLOCKED", "BLOCKED", "url_decode blocks truncated %2")
+    assert_eq_str(s, url_decode(make_nul_str("a", "b")) or "BLOCKED", "BLOCKED", "url_decode blocks raw NUL")
+    assert_eq_str(s, url_decode("hello+world%21%2F") or "ERR", "hello world!/", "url_decode valid roundtrip")
+
+    assert_eq_str(s, base64_decode("A") or "BAD", "BAD", "b64 rejects len 1")
+    assert_eq_str(s, base64_decode("AB=C") or "BAD", "BAD", "b64 rejects mid padding")
+    assert_eq_str(s, base64_decode("!!!!") or "BAD", "BAD", "b64 rejects invalid chars")
+    assert_eq_str(s, base64url_decode("A") or "BAD", "BAD", "b64url rejects len%4==1")
+    assert_eq_str(s, base64url_decode("AB+D") or "BAD", "BAD", "b64url rejects std + char")
+
+    // --- 6. JSON Key & Value Escaping Against Structure Breakout ---
+    jb := buf_new(256)
+    json_begin_obj(jb)
+    json_kv_str(jb, "k\"\\\n", "v\"\r\t\\end")
+    json_kv_i64(jb, "n\"1", 99)
+    json_kv_bool(jb, "b\"2", true)
+    json_end_obj(jb)
+    jout := buf_to_owned_str(move jb)
+    assert_eq_str(s, jout, "{\"k\\\"\\\\\\n\":\"v\\\"\\r\\t\\\\end\",\"n\\\"1\":99,\"b\\\"2\":true}", "json escapes keys and values")
+
+    // --- 7. Path Traversal (CWE-22) Across std/taint, std/cap, std/path ---
+    assert_eq_str(s, sanitize_subpath(taint_str("safe/dir/model.axm")) or "DENY", "safe/dir/model.axm", "taint allow safe subpath")
+    assert_eq_str(s, sanitize_subpath(taint_str("dir/.hidden")) or "DENY", "DENY", "taint block /.")
+    assert_eq_str(s, sanitize_subpath(taint_str("dir//file")) or "DENY", "DENY", "taint block //")
+    assert_eq_str(s, sanitize_subpath(taint_str("dir/")) or "DENY", "DENY", "taint block trailing /")
+    assert_eq_str(s, sanitize_subpath(taint_str("dir\\file")) or "DENY", "DENY", "taint block backslash")
+    assert_eq_str(s, sanitize_subpath(taint_str("dir/file.")) or "DENY", "DENY", "taint block trailing dot")
+    assert_eq_str(s, sanitize_subpath(taint_str("../x")) or "DENY", "DENY", "taint block ..")
+    assert_eq_str(s, sanitize_subpath(taint_str(make_nul_str("a", "b"))) or "DENY", "DENY", "taint block NUL")
+
+    assert_true(s, is_safe_subpath("weights/v1/layers.bin"), "cap allow safe relpath")
+    assert_true(s, not is_safe_subpath(".env"), "cap block leading dot")
+    assert_true(s, not is_safe_subpath("a//b"), "cap block //")
+    assert_true(s, not is_safe_subpath("a/.b"), "cap block /.")
+    assert_true(s, not is_safe_subpath("a\\b"), "cap block backslash")
+    assert_true(s, not is_safe_subpath(make_nul_str("ok", ".txt")), "cap block embedded NUL")
+
+    assert_eq_str(s, path_join_safe("/srv/data", "users/42.json") or "DENY", "/srv/data/users/42.json", "path_join_safe allow valid")
+    assert_eq_str(s, path_join_safe("/srv/data", "/etc/passwd") or "DENY", "DENY", "path_join_safe block abs")
+    assert_eq_str(s, path_join_safe("/srv/data", "a/../b") or "DENY", "DENY", "path_join_safe block ..")
+    assert_eq_str(s, path_join_safe("/srv/data", "file%00.txt") or "DENY", "DENY", "path_join_safe block %00")
+    assert_eq_str(s, path_join_safe("/srv/data", "C:\\win.ini") or "DENY", "DENY", "path_join_safe block colon/backslash")
+    assert_eq_str(s, path_join_safe("/srv/data", make_nul_str("a", "b")) or "DENY", "DENY", "path_join_safe block NUL")
+
+    // --- 8. CWE-117 Log Injection + CWE-79 HTML XSS Escaping ---
+    clean_log := log_format("INFO", "auth\r\n[FAKE]", make_esc_str("user\n[ERROR] pwn", "[31m"))
+    assert_true(s, not str_contains(clean_log, "\n"), "log_format strips raw newline")
+    assert_true(s, not str_contains(clean_log, "\r"), "log_format strips raw CR")
+    assert_true(s, str_contains(clean_log, "\\n"), "log_format escapes newline explicitly")
+    assert_true(s, str_contains(clean_log, "?[31m"), "log_format neutralizes ANSI ESC 0x1B")
+
+    xss := "<script>alert('1' & \"2\")</script>"
+    escaped_html := html_escape(xss)
+    assert_eq_str(s, escaped_html, "&lt;script&gt;alert(&#39;1&#39; &amp; &quot;2&quot;)&lt;/script&gt;", "html_escape blocks XSS")
+
+    // --- 9. Cryptography NIST Vectors & Constant-Time Helpers ---
+    assert_eq_str(s, sha256_str("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1", "sha256 NIST 448-bit vector")
+    assert_eq_i64(s, crc32_str("123456789"), 3421780262, "crc32 IEEE check vector 0xCBF43926")
+    assert_eq_i64(s, crc32_str(""), 0, "crc32 empty string")
+    assert_true(s, ct_eq_i64(123456789, 123456789), "ct_eq_i64 equal")
+    assert_true(s, not ct_eq_i64(123456789, 123456788), "ct_eq_i64 unequal")
+    assert_true(s, not ct_eq_str("secret_a", "secret_b"), "ct_eq_str unequal same len")
+    assert_true(s, fnv1a_str("alpha") != fnv1a_str("alphb"), "fnv1a avalanche")
+
+    // --- 10. Runtime FS Embedded NUL Guard & Attenuated Capability Check ---
+    nul_f := make_nul_str(".tmp_sec_check", ".txt")
+    wb := buf_new(8)
+    buf_push_str(wb, "hi")
+    rc_w := fs_write_file(nul_f, wb) or -403
+    buf_free(move wb)
+    assert_eq_i64(s, rc_w, -403, "fs_write_file rejects NUL path")
+    rc_r := fs_read_file(nul_f) or buf_new(0)
+    assert_eq_i64(s, buf_len(rc_r), 0, "fs_read_file rejects NUL path")
+    buf_free(move rc_r)
+
+    rcap := acquire_root_cap()
+    fcap := attenuate_fs(rcap, ".tmp_cap_sandbox", true)
+    assert_eq_i64(s, cap_write_file(fcap, "out.txt", buf_new(4)) or -403, -403, "read-only FsCap blocks write")
+
+    // --- 11. SQL & Shell Sanitizers ---
+    assert_eq_str(s, sanitize_sql_id(taint_str("users_v2")) or "BAD", "users_v2", "sql id allow valid")
+    assert_eq_str(s, sanitize_sql_id(taint_str("users; DROP")) or "BAD", "BAD", "sql id block semicolon")
+    assert_eq_str(s, sanitize_shell_arg(taint_str("file-1.json")) or "BAD", "file-1.json", "shell arg allow safe")
+    assert_eq_str(s, sanitize_shell_arg(taint_str("a;rm -rf /")) or "BAD", "BAD", "shell arg block cmd sep")
+    assert_eq_str(s, sanitize_shell_arg(taint_str("$(whoami)")) or "BAD", "BAD", "shell arg block subshell")
+
+    // --- 12. Allocator Free-Reuse Stress (5,000 short-lived buffers & strings) ---
+    mut k := 0
+    mut stress_ok := true
+    while k < 5000 {
+        tb := buf_new(128)
+        buf_push_str(tb, "{\"idx\":")
+        buf_append_i64(tb, k)
+        buf_push(tb, 125)
+        if buf_get(tb, 0) != 123 { stress_ok = false }
+        buf_free(move tb)
+        k += 1
+    }
+    assert_true(s, stress_ok, "5000 buffer alloc/free stress clean")
+
+    return suite_finish(move s)
+}

@@ -1,0 +1,182 @@
+// Axon v1.0.0 Portable Path Normalization, Joining & CWE-22 Anti-Traversal Guards (`std/path.ax`)
+// Works natively (`win-x64`, `linux-x64`, `macos-arm64`) and on `--target wasm32`.
+
+use std::os
+use std::str
+
+fn path_is_sep(c: i64) -> bool {
+    return c == 47 or c == 92 // '/' or '\'
+}
+
+fn path_is_abs(p: str) -> bool {
+    n := str_len(p)
+    if n == 0 { return false }
+    if path_is_sep(str_byte(p, 0)) { return true }
+    // Windows drive prefix `C:\` or `C:/`
+    if n >= 3 and str_byte(p, 1) == 58 and path_is_sep(str_byte(p, 2)) { return true }
+    return false
+}
+
+// Normalizes POSIX separators, resolves `.` and interior `..` cleanly without touching OS filesystem.
+fn path_normalize(p: str) -> str {
+    n := str_len(p)
+    if n == 0 { return "." }
+    abs := str_byte(p, 0) == 47 or str_byte(p, 0) == 92
+    seg_starts := ibuf_new(n + 4)
+    seg_ends := ibuf_new(n + 4)
+    mut i := 0
+    while i < n {
+        while i < n and path_is_sep(str_byte(p, i)) { i += 1 }
+        if i >= n { break }
+        st := i
+        while i < n and not path_is_sep(str_byte(p, i)) { i += 1 }
+        en := i
+        slen := en - st
+        if slen == 1 and str_byte(p, st) == 46 {
+            // Skip '.'
+            _skip := 0
+        } else if slen == 2 and str_byte(p, st) == 46 and str_byte(p, st + 1) == 46 {
+            cur_cnt := ibuf_len(seg_starts)
+            if cur_cnt > 0 {
+                last_st := ibuf_get(seg_starts, cur_cnt - 1)
+                last_en := ibuf_get(seg_ends, cur_cnt - 1)
+                if not (last_en - last_st == 2 and str_byte(p, last_st) == 46 and str_byte(p, last_st + 1) == 46) {
+                    ibuf_truncate(seg_starts, cur_cnt - 1)
+                    ibuf_truncate(seg_ends, cur_cnt - 1)
+                } else {
+                    ibuf_push(seg_starts, st)
+                    ibuf_push(seg_ends, en)
+                }
+            } else if not abs {
+                ibuf_push(seg_starts, st)
+                ibuf_push(seg_ends, en)
+            }
+        } else {
+            ibuf_push(seg_starts, st)
+            ibuf_push(seg_ends, en)
+        }
+    }
+    cnt := ibuf_len(seg_starts)
+    if cnt == 0 {
+        buf_free(move seg_starts)
+        buf_free(move seg_ends)
+        if abs { return "/" }
+        return "."
+    }
+    out := buf_new(n + 4)
+    if abs { buf_push(out, 47) }
+    mut k := 0
+    while k < cnt {
+        if k > 0 { buf_push(out, 47) }
+        s0 := ibuf_get(seg_starts, k)
+        s1 := ibuf_get(seg_ends, k)
+        mut c := s0
+        while c < s1 {
+            buf_push(out, str_byte(p, c))
+            c += 1
+        }
+        k += 1
+    }
+    buf_free(move seg_starts)
+    buf_free(move seg_ends)
+    return buf_to_owned_str(move out)
+}
+
+fn path_join(base: str, child: str) -> str {
+    nb := str_len(base)
+    nc := str_len(child)
+    if nc == 0 { return path_normalize(base) }
+    if path_is_abs(child) { return path_normalize(child) }
+    if nb == 0 { return path_normalize(child) }
+    tmp := buf_new(nb + nc + 2)
+    buf_push_str(tmp, base)
+    if not path_is_sep(str_byte(base, nb - 1)) {
+        buf_push(tmp, 47)
+    }
+    buf_push_str(tmp, child)
+    joined := buf_to_owned_str(move tmp)
+    return path_normalize(joined)
+}
+
+// Security-hardened safe subpath join (blocks NUL, `%00`, backslash, `:`, `.` / `..`, leading/trailing `/`).
+fn path_join_safe(root: str, rel: str) -> str ! i64 {
+    nr := str_len(rel)
+    if nr == 0 or nr > 512 { return err(400) }
+    if path_is_abs(rel) { return err(403) }
+    if str_byte(rel, 0) == 46 or str_byte(rel, nr - 1) == 46 or str_byte(rel, nr - 1) == 47 {
+        return err(403)
+    }
+    mut i := 0
+    while i < nr {
+        c := str_byte(rel, i)
+        if c == 0 or c < 32 or c == 92 or c == 58 { return err(403) } // NUL, ctrl, '\', ':'
+        if c == 37 and i + 2 < nr and str_byte(rel, i + 1) == 48 and str_byte(rel, i + 2) == 48 {
+            return err(403) // %00
+        }
+        if c == 47 and i + 1 < nr and str_byte(rel, i + 1) == 47 { return err(403) }
+        if c == 46 and i + 1 < nr and str_byte(rel, i + 1) == 46 { return err(403) }
+        i += 1
+    }
+    return ok(path_join(root, rel))
+}
+
+fn path_last_sep(p: str) -> i64 {
+    mut i := str_len(p) - 1
+    while i >= 0 {
+        if path_is_sep(str_byte(p, i)) { return i }
+        i -= 1
+    }
+    return -1
+}
+
+fn path_basename(p: str) -> str {
+    mut end := str_len(p)
+    while end > 1 and path_is_sep(str_byte(p, end - 1)) {
+        end -= 1
+    }
+    if end == 0 { return "" }
+    if end == 1 and path_is_sep(str_byte(p, 0)) { return "/" }
+    mut start := end - 1
+    while start >= 0 and not path_is_sep(str_byte(p, start)) {
+        start -= 1
+    }
+    return str_slice(p, start + 1, end)
+}
+
+fn path_dirname(p: str) -> str {
+    mut end := str_len(p)
+    while end > 1 and path_is_sep(str_byte(p, end - 1)) {
+        end -= 1
+    }
+    if end == 0 { return "." }
+    mut sep := end - 1
+    while sep >= 0 and not path_is_sep(str_byte(p, sep)) {
+        sep -= 1
+    }
+    if sep < 0 { return "." }
+    if sep == 0 { return "/" }
+    return str_slice(p, 0, sep)
+}
+
+fn path_ext(p: str) -> str {
+    base := path_basename(p)
+    nb := str_len(base)
+    mut i := nb - 1
+    while i > 0 {
+        c := str_byte(base, i)
+        if c == 46 { return str_slice(base, i, nb) }
+        i -= 1
+    }
+    return ""
+}
+
+fn path_stem(p: str) -> str {
+    base := path_basename(p)
+    nb := str_len(base)
+    mut i := nb - 1
+    while i > 0 {
+        if str_byte(base, i) == 46 { return str_slice(base, 0, i) }
+        i -= 1
+    }
+    return base
+}
