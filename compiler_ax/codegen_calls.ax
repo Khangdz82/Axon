@@ -122,16 +122,28 @@ fn mc_emit_mat4_mul_xmm1(c: ByteBuf, mslot: i64) {
     mc_b3(c, 0x0F, 0x58, 0xC4)       // ADDPS XMM0, XMM4
 }
 
+fn expr_has_shadowed_ident(cg: CodegenCtx, vars: IntBuf, enid: i64) -> bool {
+    if enid <= 0 {
+        return false
+    }
+    k := ast_kind(cg.nodes, enid)
+    if k == nk_ident() {
+        return cg_var_find(cg.pool, vars, ast_get(cg.nodes, enid, 1), ast_get(cg.nodes, enid, 2)) >= 0
+    }
+    if k == nk_unary() {
+        return expr_has_shadowed_ident(cg, vars, ast_get(cg.nodes, enid, 2))
+    }
+    if k == nk_binary() {
+        return expr_has_shadowed_ident(cg, vars, ast_get(cg.nodes, enid, 2)) or expr_has_shadowed_ident(cg, vars, ast_get(cg.nodes, enid, 3))
+    }
+    return false
+}
+
 fn is_nonshadowed_const_int(cg: CodegenCtx, vars: IntBuf, enid: i64) -> bool {
     if not is_const_int_expr(cg.pool, cg.nodes, cg.sym, enid) {
         return false
     }
-    if ast_kind(cg.nodes, enid) == nk_ident() {
-        if cg_var_find(cg.pool, vars, ast_get(cg.nodes, enid, 1), ast_get(cg.nodes, enid, 2)) >= 0 {
-            return false
-        }
-    }
-    return true
+    return not expr_has_shadowed_ident(cg, vars, enid)
 }
 
 fn emit_fast_val_arg(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, enid: i64) -> i64 {
@@ -229,91 +241,28 @@ fn emit_print_value(cg: CodegenCtx, slot: i64, ty: i64) {
 fn emit_jbuf_append_rdata(cg: CodegenCtx, jb_slot: i64, roff: i64, rlen: i64) {
     if rlen <= 0 { return }
     c := cg.code
-    mc_load_rax(c, jb_slot, 0)
-    mc_b3(c, 0x49, 0x89, 0xC0) // R8 = jb
-    cg_lea_rax_rdata(cg, roff)
-    mc_b3(c, 0x49, 0x89, 0xC1) // R9 = src
-    mc_b3(c, 0x49, 0x8B, 0x08) // RCX = cur_len
-    mc_b2(c, 0x31, 0xD2)       // RDX = 0
-    lp := buf_len(c)
-    mc_b2(c, 0x81, 0xFA); mc_u32(c, rlen)
-    jae_d := mc_jcc8(c, 0x73)
-    mc_b4(c, 0x41, 0x8A, 0x04, 0x11) // AL = [R9 + RDX]
-    mc_b4(c, 0x41, 0x88, 0x44, 0x08); mc_b1(c, 0x10) // [R8 + RCX + 16] = AL
-    mc_b3(c, 0x48, 0xFF, 0xC1)
-    mc_b3(c, 0x48, 0xFF, 0xC2)
-    jmp_l := mc_jcc8(c, 0xEB)
-    mc_patch_jcc8(c, jmp_l, lp)
-    mc_patch_jcc8(c, jae_d, buf_len(c))
-    mc_b3(c, 0x49, 0x89, 0x08) // [R8] = new_len
+    mc_load_rcx(c, jb_slot, 0)
+    cg_lea_reg_rdata(cg, 1, roff)
+    mc_mov_reg_imm(c, 2, rlen)
+    cg_call_fn(cg, h_jbuf_raw())
+    mc_store_rax(c, jb_slot, 0)
 }
 
 fn emit_jbuf_append_i64(cg: CodegenCtx, jb_slot: i64, val_slot: i64, sub_off: i64) {
     c := cg.code
-    mc_load_rax(c, jb_slot, 0)
-    mc_b3(c, 0x49, 0x89, 0xC0) // R8 = jb
-    mc_b3(c, 0x49, 0x8B, 0x08) // RCX = cur_len
-    mc_load_rax(c, val_slot, sub_off)
-    mc_b3(c, 0x48, 0x85, 0xC0)
-    jge_p := mc_jcc8(c, 0x7D)
-    mc_b4(c, 0x41, 0xC6, 0x44, 0x08); mc_b2(c, 0x10, 45) // '-'
-    mc_b3(c, 0x48, 0xFF, 0xC1)
-    mc_b3(c, 0x48, 0xF7, 0xD8)
-    mc_patch_jcc8(c, jge_p, buf_len(c))
-
-    // Scratch digits on stack (`SUB RSP, 32`)
-    mc_b4(c, 0x48, 0x83, 0xEC, 0x20)
-    mc_b4(c, 0x4C, 0x8D, 0x4C, 0x24); mc_b1(c, 0x1F) // R9 = RSP + 31
-    mc_b3(c, 0x4D, 0x89, 0xCA) // R10 = end_ptr
-    mc_b3(c, 0x49, 0xC7, 0xC3); mc_u32(c, 10)
-    dl := buf_len(c)
-    mc_b2(c, 0x31, 0xD2)
-    mc_b3(c, 0x49, 0xF7, 0xF3) // DIV R11
-    mc_b3(c, 0x80, 0xC2, 0x30)
-    mc_b3(c, 0x49, 0xFF, 0xC9)
-    mc_b3(c, 0x41, 0x88, 0x11)
-    mc_b3(c, 0x48, 0x85, 0xC0)
-    jnz_d := mc_jcc8(c, 0x75)
-    mc_patch_jcc8(c, jnz_d, dl)
-
-    cp := buf_len(c)
-    mc_b3(c, 0x4D, 0x39, 0xD1)
-    jae_cd := mc_jcc8(c, 0x73)
-    mc_b3(c, 0x41, 0x8A, 0x01)
-    mc_b4(c, 0x41, 0x88, 0x44, 0x08); mc_b1(c, 0x10)
-    mc_b3(c, 0x48, 0xFF, 0xC1)
-    mc_b3(c, 0x49, 0xFF, 0xC1)
-    jmp_cp := mc_jcc8(c, 0xEB)
-    mc_patch_jcc8(c, jmp_cp, cp)
-    mc_patch_jcc8(c, jae_cd, buf_len(c))
-    mc_b4(c, 0x48, 0x83, 0xC4, 0x20)
-    mc_b3(c, 0x49, 0x89, 0x08)
+    mc_load_rcx(c, jb_slot, 0)
+    mc_load_rdx(c, val_slot, sub_off)
+    cg_call_fn(cg, h_jbuf_i64())
+    mc_store_rax(c, jb_slot, 0)
 }
 
 fn emit_jbuf_append_str(cg: CodegenCtx, jb_slot: i64, val_slot: i64, sub_off: i64) {
     c := cg.code
-    q_off := cg_intern_lit(cg, "\"")
-    emit_jbuf_append_rdata(cg, jb_slot, q_off, 1)
-    mc_load_rax(c, jb_slot, 0)
-    mc_b3(c, 0x49, 0x89, 0xC0) // R8 = jb
-    mc_load_rax(c, val_slot, sub_off)
-    mc_b3(c, 0x49, 0x89, 0xC1) // R9 = str_ptr
-    mc_load_rax(c, val_slot, sub_off + 1)
-    mc_b3(c, 0x49, 0x89, 0xC2) // R10 = str_len
-    mc_b3(c, 0x49, 0x8B, 0x08) // RCX = cur_len
-    mc_b2(c, 0x31, 0xD2)
-    lp := buf_len(c)
-    mc_b3(c, 0x4C, 0x39, 0xD2)
-    jae_s := mc_jcc8(c, 0x73)
-    mc_b4(c, 0x41, 0x8A, 0x04, 0x11)
-    mc_b4(c, 0x41, 0x88, 0x44, 0x08); mc_b1(c, 0x10)
-    mc_b3(c, 0x48, 0xFF, 0xC1)
-    mc_b3(c, 0x48, 0xFF, 0xC2)
-    jmp_s := mc_jcc8(c, 0xEB)
-    mc_patch_jcc8(c, jmp_s, lp)
-    mc_patch_jcc8(c, jae_s, buf_len(c))
-    mc_b3(c, 0x49, 0x89, 0x08)
-    emit_jbuf_append_rdata(cg, jb_slot, q_off, 1)
+    mc_load_rcx(c, jb_slot, 0)
+    mc_load_rdx(c, val_slot, sub_off)
+    mc_load_r8(c, val_slot, sub_off + 1)
+    cg_call_fn(cg, h_jbuf_qstr())
+    mc_store_rax(c, jb_slot, 0)
 }
 
 // Compile-Time Zero-Reflection Struct -> JSON Code Generator (`to_json(val)`)
@@ -324,10 +273,8 @@ fn emit_to_json_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: I
     vty := er_ty(vr)
 
     jb_slot := cg_alloc_slots(cg, 1)
-    mc_b1(c, 0xBA); mc_u32(c, 4096)
-    emit_alloc_raw_rax(cg)
-    mc_b3(c, 0x48, 0xC7, 0x00); mc_u32(c, 0)
-    mc_b4(c, 0x48, 0xC7, 0x40, 0x08); mc_u32(c, 4000)
+    mc_b2(c, 0x31, 0xC9)
+    cg_call_fn(cg, h_buf_new())
     mc_store_rax(c, jb_slot, 0)
 
     if ty_tag(vty) == 10 {

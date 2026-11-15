@@ -27,7 +27,7 @@ fn parser_init(toks: IntBuf, nodes: IntBuf, extra: IntBuf) {
     ibuf_set(nodes, 13, 0)
     ibuf_set(nodes, 14, 0)
 
-    // Initialize `extra[0..8192]` LIFO scratch stack (`extra[0]` = sp starting at 1)
+    // Initialize `extra[0..8191]` LIFO scratch stack (`extra[0]` = sp starting at 1, `extra[8191]` = recursion depth)
     if ibuf_len(extra) == 0 {
         ibuf_push(extra, 1)
         mut i := 1
@@ -37,6 +37,7 @@ fn parser_init(toks: IntBuf, nodes: IntBuf, extra: IntBuf) {
         }
     } else {
         ibuf_set(extra, 0, 1)
+        ibuf_set(extra, 8191, 0)
     }
 }
 
@@ -124,8 +125,29 @@ fn scratch_mark(extra: IntBuf) -> i64 {
 
 fn scratch_push(extra: IntBuf, val: i64) {
     sp := ibuf_get(extra, 0)
+    if sp >= 8190 {
+        return
+    }
     ibuf_set(extra, sp, val)
     ibuf_set(extra, 0, sp + 1)
+}
+
+fn p_depth_enter(toks: IntBuf, nodes: IntBuf, extra: IntBuf) -> bool {
+    d := ibuf_get(extra, 8191)
+    if d >= 256 {
+        p_err(toks, nodes)
+        p_advance(nodes)
+        return false
+    }
+    ibuf_set(extra, 8191, d + 1)
+    return true
+}
+
+fn p_depth_leave(extra: IntBuf) {
+    d := ibuf_get(extra, 8191)
+    if d > 0 {
+        ibuf_set(extra, 8191, d - 1)
+    }
 }
 
 fn scratch_commit(extra: IntBuf, mark: i64) -> i64 {
@@ -308,7 +330,7 @@ fn parse_base_type(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) ->
     return ast_alloc(nodes, nk_ty_unit(), sp)
 }
 
-fn parse_type(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
+fn parse_type_body(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
     sp := p_span(toks, nodes)
     base := parse_base_type(toks, pool, nodes, extra)
     if p_eat(toks, nodes, tk_bang()) {
@@ -328,12 +350,21 @@ fn parse_type(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 
     return base
 }
 
+fn parse_type(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
+    if not p_depth_enter(toks, nodes, extra) {
+        return 0
+    }
+    r := parse_type_body(toks, pool, nodes, extra)
+    p_depth_leave(extra)
+    return r
+}
+
 // --- Expression Parsing (Pratt Precedence + Postfix + Pipeline `|>`) ---
 fn parse_call_args_into_extra(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
     // Returns `(args_off << 16) | args_cnt`
     mark := scratch_mark(extra)
     mut cnt := 0
-    while p_peek(toks, nodes) != tk_rparen() and p_peek(toks, nodes) != tk_eof() {
+    while p_peek(toks, nodes) != tk_rparen() and p_peek(toks, nodes) != tk_eof() and ibuf_get(nodes, 2) < 8 {
         sp := p_span(toks, nodes)
         mut mode := pmode_val()
         if p_eat(toks, nodes, tk_mut()) {
@@ -667,7 +698,7 @@ fn parse_postfix(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i
     return base
 }
 
-fn parse_unary(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
+fn parse_unary_body(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
     k := p_peek(toks, nodes)
     sp := p_span(toks, nodes)
     if k == tk_await() {
@@ -699,6 +730,15 @@ fn parse_unary(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64
         return parse_unary(toks, pool, nodes, extra)
     }
     return parse_postfix(toks, pool, nodes, extra)
+}
+
+fn parse_unary(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
+    if not p_depth_enter(toks, nodes, extra) {
+        return 0
+    }
+    r := parse_unary_body(toks, pool, nodes, extra)
+    p_depth_leave(extra)
+    return r
 }
 
 fn binop_prec_and_code(tk: i64) -> i64 {
@@ -887,6 +927,9 @@ fn parse_or_lvl(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i6
 }
 
 fn parse_prec_lvl(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
+    if not p_depth_enter(toks, nodes, extra) {
+        return 0
+    }
     // Pipeline `lhs |> fn_call(a, b)` desugars directly to `fn_call(lhs, a, b)`!
     mut lhs := parse_or_lvl(toks, pool, nodes, extra)
     while p_peek(toks, nodes) == tk_pipegt() {
@@ -936,6 +979,7 @@ fn parse_prec_lvl(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> 
             lhs = nc
         }
     }
+    p_depth_leave(extra)
     return lhs
 }
 
@@ -945,6 +989,15 @@ fn parse_expr(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 
 
 // --- Statements & Blocks ---
 fn parse_stmt(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
+    if not p_depth_enter(toks, nodes, extra) {
+        return 0
+    }
+    r := parse_stmt_body(toks, pool, nodes, extra)
+    p_depth_leave(extra)
+    return r
+}
+
+fn parse_stmt_body(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
     p_skip_semis(toks, nodes)
     k := p_peek(toks, nodes)
     sp := p_span(toks, nodes)
@@ -1219,11 +1272,14 @@ fn parse_stmt(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 
 }
 
 fn parse_block(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
+    if not p_depth_enter(toks, nodes, extra) {
+        return 0
+    }
     sp := p_span(toks, nodes)
     p_expect(toks, nodes, tk_lbrace())
     mark := scratch_mark(extra)
     mut cnt := 0
-    while p_peek(toks, nodes) != tk_rbrace() and p_peek(toks, nodes) != tk_eof() {
+    while p_peek(toks, nodes) != tk_rbrace() and p_peek(toks, nodes) != tk_eof() and ibuf_get(nodes, 2) < 8 {
         p_skip_semis(toks, nodes)
         if p_peek(toks, nodes) == tk_rbrace() {
             break
@@ -1237,6 +1293,7 @@ fn parse_block(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64
     bn := ast_alloc(nodes, nk_block(), sp)
     ast_set(nodes, bn, 1, off)
     ast_set(nodes, bn, 2, cnt)
+    p_depth_leave(extra)
     return bn
 }
 

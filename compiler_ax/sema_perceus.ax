@@ -17,22 +17,11 @@ use compiler_ax::sema_effects
 //   [18] = soa_used_ptr_base (`s_cnt`), [19] = soa_dyn_base (`s_cnt`)
 //   [20] = ct_consts_base, [21] = ct_consts_cnt
 //   [22] = cur_fn_flags, [23] = cur_fn_idx
-//   [24] = in_par_for_watermark, [25] = reserved, [26] = cur_fn_is_main, [27] = cur_fn_meta_off
+//   [24] = in_par_for_watermark, [25] = fn_hash_base, [26] = cur_fn_is_main, [27] = cur_fn_meta_off
+//   [28] = fn_hash_mask, [29] = struct_hash_base, [30] = struct_hash_mask
 
 fn find_struct_idx(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
-    base := ibuf_get(sym, 3)
-    cnt := ibuf_get(sym, 4)
-    mut i := 0
-    while i < cnt {
-        off := base + i * 6
-        if ibuf_get(sym, off + 1) == slen {
-            if pool_str_eq2(pool, ibuf_get(sym, off), slen, soff) {
-                return i
-            }
-        }
-        i += 1
-    }
-    return -1
+    return sym_find_struct_idx(pool, sym, soff, slen)
 }
 
 fn find_iface_idx(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
@@ -52,19 +41,7 @@ fn find_iface_idx(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
 }
 
 fn find_fn_idx(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
-    base := ibuf_get(sym, 7)
-    cnt := ibuf_get(sym, 8)
-    mut i := 0
-    while i < cnt {
-        off := base + i * 10
-        if ibuf_get(sym, off + 1) == slen {
-            if pool_str_eq2(pool, ibuf_get(sym, off), slen, soff) {
-                return i
-            }
-        }
-        i += 1
-    }
-    return -1
+    return sym_find_fn_idx(pool, sym, soff, slen)
 }
 
 fn find_struct_method_idx(pool: ByteBuf, sym: IntBuf, sidx: i64, msoff: i64, mslen: i64) -> i64 {
@@ -73,6 +50,36 @@ fn find_struct_method_idx(pool: ByteBuf, sym: IntBuf, sidx: i64, msoff: i64, msl
     sn_slen := ibuf_get(sym, s_off + 1)
     want_len := sn_slen + 2 + mslen
     f_base := ibuf_get(sym, 7)
+    hbase := ibuf_get(sym, 25)
+    if hbase > 0 {
+        mut h := pool_fnv_slice(pool, sn_soff, sn_slen)
+        h = ((h ^ 95) *% 16777619) & 0xFFFFFFFF
+        h = ((h ^ 95) *% 16777619) & 0xFFFFFFFF
+        mut j := 0
+        while j < mslen {
+            h = ((h ^ buf_get(pool, msoff + j)) *% 16777619) & 0xFFFFFFFF
+            j += 1
+        }
+        mask := ibuf_get(sym, 28)
+        mut slot := h & mask
+        while true {
+            v := ibuf_get(sym, hbase + slot)
+            if v == 0 {
+                return -1
+            }
+            fi := v - 1
+            fo := f_base + fi * 10
+            if ibuf_get(sym, fo + 1) == want_len {
+                fn_soff := ibuf_get(sym, fo)
+                if buf_get(pool, fn_soff + sn_slen) == 95 and buf_get(pool, fn_soff + sn_slen + 1) == 95 {
+                    if pool_str_eq2(pool, fn_soff, sn_slen, sn_soff) and pool_str_eq2(pool, fn_soff + sn_slen + 2, mslen, msoff) {
+                        return fi
+                    }
+                }
+            }
+            slot = (slot + 1) & mask
+        }
+    }
     f_cnt := ibuf_get(sym, 8)
     mut fi := 0
     while fi < f_cnt {
@@ -2663,6 +2670,75 @@ fn analyze_semantics_and_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sy
         ibuf_set(sym, fo + 4, pl_cnt)
         ibuf_set(sym, fo + 9, flags)
         fni += 1
+    }
+
+    // Build O(1) FNV-1a Hash Indexes for Functions (`sym[25], sym[28]`) & Structs (`sym[29], sym[30]`)
+    mut fhcap := 32
+    while fhcap < f_cnt * 2 + 16 {
+        fhcap = fhcap * 2
+    }
+    fhbase := ibuf_len(sym)
+    mut hi := 0
+    while hi < fhcap {
+        ibuf_push(sym, 0)
+        hi += 1
+    }
+    fhmask := fhcap - 1
+    ibuf_set(sym, 25, fhbase)
+    ibuf_set(sym, 28, fhmask)
+    fni = 0
+    while fni < f_cnt {
+        fo := f_meta_base + fni * 10
+        n_soff := ibuf_get(sym, fo)
+        n_slen := ibuf_get(sym, fo + 1)
+        mut slot := pool_fnv_slice(pool, n_soff, n_slen) & fhmask
+        while true {
+            cur := ibuf_get(sym, fhbase + slot)
+            if cur == 0 {
+                ibuf_set(sym, fhbase + slot, fni + 1)
+                break
+            }
+            co := f_meta_base + (cur - 1) * 10
+            if ibuf_get(sym, co + 1) == n_slen and pool_str_eq2(pool, ibuf_get(sym, co), n_slen, n_soff) {
+                break
+            }
+            slot = (slot + 1) & fhmask
+        }
+        fni += 1
+    }
+
+    mut shcap := 16
+    while shcap < s_cnt * 2 + 8 {
+        shcap = shcap * 2
+    }
+    shbase := ibuf_len(sym)
+    hi = 0
+    while hi < shcap {
+        ibuf_push(sym, 0)
+        hi += 1
+    }
+    shmask := shcap - 1
+    ibuf_set(sym, 29, shbase)
+    ibuf_set(sym, 30, shmask)
+    si = 0
+    while si < s_cnt {
+        so := s_meta_base + si * 6
+        s_soff := ibuf_get(sym, so)
+        s_slen := ibuf_get(sym, so + 1)
+        mut slot := pool_fnv_slice(pool, s_soff, s_slen) & shmask
+        while true {
+            cur := ibuf_get(sym, shbase + slot)
+            if cur == 0 {
+                ibuf_set(sym, shbase + slot, si + 1)
+                break
+            }
+            co := s_meta_base + (cur - 1) * 6
+            if ibuf_get(sym, co + 1) == s_slen and pool_str_eq2(pool, ibuf_get(sym, co), s_slen, s_soff) {
+                break
+            }
+            slot = (slot + 1) & shmask
+        }
+        si += 1
     }
 
     // Execute Compile-Time VM (`comptime` constants, LUTs, `comptime_assert`, in-body `comptime` folding)

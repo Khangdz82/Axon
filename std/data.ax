@@ -1,0 +1,419 @@
+// Axon v0.9.1 Production CSV, CLI Options, Structured Logger & Checksummed KV Store (`std/data.ax`)
+// Built for zero-dependency data pipelines, microservices, AI caches, and CLI tools.
+
+use std::os
+use std::str
+use std::collections
+use std::crypto
+
+// --- RFC-4180 CSV Escaper & Cell Extractor ---
+fn csv_escape_cell(cell: str) -> str {
+    n := str_len(cell)
+    mut needs_q := false
+    mut quotes := 0
+    mut i := 0
+    while i < n {
+        c := str_byte(cell, i)
+        if c == 34 {
+            needs_q = true
+            quotes += 1
+        } else if c == 44 or c == 10 or c == 13 {
+            needs_q = true
+        }
+        i += 1
+    }
+    if not needs_q {
+        return cell
+    }
+    b := buf_new(n + quotes + 4)
+    buf_push(b, 34)
+    i = 0
+    while i < n {
+        c := str_byte(cell, i)
+        buf_push(b, c)
+        if c == 34 {
+            buf_push(b, 34)
+        }
+        i += 1
+    }
+    buf_push(b, 34)
+    return buf_to_owned_str(move b)
+}
+
+// Extracts cell `target_col` (0-based) from an RFC-4180 CSV line (handles quoted commas & `""` escapes).
+fn csv_get_cell(line: str, target_col: i64) -> str ! i64 {
+    if target_col < 0 {
+        return err(400)
+    }
+    n := str_len(line)
+    mut col := 0
+    mut i := 0
+    cell := buf_new(n + 4)
+    while true {
+        buf_set_len_zero := 0
+        _ := buf_set_len_zero
+        mut in_q := false
+        if i < n and str_byte(line, i) == 34 {
+            in_q = true
+            i += 1
+        }
+        start_c := buf_len(cell)
+        while i < n {
+            c := str_byte(line, i)
+            if in_q {
+                if c == 34 {
+                    if i + 1 < n and str_byte(line, i + 1) == 34 {
+                        if col == target_col { buf_push(cell, 34) }
+                        i += 2
+                    } else {
+                        in_q = false
+                        i += 1
+                    }
+                } else {
+                    if col == target_col { buf_push(cell, c) }
+                    i += 1
+                }
+            } else {
+                if c == 44 or c == 10 or c == 13 {
+                    break
+                }
+                if col == target_col { buf_push(cell, c) }
+                i += 1
+            }
+        }
+        if col == target_col {
+            out := "" + buf_slice_str(cell, start_c, buf_len(cell))
+            buf_free(move cell)
+            return ok(out)
+        }
+        if i >= n or str_byte(line, i) != 44 {
+            break
+        }
+        i += 1
+        col += 1
+    }
+    buf_free(move cell)
+    return err(404)
+}
+
+// --- Zero-Alloc CLI Argument Helpers ---
+fn cli_has_flag(flag: str) -> bool {
+    argc := args_count()
+    mut i := 1
+    while i < argc {
+        if str_eq(args_get(i), flag) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+fn cli_get_opt(flag: str, default_val: str = "") -> str {
+    argc := args_count()
+    mut i := 1
+    prefix := f"{flag}="
+    while i < argc {
+        a := args_get(i)
+        if str_eq(a, flag) and i + 1 < argc {
+            return args_get(i + 1)
+        }
+        if str_starts_with(a, prefix) {
+            return str_slice(a, str_len(prefix), str_len(a))
+        }
+        i += 1
+    }
+    return default_val
+}
+
+// --- Structured RFC-8259 JSON Logger ---
+fn log_json_event(level: str, component: str, msg: str, ts_ns: i64 = 0) -> str {
+    mut t := ts_ns
+    if t <= 0 {
+        t = clock_ns()
+    }
+    return to_json((level, component, msg, t))
+}
+
+// --- Fast Open-Addressing String->String Checksummed KV Store ---
+// `meta` stores: `[0]=mask, [1]=count, [2]=max_entries`
+// `slots` stores `cap * 5` ints: `[state (0=empty,1=live,2=tomb), hash64, k_off, k_len, v_off_and_len]`
+struct KvStore {
+    meta: IntBuf
+    slots: IntBuf
+    arena: ByteBuf
+}
+
+fn kv_new(cap_hint: i64 = 256, arena_bytes: i64 = 262144) -> KvStore {
+    mut cap := 16
+    while cap < cap_hint {
+        cap = cap << 1
+    }
+    meta := ibuf_new(8)
+    ibuf_push(meta, cap - 1)
+    ibuf_push(meta, 0)
+    ibuf_push(meta, cap)
+    slots := ibuf_new(cap * 5 + 8)
+    mut i := 0
+    total := cap * 5
+    while i < total {
+        ibuf_push(slots, 0)
+        i += 1
+    }
+    mut ab := arena_bytes
+    if ab < 4096 { ab = 4096 }
+    arena := buf_new(ab)
+    return KvStore(meta, slots, arena)
+}
+
+fn kv_len(kv: KvStore) -> i64 {
+    return ibuf_get(kv.meta, 1)
+}
+
+fn kv_find_slot(kv: KvStore, key: str, h: i64) -> i64 {
+    mask := ibuf_get(kv.meta, 0)
+    cap := mask + 1
+    klen := str_len(key)
+    mut idx := h & mask
+    mut probes := 0
+    while probes < cap {
+        base := idx * 5
+        st := ibuf_get(kv.slots, base)
+        if st == 0 {
+            return -1
+        }
+        if st == 1 and ibuf_get(kv.slots, base + 1) == h and ibuf_get(kv.slots, base + 3) == klen {
+            koff := ibuf_get(kv.slots, base + 2)
+            if str_eq(buf_slice_str(kv.arena, koff, koff + klen), key) {
+                return idx
+            }
+        }
+        idx = (idx + 1) & mask
+        probes += 1
+    }
+    return -1
+}
+
+fn kv_set(kv: KvStore, key: str, val: str) -> bool {
+    klen := str_len(key)
+    vlen := str_len(val)
+    h := fnv1a_64(key)
+    mask := ibuf_get(kv.meta, 0)
+    cap := mask + 1
+
+    mut idx := h & mask
+    mut first_tomb := -1
+    mut existing := -1
+    mut probes := 0
+    while probes < cap {
+        base := idx * 5
+        st := ibuf_get(kv.slots, base)
+        if st == 0 {
+            break
+        }
+        if st == 1 and ibuf_get(kv.slots, base + 1) == h and ibuf_get(kv.slots, base + 3) == klen {
+            koff := ibuf_get(kv.slots, base + 2)
+            if str_eq(buf_slice_str(kv.arena, koff, koff + klen), key) {
+                existing = idx
+                break
+            }
+        }
+        if st == 2 and first_tomb < 0 {
+            first_tomb = idx
+        }
+        idx = (idx + 1) & mask
+        probes += 1
+    }
+
+    // Store value (or key + value) in arena with bounds guard
+    mut target := idx
+    mut reuse_key := false
+    mut old_koff := 0
+    if existing >= 0 {
+        target = existing
+        reuse_key = true
+        old_koff = ibuf_get(kv.slots, existing * 5 + 2)
+    } else if first_tomb >= 0 {
+        target = first_tomb
+    } else if probes >= cap {
+        return false
+    }
+
+    mut need := vlen
+    if not reuse_key {
+        need += klen
+    }
+    if buf_len(kv.arena) + need >= 0x3FFFFFF0 {
+        return false
+    }
+
+    mut koff := old_koff
+    if not reuse_key {
+        koff = buf_len(kv.arena)
+        if klen > 0 { buf_push_str(kv.arena, key) }
+    }
+    voff := buf_len(kv.arena)
+    if vlen > 0 { buf_push_str(kv.arena, val) }
+
+    base := target * 5
+    if existing < 0 {
+        ibuf_set(kv.meta, 1, ibuf_get(kv.meta, 1) + 1)
+    }
+    ibuf_set(kv.slots, base, 1)
+    ibuf_set(kv.slots, base + 1, h)
+    ibuf_set(kv.slots, base + 2, koff)
+    ibuf_set(kv.slots, base + 3, klen)
+    ibuf_set(kv.slots, base + 4, (voff << 32) | (vlen & 0xFFFFFFFF))
+    return true
+}
+
+fn kv_get(kv: KvStore, key: str) -> str ! i64 {
+    h := fnv1a_64(key)
+    idx := kv_find_slot(kv, key, h)
+    if idx < 0 {
+        return err(404)
+    }
+    packed := ibuf_get(kv.slots, idx * 5 + 4)
+    voff := ushr64(packed, 32)
+    vlen := packed & 0xFFFFFFFF
+    return ok(buf_slice_str(kv.arena, voff, voff + vlen))
+}
+
+fn kv_has(kv: KvStore, key: str) -> bool {
+    return kv_find_slot(kv, key, fnv1a_64(key)) >= 0
+}
+
+fn kv_del(kv: KvStore, key: str) -> bool {
+    idx := kv_find_slot(kv, key, fnv1a_64(key))
+    if idx < 0 {
+        return false
+    }
+    ibuf_set(kv.slots, idx * 5, 2)
+    ibuf_set(kv.meta, 1, ibuf_get(kv.meta, 1) - 1)
+    return true
+}
+
+// Persists live KV entries in binary `AXKV1` snapshot format protected by FNV-1a-64 integrity tag
+fn kv_save(kv: KvStore, path: str) -> i64 ! i64 {
+    cap := ibuf_get(kv.meta, 0) + 1
+    cnt := ibuf_get(kv.meta, 1)
+    // Compute total payload bytes first
+    mut pay := 0
+    mut i := 0
+    while i < cap {
+        base := i * 5
+        if ibuf_get(kv.slots, base) == 1 {
+            kl := ibuf_get(kv.slots, base + 3)
+            vl := ibuf_get(kv.slots, base + 4) & 0xFFFFFFFF
+            pay += 8 + kl + vl
+        }
+        i += 1
+    }
+    out := buf_new(24 + pay)
+    buf_push_str(out, "AXKV1")
+    buf_push(out, 0); buf_push(out, 0); buf_push(out, 0) // 8B magic header
+    buf_push_u64(out, cnt)
+    buf_push_u64(out, 0) // checksum placeholder
+    i = 0
+    while i < cap {
+        base := i * 5
+        if ibuf_get(kv.slots, base) == 1 {
+            koff := ibuf_get(kv.slots, base + 2)
+            kl := ibuf_get(kv.slots, base + 3)
+            packed := ibuf_get(kv.slots, base + 4)
+            voff := ushr64(packed, 32)
+            vl := packed & 0xFFFFFFFF
+            buf_push_u32(out, kl)
+            buf_push_u32(out, vl)
+            if kl > 0 { buf_push_str(out, buf_slice_str(kv.arena, koff, koff + kl)) }
+            if vl > 0 { buf_push_str(out, buf_slice_str(kv.arena, voff, voff + vl)) }
+        }
+        i += 1
+    }
+    // Compute 64-bit FNV-1a over payload [24..end]
+    mut csum := -3750763034362895579
+    mut j := 24
+    tot := buf_len(out)
+    while j < tot {
+        csum = (csum ^ buf_get(out, j)) *% 1099511628211
+        j += 1
+    }
+    buf_put_u64(out, 16, csum)
+    wr := fs_write_file(path, out) or -1
+    buf_free(move out)
+    if wr < 0 {
+        return err(500)
+    }
+    return ok(wr)
+}
+
+fn buf_read_u32_le(b: ByteBuf, off: i64) -> i64 {
+    return buf_get(b, off) | (buf_get(b, off + 1) << 8) | (buf_get(b, off + 2) << 16) | (buf_get(b, off + 3) << 24)
+}
+
+fn buf_read_u64_le(b: ByteBuf, off: i64) -> i64 {
+    lo := buf_read_u32_le(b, off)
+    hi := buf_read_u32_le(b, off + 4)
+    return lo | (hi << 32)
+}
+
+fn kv_load(path: str) -> KvStore ! i64 {
+    raw := fs_read_file(path) or buf_new(0)
+    rlen := buf_len(raw)
+    if rlen < 24 {
+        buf_free(move raw)
+        return err(404)
+    }
+    if not str_eq(buf_slice_str(raw, 0, 5), "AXKV1") {
+        buf_free(move raw)
+        return err(422)
+    }
+    cnt := buf_read_u64_le(raw, 8)
+    expected_csum := buf_read_u64_le(raw, 16)
+    if cnt < 0 or cnt > 10000000 {
+        buf_free(move raw)
+        return err(422)
+    }
+    mut csum := -3750763034362895579
+    mut j := 24
+    while j < rlen {
+        csum = (csum ^ buf_get(raw, j)) *% 1099511628211
+        j += 1
+    }
+    if not ct_eq_i64(csum, expected_csum) {
+        buf_free(move raw)
+        return err(403)
+    }
+
+    kv := kv_new(cnt * 2 + 16, rlen + 4096)
+    mut pos := 24
+    mut idx := 0
+    while idx < cnt {
+        if pos + 8 > rlen {
+            kv_free(move kv)
+            buf_free(move raw)
+            return err(422)
+        }
+        kl := buf_read_u32_le(raw, pos)
+        vl := buf_read_u32_le(raw, pos + 4)
+        pos += 8
+        if kl < 0 or vl < 0 or pos + kl + vl > rlen {
+            kv_free(move kv)
+            buf_free(move raw)
+            return err(422)
+        }
+        kstr := buf_slice_str(raw, pos, pos + kl)
+        vstr := buf_slice_str(raw, pos + kl, pos + kl + vl)
+        kv_set(kv, kstr, vstr)
+        pos += kl + vl
+        idx += 1
+    }
+    buf_free(move raw)
+    return ok(kv)
+}
+
+fn kv_free(move kv: KvStore) {
+    buf_free(move kv.arena)
+    buf_free(move kv.slots)
+    buf_free(move kv.meta)
+}

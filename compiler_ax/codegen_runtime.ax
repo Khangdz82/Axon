@@ -56,6 +56,11 @@ fn h_ibuf_push() -> i64       { return 10000029 }
 fn h_ibuf_get() -> i64        { return 10000030 }
 fn h_ibuf_set() -> i64        { return 10000031 }
 fn h_str_byte() -> i64        { return 10000032 }
+fn h_jbuf_ensure() -> i64     { return 10000033 }
+fn h_jbuf_raw() -> i64        { return 10000034 }
+fn h_jbuf_i64() -> i64        { return 10000035 }
+fn h_jbuf_qstr() -> i64       { return 10000036 }
+fn h_str_concat() -> i64      { return 10000037 }
 
 // Fixup Kinds
 fn fx_iat() -> i64    { return 1 }
@@ -501,17 +506,7 @@ fn cg_intern_whitebox(cg: CodegenCtx, seed_key: i64) -> i64 {
 }
 
 fn find_fn_idx_rt(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
-    base := ibuf_get(sym, 7)
-    cnt := ibuf_get(sym, 8)
-    mut i := 0
-    while i < cnt {
-        off := base + i * 10
-        if ibuf_get(sym, off + 1) == slen and pool_str_eq2(pool, ibuf_get(sym, off), slen, soff) {
-            return i
-        }
-        i += 1
-    }
-    return -1
+    return sym_find_fn_idx(pool, sym, soff, slen)
 }
 
 // Emits `_start` (or `DllMain` when `os_mode == 1`) at `.text + 0`.
@@ -600,10 +595,26 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
     c := cg.code
     osm := cg_os_mode(cg)
 
-    // 0. Compact Shared `ByteBuf` / `IntBuf` / `str` Runtime Helpers (`h_buf_*`, `h_ibuf_*`, `h_str_byte`)
+    // Propagate helper dependencies so callers don't miss transitive runtime emitters.
+    if cg_is_helper_used(cg, h_str_concat()) {
+        cg_mark_helper_used(cg, h_buf_new())
+        cg_mark_helper_used(cg, h_jbuf_raw())
+    }
+    if cg_is_helper_used(cg, h_jbuf_raw()) or cg_is_helper_used(cg, h_jbuf_i64()) or cg_is_helper_used(cg, h_jbuf_qstr()) {
+        cg_mark_helper_used(cg, h_jbuf_ensure())
+    }
+    if cg_is_helper_used(cg, h_buf_new()) or cg_is_helper_used(cg, h_ibuf_new()) or cg_is_helper_used(cg, h_jbuf_ensure()) {
+        cg_mark_helper_used(cg, h_alloc_mem())
+    }
+    if cg_is_helper_used(cg, h_jbuf_ensure()) {
+        cg_mark_helper_used(cg, h_free_mem())
+    }
+
+    // 0. Compact Shared `ByteBuf` / `IntBuf` / `str` Runtime Helpers (`h_buf_*`, `h_ibuf_*`, `h_str_byte`, `h_jbuf_*`)
     if cg_is_helper_used(cg, h_buf_new()) {
         mc_align16(c)
         s_bn := buf_len(c)
+        mc_b3(c, 0x48, 0x85, 0xC9); cg_jmp_fn(cg, 0x88, h_sec_trap())
         mc_b3(c, 0x48, 0x81, 0xF9); mc_u32(c, 0x7FFFFFF0)
         cg_jmp_fn(cg, 0x8F, h_sec_trap())
         mc_b3(c, 0x48, 0x81, 0xF9); mc_u32(c, 4096)
@@ -615,6 +626,7 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
         cg_call_fn(cg, h_alloc_mem())
         mc_b3(c, 0x48, 0x85, 0xC0)
         cg_jmp_fn(cg, 0x84, h_sec_trap())
+        mc_b3(c, 0x48, 0xC7, 0x00); mc_u32(c, 0)
         mc_b4(c, 0x48, 0x89, 0x58, 0x08)
         mc_b1(c, 0x5B)
         mc_b1(c, 0xC3)
@@ -624,6 +636,7 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
     if cg_is_helper_used(cg, h_ibuf_new()) {
         mc_align16(c)
         s_ibn := buf_len(c)
+        mc_b3(c, 0x48, 0x85, 0xC9); cg_jmp_fn(cg, 0x88, h_sec_trap())
         mc_b3(c, 0x48, 0x81, 0xF9); mc_u32(c, 0x0FFFFFF0)
         cg_jmp_fn(cg, 0x8F, h_sec_trap())
         mc_b3(c, 0x48, 0x81, 0xF9); mc_u32(c, 512)
@@ -636,6 +649,7 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
         cg_call_fn(cg, h_alloc_mem())
         mc_b3(c, 0x48, 0x85, 0xC0)
         cg_jmp_fn(cg, 0x84, h_sec_trap())
+        mc_b3(c, 0x48, 0xC7, 0x00); mc_u32(c, 0)
         mc_b4(c, 0x48, 0x89, 0x58, 0x08)
         mc_b1(c, 0x5B)
         mc_b1(c, 0xC3)
@@ -801,6 +815,236 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
         mc_b4(c, 0x42, 0x0F, 0xB6, 0x04); mc_b1(c, 0x01)
         mc_b1(c, 0xC3)
         cg_reg_helper(cg, h_str_byte(), s_sb, buf_len(c))
+    }
+
+    if cg_is_helper_used(cg, h_jbuf_ensure()) {
+        mc_align16(c)
+        s_je := buf_len(c)
+        mc_b3(c, 0x48, 0x85, 0xC9); cg_jmp_fn(cg, 0x84, h_sec_trap())
+        mc_b3(c, 0x48, 0x85, 0xD2); cg_jmp_fn(cg, 0x88, h_sec_trap())
+        mc_b3(c, 0x48, 0x81, 0xFA); mc_u32(c, 0x7FFFFFF0); cg_jmp_fn(cg, 0x8F, h_sec_trap())
+        mc_b3(c, 0x48, 0x8B, 0x01)
+        mc_b3(c, 0x49, 0x89, 0xC0)
+        mc_b3(c, 0x49, 0x01, 0xD0); cg_jmp_fn(cg, 0x80, h_sec_trap())
+        mc_b3(c, 0x49, 0x81, 0xF8); mc_u32(c, 0x7FFFFFF0); cg_jmp_fn(cg, 0x8F, h_sec_trap())
+        mc_b4(c, 0x4C, 0x3B, 0x41, 0x08)
+        ja_grow := mc_jcc8(c, 0x77)
+        mc_b3(c, 0x48, 0x89, 0xC8)
+        mc_b1(c, 0xC3)
+        mc_patch_jcc8(c, ja_grow, buf_len(c))
+        mc_b1(c, 0x53); mc_b2(c, 0x41, 0x54); mc_b2(c, 0x41, 0x55)
+        mc_b4(c, 0x48, 0x83, 0xEC, 0x20)
+        mc_b3(c, 0x48, 0x89, 0xCB)
+        mc_b4(c, 0x4C, 0x8B, 0x61, 0x08)
+        mc_b3(c, 0x49, 0xD1, 0xE4)
+        mc_b3(c, 0x4D, 0x39, 0xC4)
+        jae_je := mc_jcc8(c, 0x73)
+        mc_b3(c, 0x4D, 0x89, 0xC4)
+        mc_patch_jcc8(c, jae_je, buf_len(c))
+        mc_b2(c, 0x41, 0xB9); mc_u32(c, 0x7FFFFFF0)
+        mc_b3(c, 0x4D, 0x39, 0xCC)
+        jbe_je := mc_jcc8(c, 0x76)
+        mc_b3(c, 0x4D, 0x89, 0xCC)
+        mc_patch_jcc8(c, jbe_je, buf_len(c))
+        mc_b3(c, 0x4C, 0x8B, 0x2B)
+        mc_b3(c, 0x4C, 0x89, 0xE1)
+        mc_b4(c, 0x48, 0x83, 0xC1, 0x40)
+        cg_call_fn(cg, h_alloc_mem())
+        mc_b3(c, 0x48, 0x85, 0xC0); cg_jmp_fn(cg, 0x84, h_sec_trap())
+        mc_b4(c, 0x4C, 0x89, 0x60, 0x08)
+        mc_b3(c, 0x4D, 0x89, 0xE8)
+        mc_b4(c, 0x49, 0x83, 0xC0, 23)
+        mc_b4(c, 0x49, 0xC1, 0xE8, 3)
+        mc_b2(c, 0x31, 0xD2)
+        lp_je := buf_len(c)
+        mc_b3(c, 0x4C, 0x39, 0xC2)
+        jae_cp := mc_jcc8(c, 0x73)
+        mc_b4(c, 0x4C, 0x8B, 0x0C, 0xD3)
+        mc_b4(c, 0x4C, 0x89, 0x0C, 0xD0)
+        mc_b3(c, 0x48, 0xFF, 0xC2)
+        jmp_je := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_je, lp_je)
+        mc_patch_jcc8(c, jae_cp, buf_len(c))
+        mc_b3(c, 0x49, 0x89, 0xC4)
+        mc_b3(c, 0x48, 0x89, 0xD9)
+        cg_call_fn(cg, h_free_mem())
+        mc_b3(c, 0x4C, 0x89, 0xE0)
+        mc_b4(c, 0x48, 0x83, 0xC4, 0x20)
+        mc_b2(c, 0x41, 0x5D); mc_b2(c, 0x41, 0x5C); mc_b1(c, 0x5B)
+        mc_b1(c, 0xC3)
+        cg_reg_helper(cg, h_jbuf_ensure(), s_je, buf_len(c))
+    }
+
+    if cg_is_helper_used(cg, h_jbuf_raw()) {
+        mc_align16(c)
+        s_jr := buf_len(c)
+        mc_b3(c, 0x4D, 0x85, 0xC0); cg_jmp_fn(cg, 0x88, h_sec_trap())
+        jnz_jr := mc_jcc8(c, 0x75)
+        mc_b3(c, 0x48, 0x89, 0xC8)
+        mc_b1(c, 0xC3)
+        mc_patch_jcc8(c, jnz_jr, buf_len(c))
+        mc_b3(c, 0x48, 0x85, 0xD2); cg_jmp_fn(cg, 0x84, h_sec_trap())
+        mc_b1(c, 0x53); mc_b2(c, 0x41, 0x54)
+        mc_b4(c, 0x48, 0x83, 0xEC, 0x28)
+        mc_b3(c, 0x48, 0x89, 0xD3)
+        mc_b3(c, 0x4D, 0x89, 0xC4)
+        mc_b3(c, 0x4C, 0x89, 0xC2)
+        cg_call_fn(cg, h_jbuf_ensure())
+        mc_b3(c, 0x4C, 0x8B, 0x00)
+        mc_b2(c, 0x31, 0xD2)
+        mc_b4(c, 0x4E, 0x8D, 0x0C, 0x00)
+        mc_b4(c, 0x49, 0x83, 0xC1, 16)
+        lp_jr := buf_len(c)
+        mc_b3(c, 0x4C, 0x39, 0xE2)
+        jae_jr := mc_jcc8(c, 0x73)
+        mc_b4(c, 0x44, 0x8A, 0x14, 0x13)
+        mc_b4(c, 0x45, 0x88, 0x14, 0x11)
+        mc_b3(c, 0x48, 0xFF, 0xC2)
+        jmp_jr := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_jr, lp_jr)
+        mc_patch_jcc8(c, jae_jr, buf_len(c))
+        mc_b3(c, 0x4D, 0x01, 0xE0)
+        mc_b3(c, 0x4C, 0x89, 0x00)
+        mc_b4(c, 0x48, 0x83, 0xC4, 0x28)
+        mc_b2(c, 0x41, 0x5C); mc_b1(c, 0x5B)
+        mc_b1(c, 0xC3)
+        cg_reg_helper(cg, h_jbuf_raw(), s_jr, buf_len(c))
+    }
+
+    if cg_is_helper_used(cg, h_jbuf_i64()) {
+        mc_align16(c)
+        s_ji := buf_len(c)
+        mc_b1(c, 0x53)
+        mc_b4(c, 0x48, 0x83, 0xEC, 0x40)
+        mc_b3(c, 0x48, 0x89, 0xD3)
+        mc_b1(c, 0xBA); mc_u32(c, 24)
+        cg_call_fn(cg, h_jbuf_ensure())
+        mc_b3(c, 0x49, 0x89, 0xC0)
+        mc_b3(c, 0x49, 0x8B, 0x08)
+        mc_b3(c, 0x48, 0x89, 0xD8)
+        mc_b3(c, 0x48, 0x85, 0xC0)
+        jge_ji := mc_jcc8(c, 0x7D)
+        mc_b4(c, 0x41, 0xC6, 0x44, 0x08); mc_b2(c, 0x10, 45)
+        mc_b3(c, 0x48, 0xFF, 0xC1)
+        mc_b3(c, 0x48, 0xF7, 0xD8)
+        mc_patch_jcc8(c, jge_ji, buf_len(c))
+        mc_b4(c, 0x4C, 0x8D, 0x4C, 0x24); mc_b1(c, 0x3F)
+        mc_b3(c, 0x4D, 0x89, 0xCA)
+        mc_b3(c, 0x49, 0xC7, 0xC3); mc_u32(c, 10)
+        dl_ji := buf_len(c)
+        mc_b2(c, 0x31, 0xD2)
+        mc_b3(c, 0x49, 0xF7, 0xF3)
+        mc_b3(c, 0x80, 0xC2, 0x30)
+        mc_b3(c, 0x49, 0xFF, 0xC9)
+        mc_b3(c, 0x41, 0x88, 0x11)
+        mc_b3(c, 0x48, 0x85, 0xC0)
+        jnz_ji := mc_jcc8(c, 0x75)
+        mc_patch_jcc8(c, jnz_ji, dl_ji)
+        cp_ji := buf_len(c)
+        mc_b3(c, 0x4D, 0x39, 0xD1)
+        jae_ji := mc_jcc8(c, 0x73)
+        mc_b3(c, 0x41, 0x8A, 0x01)
+        mc_b4(c, 0x41, 0x88, 0x44, 0x08); mc_b1(c, 0x10)
+        mc_b3(c, 0x48, 0xFF, 0xC1)
+        mc_b3(c, 0x49, 0xFF, 0xC1)
+        jmp_ji := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_ji, cp_ji)
+        mc_patch_jcc8(c, jae_ji, buf_len(c))
+        mc_b3(c, 0x49, 0x89, 0x08)
+        mc_b3(c, 0x4C, 0x89, 0xC0)
+        mc_b4(c, 0x48, 0x83, 0xC4, 0x40)
+        mc_b1(c, 0x5B)
+        mc_b1(c, 0xC3)
+        cg_reg_helper(cg, h_jbuf_i64(), s_ji, buf_len(c))
+    }
+
+    if cg_is_helper_used(cg, h_jbuf_qstr()) {
+        mc_align16(c)
+        s_jq := buf_len(c)
+        mc_b3(c, 0x4D, 0x85, 0xC0); cg_jmp_fn(cg, 0x88, h_sec_trap())
+        jz_jq := mc_jcc8(c, 0x74)
+        mc_b3(c, 0x48, 0x85, 0xD2); cg_jmp_fn(cg, 0x84, h_sec_trap())
+        mc_patch_jcc8(c, jz_jq, buf_len(c))
+        mc_b3(c, 0x49, 0x81, 0xF8); mc_u32(c, 0x3FFFFFF0); cg_jmp_fn(cg, 0x8F, h_sec_trap())
+        mc_b1(c, 0x53); mc_b2(c, 0x41, 0x54)
+        mc_b4(c, 0x48, 0x83, 0xEC, 0x28)
+        mc_b3(c, 0x48, 0x89, 0xD3)
+        mc_b3(c, 0x4D, 0x89, 0xC4)
+        mc_b3(c, 0x4C, 0x89, 0xE2)
+        mc_b3(c, 0x48, 0xD1, 0xE2)
+        mc_b4(c, 0x48, 0x83, 0xC2, 4)
+        cg_call_fn(cg, h_jbuf_ensure())
+        mc_b3(c, 0x48, 0x8B, 0x08)
+        mc_b4(c, 0xC6, 0x44, 0x08, 0x10); mc_b1(c, 34)
+        mc_b3(c, 0x48, 0xFF, 0xC1)
+        mc_b2(c, 0x31, 0xD2)
+        lp_jq := buf_len(c)
+        mc_b3(c, 0x4C, 0x39, 0xE2)
+        jae_jq := mc_jcc8(c, 0x73)
+        mc_b4(c, 0x44, 0x8A, 0x0C, 0x13)
+        mc_b4(c, 0x41, 0x80, 0xF9, 34); je_q1 := mc_jcc8(c, 0x74)
+        mc_b4(c, 0x41, 0x80, 0xF9, 92); je_q2 := mc_jcc8(c, 0x74)
+        mc_b4(c, 0x41, 0x80, 0xF9, 10); jne_qn := mc_jcc8(c, 0x75)
+        mc_b3(c, 0x41, 0xB1, 110); jmp_qn := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jne_qn, buf_len(c))
+        mc_b4(c, 0x41, 0x80, 0xF9, 13); jne_qr := mc_jcc8(c, 0x75)
+        mc_b3(c, 0x41, 0xB1, 114); jmp_qr := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jne_qr, buf_len(c))
+        mc_b4(c, 0x41, 0x80, 0xF9, 9); jne_qt := mc_jcc8(c, 0x75)
+        mc_b3(c, 0x41, 0xB1, 116); jmp_qt := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jne_qt, buf_len(c))
+        mc_b4(c, 0x41, 0x80, 0xF9, 32); jae_norm := mc_jcc8(c, 0x73)
+        mc_b3(c, 0x41, 0xB1, 32)
+        mc_patch_jcc8(c, jae_norm, buf_len(c))
+        jmp_one := mc_jcc8(c, 0xEB)
+        bs_pos := buf_len(c)
+        mc_patch_jcc8(c, je_q1, bs_pos)
+        mc_patch_jcc8(c, je_q2, bs_pos)
+        mc_patch_jcc8(c, jmp_qn, bs_pos)
+        mc_patch_jcc8(c, jmp_qr, bs_pos)
+        mc_patch_jcc8(c, jmp_qt, bs_pos)
+        mc_b4(c, 0xC6, 0x44, 0x08, 0x10); mc_b1(c, 92)
+        mc_b3(c, 0x48, 0xFF, 0xC1)
+        mc_patch_jcc8(c, jmp_one, buf_len(c))
+        mc_b4(c, 0x44, 0x88, 0x4C, 0x08); mc_b1(c, 0x10)
+        mc_b3(c, 0x48, 0xFF, 0xC1)
+        mc_b3(c, 0x48, 0xFF, 0xC2)
+        jmp_jq := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_jq, lp_jq)
+        mc_patch_jcc8(c, jae_jq, buf_len(c))
+        mc_b4(c, 0xC6, 0x44, 0x08, 0x10); mc_b1(c, 34)
+        mc_b3(c, 0x48, 0xFF, 0xC1)
+        mc_b3(c, 0x48, 0x89, 0x08)
+        mc_b4(c, 0x48, 0x83, 0xC4, 0x28)
+        mc_b2(c, 0x41, 0x5C); mc_b1(c, 0x5B)
+        mc_b1(c, 0xC3)
+        cg_reg_helper(cg, h_jbuf_qstr(), s_jq, buf_len(c))
+    }
+
+    if cg_is_helper_used(cg, h_str_concat()) {
+        mc_align16(c)
+        s_sc := buf_len(c)
+        mc_b3(c, 0x48, 0x85, 0xD2); cg_jmp_fn(cg, 0x88, h_sec_trap())
+        mc_b3(c, 0x4D, 0x85, 0xC9); cg_jmp_fn(cg, 0x88, h_sec_trap())
+        mc_b3(c, 0x49, 0x89, 0xD2); mc_b3(c, 0x4D, 0x01, 0xCA); cg_jmp_fn(cg, 0x80, h_sec_trap())
+        mc_b3(c, 0x49, 0x81, 0xFA); mc_u32(c, 0x7FFFFFF0); cg_jmp_fn(cg, 0x8F, h_sec_trap())
+        mc_b1(c, 0x53); mc_b2(c, 0x41, 0x54); mc_b2(c, 0x41, 0x55); mc_b2(c, 0x41, 0x56)
+        mc_b4(c, 0x48, 0x83, 0xEC, 0x28)
+        mc_b3(c, 0x48, 0x89, 0xCB); mc_b3(c, 0x49, 0x89, 0xD4)
+        mc_b3(c, 0x4D, 0x89, 0xC5); mc_b3(c, 0x4D, 0x89, 0xCE)
+        mc_b3(c, 0x4C, 0x89, 0xE1); mc_b3(c, 0x4C, 0x01, 0xF1)
+        cg_call_fn(cg, h_buf_new())
+        mc_b3(c, 0x48, 0x89, 0xC1); mc_b3(c, 0x48, 0x89, 0xDA); mc_b3(c, 0x4D, 0x89, 0xE0)
+        cg_call_fn(cg, h_jbuf_raw())
+        mc_b3(c, 0x48, 0x89, 0xC1); mc_b3(c, 0x4C, 0x89, 0xEA); mc_b3(c, 0x4D, 0x89, 0xF0)
+        cg_call_fn(cg, h_jbuf_raw())
+        mc_b3(c, 0x48, 0x8B, 0x10)
+        mc_b4(c, 0xC6, 0x44, 0x10, 0x10); mc_b1(c, 0)
+        mc_b4(c, 0x48, 0x8D, 0x40, 0x10)
+        mc_b4(c, 0x48, 0x83, 0xC4, 0x28)
+        mc_b2(c, 0x41, 0x5E); mc_b2(c, 0x41, 0x5D); mc_b2(c, 0x41, 0x5C); mc_b1(c, 0x5B)
+        mc_b1(c, 0xC3)
+        cg_reg_helper(cg, h_str_concat(), s_sc, buf_len(c))
     }
 
     // 1. `h_detect_cpuid`: Runtime CPUID + OS XGETBV check -> `g_simd_tier` (`0=Scalar`, `1=AVX2+FMA3`, `2=AVX-512F`)
@@ -1226,11 +1470,21 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
             mc_b2(c, 0x31, 0xC0)
             mc_b3(c, 0xF3, 0x48, 0xAB)
 
-            // Copy `cmd_ptr[0..RBX]` into mutable `[RSP + 0x100]` and NUL-terminate
+            // Copy `cmd_ptr[0..RBX]` into mutable `[RSP + 0x100]` rejecting embedded NUL (CWE-158)
             mc_b4(c, 0x48, 0x8D, 0xBC, 0x24); mc_u32(c, 0x100)
-            mc_b3(c, 0x48, 0x89, 0xD9)
-            mc_b2(c, 0xF3, 0xA4)
-            mc_b3(c, 0xC6, 0x07, 0x00)
+            mc_b3(c, 0x48, 0x31, 0xC9) // XOR RCX, RCX
+            ox_cp := buf_len(c)
+            mc_b3(c, 0x48, 0x39, 0xD9) // CMP RCX, RBX
+            ox_dn := mc_jcc8(c, 0x73) // JAE ox_done
+            mc_b3(c, 0x8A, 0x04, 0x0E) // MOV AL, [RSI + RCX]
+            mc_b2(c, 0x84, 0xC0)       // TEST AL, AL
+            jz_nul_cmd := mc_jcc32(c, 0x84)
+            mc_b3(c, 0x88, 0x04, 0x0F) // MOV [RDI + RCX], AL
+            mc_b3(c, 0x48, 0xFF, 0xC1) // INC RCX
+            ox_lp := mc_jcc8(c, 0xEB)
+            mc_patch_jcc8(c, ox_lp, ox_cp)
+            mc_patch_jcc8(c, ox_dn, buf_len(c))
+            mc_b4(c, 0xC6, 0x04, 0x1F, 0x00) // MOV BYTE PTR [RDI + RBX], 0
 
             // `STARTUPINFOA.cb = 104`
             mc_b3(c, 0xC7, 0x84, 0x24); mc_u32(c, 0x80); mc_u32(c, 104)
@@ -1274,6 +1528,7 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
             jmp_ox_ok := mc_jmp32(c)
 
             mc_patch_rel32(c, jz_null_cmd, buf_len(c))
+            mc_patch_rel32(c, jz_nul_cmd, buf_len(c))
             mc_patch_rel32(c, jle_bad_len, buf_len(c))
             mc_patch_rel32(c, jz_fail, buf_len(c))
             mc_b3(c, 0x48, 0xC7, 0xC0); mc_u32(c, 0xFFFFFFFF)
@@ -1788,6 +2043,8 @@ fn emit_fs_helpers_used(cg: CodegenCtx) {
             mc_b3(c, 0x48, 0x39, 0xD0)
             ja1 := mc_jcc8(c, 0x73)
             mc_b4(c, 0x44, 0x8A, 0x0C, 0x01)
+            mc_b3(c, 0x45, 0x84, 0xC9) // TEST R9B, R9B (reject embedded NUL CWE-158)
+            jz_rnul := mc_jcc32(c, 0x84)
             mc_b4(c, 0x45, 0x88, 0x0C, 0x00)
             mc_b3(c, 0x48, 0xFF, 0xC0)
             jcp1 := mc_jcc8(c, 0xEB)
@@ -1871,6 +2128,7 @@ fn emit_fs_helpers_used(cg: CodegenCtx) {
             cg_call_iat(cg, iat_close_handle())
 
             mc_patch_rel32(c, jz_rnull, buf_len(c))
+            mc_patch_rel32(c, jz_rnul, buf_len(c))
             mc_patch_rel32(c, jle_rlen, buf_len(c))
             mc_patch_rel32(c, jae_rlen, buf_len(c))
             mc_patch_rel32(c, je_er1, buf_len(c))
@@ -1896,6 +2154,8 @@ fn emit_fs_helpers_used(cg: CodegenCtx) {
             mc_b3(c, 0x48, 0x39, 0xD0)
             lja1 := mc_jcc8(c, 0x73)
             mc_b4(c, 0x44, 0x8A, 0x0C, 0x01)
+            mc_b3(c, 0x45, 0x84, 0xC9)
+            jz_lrnul := mc_jcc32(c, 0x84)
             mc_b4(c, 0x45, 0x88, 0x0C, 0x00)
             mc_b3(c, 0x48, 0xFF, 0xC0)
             ljcp := mc_jcc8(c, 0xEB)
@@ -1977,6 +2237,7 @@ fn emit_fs_helpers_used(cg: CodegenCtx) {
             mc_b2(c, 0x0F, 0x05)
 
             mc_patch_rel32(c, jz_lrnull, buf_len(c))
+            mc_patch_rel32(c, jz_lrnul, buf_len(c))
             mc_patch_rel32(c, jle_lrlen, buf_len(c))
             mc_patch_rel32(c, jae_lrlen, buf_len(c))
             mc_patch_rel32(c, jl_er, buf_len(c))
@@ -2014,6 +2275,8 @@ fn emit_fs_helpers_used(cg: CodegenCtx) {
             mc_b3(c, 0x48, 0x39, 0xD0)
             jb1 := mc_jcc8(c, 0x73)
             mc_b4(c, 0x44, 0x8A, 0x0C, 0x01)
+            mc_b3(c, 0x45, 0x84, 0xC9)
+            jz_wnul := mc_jcc32(c, 0x84)
             mc_b4(c, 0x45, 0x88, 0x0C, 0x00)
             mc_b3(c, 0x48, 0xFF, 0xC0)
             jcp2 := mc_jcc8(c, 0xEB)
@@ -2062,6 +2325,7 @@ fn emit_fs_helpers_used(cg: CodegenCtx) {
             mc_b1(c, 0xC3)
 
             mc_patch_rel32(c, jz_wnull, buf_len(c))
+            mc_patch_rel32(c, jz_wnul, buf_len(c))
             mc_patch_rel32(c, jz_wbuf, buf_len(c))
             mc_patch_rel32(c, jle_wlen, buf_len(c))
             mc_patch_rel32(c, jae_wlen, buf_len(c))
@@ -2091,6 +2355,8 @@ fn emit_fs_helpers_used(cg: CodegenCtx) {
             mc_b3(c, 0x48, 0x39, 0xD0)
             ljb1 := mc_jcc8(c, 0x73)
             mc_b4(c, 0x44, 0x8A, 0x0C, 0x01)
+            mc_b3(c, 0x45, 0x84, 0xC9)
+            jz_lwnul := mc_jcc32(c, 0x84)
             mc_b4(c, 0x45, 0x88, 0x0C, 0x00)
             mc_b3(c, 0x48, 0xFF, 0xC0)
             ljcp2 := mc_jcc8(c, 0xEB)
@@ -2128,6 +2394,7 @@ fn emit_fs_helpers_used(cg: CodegenCtx) {
             mc_b1(c, 0xC3)
 
             mc_patch_rel32(c, jz_lwn, buf_len(c))
+            mc_patch_rel32(c, jz_lwnul, buf_len(c))
             mc_patch_rel32(c, jz_lwb, buf_len(c))
             mc_patch_rel32(c, jle_lwl, buf_len(c))
             mc_patch_rel32(c, jae_lwl, buf_len(c))

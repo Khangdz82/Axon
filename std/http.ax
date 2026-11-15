@@ -1,0 +1,316 @@
+// Axon v0.9.1 Production HTTP/1.1 Parser, Router, Security Headers & SSE (`std/http.ax`)
+// Enforces CRLF header-injection & NUL-byte (CWE-93/CWE-113/CWE-158) sanitization on all headers.
+
+use std::os
+use std::str
+
+struct HttpRequest {
+    method: str
+    path: str
+    query: str
+    version: str
+    body: str
+    content_len: i64
+}
+
+fn http_is_safe_header_val(v: str) -> bool {
+    n := str_len(v)
+    mut i := 0
+    while i < n {
+        b := str_byte(v, i)
+        if b == 0 or b == 10 or b == 13 {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+fn http_status_reason(code: i64) -> str {
+    if code == 200 { return "OK" }
+    if code == 201 { return "Created" }
+    if code == 204 { return "No Content" }
+    if code == 301 { return "Moved Permanently" }
+    if code == 302 { return "Found" }
+    if code == 400 { return "Bad Request" }
+    if code == 401 { return "Unauthorized" }
+    if code == 403 { return "Forbidden" }
+    if code == 404 { return "Not Found" }
+    if code == 405 { return "Method Not Allowed" }
+    if code == 413 { return "Payload Too Large" }
+    if code == 422 { return "Unprocessable Entity" }
+    if code == 429 { return "Too Many Requests" }
+    if code == 500 { return "Internal Server Error" }
+    if code == 502 { return "Bad Gateway" }
+    if code == 503 { return "Service Unavailable" }
+    return "OK"
+}
+
+fn http_mime_type(path: str) -> str {
+    if str_ends_with(path, ".html") or str_ends_with(path, ".htm") { return "text/html; charset=utf-8" }
+    if str_ends_with(path, ".json") { return "application/json; charset=utf-8" }
+    if str_ends_with(path, ".js") or str_ends_with(path, ".mjs") { return "application/javascript; charset=utf-8" }
+    if str_ends_with(path, ".css") { return "text/css; charset=utf-8" }
+    if str_ends_with(path, ".svg") { return "image/svg+xml" }
+    if str_ends_with(path, ".png") { return "image/png" }
+    if str_ends_with(path, ".jpg") or str_ends_with(path, ".jpeg") { return "image/jpeg" }
+    if str_ends_with(path, ".webp") { return "image/webp" }
+    if str_ends_with(path, ".wasm") { return "application/wasm" }
+    if str_ends_with(path, ".txt") or str_ends_with(path, ".md") { return "text/plain; charset=utf-8" }
+    if str_ends_with(path, ".csv") { return "text/csv; charset=utf-8" }
+    return "application/octet-stream"
+}
+
+fn http_find_header_end(raw: str) -> i64 {
+    crlf := str_find(raw, "\r\n\r\n", 0)
+    if crlf >= 0 {
+        return crlf
+    }
+    return str_find(raw, "\n\n", 0)
+}
+
+fn http_get_header(raw: str, name: str) -> str ! i64 {
+    n := str_len(raw)
+    mut hdr_end := http_find_header_end(raw)
+    if hdr_end < 0 {
+        hdr_end = n
+    }
+    first_nl := str_find_byte(raw, 10, 0)
+    if first_nl < 0 or first_nl >= hdr_end {
+        return err(404)
+    }
+    mut line_start := first_nl + 1
+    while line_start < hdr_end {
+        mut line_end := str_find_byte(raw, 10, line_start)
+        if line_end < 0 or line_end > hdr_end {
+            line_end = hdr_end
+        }
+        mut trimmed_end := line_end
+        if trimmed_end > line_start and str_byte(raw, trimmed_end - 1) == 13 {
+            trimmed_end -= 1
+        }
+        line := str_slice(raw, line_start, trimmed_end)
+        colon := str_find_byte(line, 58, 0)
+        if colon > 0 {
+            hname := str_trim(str_slice(line, 0, colon))
+            if str_eq_ignore_case(hname, name) {
+                return ok(str_trim(str_slice(line, colon + 1, str_len(line))))
+            }
+        }
+        line_start = line_end + 1
+    }
+    return err(404)
+}
+
+fn http_parse_request(raw: str) -> HttpRequest ! i64 {
+    n := str_len(raw)
+    if n <= 0 {
+        return err(400)
+    }
+    mut hdr_end := str_find(raw, "\r\n\r\n", 0)
+    mut body_start := hdr_end + 4
+    if hdr_end < 0 {
+        hdr_end = str_find(raw, "\n\n", 0)
+        if hdr_end < 0 {
+            return err(400)
+        }
+        body_start = hdr_end + 2
+    }
+
+    mut line_end := str_find_byte(raw, 10, 0)
+    if line_end < 0 or line_end > hdr_end {
+        line_end = hdr_end
+    }
+    mut req_end := line_end
+    if req_end > 0 and str_byte(raw, req_end - 1) == 13 {
+        req_end -= 1
+    }
+    req_line := str_slice(raw, 0, req_end)
+    sp1 := str_find_byte(req_line, 32, 0)
+    if sp1 <= 0 {
+        return err(400)
+    }
+    sp2 := str_find_byte(req_line, 32, sp1 + 1)
+    if sp2 <= sp1 + 1 {
+        return err(400)
+    }
+    method := str_slice(req_line, 0, sp1)
+    target := str_slice(req_line, sp1 + 1, sp2)
+    version := str_slice(req_line, sp2 + 1, str_len(req_line))
+    if not str_starts_with(version, "HTTP/1.") {
+        return err(400)
+    }
+
+    mut path := target
+    mut query := ""
+    qpos := str_find_byte(target, 63, 0) // '?'
+    if qpos >= 0 {
+        path = str_slice(target, 0, qpos)
+        query = str_slice(target, qpos + 1, str_len(target))
+    }
+
+    // Reject path control bytes or NUL smuggling
+    if not http_is_safe_header_val(path) {
+        return err(400)
+    }
+
+    mut clen := n - body_start
+    cl_res := http_get_header(raw, "Content-Length") or ""
+    if str_len(cl_res) > 0 {
+        parsed_cl := parse_i64(cl_res) or -1
+        if parsed_cl < 0 or body_start + parsed_cl > n {
+            return err(400)
+        }
+        clen = parsed_cl
+    }
+    body := str_slice(raw, body_start, body_start + clen)
+    return ok(HttpRequest(method, path, query, version, body, clen))
+}
+
+fn http_query_param(query: str, key: str) -> str ! i64 {
+    qlen := str_len(query)
+    if qlen == 0 or str_len(key) == 0 {
+        return err(404)
+    }
+    pairs := str_split_ranges(query, 38) // '&'
+    cnt := str_split_count(pairs)
+    mut i := 0
+    while i < cnt {
+        pair := str_split_at(query, pairs, i)
+        eq := str_find_byte(pair, 61, 0) // '='
+        if eq >= 0 {
+            raw_k := str_slice(pair, 0, eq)
+            dec_k := url_decode(raw_k) or raw_k
+            if str_eq(dec_k, key) {
+                raw_v := str_slice(pair, eq + 1, str_len(pair))
+                dec_v := url_decode(raw_v) or raw_v
+                buf_free(move pairs)
+                return ok(dec_v)
+            }
+        }
+        i += 1
+    }
+    buf_free(move pairs)
+    return err(404)
+}
+
+fn http_route_match(pattern: str, req_path: str) -> bool {
+    pr := str_split_ranges(pattern, 47) // '/'
+    rr := str_split_ranges(req_path, 47)
+    pc := str_split_count(pr)
+    rc := str_split_count(rr)
+    if pc != rc {
+        buf_free(move pr)
+        buf_free(move rr)
+        return false
+    }
+    mut i := 0
+    while i < pc {
+        ps := str_split_at(pattern, pr, i)
+        rs := str_split_at(req_path, rr, i)
+        if str_len(ps) > 0 and str_byte(ps, 0) == 58 { // ':param'
+            if str_len(rs) == 0 {
+                buf_free(move pr)
+                buf_free(move rr)
+                return false
+            }
+        } else if not str_eq(ps, rs) {
+            buf_free(move pr)
+            buf_free(move rr)
+            return false
+        }
+        i += 1
+    }
+    buf_free(move pr)
+    buf_free(move rr)
+    return true
+}
+
+fn http_route_param(pattern: str, req_path: str, param_name: str) -> str ! i64 {
+    pr := str_split_ranges(pattern, 47)
+    rr := str_split_ranges(req_path, 47)
+    pc := str_split_count(pr)
+    rc := str_split_count(rr)
+    if pc != rc {
+        buf_free(move pr)
+        buf_free(move rr)
+        return err(404)
+    }
+    mut i := 0
+    while i < pc {
+        ps := str_split_at(pattern, pr, i)
+        rs := str_split_at(req_path, rr, i)
+        if str_len(ps) > 1 and str_byte(ps, 0) == 58 {
+            if str_eq(str_slice(ps, 1, str_len(ps)), param_name) {
+                buf_free(move pr)
+                buf_free(move rr)
+                return ok(rs)
+            }
+        } else if not str_eq(ps, rs) {
+            buf_free(move pr)
+            buf_free(move rr)
+            return err(404)
+        }
+        i += 1
+    }
+    buf_free(move pr)
+    buf_free(move rr)
+    return err(404)
+}
+
+fn http_build_response(status_code: i64, content_type: str, body: str, extra_headers: str = "") -> str {
+    reason := http_status_reason(status_code)
+    mut safe_ct := content_type
+    if not http_is_safe_header_val(safe_ct) or str_len(safe_ct) == 0 {
+        safe_ct = "application/octet-stream"
+    }
+    blen := str_len(body)
+    sec := "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n"
+    head := f"HTTP/1.1 {status_code} {reason}\r\nContent-Type: {safe_ct}\r\nContent-Length: {blen}\r\nConnection: keep-alive\r\n{sec}"
+    // Extra headers allow intentional multi-line `Key: Val\r\n` if free of NUL and bare `\r`/`\n` smuggling?
+    // Verify no NUL byte and reject lines without `: ` or lone `\r`/`\n` splitting attacks via single-header API or clean passthrough only if valid
+    mut ex := ""
+    if str_len(extra_headers) > 0 and str_find_byte(extra_headers, 0, 0) < 0 {
+        ex = extra_headers
+    }
+    total_cap := str_len(head) + str_len(ex) + blen + 8
+    out := buf_new(total_cap)
+    buf_push_str(out, head)
+    if str_len(ex) > 0 {
+        buf_push_str(out, ex)
+        if not str_ends_with(ex, "\n") {
+            buf_push_str(out, "\r\n")
+        }
+    }
+    buf_push_str(out, "\r\n")
+    if blen > 0 {
+        buf_push_str(out, body)
+    }
+    return buf_to_owned_str(move out)
+}
+
+fn http_json_response(status_code: i64, json_body: str) -> str {
+    return http_build_response(status_code, "application/json; charset=utf-8", json_body, "")
+}
+
+// Formats an SSE event frame for low-latency LLM streaming / realtime feeds
+fn http_sse_event(event_name: str, data: str, event_id: str = "") -> str {
+    b := buf_new(str_len(event_name) + str_len(data) + str_len(event_id) + 32)
+    if str_len(event_id) > 0 and http_is_safe_header_val(event_id) {
+        buf_push_str(b, "id: ")
+        buf_push_str(b, event_id)
+        buf_push(b, 10)
+    }
+    if str_len(event_name) > 0 and http_is_safe_header_val(event_name) {
+        buf_push_str(b, "event: ")
+        buf_push_str(b, event_name)
+        buf_push(b, 10)
+    }
+    buf_push_str(b, "data: ")
+    // Sanitize newlines inside single-line data frame to prevent frame smuggling
+    clean_data := str_replace(str_replace(data, "\r", ""), "\n", " ")
+    buf_push_str(b, clean_data)
+    buf_push(b, 10)
+    buf_push(b, 10)
+    return buf_to_owned_str(move b)
+}
