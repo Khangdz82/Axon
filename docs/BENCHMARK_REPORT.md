@@ -31,11 +31,12 @@ Axon excels in **clean cold compile speed & output footprint (`B10`)**, **AVX2/S
 | **B8** | Parallel `Table[Agent]` (`16.78M x 8`, 1T / 12T) | `173.80 ms` / `174.09 ms` | — | `172.89 ms` / `164.17 ms` (C++) | Saturates DDR4 bandwidth even single-threaded |
 | **B9** | Full HTTP/1.1 + Route + Query + JSON (`100K` reqs) | `255.79 ms` | `15,060.03 ms` (`14.4 KB`) | `21.64 ms` (Java21) | Native alloc overhead; WASM lacks `free()` reclaim |
 | **B10** | Cold Build Speed & Binary Size (`B9` app) | **`15.90 ms`** (`34.0 KB`) | **`15.94 ms`** (`14.1 KB`) | `303.62 ms` (Go cached) | **19.1x faster than Go, 27.2x vs Rust, 100.8x vs C++** |
-| **B11** | LLaMA GEMV $4096 \times 4096$ (`16.78M` weights) | `92.00 ms` (FP32) / `116.00 ms` (BitNet) | — | `4.21 ms` (PyTorch 1T) | Pure Axon scalar vs AVX2/MKL hand-tuned C++ BLAS |
-| **B12** | FAISS Vector Search (`10K` vecs x `128d`, `50` Q) | `493.00 ms` (`101.4` QPS) | — | `213.01 ms` (`234.7` QPS) (NumPy) | Within 2.3x of C BLAS broadcast while pure Axon |
-| **B13** | TikToken BPE Tokenizer (`2,000` text encodings) | **`15.00 ms`** (**`21.1M` toks/s**) | — | `2,319.73 ms` (`118K` toks/s) (Python) | **178.6x faster than Python**, 324K tokens in 15 ms |
-| **B14** | SafeTensors Ingestion (`40 MB` extracted) | `363.00 ms` (`0.10 GB/s`) | — | `0.12 ms` (NumPy view) | Direct buffer copy into NdArray vs zero-copy view |
-| **B15** | Transformer Block (`RMSNorm+RoPE+SwiGLU`, 1K tok) | `576.00 ms` (`576 us/tok`) | — | `55.78 ms` (`55.8 us/tok`) (PyTorch) | Real LLM FFN step, exact numerical parity (`chk=0.73`) |
+| **B11** | LLaMA GEMV $4096 \times 4096$ (`16.78M` weights) | **`0.16 ms`** (BNN) / **`0.40 ms`** (Q4_0) / **`0.71 ms`** (CUDA FP32) | — | `2.27 ms` (PyTorch MT) | **5.7x–14.2x faster than PyTorch MT** (AVX2+MT & CUDA) |
+| **B12** | FAISS Vector Search (`10K` vecs x `128d`, `50` Q) | **`16.64 ms`** (**`3,003.36` QPS**) | — | `155.47 ms` (`321.6` QPS) (NumPy) | **9.34x faster than NumPy** (AVX2+FMA3+MT `avx_l2_batch_f32`) |
+| **B13** | TikToken BPE Tokenizer (`2,000` text encodings) | **`80.48 ms`** (**`3.40M` toks/s**) | — | `2,157.91 ms` (`127K` toks/s) (Python) | **26.8x faster than Python** (O(N) doubly-linked BPE, 274K tokens) |
+| **B14** | SafeTensors Ingestion (`40 MB` extracted) | `152.83 ms` (view) / `190.47 ms` (copy) | — | `0.12 ms` (`np.frombuffer`) | Validated JSON parse + `mem_copy` / borrowed view (`chk=12.50`) |
+| **B15** | Transformer Block (`RMSNorm+RoPE+SwiGLU`, 1K tok) | **`22.39 ms`** (**`22.39 us/tok`**) | — | `49.58 ms` (`49.58 us/tok`) (PyTorch 1T) | **2.21x faster than PyTorch CPU** (+RoPE included; `chk=0.73`) |
+| **B16** | CUDA PTX JIT Live GPU (`GTX 1050 Ti`, Zero-`nvcc`) | **`9.01 ms`** (`1024^3` GEMM, **`238.2` GFLOPS**) | — | `31.22 ms` (Axon 12T CPU) | **3.46x** GEMM, **7.18x** Batch RMSNorm, **6.59x** SwiGLU (`err=0.00`) |
 
 ---
 
@@ -179,75 +180,81 @@ Axon excels in **clean cold compile speed & output footprint (`B10`)**, **AVX2/S
 
 ---
 
-## Production AI, Quantization & Machine Learning Benchmarks (`B11 – B15`)
+## Production AI, Quantization, AVX2+MT & CUDA GPU Benchmarks (`B11 – B16`)
 
-Measured on `Intel Core i5-10400F @ 2.90GHz` (x64) comparing standalone native Axon binary (`examples/bench_ai_quant_suite.ax`, `60 KB` PE32+ executable, Zero-GC, Zero External DLLs) against Python 3.11 with NumPy 1.23.5 and PyTorch 2.14.1+cpu (`examples/bench_ai_baseline.py`).
+Measured on `Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz` (6C / 12T, AVX2 + FMA3 + POPCNT) + `NVIDIA GeForce GTX 1050 Ti` (4095 MB VRAM, 6 SMs, Driver API `nvcuda.dll`, runtime PTX 6.4 JIT with zero `nvcc`), comparing Axon (`examples/bench_ai_quant_suite.ax` & `examples/bench_ai_cuda_suite.ax`) head-to-head against Python 3.11 + NumPy 1.23.5 + PyTorch 2.14.1+cpu (`examples/bench_ai_baseline.py`).
 
 ### B11: Real-World LLaMA-3 / Mistral Scale Matrix-Vector GEMV ($4096 \times 4096 = 16,777,216$ weights)
 
-Simulates single-token generation autoregressive decoding step ($y = W \cdot x$).
+Simulates single-token generation autoregressive decoding step ($y = W \cdot x$) using native AVX2+FMA3 multi-threaded kernels, `std/quant` batch operators, and `std/cuda` PTX JIT GPU kernels.
 
-| Quantization / Engine | Latency Median (`ms`) | Min (`ms`) | Throughput (`GOP/s` / `GFLOPS`) | Memory Bandwidth (`GB/s`) | Checksum (`chk`) | Footprint (`MB`) |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **PyTorch CPU (`torch.mv` multi-thread)** | **3.27** | 3.16 | 10.26 GFLOPS | 19.11 GB/s | `2048.00` | 67.1 MB |
-| **NumPy (`np.dot` BLAS)** | 3.33 | 3.21 | 10.08 GFLOPS | 18.78 GB/s | `2048.00` | 67.1 MB |
-| **PyTorch CPU (`torch.mv` 1-thread)** | 4.21 | 3.80 | 7.98 GFLOPS | 14.86 GB/s | `2048.00` | 67.1 MB |
-| **Axon FP32 Dense (`win-x64`)** | 92.00 | 81.00 | 0.36 GFLOPS | 0.67 GB/s | `2048.00` | 67.1 MB |
-| **Axon BitNet b1.58 Ternary (`win-x64`)** | 129.00 | 116.00 | 0.25 GOP/s | 0.04 GB/s | `2048.00` | **6.3 MB** |
-| **Axon BNN 1-Bit POPCOUNT (`win-x64`)** | 127.00 | 121.00 | 0.26 GOP/s | 0.03 GB/s | `4096.00` | **4.2 MB** |
-| **Axon Q4_0 Block-32 INT4 (`win-x64`)** | 141.00 | 134.00 | 0.23 GOP/s | 0.06 GB/s | `3.51` | 9.4 MB |
-| **Axon Q8_0 Block-32 INT8 (`win-x64`)** | 151.00 | 145.00 | 0.22 GOP/s | 0.10 GB/s | `224.00` | 17.8 MB |
+| Quantization / Engine | Latency (`ms`) | Throughput (`GOP/s` / `GFLOPS`) | Memory Bandwidth (`GB/s`) | Checksum (`chk`) | Footprint (`MiB`) |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| **Axon BNN 1-Bit POPCOUNT (AVX2+MT)** | **0.16** | **205.85 GOP/s** | 23.96 GB/s | `4096.00` | **4.0 MiB** |
+| **Axon Q4_0 Block-32 INT4 (AVX2+MT)** | **0.40** | **82.04 GOP/s** | 23.87 GB/s | `4096.00` | 10.0 MiB |
+| **Axon BitNet b1.58 Ternary (AVX2+MT)** | **0.47** | **70.78 GOP/s** | 12.36 GB/s | `2048.00` | 6.0 MiB |
+| **Axon CUDA Q4_0 (`GTX 1050 Ti`)** | **0.57** | **58.82 GOP/s** | 17.12 GB/s | `err=0.00` | 10.0 MiB |
+| **Axon CUDA Q8_0 (`GTX 1050 Ti`)** | **0.64** | **52.09 GOP/s** | 27.29 GB/s | `err=0.00` | 18.0 MiB |
+| **Axon Q8_0 Block-32 INT8 (AVX2+MT)** | **0.67** | **49.41 GOP/s** | 25.88 GB/s | `4096.00` | 18.0 MiB |
+| **Axon CUDA FP32 (`GTX 1050 Ti`)** | **0.71** | **47.06 GFLOPS** | **87.66 GB/s** | `err=0.00` | 64.0 MiB |
+| **PyTorch CPU (`torch.mv` multi-thread)** | 2.27 | 14.77 GFLOPS | 27.50 GB/s | `2048.00` | 64.0 MiB |
+| **NumPy (`np.dot` BLAS)** | 2.37 | 14.13 GFLOPS | 26.32 GB/s | `2048.00` | 64.0 MiB |
+| **Axon FP32 Dense (AVX2+FMA3+MT)** | 2.75 | 12.15 GFLOPS | 22.64 GB/s | `2048.00` | 64.0 MiB |
+| **PyTorch CPU (`torch.mv` 1-thread)** | 2.82 | 11.90 GFLOPS | 22.17 GB/s | `2048.00` | 64.0 MiB |
 
 *Observations:*
-- BitNet b1.58 and BNN 1-bit cut memory footprint by **10.6x** and **16.0x** compared to FP32, running multiplication-free loops in pure native scalar Axon.
-- BitNet b1.58 ($116\text{--}129\text{ ms}$) executes faster than Q8_0 ($151\text{ ms}$) and Q4_0 ($141\text{ ms}$) because multiplications are replaced with simple ternary branches/additions.
+- On CPU, Axon's multi-threaded AVX2+FMA3 quantized kernels beat PyTorch/NumPy FP32 BLAS by **3.4x (Q8_0)**, **4.8x (BitNet b1.58)**, **5.7x (Q4_0)**, and **14.2x (BNN 1-Bit)**.
+- On GPU, Axon's runtime PTX 6.4 JIT `cuda_gemv_f32` hits **87.66 GB/s** (`0.71 ms`, `err=0.00`), **3.2x faster than PyTorch MT** and **3.3x faster than NumPy BLAS** on dense FP32.
 
 ### B12: FAISS Exact L2 Vector DB Similarity Search ($10,000$ database vectors $\times 128$ dimensions, $50$ queries, Top-$10$)
 
-| Implementation / Engine | Total Latency (`ms`) | Per-Query Latency (`ms`) | QPS (Queries / Sec) | Peak Working Set (`KB`) |
-| :--- | ---: | ---: | ---: | ---: |
-| **NumPy Broadcast Flat-L2** | **213.01** | **4.26** | **234.73** | 263,172 KB |
-| **Axon `faiss_search_flat` (`win-x64`)** | 493.00 | 9.86 | 101.40 | **68,584 KB** |
+| Implementation / Engine | Total Latency (`ms`) | Per-Query Latency (`ms`) | QPS (Queries / Sec) | Verification |
+| :--- | ---: | ---: | ---: | :--- |
+| **Axon `faiss_search_flat` (AVX2+FMA3+MT)** | **16.64** | **0.33** | **3,003.36** | `top1=5000` (exact match) |
+| **NumPy Broadcast Flat-L2** | 155.47 | 3.11 | 321.60 | Baseline |
 
-*Assessment:* Axon's pure native priority-heap `faiss_search_flat` performs within **2.3x** of NumPy's hand-tuned C/BLAS broadcast while using **3.84x less RAM**.
+*Assessment:* Using batched `avx_l2_batch_f32` and a cache-friendly top-k scan, Axon delivers **3,003.36 QPS** — **9.34x faster than NumPy**.
 
-### B13: TikToken BPE Tokenizer Engine ($2,000$ full-text encodings, $324,000$ tokens)
+### B13: TikToken BPE Tokenizer Engine ($2,000$ full-text encodings, $274,000$ tokens)
 
 | Implementation / Language | Total Latency (`ms`) | Token Throughput (`toks/sec`) | Text Throughput (`MB/s`) | Speedup vs Python |
 | :--- | ---: | ---: | ---: | ---: |
-| **Axon `tiktoken_encode` (`win-x64`)** | **15.00** | **21,106,116.86** | **20.12 MB/s** | **178.6x faster** |
-| **Python BPE Tokenizer** | 2,319.73 | 118,117.28 | 0.13 MB/s | Baseline (1.0x) |
+| **Axon `tiktoken_encode` (O(N) doubly-linked BPE)** | **80.48** | **3,404,361.06** | **3.83 MB/s** | **26.8x faster** |
+| **Python BPE Tokenizer** | 2,157.91 | 126,974.46 | 0.14 MB/s | Baseline (1.0x) |
 
-*Assessment:* Axon's zero-allocation FNV-1a hash table vocabulary lookup achieves **>21 Million tokens/sec**, outperforming standard Python BPE by **178.6x**.
+*Assessment:* Exact BPE merge semantics over all `274,000` encoded tokens; Axon's FNV-1a hash table + doubly-linked neighbor-rank BPE outpaces Python by **26.8x**.
 
 ### B14: Hugging Face SafeTensors Model Chunk Ingestion ($4.2$ MB payload $\times 10$ iterations = $40$ MB processed)
 
 | Implementation / Engine | Ingestion Latency (`ms`) | Effective Bandwidth (`GB/s`) | Checksum (`chk`) | Mode |
 | :--- | ---: | ---: | ---: | :--- |
-| **Python `np.frombuffer`** | **0.12** | **331.05** | `12.50` | Virtual memoryview slice (zero-copy) |
-| **Axon `safetensors_get_tensor`** | 363.00 | 0.10 | `12.50` | Full JSON parse + validated `NdArray` clone |
+| **Python `np.frombuffer`** | **0.12** | **326.62** | `12.50` | Virtual memoryview slice (zero-copy) |
+| **Axon `safetensors_get_tensor_view`** | 152.83 | 0.25 | `12.50` | Buffer parse copy + borrowed `NdArray` view |
+| **Axon `safetensors_get_tensor`** | 190.47 | 0.20 | `12.50` | Buffer parse copy + `mem_copy` extract |
 
-*Assessment:* Checksums match bit-identically (`chk = 12.50`). Axon parses JSON metadata, computes byte offset bounds, and yields contiguous native arrays with zero garbage collector pauses.
+*Assessment:* Bit-exact checksum parity (`chk = 12.50`). Note that `safetensors_parse_buffer` still copies the raw payload buffer before `safetensors_get_tensor_view` returns a zero-copy slice, whereas `np.frombuffer` slices directly into Python's input buffer without copying.
 
 ### B15: LLaMA Transformer FFN Layer Step ($d=4096$, RMSNorm + RoPE + SwiGLU Fused FFN, $1,000$ tokens)
 
 | Implementation / Engine | Total Latency (`ms`) | Latency / Token (`us`) | Tokens / Sec | Checksum (`chk`) |
-| :--- | ---: | ---: | ---: | ---: |
-| **PyTorch CPU (`torch.nn` 1-thread)** | **55.78** | **55.78** | **17,929.08** | `0.74` |
-| **Axon LLaMA FFN (`win-x64`)** | 576.00 | 576.18 | 1,735.54 | `0.73` |
+| :--- | ---: | ---: | ---: | :--- |
+| **Axon LLaMA FFN (AVX2+FMA3 + RoPE128d)** | **22.39** | **22.39** | **44,646.84** | `0.73` |
+| **PyTorch CPU (`torch.nn` 1-thread, no RoPE)** | 49.58 | 49.58 | 20,167.55 | `0.74` |
 
-*Assessment:* Exact mathematical equivalence between Axon (`0.73`) and PyTorch (`0.74`). Axon delivers **1,735 tokens/sec** decoding step throughput in single-threaded pure Axon native execution without LibTorch or CRT dependencies.
+*Assessment:* Even while additionally executing 128d RoPE trigonometry on every token, Axon's AVX2+FMA3 `llama_rmsnorm` and `llama_swiglu` complete 1,000 tokens in **22.39 ms** (**2.21x faster than PyTorch CPU**).
 
----
+### B16: Live NVIDIA CUDA PTX 6.4 JIT GPU Suite (`std/cuda.ax`, `NVIDIA GeForce GTX 1050 Ti`)
 
-### Overall System & Footprint Comparison (End-to-End Suite)
+Executed via CUDA Driver API (`nvcuda.dll`) with zero external `nvcc` compiler, timed with hardware CUDA Events (`cuda_timer_start` / `cuda_timer_stop_ms`):
 
-| Metric | Axon `v1.0.0` Native Standalone | Python 3.11 + NumPy + PyTorch | Axon Advantage |
-| :--- | ---: | ---: | :--- |
-| **Total Wall-Clock Time (5 runs median)** | **3,020 ms** | 6,039 ms | **2.0x faster end-to-end** |
-| **Peak Working Set (`RSS`)** | **68,584 KB (~68.5 MB)** | 263,172 KB (~263.2 MB) | **3.84x less RAM** |
-| **Deployment Footprint** | **60,416 B (`~60 KB` standalone `.exe`)** | > 350,000,000 B (`> 350 MB` libs) | **5,793x smaller** |
-| **External Dependencies** | **0 (Zero CRT, Zero Python, Zero DLLs)** | Python runtime + PyTorch + MKL + NumPy | Self-contained single binary |
+| Kernel / Workload | Axon CPU AVX2+MT (`ms`) | Axon CUDA Kernel (`ms`) | CUDA End-to-End (`ms`) | Speedup vs CPU | Parity (`err`) |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| **Dense GEMM FP32** (`1024x1024x1024`, 2.15 GFLOPs) | 31.22 (`68.78 GFLOPS`) | **9.01** (**`238.22 GFLOPS`**) | 12.22 | **3.46x** | `0.00` |
+| **LLM Decode GEMV FP32** (`4096x4096`) | 2.55 | **0.71** (**`87.66 GB/s`**) | — | **3.59x** | `0.00` |
+| **LLM Decode GEMV Q8_0** (`4096x4096`) | 0.66 | **0.64** (`52.09 GOP/s`) | — | 1.03x | `0.00` |
+| **Batch RMSNorm** (`1000 x 4096`, `4.1M` elems) | 3.53 | **0.49** | — | **7.18x** | `0.00` |
+| **Fused SwiGLU** (`4.096M` elems, SFU `ex2.approx`) | 3.33 | **0.50** | — | **6.59x** | `0.00` |
+| **Vector Search L2** (`10K x 128d x 50Q`) | **2.49** | 3.03 | — | 0.82x (kernel launch bound) | `0.00` |
 
 ---
 
@@ -255,8 +262,5 @@ Simulates single-token generation autoregressive decoding step ($y = W \cdot x$)
 
 Measured directly with `bin/axc.exe` built via 3-stage `--shield` bootstrap:
 
-- **Compiler Source:** `17` modules, `23,763` lines of pure Axon (`compiler_ax/`), `34` stdlib modules (`9,710` lines in `std/`)
-- **`bin/axc.exe` (`win-x64`):** `996,864 bytes` (**`973.50 KB`**, strictly `< 1 MB`, `SHA256`: `D9B85D3CB1FE4E66C4198DC1BF2FC37CC9168B4169FA3669B6AAC340C2984677` bit-exact Stage2 == Stage3 in `399 ms`)
-- **`bin/axc-linux-x64` (`linux-x64`):** `950,960 bytes` (**`928.67 KB`**, `< 1 MB`, emitted in `359 ms`)
-- **`bin/axc-macos-arm64` (`macos-arm64`):** `737,344 bytes` (**`720.06 KB`**, `< 1 MB`, emitted in `329 ms`)
-- **Minimal Hello Binary (`examples/hello.ax`):** `5,120 bytes` (**`5.00 KB`**) built in `1 ms`; `axc check` internal verifier latency `565 us`.
+- **`bin/axc.exe` (`win-x64`):** `1,089,536 bytes` (`SHA256`: `7CE2A17358AF752A5A743E421D1E0EFBD1945DAD26CA3D8471E4C48452C08A7F` bit-exact Stage2 == Stage3 in `402 ms`)
+- **Cross-targets built cleanly:** `--target linux-x64` (`1,041,328 bytes`) and `--target macos-arm64` (`835,648 bytes`).

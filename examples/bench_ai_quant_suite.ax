@@ -38,7 +38,7 @@ fn bench_gemv_suite(dim: i64, rows: i64) {
     println(f" WORKLOAD 1: Real-World GEMV Token Generation ({rows}x{dim} = {total_weights} weights)")
     println(f"================================================================================")
 
-    // 1. FP32 Dense Baseline
+    // 1. FP32 Dense Baseline (AVX2 + FMA3 + Multi-Threaded)
     fp32_mem := mem_alloc_aligned(total_weights * 4 + 64)
     mut w := 0
     while w < total_weights {
@@ -46,83 +46,66 @@ fn bench_gemv_suite(dim: i64, rows: i64) {
         w += 1
     }
     // Warmup
-    mut r := 0
+    avx_gemv_f32(fp32_mem, act, out_vec, rows, dim)
     mut t0 := clock_ns()
-    r = 0
-    while r < rows {
-        mut dot := 0.0
-        row_base := r * dim
-        mut c := 0
-        while c < dim {
-            dot = dot + ptr_read_f32(act, c) * ptr_read_f32(fp32_mem, row_base + c)
-            c += 1
-        }
-        ptr_write_f32(out_vec, r, dot)
-        r += 1
-    }
+    avx_gemv_f32(fp32_mem, act, out_vec, rows, dim)
     t_fp32 := (clock_ns() - t0) / 1000
-    chk_fp32 := ptr_read_f32(out_vec, 0)
-    gflops_fp32 := (((2.0 * (total_weights as f64)) / 1000000.0) / (t_fp32 as f64)) * 1000.0
-    bw_fp32 := (((total_weights as f64) * 4.0 / (1024.0 * 1024.0 * 1024.0)) / ((t_fp32 as f64) / 1000000.0))
-    println(f" [1.1] FP32 Dense (67.1 MB)      : {t_fp32 / 1000} ms | {gflops_fp32} GFLOPS | {bw_fp32} GB/s | chk={chk_fp32}")
+    t_fp32_f := if t_fp32 > 0 { t_fp32 as f64 } else { 1.0 }
+    chk_fp32 := ptr_read_f32(out_vec, 0) + 0.0
+    gflops_fp32 := (((2.0 * (total_weights as f64)) / 1000000.0) / t_fp32_f) * 1000.0
+    bw_fp32 := (((total_weights as f64) * 4.0 / (1024.0 * 1024.0 * 1024.0)) / (t_fp32_f / 1000000.0))
+    ms_fp32 := t_fp32_f / 1000.0
+    println(f" [1.1] FP32 Dense (64.0 MiB)     : {ms_fp32} ms | {gflops_fp32} GFLOPS | {bw_fp32} GB/s | chk={chk_fp32}")
     mem_free_aligned(fp32_mem)
 
-    // 2. Q8_0 (Block-32 Symmetric INT8)
-    q8_mem := mem_alloc_aligned(total_blocks * 34 + 64)
+    // 2. Q8_0 (Block-32 Symmetric INT8: 36B/block = 4B FP32 scale + 32B weights)
+    q8_mem := mem_alloc_aligned(total_blocks * 36 + 64)
     mut b := 0
     while b < total_blocks {
-        addr := q8_mem + b * 34
-        ptr_write_u8(addr, 0, 0x80)
-        ptr_write_u8(addr, 1, 0x3F) // BF16 scale = 1.0
+        addr := q8_mem + b * 36
+        ptr_write_f32(addr, 0, 1.0)
         mut k := 0
         while k < 32 {
-            ptr_write_u8(addr, 2 + k, 1)
+            ptr_write_u8(addr, 4 + k, 1)
             k += 1
         }
         b += 1
     }
+    gemv_q8_0_batch(act, q8_mem, out_vec, rows, num_blocks)
     t0 = clock_ns()
-    r = 0
-    while r < rows {
-        addr := q8_mem + r * num_blocks * 34
-        v := gemv_q8_0(act, addr, num_blocks)
-        ptr_write_f32(out_vec, r, v)
-        r += 1
-    }
+    gemv_q8_0_batch(act, q8_mem, out_vec, rows, num_blocks)
     t_q8 := (clock_ns() - t0) / 1000
-    chk_q8 := ptr_read_f32(out_vec, 0)
-    gops_q8 := (((2.0 * (total_weights as f64)) / 1000000.0) / (t_q8 as f64)) * 1000.0
-    bw_q8 := ((((total_blocks as f64) * 34.0) / (1024.0 * 1024.0 * 1024.0)) / ((t_q8 as f64) / 1000000.0))
-    println(f" [1.2] Q8_0 INT8 (17.8 MB)       : {t_q8 / 1000} ms | {gops_q8} GOP/s  | {bw_q8} GB/s | chk={chk_q8}")
+    t_q8_f := if t_q8 > 0 { t_q8 as f64 } else { 1.0 }
+    chk_q8 := ptr_read_f32(out_vec, 0) + 0.0
+    gops_q8 := (((2.0 * (total_weights as f64)) / 1000000.0) / t_q8_f) * 1000.0
+    bw_q8 := ((((total_blocks as f64) * 36.0) / (1024.0 * 1024.0 * 1024.0)) / (t_q8_f / 1000000.0))
+    ms_q8 := t_q8_f / 1000.0
+    println(f" [1.2] Q8_0 INT8 (18.0 MiB)      : {ms_q8} ms | {gops_q8} GOP/s  | {bw_q8} GB/s | chk={chk_q8}")
     mem_free_aligned(q8_mem)
 
-    // 3. Q4_0 (Block-32 Nibble INT4)
-    q4_mem := mem_alloc_aligned(total_blocks * 18 + 64)
+    // 3. Q4_0 (Block-32 Nibble INT4: 20B/block = 4B FP32 scale + 16B nibbles)
+    q4_mem := mem_alloc_aligned(total_blocks * 20 + 64)
     b = 0
     while b < total_blocks {
-        addr := q4_mem + b * 18
-        ptr_write_u8(addr, 0, 0x00)
-        ptr_write_u8(addr, 1, 0x3C) // FP16 scale = 1.0
+        addr := q4_mem + b * 20
+        ptr_write_f32(addr, 0, 1.0)
         mut k := 0
         while k < 16 {
-            ptr_write_u8(addr, 2 + k, 0x99) // nibble 9 => +1
+            ptr_write_u8(addr, 4 + k, 0x99) // nibble 9 => 9 - 8 = +1
             k += 1
         }
         b += 1
     }
+    gemv_q4_0_batch(act, q4_mem, out_vec, rows, num_blocks)
     t0 = clock_ns()
-    r = 0
-    while r < rows {
-        addr := q4_mem + r * num_blocks * 18
-        v := gemv_q4_0(act, addr, num_blocks)
-        ptr_write_f32(out_vec, r, v)
-        r += 1
-    }
+    gemv_q4_0_batch(act, q4_mem, out_vec, rows, num_blocks)
     t_q4 := (clock_ns() - t0) / 1000
-    chk_q4 := ptr_read_f32(out_vec, 0)
-    gops_q4 := (((2.0 * (total_weights as f64)) / 1000000.0) / (t_q4 as f64)) * 1000.0
-    bw_q4 := ((((total_blocks as f64) * 18.0) / (1024.0 * 1024.0 * 1024.0)) / ((t_q4 as f64) / 1000000.0))
-    println(f" [1.3] Q4_0 INT4 (9.4 MB)        : {t_q4 / 1000} ms | {gops_q4} GOP/s  | {bw_q4} GB/s | chk={chk_q4}")
+    t_q4_f := if t_q4 > 0 { t_q4 as f64 } else { 1.0 }
+    chk_q4 := ptr_read_f32(out_vec, 0) + 0.0
+    gops_q4 := (((2.0 * (total_weights as f64)) / 1000000.0) / t_q4_f) * 1000.0
+    bw_q4 := ((((total_blocks as f64) * 20.0) / (1024.0 * 1024.0 * 1024.0)) / (t_q4_f / 1000000.0))
+    ms_q4 := t_q4_f / 1000.0
+    println(f" [1.3] Q4_0 INT4 (10.0 MiB)      : {ms_q4} ms | {gops_q4} GOP/s  | {bw_q4} GB/s | chk={chk_q4}")
     mem_free_aligned(q4_mem)
 
     // 4. BitNet b1.58 Ternary {-1, 0, +1} Multiplication-Free
@@ -138,19 +121,16 @@ fn bench_gemv_suite(dim: i64, rows: i64) {
         }
         b += 1
     }
+    gemv_bitnet_158_batch(act, bn_mem, out_vec, rows, num_blocks)
     t0 = clock_ns()
-    r = 0
-    while r < rows {
-        addr := bn_mem + r * num_blocks * 12
-        v := gemv_bitnet_158(act, addr, num_blocks)
-        ptr_write_f32(out_vec, r, v)
-        r += 1
-    }
+    gemv_bitnet_158_batch(act, bn_mem, out_vec, rows, num_blocks)
     t_bn := (clock_ns() - t0) / 1000
-    chk_bn := ptr_read_f32(out_vec, 0)
-    gops_bn := (((2.0 * (total_weights as f64)) / 1000000.0) / (t_bn as f64)) * 1000.0
-    bw_bn := ((((total_blocks as f64) * 12.0) / (1024.0 * 1024.0 * 1024.0)) / ((t_bn as f64) / 1000000.0))
-    println(f" [1.4] BitNet b1.58 (6.3 MB)     : {t_bn / 1000} ms | {gops_bn} GOP/s  | {bw_bn} GB/s | chk={chk_bn}")
+    t_bn_f := if t_bn > 0 { t_bn as f64 } else { 1.0 }
+    chk_bn := ptr_read_f32(out_vec, 0) + 0.0
+    gops_bn := (((2.0 * (total_weights as f64)) / 1000000.0) / t_bn_f) * 1000.0
+    bw_bn := ((((total_blocks as f64) * 12.0) / (1024.0 * 1024.0 * 1024.0)) / (t_bn_f / 1000000.0))
+    ms_bn := t_bn_f / 1000.0
+    println(f" [1.4] BitNet b1.58 (6.0 MiB)    : {ms_bn} ms | {gops_bn} GOP/s  | {bw_bn} GB/s | chk={chk_bn}")
     mem_free_aligned(bn_mem)
 
     // 5. BNN 1-bit POPCOUNT-XNOR
@@ -165,19 +145,16 @@ fn bench_gemv_suite(dim: i64, rows: i64) {
         ptr_write_u8(addr, 7, 0xFF)
         b += 1
     }
+    gemv_bnn_1bit_batch(act, bnn_mem, out_vec, rows, num_blocks)
     t0 = clock_ns()
-    r = 0
-    while r < rows {
-        addr := bnn_mem + r * num_blocks * 8
-        v := gemv_bnn_1bit(act, addr, num_blocks)
-        ptr_write_f32(out_vec, r, v)
-        r += 1
-    }
+    gemv_bnn_1bit_batch(act, bnn_mem, out_vec, rows, num_blocks)
     t_bnn := (clock_ns() - t0) / 1000
-    chk_bnn := ptr_read_f32(out_vec, 0)
-    gops_bnn := (((2.0 * (total_weights as f64)) / 1000000.0) / (t_bnn as f64)) * 1000.0
-    bw_bnn := ((((total_blocks as f64) * 8.0) / (1024.0 * 1024.0 * 1024.0)) / ((t_bnn as f64) / 1000000.0))
-    println(f" [1.5] BNN 1-bit (4.2 MB)        : {t_bnn / 1000} ms | {gops_bnn} GOP/s  | {bw_bnn} GB/s | chk={chk_bnn}")
+    t_bnn_f := if t_bnn > 0 { t_bnn as f64 } else { 1.0 }
+    chk_bnn := ptr_read_f32(out_vec, 0) + 0.0
+    gops_bnn := (((2.0 * (total_weights as f64)) / 1000000.0) / t_bnn_f) * 1000.0
+    bw_bnn := ((((total_blocks as f64) * 8.0) / (1024.0 * 1024.0 * 1024.0)) / (t_bnn_f / 1000000.0))
+    ms_bnn := t_bnn_f / 1000.0
+    println(f" [1.5] BNN 1-bit (4.0 MiB)       : {ms_bnn} ms | {gops_bnn} GOP/s  | {bw_bnn} GB/s | chk={chk_bnn}")
     mem_free_aligned(bnn_mem)
 
     mem_free_aligned(act)
@@ -212,16 +189,26 @@ fn bench_faiss_suite(num_vecs: i64, dim: i64, num_queries: i64) {
     }
     ptr_write_f32(q_temp, 0, 5.0)
 
+    // Warmup
+    warm_q := faiss_search_flat(idx, q_temp, 10)
+    top1_idx := ibuf_get(warm_q.indices, 0)
+    buf_free(move warm_q.indices)
+    np_free(move warm_q.distances)
+
     mut t0 := clock_ns()
     mut q := 0
     while q < num_queries {
         res := faiss_search_flat(idx, q_temp, 10)
+        buf_free(move res.indices)
+        np_free(move res.distances)
         q += 1
     }
     t_search := (clock_ns() - t0) / 1000
-    qps := ((num_queries as f64) * 1000000.0) / (t_search as f64)
-    latency_ms_per_q := (t_search as f64) / ((num_queries as f64) * 1000.0)
-    println(f" [2.1] IndexFlatL2 Brute-Force   : {t_search / 1000} ms total | {latency_ms_per_q} ms/query | {qps} QPS")
+    t_search_f := if t_search > 0 { t_search as f64 } else { 1.0 }
+    qps := ((num_queries as f64) * 1000000.0) / t_search_f
+    ms_search := t_search_f / 1000.0
+    latency_ms_per_q := t_search_f / ((num_queries as f64) * 1000.0)
+    println(f" [2.1] IndexFlatL2 Brute-Force   : {ms_search} ms total | {latency_ms_per_q} ms/query | {qps} QPS | top1={top1_idx}")
 
     mem_free_aligned(v_temp)
     mem_free_aligned(q_temp)
@@ -256,6 +243,7 @@ fn bench_tiktoken_suite(reps: i64) {
     
     // Warmup
     warm := tiktoken_encode(v, sample)
+    buf_free(move warm)
 
     mut total_tokens := 0
     mut t0 := clock_ns()
@@ -263,12 +251,15 @@ fn bench_tiktoken_suite(reps: i64) {
     while r < reps {
         toks := tiktoken_encode(v, sample)
         total_tokens = total_tokens + ibuf_len(toks)
+        buf_free(move toks)
         r += 1
     }
     t_tok := (clock_ns() - t0) / 1000
-    throughput := ((total_tokens as f64) * 1000000.0) / (t_tok as f64)
-    mb_throughput := ((((str_len(sample) * reps) as f64) / (1024.0 * 1024.0)) / ((t_tok as f64) / 1000000.0))
-    println(f" [3.1] BPE FNV-1a Tokenizer      : {t_tok / 1000} ms ({total_tokens} tokens) | {throughput} toks/sec | {mb_throughput} MB/s")
+    t_tok_f := if t_tok > 0 { t_tok as f64 } else { 1.0 }
+    ms_tok := t_tok_f / 1000.0
+    throughput := ((total_tokens as f64) * 1000000.0) / t_tok_f
+    mb_throughput := ((((str_len(sample) * reps) as f64) / (1024.0 * 1024.0)) / (t_tok_f / 1000000.0))
+    println(f" [3.1] BPE FNV-1a Tokenizer      : {ms_tok} ms ({total_tokens} tokens) | {throughput} toks/sec | {mb_throughput} MB/s")
 
     tiktoken_vocab_free(move v)
 }
@@ -288,22 +279,47 @@ fn bench_safetensors_suite(reps: i64) {
     t_ser := (clock_ns() - t0) / 1000
     len_bytes := buf_len(serialized)
 
-    // Benchmark parsing + extraction
+    // Warmup
+    st_w := safetensors_parse_buffer(serialized) or return
+    tw_arr := safetensors_get_tensor(st_w, "model.layers.0.mlp.weight", rows, cols) or return
+    np_free(move tw_arr)
+    safetensors_free(move st_w)
+
+    // Benchmark [4.1] mem_copy extraction
     t0 = clock_ns()
     mut r := 0
     mut chk := 0.0
     while r < reps {
         st := safetensors_parse_buffer(serialized) or return
         t_arr := safetensors_get_tensor(st, "model.layers.0.mlp.weight", rows, cols) or return
-        chk = chk + np_get_1d(t_arr, 0)
+        chk = chk + ptr_read_f32(t_arr.data_ptr, 0)
         np_free(move t_arr)
         safetensors_free(move st)
         r += 1
     }
     t_parse := (clock_ns() - t0) / 1000
+    t_parse_f := if t_parse > 0 { t_parse as f64 } else { 1.0 }
+    ms_parse := t_parse_f / 1000.0
     mb_processed := ((len_bytes as f64) * (reps as f64)) / (1024.0 * 1024.0)
-    bw := (mb_processed / 1024.0) / ((t_parse as f64) / 1000000.0)
-    println(f" [4.1] SafeTensors Deserializer  : {t_parse / 1000} ms ({mb_processed} MB) | {bw} GB/s bandwidth | chk={chk}")
+    bw := (mb_processed / 1024.0) / (t_parse_f / 1000000.0)
+    println(f" [4.1] SafeTensors Copy Extract  : {ms_parse} ms ({mb_processed} MB) | {bw} GB/s bandwidth | chk={chk}")
+
+    // Benchmark [4.2] zero-copy borrowed view extraction
+    t0 = clock_ns()
+    r = 0
+    mut chk_v := 0.0
+    while r < reps {
+        st := safetensors_parse_buffer(serialized) or return
+        v_arr := safetensors_get_tensor_view(st, "model.layers.0.mlp.weight", rows, cols) or return
+        chk_v = chk_v + ptr_read_f32(v_arr.data_ptr, 0)
+        safetensors_free(move st)
+        r += 1
+    }
+    t_view := (clock_ns() - t0) / 1000
+    t_view_f := if t_view > 0 { t_view as f64 } else { 1.0 }
+    ms_view := t_view_f / 1000.0
+    bw_view := (mb_processed / 1024.0) / (t_view_f / 1000000.0)
+    println(f" [4.2] SafeTensors Zero-Copy View: {ms_view} ms ({mb_processed} MB) | {bw_view} GB/s bandwidth | chk={chk_v}")
 
     np_free(move arr)
     buf_free(move serialized)
@@ -332,22 +348,28 @@ fn bench_transformer_step(dim: i64, tokens: i64) {
         i += 1
     }
 
+    llama_rmsnorm(x, w_norm, out_norm, dim)
+    llama_apply_rope(out_norm, 0, 128)
+    llama_swiglu(gate, up, out_ffn, dim)
+
     mut t0 := clock_ns()
     mut r := 0
     while r < tokens {
-        // 1. RMSNorm
+        // 1. RMSNorm (AVX2+FMA3)
         llama_rmsnorm(x, w_norm, out_norm, dim)
         // 2. Rotary Position Embedding on 128d head
         llama_apply_rope(out_norm, r, 128)
-        // 3. SwiGLU Fused Activation
+        // 3. SwiGLU Fused Activation (AVX2+FMA3)
         llama_swiglu(gate, up, out_ffn, dim)
         r += 1
     }
     t_ffn := (clock_ns() - t0) / 1000
-    us_per_tok := (t_ffn as f64) / (tokens as f64)
-    toks_sec := ((tokens as f64) * 1000000.0) / (t_ffn as f64)
-    chk := ptr_read_f32(out_ffn, 0)
-    println(f" [5.1] RMSNorm+RoPE+SwiGLU FFN   : {t_ffn / 1000} ms | {us_per_tok} us/token | {toks_sec} tokens/sec | chk={chk}")
+    t_ffn_f := if t_ffn > 0 { t_ffn as f64 } else { 1.0 }
+    ms_ffn := t_ffn_f / 1000.0
+    us_per_tok := t_ffn_f / (tokens as f64)
+    toks_sec := ((tokens as f64) * 1000000.0) / t_ffn_f
+    chk := ptr_read_f32(out_ffn, 0) + 0.0
+    println(f" [5.1] RMSNorm+RoPE+SwiGLU FFN   : {ms_ffn} ms | {us_per_tok} us/token | {toks_sec} tokens/sec | chk={chk}")
 
     mem_free_aligned(x)
     mem_free_aligned(w_norm)

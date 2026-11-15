@@ -214,58 +214,79 @@ fn tiktoken_get_rank_span(v: BpeVocabTable, text: str, off: i64, len: i64) -> i6
 
 // --- 2. BPE Merge Engine ---
 
-// Tokenize text into token IDs using exact byte-span BPE merges
+// Tokenize text into token IDs using O(N) doubly-linked BPE merges
 fn tiktoken_encode(v: BpeVocabTable, text: str) -> IntBuf {
     n := str_len(text)
     out := ibuf_new(n + 8)
     if n == 0 { return out }
 
-    // Track byte boundaries [0, 1, 2, ..., n] for n active pieces.
-    // Piece p spans [bounds[p], bounds[p + 1]) directly in `text`.
-    bounds := ibuf_new(n + 2)
+    // Single aligned slab: [starts(n), lens(n), prev(n), next(n), pair_rank(n)]
+    slab := mem_alloc_aligned(n * 40 + 64)
+    off_l := n
+    off_p := n * 2
+    off_n := n * 3
+    off_r := n * 4
+
     mut i := 0
-    while i <= n {
-        ibuf_push(bounds, i)
+    while i < n {
+        ptr_write_i64(slab, i, i)
+        ptr_write_i64(slab, off_l + i, 1)
+        ptr_write_i64(slab, off_p + i, i - 1)
+        ptr_write_i64(slab, off_n + i, if i + 1 < n { i + 1 } else { -1 })
+        if i + 1 < n {
+            ptr_write_i64(slab, off_r + i, tiktoken_get_rank_span(v, text, i, 2))
+        } else {
+            ptr_write_i64(slab, off_r + i, -1)
+        }
         i += 1
     }
-    mut num_pieces := n
 
-    // Iterative BPE merges
-    while num_pieces > 1 {
+    // Iterative BPE merges updating only the 2 adjacent neighbor ranks per merge
+    while true {
         mut min_rank := 999999999999
         mut best_idx := -1
-
-        mut p := 0
-        while p < num_pieces - 1 {
-            s1 := ibuf_get(bounds, p)
-            e2 := ibuf_get(bounds, p + 2)
-            rank := tiktoken_get_rank_span(v, text, s1, e2 - s1)
-            if rank >= 0 and rank < min_rank {
-                min_rank = rank
-                best_idx = p
+        mut cur := 0
+        while cur >= 0 {
+            rnk := ptr_read_i64(slab, off_r + cur)
+            if rnk >= 0 and rnk < min_rank {
+                min_rank = rnk
+                best_idx = cur
             }
-            p += 1
+            cur = ptr_read_i64(slab, off_n + cur)
         }
 
         if best_idx < 0 {
             break
         }
 
-        // Remove boundary at best_idx + 1 in-place to merge pieces best_idx and best_idx + 1
-        mut m := best_idx + 1
-        while m < num_pieces {
-            ibuf_set(bounds, m, ibuf_get(bounds, m + 1))
-            m += 1
+        r := ptr_read_i64(slab, off_n + best_idx)
+        rn := ptr_read_i64(slab, off_n + r)
+        new_len := ptr_read_i64(slab, off_l + best_idx) + ptr_read_i64(slab, off_l + r)
+        b_start := ptr_read_i64(slab, best_idx)
+
+        ptr_write_i64(slab, off_l + best_idx, new_len)
+        ptr_write_i64(slab, off_n + best_idx, rn)
+        if rn >= 0 {
+            ptr_write_i64(slab, off_p + rn, best_idx)
+            rn_len := ptr_read_i64(slab, off_l + rn)
+            ptr_write_i64(slab, off_r + best_idx, tiktoken_get_rank_span(v, text, b_start, new_len + rn_len))
+        } else {
+            ptr_write_i64(slab, off_r + best_idx, -1)
         }
-        num_pieces -= 1
+
+        pv := ptr_read_i64(slab, off_p + best_idx)
+        if pv >= 0 {
+            p_start := ptr_read_i64(slab, pv)
+            p_len := ptr_read_i64(slab, off_l + pv)
+            ptr_write_i64(slab, off_r + pv, tiktoken_get_rank_span(v, text, p_start, p_len + new_len))
+        }
     }
 
     // Map final pieces to token IDs with exact raw-byte fallback
     mut k := 0
-    while k < num_pieces {
-        ps := ibuf_get(bounds, k)
-        pe := ibuf_get(bounds, k + 1)
-        plen := pe - ps
+    while k >= 0 {
+        ps := ptr_read_i64(slab, k)
+        plen := ptr_read_i64(slab, off_l + k)
         rank := tiktoken_get_rank_span(v, text, ps, plen)
         if rank >= 0 {
             ibuf_push(out, rank)
@@ -276,10 +297,10 @@ fn tiktoken_encode(v: BpeVocabTable, text: str) -> IntBuf {
                 bi += 1
             }
         }
-        k += 1
+        k = ptr_read_i64(slab, off_n + k)
     }
 
-    buf_free(move bounds)
+    mem_free_aligned(slab)
     return out
 }
 

@@ -1,0 +1,762 @@
+// Axon Native NVIDIA CUDA Driver & Runtime PTX JIT Engine (`std/cuda.ax`)
+// 100% Zero-nvcc, Zero-cudart, Zero-Python: talks directly to NVIDIA GPU Driver
+// (`nvcuda.dll` on Windows, `libcuda.so.1` on Linux) via `dll_load`/`c_call_v`,
+// and JIT-compiles tuned PTX 6.4 (`sm_52+`, Blackwell/Ada/Ampere/Turing/Pascal/Maxwell)
+// kernels in-driver with zero external SDK dependencies.
+
+// Compact CudaCtx (8 fields -> fast value passing; driver & kernel table in `tbl` `[0..31]*8`).
+// tbl[0..15]: fn_ctx_sync(0), fn_ctx_destroy(1), fn_mem_alloc(2), fn_mem_free(3),
+//   fn_memcpy_h2d(4), fn_memcpy_d2h(5), fn_memcpy_d2d(6), fn_mod_load(7),
+//   fn_mod_unload(8), fn_mod_get_fn(9), fn_launch(10), fn_ev_create(11),
+//   fn_ev_destroy(12), fn_ev_record(13), fn_ev_sync(14), fn_ev_elapsed(15)
+// tbl[16..23]: k_gemv_f32(16), k_gemm_f32(17), k_q8_gemv(18), k_q4_gemv(19),
+//   k_l2_dist(20), k_rmsnorm(21), k_swiglu(22), k_scale_add(23)
+// tbl[24..31]: ev_start(24), ev_stop(25), sm_count(26), vram_bytes(27), device(28), last_err(29)
+
+struct CudaCtx {
+    dll: i64
+    cu_ctx: i64
+    cu_mod: i64
+    tbl: i64
+    argv: i64
+    pbox: i64
+    dev_name: str
+}
+
+fn _cuda_load_driver() -> i64 {
+    mut h := dll_load("nvcuda.dll")
+    if h == 0 {
+        h = dll_load("libcuda.so.1")
+    }
+    if h == 0 {
+        h = dll_load("libcuda.so")
+    }
+    return h
+}
+
+fn _cuda_sym2(dll: i64, a: str, b: str) -> i64 {
+    mut p := dll_sym(dll, a)
+    if p == 0 { p = dll_sym(dll, b) }
+    return p
+}
+
+fn _cuda_cstr_alloc(s: str) -> i64 {
+    n := str_len(s)
+    buf := mem_alloc_aligned(n + 8)
+    mut i := 0
+    while i < n {
+        ptr_write_u8(buf, i, str_byte(s, i))
+        i += 1
+    }
+    ptr_write_u8(buf, n, 0)
+    return buf
+}
+
+fn _ptx_append(buf: i64, pos: i64, s: str) -> i64 {
+    n := str_len(s)
+    mut i := 0
+    while i < n {
+        ptr_write_u8(buf, pos + i, str_byte(s, i))
+        i += 1
+    }
+    return pos + n
+}
+
+fn _cuda_build_kernels_ptx() -> i64 {
+    b := mem_alloc_aligned(32768)
+    mut p := 0
+    p = _ptx_append(b, p, ".version 6.4\n.target sm_52\n.address_size 64\n\n")
+
+    // 1. Warp-cooperative coalesced GEMV (`1 warp = 32 lanes per row`, block = 256 = 8 rows)
+    p = _ptx_append(b, p, ".visible .entry axon_gemv_f32(\n")
+    p = _ptx_append(b, p, "    .param .u64 p_w, .param .u64 p_x, .param .u64 p_out,\n")
+    p = _ptx_append(b, p, "    .param .u32 p_rows, .param .u32 p_cols)\n{\n")
+    p = _ptx_append(b, p, "    .reg .pred %p<4>;\n    .reg .b32 %r<16>;\n    .reg .b64 %rd<10>;\n    .reg .f32 %f<8>;\n")
+    p = _ptx_append(b, p, "    mov.u32 %r1, %tid.x;\n")
+    p = _ptx_append(b, p, "    shr.u32 %r2, %r1, 5;\n")          // warp_in_cta
+    p = _ptx_append(b, p, "    and.b32 %r3, %r1, 31;\n")         // lane = 0..31
+    p = _ptx_append(b, p, "    mov.u32 %r4, %ctaid.x;\n")
+    p = _ptx_append(b, p, "    mad.lo.u32 %r4, %r4, 8, %r2;\n")  // row = cta*8 + warp
+    p = _ptx_append(b, p, "    ld.param.u32 %r5, [p_rows];\n")
+    p = _ptx_append(b, p, "    setp.ge.u32 %p1, %r4, %r5;\n")
+    p = _ptx_append(b, p, "    @%p1 bra GV_DONE;\n")
+    p = _ptx_append(b, p, "    ld.param.u32 %r6, [p_cols];\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd1, [p_w];\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd2, [p_x];\n")
+    p = _ptx_append(b, p, "    mul.wide.u32 %rd3, %r4, %r6;\n")
+    p = _ptx_append(b, p, "    shl.b64 %rd3, %rd3, 2;\n")
+    p = _ptx_append(b, p, "    add.u64 %rd1, %rd1, %rd3;\n")     // w_row
+    p = _ptx_append(b, p, "    mov.f32 %f1, 0f00000000;\n")
+    p = _ptx_append(b, p, "    mov.u32 %r7, %r3;\n")             // k = lane
+    p = _ptx_append(b, p, "GV_LP:\n")
+    p = _ptx_append(b, p, "    setp.ge.u32 %p2, %r7, %r6;\n")
+    p = _ptx_append(b, p, "    @%p2 bra GV_RED;\n")
+    p = _ptx_append(b, p, "    mul.wide.u32 %rd4, %r7, 4;\n")
+    p = _ptx_append(b, p, "    add.u64 %rd5, %rd1, %rd4;\n")
+    p = _ptx_append(b, p, "    add.u64 %rd6, %rd2, %rd4;\n")
+    p = _ptx_append(b, p, "    ld.global.f32 %f2, [%rd5];\n")
+    p = _ptx_append(b, p, "    ld.global.f32 %f3, [%rd6];\n")
+    p = _ptx_append(b, p, "    fma.rn.f32 %f1, %f2, %f3, %f1;\n")
+    p = _ptx_append(b, p, "    add.u32 %r7, %r7, 32;\n")
+    p = _ptx_append(b, p, "    bra GV_LP;\n")
+    p = _ptx_append(b, p, "GV_RED:\n")
+    p = _ptx_append(b, p, "    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 16, 31, 0xffffffff;\n")
+    p = _ptx_append(b, p, "    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 8, 31, 0xffffffff;\n")
+    p = _ptx_append(b, p, "    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 4, 31, 0xffffffff;\n")
+    p = _ptx_append(b, p, "    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 2, 31, 0xffffffff;\n")
+    p = _ptx_append(b, p, "    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 1, 31, 0xffffffff;\n")
+    p = _ptx_append(b, p, "    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n")
+    p = _ptx_append(b, p, "    setp.ne.u32 %p3, %r3, 0;\n")
+    p = _ptx_append(b, p, "    @%p3 bra GV_DONE;\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd7, [p_out];\n")
+    p = _ptx_append(b, p, "    mul.wide.u32 %rd8, %r4, 4;\n")
+    p = _ptx_append(b, p, "    add.u64 %rd7, %rd7, %rd8;\n")
+    p = _ptx_append(b, p, "    st.global.f32 [%rd7], %f1;\n")
+    p = _ptx_append(b, p, "GV_DONE:\n    ret;\n}\n\n")
+
+    // 2. Shared-memory 16x16 Tiled GEMM (`C = A * B`, arbitrary M, K, N)
+    p = _ptx_append(b, p, ".visible .entry axon_gemm_f32(\n")
+    p = _ptx_append(b, p, "    .param .u64 p_a, .param .u64 p_b, .param .u64 p_c,\n")
+    p = _ptx_append(b, p, "    .param .u32 p_m, .param .u32 p_k, .param .u32 p_n)\n{\n")
+    p = _ptx_append(b, p, "    .shared .align 4 .f32 sA[256];\n    .shared .align 4 .f32 sB[256];\n")
+    p = _ptx_append(b, p, "    .reg .pred %p<5>;\n    .reg .b32 %r<24>;\n    .reg .b64 %rd<12>;\n    .reg .f32 %f<10>;\n")
+    p = _ptx_append(b, p, "    mov.u32 %r1, %tid.x;\n    mov.u32 %r2, %tid.y;\n")
+    p = _ptx_append(b, p, "    mov.u32 %r3, %ctaid.x;\n    mov.u32 %r4, %ctaid.y;\n")
+    p = _ptx_append(b, p, "    mad.lo.u32 %r5, %r4, 16, %r2;\n") // row
+    p = _ptx_append(b, p, "    mad.lo.u32 %r6, %r3, 16, %r1;\n") // col
+    p = _ptx_append(b, p, "    ld.param.u32 %r7, [p_m];\n    ld.param.u32 %r8, [p_k];\n    ld.param.u32 %r9, [p_n];\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd1, [p_a];\n    ld.param.u64 %rd2, [p_b];\n    ld.param.u64 %rd3, [p_c];\n")
+    p = _ptx_append(b, p, "    mad.lo.u32 %r10, %r2, 16, %r1;\n")
+    p = _ptx_append(b, p, "    shl.b32 %r10, %r10, 2;\n") // sIdx byte offset = (ty*16+tx)*4
+    p = _ptx_append(b, p, "    mov.u32 %r11, sA;\n    add.u32 %r12, %r11, %r10;\n") // &sA[ty][tx]
+    p = _ptx_append(b, p, "    mov.u32 %r13, sB;\n    add.u32 %r14, %r13, %r10;\n") // &sB[ty][tx]
+    p = _ptx_append(b, p, "    mov.f32 %f1, 0f00000000;\n")
+    p = _ptx_append(b, p, "    mov.u32 %r15, 0;\n") // t = 0, 16, ...
+    p = _ptx_append(b, p, "GM_TLP:\n")
+    p = _ptx_append(b, p, "    setp.ge.u32 %p1, %r15, %r8;\n    @%p1 bra GM_ST;\n")
+    // Load A[row, t + tx]
+    p = _ptx_append(b, p, "    add.u32 %r16, %r15, %r1;\n")
+    p = _ptx_append(b, p, "    setp.lt.u32 %p2, %r5, %r7;\n    setp.lt.u32 %p3, %r16, %r8;\n    and.pred %p2, %p2, %p3;\n")
+    p = _ptx_append(b, p, "    mov.f32 %f2, 0f00000000;\n    @!%p2 bra GM_LA_DONE;\n")
+    p = _ptx_append(b, p, "    mad.lo.u32 %r17, %r5, %r8, %r16;\n    mul.wide.u32 %rd4, %r17, 4;\n    add.u64 %rd5, %rd1, %rd4;\n")
+    p = _ptx_append(b, p, "    ld.global.f32 %f2, [%rd5];\n")
+    p = _ptx_append(b, p, "GM_LA_DONE:\n    st.shared.f32 [%r12], %f2;\n")
+    // Load B[t + ty, col]
+    p = _ptx_append(b, p, "    add.u32 %r18, %r15, %r2;\n")
+    p = _ptx_append(b, p, "    setp.lt.u32 %p2, %r18, %r8;\n    setp.lt.u32 %p3, %r6, %r9;\n    and.pred %p2, %p2, %p3;\n")
+    p = _ptx_append(b, p, "    mov.f32 %f3, 0f00000000;\n    @!%p2 bra GM_LB_DONE;\n")
+    p = _ptx_append(b, p, "    mad.lo.u32 %r19, %r18, %r9, %r6;\n    mul.wide.u32 %rd4, %r19, 4;\n    add.u64 %rd5, %rd2, %rd4;\n")
+    p = _ptx_append(b, p, "    ld.global.f32 %f3, [%rd5];\n")
+    p = _ptx_append(b, p, "GM_LB_DONE:\n    st.shared.f32 [%r14], %f3;\n")
+    p = _ptx_append(b, p, "    bar.sync 0;\n")
+    p = _ptx_append(b, p, "    shl.b32 %r20, %r2, 6;\n    add.u32 %r20, %r11, %r20;\n") // &sA[ty][0]
+    p = _ptx_append(b, p, "    shl.b32 %r21, %r1, 2;\n    add.u32 %r21, %r13, %r21;\n") // &sB[0][tx]
+    p = _ptx_append(b, p, "    mov.u32 %r22, 16;\n")
+    p = _ptx_append(b, p, "GM_KLP:\n")
+    p = _ptx_append(b, p, "    ld.shared.f32 %f4, [%r20];\n    ld.shared.f32 %f5, [%r21];\n")
+    p = _ptx_append(b, p, "    fma.rn.f32 %f1, %f4, %f5, %f1;\n")
+    p = _ptx_append(b, p, "    add.u32 %r20, %r20, 4;\n    add.u32 %r21, %r21, 64;\n")
+    p = _ptx_append(b, p, "    sub.s32 %r22, %r22, 1;\n    setp.ne.u32 %p4, %r22, 0;\n    @%p4 bra GM_KLP;\n")
+    p = _ptx_append(b, p, "    bar.sync 0;\n")
+    p = _ptx_append(b, p, "    add.u32 %r15, %r15, 16;\n    bra GM_TLP;\n")
+    p = _ptx_append(b, p, "GM_ST:\n")
+    p = _ptx_append(b, p, "    setp.lt.u32 %p2, %r5, %r7;\n    setp.lt.u32 %p3, %r6, %r9;\n    and.pred %p2, %p2, %p3;\n")
+    p = _ptx_append(b, p, "    @!%p2 bra GM_DONE;\n")
+    p = _ptx_append(b, p, "    mad.lo.u32 %r17, %r5, %r9, %r6;\n    mul.wide.u32 %rd4, %r17, 4;\n    add.u64 %rd5, %rd3, %rd4;\n")
+    p = _ptx_append(b, p, "    st.global.f32 [%rd5], %f1;\n")
+    p = _ptx_append(b, p, "GM_DONE:\n    ret;\n}\n\n")
+
+    // 3. Q8_0 Warp-per-Row GEMV (`36B/block = f32 scale + 32 x i8` mapped 1:1 to 32 warp lanes!)
+    p = _ptx_append(b, p, ".visible .entry axon_q8_0_gemv(\n")
+    p = _ptx_append(b, p, "    .param .u64 p_act, .param .u64 p_q8, .param .u64 p_out,\n")
+    p = _ptx_append(b, p, "    .param .u32 p_rows, .param .u32 p_nblk)\n{\n")
+    p = _ptx_append(b, p, "    .reg .pred %p<4>;\n    .reg .b32 %r<16>;\n    .reg .b64 %rd<12>;\n    .reg .f32 %f<8>;\n")
+    p = _ptx_append(b, p, "    mov.u32 %r1, %tid.x;\n    shr.u32 %r2, %r1, 5;\n    and.b32 %r3, %r1, 31;\n")
+    p = _ptx_append(b, p, "    mov.u32 %r4, %ctaid.x;\n    mad.lo.u32 %r4, %r4, 8, %r2;\n")
+    p = _ptx_append(b, p, "    ld.param.u32 %r5, [p_rows];\n    setp.ge.u32 %p1, %r4, %r5;\n    @%p1 bra Q8_DONE;\n")
+    p = _ptx_append(b, p, "    ld.param.u32 %r6, [p_nblk];\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd1, [p_act];\n    ld.param.u64 %rd2, [p_q8];\n")
+    p = _ptx_append(b, p, "    mul.wide.u32 %rd3, %r4, %r6;\n    mul.lo.u64 %rd3, %rd3, 36;\n    add.u64 %rd2, %rd2, %rd3;\n")
+    p = _ptx_append(b, p, "    add.u64 %rd2, %rd2, 0;\n")
+    p = _ptx_append(b, p, "    mul.wide.u32 %rd4, %r3, 4;\n    add.u64 %rd1, %rd1, %rd4;\n") // act + lane*4
+    p = _ptx_append(b, p, "    cvt.u64.u32 %rd5, %r3;\n")
+    p = _ptx_append(b, p, "    mov.f32 %f1, 0f00000000;\n    mov.u32 %r7, 0;\n")
+    p = _ptx_append(b, p, "Q8_LP:\n")
+    p = _ptx_append(b, p, "    setp.ge.u32 %p2, %r7, %r6;\n    @%p2 bra Q8_RED;\n")
+    p = _ptx_append(b, p, "    ld.global.f32 %f2, [%rd2];\n")              // scale
+    p = _ptx_append(b, p, "    add.u64 %rd6, %rd2, 4;\n    add.u64 %rd6, %rd6, %rd5;\n")
+    p = _ptx_append(b, p, "    ld.global.s8 %r8, [%rd6];\n")               // w_q[lane]
+    p = _ptx_append(b, p, "    cvt.rn.f32.s32 %f3, %r8;\n")
+    p = _ptx_append(b, p, "    ld.global.f32 %f4, [%rd1];\n")              // act[b*32+lane]
+    p = _ptx_append(b, p, "    mul.f32 %f3, %f3, %f4;\n    fma.rn.f32 %f1, %f3, %f2, %f1;\n")
+    p = _ptx_append(b, p, "    add.u64 %rd2, %rd2, 36;\n    add.u64 %rd1, %rd1, 128;\n")
+    p = _ptx_append(b, p, "    add.u32 %r7, %r7, 1;\n    bra Q8_LP;\n")
+    p = _ptx_append(b, p, "Q8_RED:\n")
+    p = _ptx_append(b, p, "    mov.b32 %r8, %f1;\n    shfl.sync.down.b32 %r9, %r8, 16, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 8, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 4, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 2, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 1, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n")
+    p = _ptx_append(b, p, "    setp.ne.u32 %p3, %r3, 0;\n    @%p3 bra Q8_DONE;\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd7, [p_out];\n    mul.wide.u32 %rd8, %r4, 4;\n    add.u64 %rd7, %rd7, %rd8;\n    st.global.f32 [%rd7], %f1;\n")
+    p = _ptx_append(b, p, "Q8_DONE:\n    ret;\n}\n\n")
+
+    // 4. Q4_0 Warp-per-Row GEMV (`20B/block = f32 scale + 16 packed bytes = 32 nibbles` -> 32 lanes!)
+    p = _ptx_append(b, p, ".visible .entry axon_q4_0_gemv(\n")
+    p = _ptx_append(b, p, "    .param .u64 p_act, .param .u64 p_q4, .param .u64 p_out,\n")
+    p = _ptx_append(b, p, "    .param .u32 p_rows, .param .u32 p_nblk)\n{\n")
+    p = _ptx_append(b, p, "    .reg .pred %p<4>;\n    .reg .b32 %r<16>;\n    .reg .b64 %rd<12>;\n    .reg .f32 %f<8>;\n")
+    p = _ptx_append(b, p, "    mov.u32 %r1, %tid.x;\n    shr.u32 %r2, %r1, 5;\n    and.b32 %r3, %r1, 31;\n")
+    p = _ptx_append(b, p, "    mov.u32 %r4, %ctaid.x;\n    mad.lo.u32 %r4, %r4, 8, %r2;\n")
+    p = _ptx_append(b, p, "    ld.param.u32 %r5, [p_rows];\n    setp.ge.u32 %p1, %r4, %r5;\n    @%p1 bra Q4_DONE;\n")
+    p = _ptx_append(b, p, "    ld.param.u32 %r6, [p_nblk];\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd1, [p_act];\n    ld.param.u64 %rd2, [p_q4];\n")
+    p = _ptx_append(b, p, "    mul.wide.u32 %rd3, %r4, %r6;\n    mul.lo.u64 %rd3, %rd3, 20;\n    add.u64 %rd2, %rd2, %rd3;\n")
+    p = _ptx_append(b, p, "    mul.wide.u32 %rd4, %r3, 4;\n    add.u64 %rd1, %rd1, %rd4;\n")
+    p = _ptx_append(b, p, "    shr.u32 %r10, %r3, 1;\n    cvt.u64.u32 %rd5, %r10;\n    and.b32 %r11, %r3, 1;\n    shl.b32 %r11, %r11, 2;\n") // shift = (lane & 1)*4
+    p = _ptx_append(b, p, "    mov.f32 %f1, 0f00000000;\n    mov.u32 %r7, 0;\n")
+    p = _ptx_append(b, p, "Q4_LP:\n")
+    p = _ptx_append(b, p, "    setp.ge.u32 %p2, %r7, %r6;\n    @%p2 bra Q4_RED;\n")
+    p = _ptx_append(b, p, "    ld.global.f32 %f2, [%rd2];\n")
+    p = _ptx_append(b, p, "    add.u64 %rd6, %rd2, 4;\n    add.u64 %rd6, %rd6, %rd5;\n")
+    p = _ptx_append(b, p, "    ld.global.u8 %r8, [%rd6];\n")
+    p = _ptx_append(b, p, "    shr.u32 %r8, %r8, %r11;\n    and.b32 %r8, %r8, 15;\n    sub.s32 %r8, %r8, 8;\n")
+    p = _ptx_append(b, p, "    cvt.rn.f32.s32 %f3, %r8;\n")
+    p = _ptx_append(b, p, "    ld.global.f32 %f4, [%rd1];\n")
+    p = _ptx_append(b, p, "    mul.f32 %f3, %f3, %f4;\n    fma.rn.f32 %f1, %f3, %f2, %f1;\n")
+    p = _ptx_append(b, p, "    add.u64 %rd2, %rd2, 20;\n    add.u64 %rd1, %rd1, 128;\n")
+    p = _ptx_append(b, p, "    add.u32 %r7, %r7, 1;\n    bra Q4_LP;\n")
+    p = _ptx_append(b, p, "Q4_RED:\n")
+    p = _ptx_append(b, p, "    mov.b32 %r8, %f1;\n    shfl.sync.down.b32 %r9, %r8, 16, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 8, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 4, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 2, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 1, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n")
+    p = _ptx_append(b, p, "    setp.ne.u32 %p3, %r3, 0;\n    @%p3 bra Q4_DONE;\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd7, [p_out];\n    mul.wide.u32 %rd8, %r4, 4;\n    add.u64 %rd7, %rd7, %rd8;\n    st.global.f32 [%rd7], %f1;\n")
+    p = _ptx_append(b, p, "Q4_DONE:\n    ret;\n}\n\n")
+
+    // 5. Batch L2 Squared Distance (`1 warp per database vector`)
+    p = _ptx_append(b, p, ".visible .entry axon_l2_dist_f32(\n")
+    p = _ptx_append(b, p, "    .param .u64 p_db, .param .u64 p_q, .param .u64 p_out,\n")
+    p = _ptx_append(b, p, "    .param .u32 p_n, .param .u32 p_dim)\n{\n")
+    p = _ptx_append(b, p, "    .reg .pred %p<4>;\n    .reg .b32 %r<16>;\n    .reg .b64 %rd<10>;\n    .reg .f32 %f<8>;\n")
+    p = _ptx_append(b, p, "    mov.u32 %r1, %tid.x;\n    shr.u32 %r2, %r1, 5;\n    and.b32 %r3, %r1, 31;\n")
+    p = _ptx_append(b, p, "    mov.u32 %r4, %ctaid.x;\n    mad.lo.u32 %r4, %r4, 8, %r2;\n")
+    p = _ptx_append(b, p, "    ld.param.u32 %r5, [p_n];\n    setp.ge.u32 %p1, %r4, %r5;\n    @%p1 bra L2_DONE;\n")
+    p = _ptx_append(b, p, "    ld.param.u32 %r6, [p_dim];\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd1, [p_db];\n    ld.param.u64 %rd2, [p_q];\n")
+    p = _ptx_append(b, p, "    mul.wide.u32 %rd3, %r4, %r6;\n    shl.b64 %rd3, %rd3, 2;\n    add.u64 %rd1, %rd1, %rd3;\n")
+    p = _ptx_append(b, p, "    mov.f32 %f1, 0f00000000;\n    mov.u32 %r7, %r3;\n")
+    p = _ptx_append(b, p, "L2_LP:\n")
+    p = _ptx_append(b, p, "    setp.ge.u32 %p2, %r7, %r6;\n    @%p2 bra L2_RED;\n")
+    p = _ptx_append(b, p, "    mul.wide.u32 %rd4, %r7, 4;\n    add.u64 %rd5, %rd1, %rd4;\n    add.u64 %rd6, %rd2, %rd4;\n")
+    p = _ptx_append(b, p, "    ld.global.f32 %f2, [%rd5];\n    ld.global.f32 %f3, [%rd6];\n")
+    p = _ptx_append(b, p, "    sub.f32 %f4, %f2, %f3;\n    fma.rn.f32 %f1, %f4, %f4, %f1;\n")
+    p = _ptx_append(b, p, "    add.u32 %r7, %r7, 32;\n    bra L2_LP;\n")
+    p = _ptx_append(b, p, "L2_RED:\n")
+    p = _ptx_append(b, p, "    mov.b32 %r8, %f1;\n    shfl.sync.down.b32 %r9, %r8, 16, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 8, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 4, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 2, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n    mov.b32 %r8, %f1;\n")
+    p = _ptx_append(b, p, "    shfl.sync.down.b32 %r9, %r8, 1, 31, 0xffffffff;\n    mov.b32 %f2, %r9;\n    add.f32 %f1, %f1, %f2;\n")
+    p = _ptx_append(b, p, "    setp.ne.u32 %p3, %r3, 0;\n    @%p3 bra L2_DONE;\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd7, [p_out];\n    mul.wide.u32 %rd8, %r4, 4;\n    add.u64 %rd7, %rd7, %rd8;\n    st.global.f32 [%rd7], %f1;\n")
+    p = _ptx_append(b, p, "L2_DONE:\n    ret;\n}\n\n")
+
+    // 6. RMSNorm (`1 CTA = 256 threads per row`, gridDim.x = rows, shared tree reduction)
+    p = _ptx_append(b, p, ".visible .entry axon_rmsnorm_f32(\n")
+    p = _ptx_append(b, p, "    .param .u64 p_x, .param .u64 p_w, .param .u64 p_out,\n")
+    p = _ptx_append(b, p, "    .param .u32 p_dim, .param .f32 p_eps)\n{\n")
+    p = _ptx_append(b, p, "    .shared .align 4 .f32 sR[256];\n")
+    p = _ptx_append(b, p, "    .reg .pred %p<4>;\n    .reg .b32 %r<13>;\n    .reg .b64 %rd<12>;\n    .reg .f32 %f<8>;\n")
+    p = _ptx_append(b, p, "    mov.u32 %r1, %tid.x;\n    mov.u32 %r10, %ctaid.x;\n    ld.param.u32 %r2, [p_dim];\n")
+    p = _ptx_append(b, p, "    mul.wide.u32 %rd9, %r10, %r2;\n    shl.b64 %rd9, %rd9, 2;\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd1, [p_x];\n    add.u64 %rd1, %rd1, %rd9;\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd2, [p_w];\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd3, [p_out];\n    add.u64 %rd3, %rd3, %rd9;\n")
+    p = _ptx_append(b, p, "    ld.param.f32 %f6, [p_eps];\n")
+    p = _ptx_append(b, p, "    mov.f32 %f1, 0f00000000;\n    mov.u32 %r3, %r1;\n")
+    p = _ptx_append(b, p, "RM_S1:\n    setp.ge.u32 %p1, %r3, %r2;\n    @%p1 bra RM_RD0;\n")
+    p = _ptx_append(b, p, "    mul.wide.u32 %rd4, %r3, 4;\n    add.u64 %rd5, %rd1, %rd4;\n    ld.global.f32 %f2, [%rd5];\n")
+    p = _ptx_append(b, p, "    fma.rn.f32 %f1, %f2, %f2, %f1;\n    add.u32 %r3, %r3, 256;\n    bra RM_S1;\n")
+    p = _ptx_append(b, p, "RM_RD0:\n    mov.u32 %r4, sR;\n    shl.b32 %r5, %r1, 2;\n    add.u32 %r6, %r4, %r5;\n    st.shared.f32 [%r6], %f1;\n")
+    p = _ptx_append(b, p, "    bar.sync 0;\n    mov.u32 %r7, 128;\n")
+    p = _ptx_append(b, p, "RM_RD:\n    setp.eq.u32 %p1, %r7, 0;\n    @%p1 bra RM_INV;\n")
+    p = _ptx_append(b, p, "    setp.lt.u32 %p2, %r1, %r7;\n    @!%p2 bra RM_SK;\n")
+    p = _ptx_append(b, p, "    add.u32 %r8, %r1, %r7;\n    shl.b32 %r8, %r8, 2;\n    add.u32 %r9, %r4, %r8;\n")
+    p = _ptx_append(b, p, "    ld.shared.f32 %f3, [%r6];\n    ld.shared.f32 %f4, [%r9];\n    add.f32 %f3, %f3, %f4;\n    st.shared.f32 [%r6], %f3;\n")
+    p = _ptx_append(b, p, "RM_SK:\n    bar.sync 0;\n    shr.u32 %r7, %r7, 1;\n    bra RM_RD;\n")
+    p = _ptx_append(b, p, "RM_INV:\n    setp.eq.u32 %p1, %r1, 0;\n    @!%p1 bra RM_BCAST;\n")
+    p = _ptx_append(b, p, "    ld.shared.f32 %f3, [%r4];\n    cvt.rn.f32.u32 %f4, %r2;\n    div.rn.f32 %f3, %f3, %f4;\n    add.f32 %f3, %f3, %f6;\n")
+    p = _ptx_append(b, p, "    rsqrt.approx.f32 %f3, %f3;\n    st.shared.f32 [%r4], %f3;\n")
+    p = _ptx_append(b, p, "RM_BCAST:\n    bar.sync 0;\n    ld.shared.f32 %f5, [%r4];\n")
+    p = _ptx_append(b, p, "    mov.u32 %r3, %r1;\n")
+    p = _ptx_append(b, p, "RM_S2:\n    setp.ge.u32 %p1, %r3, %r2;\n    @%p1 bra RM_DONE;\n")
+    p = _ptx_append(b, p, "    mul.wide.u32 %rd4, %r3, 4;\n    add.u64 %rd5, %rd1, %rd4;\n    add.u64 %rd6, %rd2, %rd4;\n    add.u64 %rd7, %rd3, %rd4;\n")
+    p = _ptx_append(b, p, "    ld.global.f32 %f2, [%rd5];\n    ld.global.f32 %f3, [%rd6];\n")
+    p = _ptx_append(b, p, "    mul.f32 %f2, %f2, %f5;\n    mul.f32 %f2, %f2, %f3;\n    st.global.f32 [%rd7], %f2;\n")
+    p = _ptx_append(b, p, "    add.u32 %r3, %r3, 256;\n    bra RM_S2;\n")
+    p = _ptx_append(b, p, "RM_DONE:\n    ret;\n}\n\n")
+
+    // 7. Fused SwiGLU (`out[i] = (gate[i] / (1 + exp(-gate[i]))) * up[i]`, hardware SFU `ex2.approx`)
+    p = _ptx_append(b, p, ".visible .entry axon_swiglu_f32(\n")
+    p = _ptx_append(b, p, "    .param .u64 p_gate, .param .u64 p_up, .param .u64 p_out,\n")
+    p = _ptx_append(b, p, "    .param .u32 p_dim)\n{\n")
+    p = _ptx_append(b, p, "    .reg .pred %p<2>;\n    .reg .b32 %r<4>;\n    .reg .b64 %rd<8>;\n    .reg .f32 %f<8>;\n")
+    p = _ptx_append(b, p, "    mov.u32 %r1, %ctaid.x;\n    mov.u32 %r2, %tid.x;\n    mad.lo.u32 %r1, %r1, 256, %r2;\n")
+    p = _ptx_append(b, p, "    ld.param.u32 %r3, [p_dim];\n    setp.ge.u32 %p1, %r1, %r3;\n    @%p1 bra SW_DONE;\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd1, [p_gate];\n    ld.param.u64 %rd2, [p_up];\n    ld.param.u64 %rd3, [p_out];\n")
+    p = _ptx_append(b, p, "    mul.wide.u32 %rd4, %r1, 4;\n")
+    p = _ptx_append(b, p, "    add.u64 %rd5, %rd1, %rd4;\n    add.u64 %rd6, %rd2, %rd4;\n    add.u64 %rd7, %rd3, %rd4;\n")
+    p = _ptx_append(b, p, "    ld.global.f32 %f1, [%rd5];\n    ld.global.f32 %f2, [%rd6];\n")
+    p = _ptx_append(b, p, "    neg.f32 %f3, %f1;\n")
+    p = _ptx_append(b, p, "    mul.f32 %f3, %f3, 0f3FB8AA3B;\n") // -g * LOG2E
+    p = _ptx_append(b, p, "    ex2.approx.ftz.f32 %f4, %f3;\n")
+    p = _ptx_append(b, p, "    add.f32 %f4, %f4, 0f3F800000;\n") // 1 + exp(-g)
+    p = _ptx_append(b, p, "    mul.f32 %f5, %f1, %f2;\n")
+    p = _ptx_append(b, p, "    div.rn.f32 %f6, %f5, %f4;\n")
+    p = _ptx_append(b, p, "    st.global.f32 [%rd7], %f6;\n")
+    p = _ptx_append(b, p, "SW_DONE:\n    ret;\n}\n\n")
+
+    // 8. Vector scale-add (`out[i] = alpha * a[i] + b[i]`)
+    p = _ptx_append(b, p, ".visible .entry axon_scale_add_f32(\n")
+    p = _ptx_append(b, p, "    .param .u64 p_a, .param .u64 p_b, .param .u64 p_out,\n")
+    p = _ptx_append(b, p, "    .param .u32 p_n, .param .f32 p_alpha)\n{\n")
+    p = _ptx_append(b, p, "    .reg .pred %p<2>;\n    .reg .b32 %r<4>;\n    .reg .b64 %rd<8>;\n    .reg .f32 %f<5>;\n")
+    p = _ptx_append(b, p, "    mov.u32 %r1, %ctaid.x;\n    mov.u32 %r2, %tid.x;\n    mad.lo.u32 %r1, %r1, 256, %r2;\n")
+    p = _ptx_append(b, p, "    ld.param.u32 %r3, [p_n];\n    setp.ge.u32 %p1, %r1, %r3;\n    @%p1 bra SA_DONE;\n")
+    p = _ptx_append(b, p, "    ld.param.u64 %rd1, [p_a];\n    ld.param.u64 %rd2, [p_b];\n    ld.param.u64 %rd3, [p_out];\n")
+    p = _ptx_append(b, p, "    ld.param.f32 %f1, [p_alpha];\n")
+    p = _ptx_append(b, p, "    mul.wide.u32 %rd4, %r1, 4;\n")
+    p = _ptx_append(b, p, "    add.u64 %rd5, %rd1, %rd4;\n    add.u64 %rd6, %rd2, %rd4;\n    add.u64 %rd7, %rd3, %rd4;\n")
+    p = _ptx_append(b, p, "    ld.global.f32 %f2, [%rd5];\n    ld.global.f32 %f3, [%rd6];\n")
+    p = _ptx_append(b, p, "    fma.rn.f32 %f4, %f1, %f2, %f3;\n")
+    p = _ptx_append(b, p, "    st.global.f32 [%rd7], %f4;\n")
+    p = _ptx_append(b, p, "SA_DONE:\n    ret;\n}\n")
+
+    ptr_write_u8(b, p, 0)
+    return b
+}
+
+fn cuda_device_count() -> i64 {
+    dll := _cuda_load_driver()
+    if dll == 0 { return 0 }
+    f_init := dll_sym(dll, "cuInit")
+    f_cnt := dll_sym(dll, "cuDeviceGetCount")
+    if f_init == 0 or f_cnt == 0 { dll_close(dll); return 0 }
+    av := mem_alloc_aligned(32)
+    out := mem_alloc_aligned(16)
+    ptr_write_i64(av, 0, 0)
+    if c_call_v(f_init, 1, av) != 0 {
+        mem_free_aligned(av); mem_free_aligned(out); dll_close(dll); return 0
+    }
+    ptr_write_i64(av, 0, out)
+    if c_call_v(f_cnt, 1, av) != 0 {
+        mem_free_aligned(av); mem_free_aligned(out); dll_close(dll); return 0
+    }
+    cnt := ptr_read_i64(out, 0) & 0xFFFFFFFF
+    mem_free_aligned(av); mem_free_aligned(out); dll_close(dll)
+    return cnt
+}
+
+fn cuda_available() -> bool {
+    return cuda_device_count() > 0
+}
+
+fn _cuda_get_fn(f_get_fn: i64, argv: i64, mod_h: i64, name: str) -> i64 {
+    out := mem_alloc_aligned(16)
+    cname := _cuda_cstr_alloc(name)
+    ptr_write_i64(argv, 0, out)
+    ptr_write_i64(argv, 1, mod_h)
+    ptr_write_i64(argv, 2, cname)
+    rc := c_call_v(f_get_fn, 3, argv)
+    fn_h := if rc == 0 { ptr_read_i64(out, 0) } else { 0 }
+    mem_free_aligned(out)
+    mem_free_aligned(cname)
+    return fn_h
+}
+
+fn cuda_init(device_ord: i64 = 0) -> CudaCtx {
+    dll := _cuda_load_driver()
+    mut empty := CudaCtx(dll = 0, cu_ctx = 0, cu_mod = 0, tbl = 0, argv = 0, pbox = 0, dev_name = "")
+    if dll == 0 { return empty }
+    f_init := dll_sym(dll, "cuInit")
+    f_cnt := dll_sym(dll, "cuDeviceGetCount")
+    f_dev := dll_sym(dll, "cuDeviceGet")
+    f_name := dll_sym(dll, "cuDeviceGetName")
+    f_attr := dll_sym(dll, "cuDeviceGetAttribute")
+    f_vram := _cuda_sym2(dll, "cuDeviceTotalMem_v2", "cuDeviceTotalMem")
+    f_ctx_cr := _cuda_sym2(dll, "cuCtxCreate_v2", "cuCtxCreate")
+    if f_init == 0 or f_ctx_cr == 0 { dll_close(dll); return empty }
+
+    tbl := mem_alloc_aligned(256)
+    argv := mem_alloc_aligned(128)
+    pbox := mem_alloc_aligned(256)
+    tmp := mem_alloc_aligned(128)
+
+    ptr_write_i64(argv, 0, 0)
+    if c_call_v(f_init, 1, argv) != 0 {
+        mem_free_aligned(tbl); mem_free_aligned(argv); mem_free_aligned(pbox); mem_free_aligned(tmp); dll_close(dll); return empty
+    }
+    ptr_write_i64(argv, 0, tmp)
+    c_call_v(f_cnt, 1, argv)
+    cnt := ptr_read_i64(tmp, 0) & 0xFFFFFFFF
+    if device_ord >= cnt {
+        mem_free_aligned(tbl); mem_free_aligned(argv); mem_free_aligned(pbox); mem_free_aligned(tmp); dll_close(dll); return empty
+    }
+    ptr_write_i64(argv, 0, tmp)
+    ptr_write_i64(argv, 1, device_ord)
+    c_call_v(f_dev, 2, argv)
+    dev := ptr_read_i64(tmp, 0) & 0xFFFFFFFF
+
+    nbuf := mem_alloc_aligned(128)
+    ptr_write_i64(argv, 0, nbuf); ptr_write_i64(argv, 1, 128); ptr_write_i64(argv, 2, dev)
+    c_call_v(f_name, 3, argv)
+    dname := str_from_cstr(nbuf)
+
+    mut sms := 0
+    if f_attr != 0 {
+        ptr_write_i64(argv, 0, tmp); ptr_write_i64(argv, 1, 16); ptr_write_i64(argv, 2, dev)
+        if c_call_v(f_attr, 3, argv) == 0 { sms = ptr_read_i64(tmp, 0) & 0xFFFFFFFF }
+    }
+    mut vram := 0
+    if f_vram != 0 {
+        ptr_write_i64(argv, 0, tmp); ptr_write_i64(argv, 1, dev)
+        if c_call_v(f_vram, 2, argv) == 0 { vram = ptr_read_i64(tmp, 0) }
+    }
+
+    ptr_write_i64(argv, 0, tmp); ptr_write_i64(argv, 1, 0); ptr_write_i64(argv, 2, dev)
+    rc_ctx := c_call_v(f_ctx_cr, 3, argv)
+    cu_ctx := if rc_ctx == 0 { ptr_read_i64(tmp, 0) } else { 0 }
+    if cu_ctx == 0 {
+        mem_free_aligned(tbl); mem_free_aligned(argv); mem_free_aligned(pbox); mem_free_aligned(tmp); dll_close(dll); return empty
+    }
+
+    f_mod_load := dll_sym(dll, "cuModuleLoadData")
+    f_mod_get_fn := dll_sym(dll, "cuModuleGetFunction")
+    f_ev_cr := dll_sym(dll, "cuEventCreate")
+
+    ptx_ptr := _cuda_build_kernels_ptx()
+    ptr_write_i64(argv, 0, tmp); ptr_write_i64(argv, 1, ptx_ptr)
+    rc_mod := c_call_v(f_mod_load, 2, argv)
+    mem_free_aligned(ptx_ptr)
+    cu_mod := if rc_mod == 0 { ptr_read_i64(tmp, 0) } else { 0 }
+
+    mut ev0 := 0
+    mut ev1 := 0
+    if f_ev_cr != 0 {
+        ptr_write_i64(argv, 0, tmp); ptr_write_i64(argv, 1, 0)
+        if c_call_v(f_ev_cr, 2, argv) == 0 { ev0 = ptr_read_i64(tmp, 0) }
+        ptr_write_i64(argv, 0, tmp); ptr_write_i64(argv, 1, 0)
+        if c_call_v(f_ev_cr, 2, argv) == 0 { ev1 = ptr_read_i64(tmp, 0) }
+    }
+    mem_free_aligned(tmp)
+
+    ptr_write_i64(tbl, 0, dll_sym(dll, "cuCtxSynchronize"))
+    ptr_write_i64(tbl, 1, _cuda_sym2(dll, "cuCtxDestroy_v2", "cuCtxDestroy"))
+    ptr_write_i64(tbl, 2, _cuda_sym2(dll, "cuMemAlloc_v2", "cuMemAlloc"))
+    ptr_write_i64(tbl, 3, _cuda_sym2(dll, "cuMemFree_v2", "cuMemFree"))
+    ptr_write_i64(tbl, 4, _cuda_sym2(dll, "cuMemcpyHtoD_v2", "cuMemcpyHtoD"))
+    ptr_write_i64(tbl, 5, _cuda_sym2(dll, "cuMemcpyDtoH_v2", "cuMemcpyDtoH"))
+    ptr_write_i64(tbl, 6, _cuda_sym2(dll, "cuMemcpyDtoD_v2", "cuMemcpyDtoD"))
+    ptr_write_i64(tbl, 7, f_mod_load)
+    ptr_write_i64(tbl, 8, dll_sym(dll, "cuModuleUnload"))
+    ptr_write_i64(tbl, 9, f_mod_get_fn)
+    ptr_write_i64(tbl, 10, dll_sym(dll, "cuLaunchKernel"))
+    ptr_write_i64(tbl, 11, f_ev_cr)
+    ptr_write_i64(tbl, 12, _cuda_sym2(dll, "cuEventDestroy_v2", "cuEventDestroy"))
+    ptr_write_i64(tbl, 13, dll_sym(dll, "cuEventRecord"))
+    ptr_write_i64(tbl, 14, dll_sym(dll, "cuEventSynchronize"))
+    ptr_write_i64(tbl, 15, dll_sym(dll, "cuEventElapsedTime"))
+
+    if cu_mod != 0 and f_mod_get_fn != 0 {
+        ptr_write_i64(tbl, 16, _cuda_get_fn(f_mod_get_fn, argv, cu_mod, "axon_gemv_f32"))
+        ptr_write_i64(tbl, 17, _cuda_get_fn(f_mod_get_fn, argv, cu_mod, "axon_gemm_f32"))
+        ptr_write_i64(tbl, 18, _cuda_get_fn(f_mod_get_fn, argv, cu_mod, "axon_q8_0_gemv"))
+        ptr_write_i64(tbl, 19, _cuda_get_fn(f_mod_get_fn, argv, cu_mod, "axon_q4_0_gemv"))
+        ptr_write_i64(tbl, 20, _cuda_get_fn(f_mod_get_fn, argv, cu_mod, "axon_l2_dist_f32"))
+        ptr_write_i64(tbl, 21, _cuda_get_fn(f_mod_get_fn, argv, cu_mod, "axon_rmsnorm_f32"))
+        ptr_write_i64(tbl, 22, _cuda_get_fn(f_mod_get_fn, argv, cu_mod, "axon_swiglu_f32"))
+        ptr_write_i64(tbl, 23, _cuda_get_fn(f_mod_get_fn, argv, cu_mod, "axon_scale_add_f32"))
+    } else {
+        mut zi := 16
+        while zi < 24 { ptr_write_i64(tbl, zi, 0); zi += 1 }
+    }
+    ptr_write_i64(tbl, 24, ev0)
+    ptr_write_i64(tbl, 25, ev1)
+    ptr_write_i64(tbl, 26, sms)
+    ptr_write_i64(tbl, 27, vram)
+    ptr_write_i64(tbl, 28, dev)
+    ptr_write_i64(tbl, 29, rc_mod)
+    ptr_write_i64(tbl, 30, nbuf)
+
+    return CudaCtx(dll = dll, cu_ctx = cu_ctx, cu_mod = cu_mod, tbl = tbl, argv = argv, pbox = pbox, dev_name = dname)
+}
+
+fn cuda_ready(ctx: CudaCtx) -> bool {
+    if ctx.cu_ctx == 0 or ctx.cu_mod == 0 or ctx.tbl == 0 { return false }
+    return ptr_read_i64(ctx.tbl, 16) != 0
+}
+
+fn cuda_last_err(ctx: CudaCtx) -> i64 {
+    if ctx.tbl == 0 { return -1 }
+    return ptr_read_i64(ctx.tbl, 29)
+}
+fn cuda_device_name(ctx: CudaCtx) -> str { return ctx.dev_name }
+fn cuda_device_vram_mb(ctx: CudaCtx) -> i64 { return if ctx.tbl == 0 { 0 } else { ptr_read_i64(ctx.tbl, 27) / (1024 * 1024) } }
+fn cuda_sm_count(ctx: CudaCtx) -> i64 { return if ctx.tbl == 0 { 0 } else { ptr_read_i64(ctx.tbl, 26) } }
+
+fn cuda_sync(ctx: CudaCtx) -> i64 {
+    f := ptr_read_i64(ctx.tbl, 0)
+    if f == 0 { return -1 }
+    return c_call_v(f, 0, ctx.argv)
+}
+
+fn cuda_alloc(ctx: CudaCtx, bytes: i64) -> i64 {
+    f := ptr_read_i64(ctx.tbl, 2)
+    if f == 0 or bytes <= 0 { return 0 }
+    ptr_write_i64(ctx.pbox, 0, 0)
+    ptr_write_i64(ctx.argv, 0, ctx.pbox)
+    ptr_write_i64(ctx.argv, 1, bytes)
+    rc := c_call_v(f, 2, ctx.argv)
+    if rc != 0 { return 0 }
+    return ptr_read_i64(ctx.pbox, 0)
+}
+
+fn cuda_alloc_f32(ctx: CudaCtx, count: i64) -> i64 {
+    return cuda_alloc(ctx, count * 4)
+}
+
+fn cuda_mem_free(ctx: CudaCtx, dptr: i64) {
+    if dptr == 0 or ctx.tbl == 0 { return }
+    f := ptr_read_i64(ctx.tbl, 3)
+    if f == 0 { return }
+    ptr_write_i64(ctx.argv, 0, dptr)
+    c_call_v(f, 1, ctx.argv)
+}
+
+fn cuda_h2d(ctx: CudaCtx, dptr: i64, host_ptr: i64, bytes: i64) -> i64 {
+    f := ptr_read_i64(ctx.tbl, 4)
+    if f == 0 { return -1 }
+    ptr_write_i64(ctx.argv, 0, dptr)
+    ptr_write_i64(ctx.argv, 1, host_ptr)
+    ptr_write_i64(ctx.argv, 2, bytes)
+    return c_call_v(f, 3, ctx.argv)
+}
+
+fn cuda_d2h(ctx: CudaCtx, host_ptr: i64, dptr: i64, bytes: i64) -> i64 {
+    f := ptr_read_i64(ctx.tbl, 5)
+    if f == 0 { return -1 }
+    ptr_write_i64(ctx.argv, 0, host_ptr)
+    ptr_write_i64(ctx.argv, 1, dptr)
+    ptr_write_i64(ctx.argv, 2, bytes)
+    return c_call_v(f, 3, ctx.argv)
+}
+
+fn cuda_d2d(ctx: CudaCtx, dst_dptr: i64, src_dptr: i64, bytes: i64) -> i64 {
+    f := ptr_read_i64(ctx.tbl, 6)
+    if f == 0 { return -1 }
+    ptr_write_i64(ctx.argv, 0, dst_dptr)
+    ptr_write_i64(ctx.argv, 1, src_dptr)
+    ptr_write_i64(ctx.argv, 2, bytes)
+    return c_call_v(f, 3, ctx.argv)
+}
+
+fn cuda_load_ptx(ctx: CudaCtx, ptx_src: str) -> i64 {
+    f := ptr_read_i64(ctx.tbl, 7)
+    if f == 0 { return 0 }
+    cp := _cuda_cstr_alloc(ptx_src)
+    ptr_write_i64(ctx.pbox, 0, 0)
+    ptr_write_i64(ctx.argv, 0, ctx.pbox)
+    ptr_write_i64(ctx.argv, 1, cp)
+    rc := c_call_v(f, 2, ctx.argv)
+    mem_free_aligned(cp)
+    if rc != 0 { return 0 }
+    return ptr_read_i64(ctx.pbox, 0)
+}
+
+fn cuda_get_fn(ctx: CudaCtx, hmod: i64, name: str) -> i64 {
+    f := ptr_read_i64(ctx.tbl, 9)
+    if f == 0 or hmod == 0 { return 0 }
+    return _cuda_get_fn(f, ctx.argv, hmod, name)
+}
+
+// Launch using pre-populated `params_ptr_array` (`void**`).
+fn cuda_launch_raw(ctx: CudaCtx, kfn: i64, gx: i64, gy: i64, gz: i64, bx: i64, by: i64, bz: i64, shmem: i64, params: i64) -> i64 {
+    f := ptr_read_i64(ctx.tbl, 10)
+    if kfn == 0 or f == 0 { return -1 }
+    ptr_write_i64(ctx.argv, 0, kfn)
+    ptr_write_i64(ctx.argv, 1, gx)
+    ptr_write_i64(ctx.argv, 2, gy)
+    ptr_write_i64(ctx.argv, 3, gz)
+    ptr_write_i64(ctx.argv, 4, bx)
+    ptr_write_i64(ctx.argv, 5, by)
+    ptr_write_i64(ctx.argv, 6, bz)
+    ptr_write_i64(ctx.argv, 7, shmem)
+    ptr_write_i64(ctx.argv, 8, 0)
+    ptr_write_i64(ctx.argv, 9, params)
+    ptr_write_i64(ctx.argv, 10, 0)
+    return c_call_v(f, 11, ctx.argv)
+}
+
+fn _cuda_pack5_u64x3_u32x2(pbox: i64, a0: i64, a1: i64, a2: i64, a3: i64, a4: i64) -> i64 {
+    vals := pbox + 64
+    ptr_write_i64(vals, 0, a0)
+    ptr_write_i64(vals, 1, a1)
+    ptr_write_i64(vals, 2, a2)
+    ptr_write_i64(vals, 3, a3)
+    ptr_write_i64(vals, 4, a4)
+    ptr_write_i64(pbox, 0, vals)
+    ptr_write_i64(pbox, 1, vals + 8)
+    ptr_write_i64(pbox, 2, vals + 16)
+    ptr_write_i64(pbox, 3, vals + 24)
+    ptr_write_i64(pbox, 4, vals + 32)
+    return pbox
+}
+
+fn cuda_gemv_f32(ctx: CudaCtx, d_w: i64, d_x: i64, d_out: i64, rows: i64, cols: i64) -> i64 {
+    if rows <= 0 or cols <= 0 { return 0 }
+    params := _cuda_pack5_u64x3_u32x2(ctx.pbox, d_w, d_x, d_out, rows, cols)
+    gx := (rows + 7) / 8
+    return cuda_launch_raw(ctx, ptr_read_i64(ctx.tbl, 16), gx, 1, 1, 256, 1, 1, 0, params)
+}
+
+fn cuda_gemm_f32(ctx: CudaCtx, d_a: i64, d_b: i64, d_c: i64, m: i64, k: i64, n: i64) -> i64 {
+    if m <= 0 or k <= 0 or n <= 0 { return 0 }
+    vals := ctx.pbox + 64
+    ptr_write_i64(vals, 0, d_a)
+    ptr_write_i64(vals, 1, d_b)
+    ptr_write_i64(vals, 2, d_c)
+    ptr_write_i64(vals, 3, m)
+    ptr_write_i64(vals, 4, k)
+    ptr_write_i64(vals, 5, n)
+    mut i := 0
+    while i < 6 { ptr_write_i64(ctx.pbox, i, vals + i * 8); i += 1 }
+    gx := (n + 15) / 16
+    gy := (m + 15) / 16
+    return cuda_launch_raw(ctx, ptr_read_i64(ctx.tbl, 17), gx, gy, 1, 16, 16, 1, 0, ctx.pbox)
+}
+
+fn cuda_gemv_q8_0(ctx: CudaCtx, d_act: i64, d_q8: i64, d_out: i64, rows: i64, nblk: i64) -> i64 {
+    if rows <= 0 or nblk <= 0 { return 0 }
+    params := _cuda_pack5_u64x3_u32x2(ctx.pbox, d_act, d_q8, d_out, rows, nblk)
+    gx := (rows + 7) / 8
+    return cuda_launch_raw(ctx, ptr_read_i64(ctx.tbl, 18), gx, 1, 1, 256, 1, 1, 0, params)
+}
+
+fn cuda_gemv_q4_0(ctx: CudaCtx, d_act: i64, d_q4: i64, d_out: i64, rows: i64, nblk: i64) -> i64 {
+    if rows <= 0 or nblk <= 0 { return 0 }
+    params := _cuda_pack5_u64x3_u32x2(ctx.pbox, d_act, d_q4, d_out, rows, nblk)
+    gx := (rows + 7) / 8
+    return cuda_launch_raw(ctx, ptr_read_i64(ctx.tbl, 19), gx, 1, 1, 256, 1, 1, 0, params)
+}
+
+fn cuda_l2_batch_f32(ctx: CudaCtx, d_db: i64, d_q: i64, d_out: i64, n_vecs: i64, dim: i64) -> i64 {
+    if n_vecs <= 0 or dim <= 0 { return 0 }
+    params := _cuda_pack5_u64x3_u32x2(ctx.pbox, d_db, d_q, d_out, n_vecs, dim)
+    gx := (n_vecs + 7) / 8
+    return cuda_launch_raw(ctx, ptr_read_i64(ctx.tbl, 20), gx, 1, 1, 256, 1, 1, 0, params)
+}
+
+fn cuda_rmsnorm_batch_f32(ctx: CudaCtx, d_x: i64, d_w: i64, d_out: i64, rows: i64, dim: i64, eps: f64) -> i64 {
+    if rows <= 0 or dim <= 0 { return 0 }
+    vals := ctx.pbox + 64
+    ptr_write_i64(vals, 0, d_x)
+    ptr_write_i64(vals, 1, d_w)
+    ptr_write_i64(vals, 2, d_out)
+    ptr_write_i64(vals, 3, dim)
+    ptr_write_f32(vals, 8, eps)
+    mut i := 0
+    while i < 5 { ptr_write_i64(ctx.pbox, i, vals + i * 8); i += 1 }
+    return cuda_launch_raw(ctx, ptr_read_i64(ctx.tbl, 21), rows, 1, 1, 256, 1, 1, 0, ctx.pbox)
+}
+
+fn cuda_rmsnorm_f32(ctx: CudaCtx, d_x: i64, d_w: i64, d_out: i64, dim: i64, eps: f64) -> i64 {
+    return cuda_rmsnorm_batch_f32(ctx, d_x, d_w, d_out, 1, dim, eps)
+}
+
+fn cuda_swiglu_f32(ctx: CudaCtx, d_gate: i64, d_up: i64, d_out: i64, dim: i64) -> i64 {
+    if dim <= 0 { return 0 }
+    vals := ctx.pbox + 64
+    ptr_write_i64(vals, 0, d_gate)
+    ptr_write_i64(vals, 1, d_up)
+    ptr_write_i64(vals, 2, d_out)
+    ptr_write_i64(vals, 3, dim)
+    mut i := 0
+    while i < 4 { ptr_write_i64(ctx.pbox, i, vals + i * 8); i += 1 }
+    gx := (dim + 255) / 256
+    return cuda_launch_raw(ctx, ptr_read_i64(ctx.tbl, 22), gx, 1, 1, 256, 1, 1, 0, ctx.pbox)
+}
+
+fn cuda_scale_add_f32(ctx: CudaCtx, d_a: i64, d_b: i64, d_out: i64, n: i64, alpha: f64) -> i64 {
+    if n <= 0 { return 0 }
+    vals := ctx.pbox + 64
+    ptr_write_i64(vals, 0, d_a)
+    ptr_write_i64(vals, 1, d_b)
+    ptr_write_i64(vals, 2, d_out)
+    ptr_write_i64(vals, 3, n)
+    ptr_write_f32(vals, 8, alpha)
+    mut i := 0
+    while i < 5 { ptr_write_i64(ctx.pbox, i, vals + i * 8); i += 1 }
+    gx := (n + 255) / 256
+    return cuda_launch_raw(ctx, ptr_read_i64(ctx.tbl, 23), gx, 1, 1, 256, 1, 1, 0, ctx.pbox)
+}
+
+fn cuda_timer_start(ctx: CudaCtx) {
+    ev0 := ptr_read_i64(ctx.tbl, 24)
+    f := ptr_read_i64(ctx.tbl, 13)
+    if ev0 == 0 or f == 0 { return }
+    ptr_write_i64(ctx.argv, 0, ev0)
+    ptr_write_i64(ctx.argv, 1, 0)
+    c_call_v(f, 2, ctx.argv)
+}
+
+fn cuda_timer_stop_ms(ctx: CudaCtx) -> f64 {
+    ev0 := ptr_read_i64(ctx.tbl, 24)
+    ev1 := ptr_read_i64(ctx.tbl, 25)
+    f_rec := ptr_read_i64(ctx.tbl, 13)
+    f_sync := ptr_read_i64(ctx.tbl, 14)
+    f_elap := ptr_read_i64(ctx.tbl, 15)
+    if ev0 == 0 or ev1 == 0 or f_rec == 0 { return 0.0 }
+    ptr_write_i64(ctx.argv, 0, ev1)
+    ptr_write_i64(ctx.argv, 1, 0)
+    c_call_v(f_rec, 2, ctx.argv)
+    ptr_write_i64(ctx.argv, 0, ev1)
+    c_call_v(f_sync, 1, ctx.argv)
+    ptr_write_f32(ctx.pbox, 0, 0.0)
+    ptr_write_i64(ctx.argv, 0, ctx.pbox)
+    ptr_write_i64(ctx.argv, 1, ev0)
+    ptr_write_i64(ctx.argv, 2, ev1)
+    c_call_v(f_elap, 3, ctx.argv)
+    return ptr_read_f32(ctx.pbox, 0)
+}
+
+fn cuda_free(mut ctx: CudaCtx) {
+    if ctx.tbl != 0 {
+        ev0 := ptr_read_i64(ctx.tbl, 24)
+        ev1 := ptr_read_i64(ctx.tbl, 25)
+        f_evd := ptr_read_i64(ctx.tbl, 12)
+        if ev0 != 0 and f_evd != 0 { ptr_write_i64(ctx.argv, 0, ev0); c_call_v(f_evd, 1, ctx.argv) }
+        if ev1 != 0 and f_evd != 0 { ptr_write_i64(ctx.argv, 0, ev1); c_call_v(f_evd, 1, ctx.argv) }
+        f_mu := ptr_read_i64(ctx.tbl, 8)
+        if ctx.cu_mod != 0 and f_mu != 0 { ptr_write_i64(ctx.argv, 0, ctx.cu_mod); c_call_v(f_mu, 1, ctx.argv) }
+        f_cd := ptr_read_i64(ctx.tbl, 1)
+        if ctx.cu_ctx != 0 and f_cd != 0 { ptr_write_i64(ctx.argv, 0, ctx.cu_ctx); c_call_v(f_cd, 1, ctx.argv) }
+        nb := ptr_read_i64(ctx.tbl, 30)
+        if nb != 0 { mem_free_aligned(nb) }
+        mem_free_aligned(ctx.tbl)
+    }
+    if ctx.argv != 0 { mem_free_aligned(ctx.argv) }
+    if ctx.pbox != 0 { mem_free_aligned(ctx.pbox) }
+    if ctx.dll != 0 { dll_close(ctx.dll) }
+    ctx.cu_ctx = 0
+    ctx.cu_mod = 0
+    ctx.tbl = 0
+    ctx.dll = 0
+}

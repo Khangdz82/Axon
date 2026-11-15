@@ -44,13 +44,7 @@ fn faiss_index_flat_add(mut index: IndexFlat, vec_ptr: i64) -> bool {
     if index.num_vectors >= index.capacity {
         return false // Full capacity
     }
-    base := index.num_vectors * index.dim
-    mut i := 0
-    while i < index.dim {
-        v := ptr_read_f32(vec_ptr, i)
-        ptr_write_f32(index.vectors_ptr, base + i, v)
-        i += 1
-    }
+    mem_copy(index.vectors_ptr + index.num_vectors * index.dim * 4, vec_ptr, index.dim * 4)
     index.num_vectors = index.num_vectors + 1
     return true
 }
@@ -72,15 +66,9 @@ fn faiss_compute_distance(index: IndexFlat, query_ptr: i64, vec_idx: i64) -> f64
         }
         return total
     } else {
-        // Inner Product: sum(q * v)
-        while i < index.dim {
-            q := ptr_read_f32(query_ptr, i)
-            v := ptr_read_f32(index.vectors_ptr, base + i)
-            total = total + q * v
-            i += 1
-        }
-        // Negate so smaller = closer
-        return 0.0 - total
+        // Inner Product: -sum(q * v) via SIMD dot product
+        if index.dim <= 0 { return 0.0 }
+        return 0.0 - dlpack_dot_f32(query_ptr, index.vectors_ptr + base * 4, index.dim)
     }
 }
 
@@ -106,18 +94,29 @@ fn faiss_search_flat(index: IndexFlat, query_ptr: i64, k: i64) -> FaissSearchRes
 
     res_indices := ibuf_new(top_k)
     res_dists := np_full(top_k, 1, 999999999999.0)
+    is_l2 := index.metric == faiss_metric_l2()
 
-    // Linear scan over all stored vectors with priority insertion
+    // Compute L2 distances in one AVX2 + FMA3 + MT batch pass
+    mut dists_ptr := 0
+    if is_l2 {
+        dists_ptr = mem_alloc_aligned(index.num_vectors * 4 + 64)
+        avx_l2_batch_f32(index.vectors_ptr, query_ptr, dists_ptr, index.num_vectors, index.dim)
+    }
+
+    mut cur_len := 0
+    mut max_in_top := 999999999999.0
     mut v := 0
     while v < index.num_vectors {
-        d := faiss_compute_distance(index, query_ptr, v)
+        d := if is_l2 {
+            ptr_read_f32(dists_ptr, v)
+        } else {
+            0.0 - dlpack_dot_f32(query_ptr, index.vectors_ptr + v * index.dim * 4, index.dim)
+        }
 
-        mut cur_len := ibuf_len(res_indices)
-        max_in_top := np_get_1d(res_dists, top_k - 1)
         if cur_len < top_k or d < max_in_top {
             mut ins := 0
             while ins < cur_len {
-                if d < np_get_1d(res_dists, ins) {
+                if d < ptr_read_f32(res_dists.data_ptr, ins) {
                     break
                 }
                 ins += 1
@@ -131,14 +130,19 @@ fn faiss_search_flat(index: IndexFlat, query_ptr: i64, k: i64) -> FaissSearchRes
             mut s := cur_len - 1
             while s > ins {
                 ibuf_set(res_indices, s, ibuf_get(res_indices, s - 1))
-                np_set_1d(res_dists, s, np_get_1d(res_dists, s - 1))
+                ptr_write_f32(res_dists.data_ptr, s, ptr_read_f32(res_dists.data_ptr, s - 1))
                 s -= 1
             }
 
             ibuf_set(res_indices, ins, v)
-            np_set_1d(res_dists, ins, d)
+            ptr_write_f32(res_dists.data_ptr, ins, d)
+            max_in_top = ptr_read_f32(res_dists.data_ptr, top_k - 1)
         }
         v += 1
+    }
+
+    if dists_ptr != 0 {
+        mem_free_aligned(dists_ptr)
     }
 
     return FaissSearchResult(indices = res_indices, distances = res_dists)

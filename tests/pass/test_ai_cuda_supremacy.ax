@@ -1,0 +1,324 @@
+// Test AI + AVX2/FMA3+MT + Stdlib + CUDA Driver API PTX JIT Parity & Supremacy
+
+use std::quant
+use std::numpy
+use std::llama
+use std::faiss
+use std::safetensors
+use std::tiktoken
+use std::cuda
+use std::collections
+use std::ai_math
+
+fn abs_d(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn check_near(name: str, got: f64, exp: f64, tol: f64) -> i32 {
+    err := abs_d(got - exp)
+    if err > tol {
+        println(f"[FAIL] {name}: got={got}, exp={exp}, err={err}")
+        return 1
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    mut fails := 0
+
+    // 1. mem_copy + AVX2 GEMV (1T odd + MT) + GEMM (non-16-multiple) + np_matmul/np_dot
+    n_c := 131
+    m_c := 257
+    w_ptr := mem_alloc_aligned(m_c * n_c * 4 + 64)
+    x_ptr := mem_alloc_aligned(n_c * 4 + 64)
+    y_ptr := mem_alloc_aligned(m_c * 4 + 64)
+    mut i := 0
+    while i < n_c { ptr_write_f32(x_ptr, i, ((i % 7) as f64 - 3.0) * 0.25); i += 1 }
+    mut r := 0
+    while r < m_c {
+        mut c := 0
+        while c < n_c { ptr_write_f32(w_ptr, r * n_c + c, ((r + c) % 9) as f64 * 0.125); c += 1 }
+        r += 1
+    }
+    avx_gemv_f32(w_ptr, x_ptr, y_ptr, m_c, n_c)
+    mut ref_last := 0.0
+    i = 0
+    while i < n_c { ref_last = ref_last + ptr_read_f32(w_ptr, (m_c - 1) * n_c + i) * ptr_read_f32(x_ptr, i); i += 1 }
+    fails += check_near("avx_gemv_f32[last]", ptr_read_f32(y_ptr, m_c - 1), ref_last, 0.001)
+
+    // mem_copy check
+    cp_ptr := mem_alloc_aligned(n_c * 4 + 64)
+    mem_copy(cp_ptr, x_ptr, n_c * 4)
+    fails += check_near("mem_copy[130]", ptr_read_f32(cp_ptr, 130), ptr_read_f32(x_ptr, 130), 0.0001)
+    mem_free_aligned(cp_ptr)
+    mem_free_aligned(w_ptr); mem_free_aligned(x_ptr); mem_free_aligned(y_ptr)
+
+    // np_matmul (43 x 37 * 37 x 53 -> AVX2 GEMM) + np_dot
+    a := np_zeros(43, 37)
+    b := np_zeros(37, 53)
+    i = 0
+    while i < 43 * 37 { ptr_write_f32(a.data_ptr, i, ((i % 5) as f64) * 0.2); i += 1 }
+    i = 0
+    while i < 37 * 53 { ptr_write_f32(b.data_ptr, i, ((i % 7) as f64) * 0.15); i += 1 }
+    c_mat := np_matmul(a, b)
+    mut ref_mm := 0.0
+    i = 0
+    while i < 37 { ref_mm = ref_mm + ptr_read_f32(a.data_ptr, 42 * 37 + i) * ptr_read_f32(b.data_ptr, i * 53 + 52); i += 1 }
+    fails += check_near("np_matmul[42,52]", np_get(c_mat, 42, 52), ref_mm, 0.001)
+    va := np_full(1, 259, 1.5)
+    vb := np_full(1, 259, 2.0)
+    fails += check_near("np_dot(259)", np_dot(va, vb), 259.0 * 3.0, 0.001)
+    np_free(move a); np_free(move b); np_free(move c_mat); np_free(move va); np_free(move vb)
+
+    // 2. std/quant single + batch AVX2/MT (Q8_0, Q4_0, BitNet, BNN)
+    qrows := 64
+    nblk := 16
+    qcols := nblk * 32
+    act := mem_alloc_aligned(qcols * 4 + 64)
+    fsrc := mem_alloc_aligned(qrows * qcols * 4 + 64)
+    q8 := mem_alloc_aligned(qrows * nblk * 36 + 64)
+    q4 := mem_alloc_aligned(qrows * nblk * 20 + 64)
+    bn := mem_alloc_aligned(qrows * nblk * 12 + 64)
+    bnn := mem_alloc_aligned(qrows * nblk * 8 + 64)
+    qout := mem_alloc_aligned(qrows * 4 + 64)
+    scr := mem_alloc_aligned(64)
+    i = 0
+    while i < qcols { ptr_write_f32(act, i, ((i % 9) as f64 - 4.0) * 0.2); i += 1 }
+    r = 0
+    while r < qrows {
+        mut bi := 0
+        while bi < nblk {
+            mut j := 0
+            while j < 32 {
+                ptr_write_f32(fsrc, r * qcols + bi * 32 + j, (((r + bi + j) % 13) as f64 - 6.0) * 0.15)
+                j += 1
+            }
+            sb := fsrc + (r * qcols + bi * 32) * 4
+            quantize_q8_0_block(sb, q8 + (r * nblk + bi) * 36, scr)
+            quantize_q4_0_block(sb, q4 + (r * nblk + bi) * 20)
+            quantize_bitnet_158_block(sb, bn + (r * nblk + bi) * 12)
+            quantize_bnn_1bit_block(sb, bnn + (r * nblk + bi) * 8)
+            bi += 1
+        }
+        r += 1
+    }
+    gemv_q8_0_batch(act, q8, qout, qrows, nblk)
+    fails += check_near("gemv_q8_0_batch[63]==gemv_q8_0", ptr_read_f32(qout, 63), gemv_q8_0(act, q8 + 63 * nblk * 36, nblk), 0.001)
+    gemv_q4_0_batch(act, q4, qout, qrows, nblk)
+    fails += check_near("gemv_q4_0_batch[63]==gemv_q4_0", ptr_read_f32(qout, 63), gemv_q4_0(act, q4 + 63 * nblk * 20, nblk), 0.001)
+    gemv_bitnet_158_batch(act, bn, qout, qrows, nblk)
+    fails += check_near("gemv_bitnet_158_batch[63]", ptr_read_f32(qout, 63), gemv_bitnet_158(act, bn + 63 * nblk * 12, nblk), 0.001)
+    gemv_bnn_1bit_batch(act, bnn, qout, qrows, nblk)
+    fails += check_near("gemv_bnn_1bit_batch[63]", ptr_read_f32(qout, 63), gemv_bnn_1bit(act, bnn + 63 * nblk * 8, nblk), 0.001)
+
+    // 3. std/llama RMSNorm + SwiGLU AVX2 checks
+    ldim := 131
+    lx := mem_alloc_aligned(ldim * 4 + 64)
+    lw := mem_alloc_aligned(ldim * 4 + 64)
+    lo := mem_alloc_aligned(ldim * 4 + 64)
+    i = 0
+    while i < ldim {
+        ptr_write_f32(lx, i, ((i % 7) as f64 - 3.0) * 0.5)
+        ptr_write_f32(lw, i, 1.0 + (i % 3) as f64 * 0.1)
+        i += 1
+    }
+    llama_rmsnorm(lx, lw, lo, ldim, 0.00001)
+    mut ss := 0.0
+    i = 0
+    while i < ldim { xv := ptr_read_f32(lx, i); ss = ss + xv * xv; i += 1 }
+    inv_rms := 1.0 / sqrt_f64(ss / (ldim as f64) + 0.00001)
+    fails += check_near("llama_rmsnorm[130]", ptr_read_f32(lo, 130), ptr_read_f32(lx, 130) * inv_rms * ptr_read_f32(lw, 130), 0.001)
+    llama_swiglu(lx, lw, lo, ldim)
+    g0 := ptr_read_f32(lx, 130)
+    u0 := ptr_read_f32(lw, 130)
+    exp_sw := (g0 / (1.0 + exp_f64(0.0 - g0))) * u0
+    fails += check_near("llama_swiglu[130]", ptr_read_f32(lo, 130), exp_sw, 0.001)
+    mem_free_aligned(lx); mem_free_aligned(lw); mem_free_aligned(lo)
+
+    // 4. std/faiss L2 + IP Top-K search
+    mut fidx := faiss_index_flat_new(64, faiss_metric_l2(), 200)
+    mut fidx_ip := faiss_index_flat_new(64, faiss_metric_ip(), 200)
+    fv := mem_alloc_aligned(64 * 4 + 64)
+    i = 0
+    while i < 64 { ptr_write_f32(fv, i, 0.5); i += 1 }
+    mut v_i := 0
+    while v_i < 200 {
+        ptr_write_f32(fv, 0, (v_i as f64) * 0.1)
+        faiss_index_flat_add(mut fidx, fv)
+        faiss_index_flat_add(mut fidx_ip, fv)
+        v_i += 1
+    }
+    ptr_write_f32(fv, 0, 14.3)
+    res_l2 := faiss_search_flat(fidx, fv, 3)
+    if ibuf_get(res_l2.indices, 0) != 143 {
+        println(f"[FAIL] faiss L2 top1={ibuf_get(res_l2.indices, 0)}, expected 143")
+        fails += 1
+    }
+    res_ip := faiss_search_flat(fidx_ip, fv, 3)
+    if ibuf_get(res_ip.indices, 0) != 199 {
+        println(f"[FAIL] faiss IP top1={ibuf_get(res_ip.indices, 0)}, expected 199")
+        fails += 1
+    }
+    buf_free(move res_l2.indices); np_free(move res_l2.distances)
+    buf_free(move res_ip.indices); np_free(move res_ip.distances)
+    mem_free_aligned(fv)
+    faiss_index_flat_free(move fidx); faiss_index_flat_free(move fidx_ip)
+
+    // 5. std/safetensors copy + zero-copy view
+    st_arr := np_full(16, 8, 2.75)
+    st_buf := safetensors_serialize("w.test", st_arr)
+    st := safetensors_parse_buffer(st_buf) or return 201
+    ex_arr := safetensors_get_tensor(st, "w.test", 16, 8) or return 202
+    vw_arr := safetensors_get_tensor_view(st, "w.test", 16, 8) or return 203
+    fails += check_near("safetensors copy[127]", ptr_read_f32(ex_arr.data_ptr, 127), 2.75, 0.0001)
+    fails += check_near("safetensors view[127]", ptr_read_f32(vw_arr.data_ptr, 127), 2.75, 0.0001)
+    np_free(move ex_arr); safetensors_free(move st); np_free(move st_arr); buf_free(move st_buf)
+
+    // 6. std/tiktoken O(N) BPE encode + decode exact roundtrip
+    mut vocab := tiktoken_vocab_new(512)
+    tiktoken_add_token(mut vocab, "th", 256)
+    tiktoken_add_token(mut vocab, "the", 257)
+    tiktoken_add_token(mut vocab, "in", 258)
+    tiktoken_add_token(mut vocab, "ing", 259)
+    tiktoken_add_token(mut vocab, "er", 260)
+    tiktoken_add_token(mut vocab, "on", 261)
+    sample := "the quick programmer thinking on ethernet!"
+    toks := tiktoken_encode(vocab, sample)
+    decoded := tiktoken_decode(vocab, toks)
+    if decoded != sample {
+        println(f"[FAIL] tiktoken roundtrip mismatch: {decoded}")
+        fails += 1
+    }
+    buf_free(move toks); tiktoken_vocab_free(move vocab)
+
+    // 7. std/cuda Driver API + PTX 6.4 JIT live GPU checks
+    if cuda_available() {
+        mut ctx := cuda_init(0)
+        if !cuda_ready(ctx) {
+            println(f"[FAIL] cuda_ready=false err={cuda_last_err(ctx)}")
+            fails += 1
+        } else {
+            // Q8_0 / Q4_0 GPU parity
+            d_act := cuda_alloc_f32(ctx, qcols)
+            d_q8 := cuda_alloc(ctx, qrows * nblk * 36)
+            d_q4 := cuda_alloc(ctx, qrows * nblk * 20)
+            d_qo := cuda_alloc_f32(ctx, qrows)
+            d_qo2 := cuda_alloc_f32(ctx, qrows)
+            h_gpu := mem_alloc_aligned(qrows * 4 + 64)
+
+            cuda_h2d(ctx, d_act, act, qcols * 4)
+            cuda_h2d(ctx, d_q8, q8, qrows * nblk * 36)
+            cuda_h2d(ctx, d_q4, q4, qrows * nblk * 20)
+
+            gemv_q8_0_batch(act, q8, qout, qrows, nblk)
+            cuda_gemv_q8_0(ctx, d_act, d_q8, d_qo, qrows, nblk)
+            cuda_d2d(ctx, d_qo2, d_qo, qrows * 4)
+            cuda_sync(ctx)
+            cuda_d2h(ctx, h_gpu, d_qo2, qrows * 4)
+            fails += check_near("cuda_gemv_q8_0 + d2d[63]", ptr_read_f32(h_gpu, 63), ptr_read_f32(qout, 63), 0.002)
+
+            gemv_q4_0_batch(act, q4, qout, qrows, nblk)
+            cuda_gemv_q4_0(ctx, d_act, d_q4, d_qo, qrows, nblk)
+            cuda_sync(ctx)
+            cuda_d2h(ctx, h_gpu, d_qo, qrows * 4)
+            fails += check_near("cuda_gemv_q4_0[63]", ptr_read_f32(h_gpu, 63), ptr_read_f32(qout, 63), 0.002)
+
+            // Batch multi-row RMSNorm on GPU vs CPU row-by-row (rows=17, dim=131 odd!)
+            r_rows := 17
+            r_dim := 131
+            hrx := mem_alloc_aligned(r_rows * r_dim * 4 + 64)
+            hrw := mem_alloc_aligned(r_dim * 4 + 64)
+            hrc := mem_alloc_aligned(r_rows * r_dim * 4 + 64)
+            hrg := mem_alloc_aligned(r_rows * r_dim * 4 + 64)
+            i = 0
+            while i < r_rows * r_dim { ptr_write_f32(hrx, i, ((i % 11) as f64 - 5.0) * 0.3); i += 1 }
+            i = 0
+            while i < r_dim { ptr_write_f32(hrw, i, 1.0 + (i % 4) as f64 * 0.1); i += 1 }
+            r = 0
+            while r < r_rows {
+                llama_rmsnorm(hrx + r * r_dim * 4, hrw, hrc + r * r_dim * 4, r_dim, 0.00001)
+                r += 1
+            }
+            drx := cuda_alloc_f32(ctx, r_rows * r_dim)
+            drw := cuda_alloc_f32(ctx, r_dim)
+            dro := cuda_alloc_f32(ctx, r_rows * r_dim)
+            cuda_h2d(ctx, drx, hrx, r_rows * r_dim * 4)
+            cuda_h2d(ctx, drw, hrw, r_dim * 4)
+            cuda_timer_start(ctx)
+            cuda_rmsnorm_batch_f32(ctx, drx, drw, dro, r_rows, r_dim, 0.00001)
+            t_ev := cuda_timer_stop_ms(ctx) + 0.0
+            cuda_d2h(ctx, hrg, dro, r_rows * r_dim * 4)
+            fails += check_near("cuda_rmsnorm_batch_f32[16,130]", ptr_read_f32(hrg, 16 * r_dim + 130), ptr_read_f32(hrc, 16 * r_dim + 130), 0.002)
+            if t_ev < 0.0 { fails += 1 }
+
+            // SwiGLU & scale_add & GEMM & GEMV & L2 on GPU
+            cuda_swiglu_f32(ctx, drx, drx, dro, r_rows * r_dim)
+            cuda_sync(ctx)
+            cuda_d2h(ctx, hrg, dro, r_rows * r_dim * 4)
+            llama_swiglu(hrx, hrx, hrc, r_rows * r_dim)
+            fails += check_near("cuda_swiglu_f32[last]", ptr_read_f32(hrg, r_rows * r_dim - 1), ptr_read_f32(hrc, r_rows * r_dim - 1), 0.002)
+
+            cuda_scale_add_f32(ctx, drx, drx, dro, 64, 2.0)
+            cuda_sync(ctx)
+            cuda_d2h(ctx, hrg, dro, 64 * 4)
+            fails += check_near("cuda_scale_add_f32[63]", ptr_read_f32(hrg, 63), 3.0 * ptr_read_f32(hrx, 63), 0.001)
+
+            // GEMV_f32, GEMM_f32, L2_batch_f32, single RMSNorm_f32 on GPU
+            d_vout := cuda_alloc_f32(ctx, r_rows)
+            cuda_gemv_f32(ctx, drx, drw, d_vout, r_rows, r_dim)
+            avx_gemv_f32(hrx, hrw, hrc, r_rows, r_dim)
+            cuda_sync(ctx); cuda_d2h(ctx, hrg, d_vout, r_rows * 4)
+            fails += check_near("cuda_gemv_f32[16]", ptr_read_f32(hrg, 16), ptr_read_f32(hrc, 16), 0.002)
+
+            cuda_l2_batch_f32(ctx, drx, drw, d_vout, r_rows, r_dim)
+            avx_l2_batch_f32(hrx, hrw, hrc, r_rows, r_dim)
+            cuda_sync(ctx); cuda_d2h(ctx, hrg, d_vout, r_rows * 4)
+            fails += check_near("cuda_l2_batch_f32[16]", ptr_read_f32(hrg, 16), ptr_read_f32(hrc, 16), 0.01)
+
+            cuda_rmsnorm_f32(ctx, drx, drw, dro, r_dim, 0.00001)
+            llama_rmsnorm(hrx, hrw, hrc, r_dim, 0.00001)
+            cuda_sync(ctx); cuda_d2h(ctx, hrg, dro, r_dim * 4)
+            fails += check_near("cuda_rmsnorm_f32[130]", ptr_read_f32(hrg, 130), ptr_read_f32(hrc, 130), 0.002)
+
+            gm := 23; gk := 19; gn := 29
+            d_ga := cuda_alloc_f32(ctx, gm * gk)
+            d_gb := cuda_alloc_f32(ctx, gk * gn)
+            d_gc := cuda_alloc_f32(ctx, gm * gn)
+            h_ga := mem_alloc_aligned(gm * gk * 4 + 64)
+            h_gb := mem_alloc_aligned(gk * gn * 4 + 64)
+            h_gc := mem_alloc_aligned(gm * gn * 4 + 64)
+            h_gg := mem_alloc_aligned(gm * gn * 4 + 64)
+            i = 0
+            while i < gm * gk { ptr_write_f32(h_ga, i, ((i % 7) as f64) * 0.1); i += 1 }
+            i = 0
+            while i < gk * gn { ptr_write_f32(h_gb, i, ((i % 5) as f64) * 0.2); i += 1 }
+            avx_gemm_f32(h_ga, h_gb, h_gc, gm, gk, gn)
+            cuda_h2d(ctx, d_ga, h_ga, gm * gk * 4); cuda_h2d(ctx, d_gb, h_gb, gk * gn * 4)
+            cuda_gemm_f32(ctx, d_ga, d_gb, d_gc, gm, gk, gn)
+            cuda_sync(ctx); cuda_d2h(ctx, h_gg, d_gc, gm * gn * 4)
+            fails += check_near("cuda_gemm_f32[22,28]", ptr_read_f32(h_gg, 22 * gn + 28), ptr_read_f32(h_gc, 22 * gn + 28), 0.002)
+            cuda_mem_free(ctx, d_ga); cuda_mem_free(ctx, d_gb); cuda_mem_free(ctx, d_gc); cuda_mem_free(ctx, d_vout)
+            mem_free_aligned(h_ga); mem_free_aligned(h_gb); mem_free_aligned(h_gc); mem_free_aligned(h_gg)
+
+            cuda_mem_free(ctx, drx); cuda_mem_free(ctx, drw); cuda_mem_free(ctx, dro)
+            mem_free_aligned(hrx); mem_free_aligned(hrw); mem_free_aligned(hrc); mem_free_aligned(hrg)
+            cuda_mem_free(ctx, d_act); cuda_mem_free(ctx, d_q8); cuda_mem_free(ctx, d_q4)
+            cuda_mem_free(ctx, d_qo); cuda_mem_free(ctx, d_qo2)
+            mem_free_aligned(h_gpu)
+        }
+        cuda_free(mut ctx)
+    } else {
+        println("  [SKIP] CUDA GPU unavailable on this host - CPU/AVX2/stdlib checks complete.")
+    }
+
+    mem_free_aligned(act); mem_free_aligned(fsrc); mem_free_aligned(q8)
+    mem_free_aligned(q4); mem_free_aligned(bn); mem_free_aligned(bnn)
+    mem_free_aligned(qout); mem_free_aligned(scr)
+
+    if fails > 0 {
+        return 210
+    }
+    println("  [AI+CUDA] AVX2+FMA3+MT, stdlib AI ops, BPE O(N), and CUDA PTX JIT parity verified!")
+    return 0
+}
