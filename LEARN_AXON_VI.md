@@ -120,6 +120,7 @@ Nếu cố tình gán lại một biến không có `mut`, trình biên dịch c
 ### 2.3. Logic đoản mạch (`and`, `or`, `not`) và Toán tử số học an toàn
 
 - **Đoản mạch (Short-circuit):** Trong `a and b`, nếu `a` sai thì `b` không bao giờ được thực thi. Trong `a or b`, nếu `a` đúng thì `b` được bỏ qua. Nhờ vậy biểu thức `if i < n and str_byte(s, i) == 65` luôn an toàn tuyệt đối.
+- **Toán tử lũy thừa `**` và phép gán `**=`, `%=`:** Axon hỗ trợ toán tử lũy thừa số học `**` theo phong cách Python (`2 ** 10 == 1024`), được biên dịch thành thuật toán bình phương và nhân nhanh (exponentiation by squaring) ngay trên thanh ghi CPU với 0 lời gọi hàm ngoài, và tự động tính trước (constant folding) tại thời điểm biên dịch nếu là hằng số.
 - **Chặn chia cho `0` từ lúc biên dịch lẫn lúc chạy:** Phép chia/chia dư cho hằng số `0` bị chặn ngay lúc biên dịch với **`[SAFETY ERROR E0406]`**, còn số chia biến thiên lúc chạy được bảo vệ phần cứng chống chia cho `0` và tràn `INT64_MIN / -1`.
 - **Chống tràn số tự động:** Trong hàm có `@shield`, các phép `+`, `-`, `*` tự động kiểm tra cờ tràn phần cứng CPU (`JO`).
 - **Toán tử tràn có chủ đích (Wrapping):** Khi viết thuật toán băm hay mật mã cần tràn bit 64-bit hai bù chuẩn xác, sử dụng `+%`, `-%`, `*%`:
@@ -128,6 +129,61 @@ Nếu cố tình gán lại một biến không có `mut`, trình biên dịch c
 mut hash := -3750763034362895579
 hash = (hash ^ byte_val) *% 1099511628211
 ```
+
+### 2.4. Cú pháp Pythonic Chuyên Sâu (Ergonomics tối ưu cho độ đọc & tiện dụng)
+
+Nhằm giúp lập trình viên từ Python, TypeScript và C++ tiếp cận tự nhiên và viết mã nhanh nhất, Axon cung cấp lớp cú pháp Pythonic mạch lạc, 100% không chi phí ẩn (Zero Cost Abstraction):
+
+1. **Từ khóa `def` hoặc `fn`:** Bạn có thể định nghĩa hàm bằng `def` hoặc `fn` tùy thói quen:
+   ```axon
+   def add(a: int, b: int = 10) -> int: {
+       return a + b
+   }
+   ```
+2. **Dấu hai chấm `:` tùy chọn ở cuối tiêu đề:** Cho phép viết `:` trước `{` ở `def`, `fn`, `struct`, `if`, `elif`, `else`, `while`, `for`:
+   ```axon
+   if status: {
+       pass
+   } elif score > 50: {
+       println("Passed")
+   } else: {
+       println("Failed")
+   }
+   ```
+3. **Từ khóa `elif` & lệnh giữ chỗ `pass`:**
+   - Dùng `elif` liên tiếp mạch lạc thay cho `else if` rườm rà.
+   - Dùng `pass` khi cần giữ khung khối mã rỗng (stub/placeholder) mà không sinh mã máy thừa (0 instructions).
+4. **Chú thích kiểu Python (`#`):** Hỗ trợ cả `# ghi chú` bên cạnh `// ghi chú`.
+5. **Giá trị hằng & Bí danh kiểu chuẩn Python:**
+   - Giá trị chân lý: `True`, `False` (bên cạnh `true`, `false`).
+   - Kiểu rỗng / đơn vị: `None`, `nil`, `null`, kiểu `NoneType`.
+   - Bí danh kiểu trực quan: `int` (tương đương `i64`), `float` (tương đương `f64`).
+6. **Biểu thức điều kiện ba ngôi Python (Python Ternary):**
+   ```axon
+   level := "Pro" if score >= 90 else "Standard"
+   ```
+   Tự động desugar thành nhánh điều kiện `nk_if_expr` tối ưu tốc độ CPU.
+7. **Kiểm tra khoảng thành viên `in` & `not in`:**
+   ```axon
+   if x in 0..100: {
+       println("Within range")
+   }
+   if y not in 100..200: {
+       println("Outside range")
+   }
+   ```
+   Tương đương với `x >= 0 and x < 100` với 0 chi phí cấp phát bộ nhớ.
+8. **Vòng lặp `range()` Pythonic:**
+   ```axon
+   for i in range(5): {
+       println(f"i = {i}")
+   }
+   for i in range(1, 10): {
+       println(f"step {i}")
+   }
+   ```
+9. **Hàm kích thước toàn năng `len(x)`:**
+   Truy xuất độ dài $O(1)$ tức thì cho chuỗi `str`, `ByteBuf`, `IntBuf`.
 
 ---
 

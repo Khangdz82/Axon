@@ -8,6 +8,14 @@
 
 ## Official Self-Hosted Releases (`v5.0` -> `v1.0.0`)
 
+- [x] **Feature: Deep Pythonic Syntax Ergonomics & Zero-Cost Abstractions (`feature/pythonic-syntax-ergonomics`)** (COMPLETED & VERIFIED)
+  - [x] **Keyword & Header Ergonomics:** Added `def` keyword alias for `fn`, optional `:` trailing colons on `def`/`fn`, `if`, `elif`, `else`, `while`, `for`, `struct` headers.
+  - [x] **Flow Control & Placeholders:** Added `elif` chained statements and `pass` no-op statement (0 instructions).
+  - [x] **Pythonic Comments & Literals:** Added `#` line comments, canonical `True` / `False` boolean literals, `None` / `nil` / `null` units, and `int` / `float` type aliases.
+  - [x] **Power & Compound Arithmetic:** Added `**` operator and `**=`, `%=` in-place operators lowering to CPU fast binary exponentiation by squaring in registers.
+  - [x] **Expressions & Iteration:** Added Python ternary `a if cond else b`, range membership `x in min..max` & `x not in min..max`, `for i in range(...)` zero-cost range loops, and universal `len(x)` built-in.
+  - [x] **Verification & Tests:** Created [`tests/pass/31_pythonic_deep_syntax.ax`](tests/pass/31_pythonic_deep_syntax.ax); passed 100% of all regression test suites across compiler and stdlib.
+
 - [x] **Release `v1.0.0`: Official Production Release, Browser WASM32 Playground, 34-Module Stdlib & Rigorous `B1–B10` Verification** (COMPLETED & VERIFIED)
   - [x] **Interactive Browser Playground ([`playground/index.html`](playground/index.html)):** Standalone zero-dependency HTML/JS recursive-descent compiler emitting valid W3C WebAssembly + `0xFD SIMD128` + `wasi_snapshot_preview1` with Live Canvas2D & binary opcode inspector:
     - `particles` (`1M SIMD128`): `1,740 B` (`1.70 KB`, `26` `0xFD` opcodes, `5.15 ms` WASI run), `errors` (`T ! Error`): `1,215 B` (`1.19 KB`), `ai` (Linear+ReLU+Softmax): `2,095 B` (`2.05 KB`), `game` (2D arcade): `1,726 B` (`1.69 KB`) — `4/4` `WebAssembly.validate = true`, `rc = 0`.

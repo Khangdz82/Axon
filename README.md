@@ -23,18 +23,30 @@ The entire compiler (`compiler_ax/`, `17` modules, `23,763` lines) is written in
 
 ## Language Tour at a Glance
 
-Axon adopts indentation-friendly Pythonic declarations, `and`/`or`/`not` logic operators, default & named `=` arguments, zero-cost `T ! Error` unions in CPU registers, and explicit linear ownership (`move`) without garbage-collector pauses or Rust-style lifetime annotations (`0 'a`):
+Axon pairs zero-cost bare-metal performance with Pythonic ergonomics: `def` or `fn` functions, optional `:` block headers, `elif` chains, `pass` stubs, `#` comments, `True`/`False` literals, `**` power operators, `x if cond else y` ternaries, `in 0..100` range tests, `range(n)` loops, `len()` built-ins, `and`/`or`/`not` logic, default & named `=` arguments, zero-cost `T ! Error` unions in CPU registers, and Perceus linear ownership (`move`) with zero garbage-collector pauses and zero lifetime annotations:
 
 ```axon
-// 1. Readable functions, default parameters, named arguments & @shield protection (`examples/hello.ax`)
-fn greet(name: str, role: str = "Systems Engineer") {
-    println(f"Hello, {name}! Welcome to Axon ({role}).")
+# 1. Pythonic syntax, def/fn, optional colons, default & named arguments, ** power (`tests/pass/31_pythonic_deep_syntax.ax`)
+def greet(name: str, power_level: int = 2 ** 10): {
+    status := "Legendary" if power_level > 1000 else "Rookie"
+    println(f"Hello, {name}! Level: {power_level} ({status})")
 }
 
 @shield
-fn main() -> i32 {
-    greet("World")
-    greet("Khang", role = "Language Architect")
+def main() -> i32: {
+    greet("Architect")
+    greet("Khang", power_level = 9001)
+
+    for i in range(3): {
+        if i in 0..2: {
+            # In-place modulo and power arithmetic
+            mut n := 10
+            n **= 2
+            n %= 7
+        } else: {
+            pass
+        }
+    }
     return 0
 }
 ```

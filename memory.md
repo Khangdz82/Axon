@@ -23,6 +23,12 @@
 ### Completed
 - Phát hành chính thức **`v1.0.0`** (commit `b141ebf`, tag `v1.0.0`, bộ cài `install.ps1` `1267.84 KB` -> `axc 1.0.0-selfhosted`).
 - Verification sau chỉnh sửa cuối đạt 100%: Native+Shield **`29/29`**, `fail_compile` **`25/25`**, WASM32+WASI **`3/3`**, Trap Matrix **`6/6`**, Playground Node **`4/4`**.
+- **Tối ưu Cú pháp Pythonic Chuyên sâu trên nhánh `feature/pythonic-syntax-ergonomics`**:
+  - Bổ sung `def` / `fn`, dấu hai chấm `:` tùy chọn ở tiêu đề block, chuỗi nhánh `elif`, lệnh giữ chỗ `pass`.
+  - Bổ sung comment `#` chuẩn Python, hằng số `True` / `False`, giá trị `None` / `nil` / `null` kiểu `NoneType`, alias kiểu `int` / `float`.
+  - Bổ sung toán tử lũy thừa `**` và gán kết hợp `**=`, `%=` (sinh mã nhị phân x86_64 tính trên thanh ghi CPU, constant folding tại comptime).
+  - Bổ sung toán tử 3 ngôi `x if cond else y`, kiểm tra khoảng `x in min..max` & `x not in min..max`, vòng lặp `for i in range(...)` 0 cấp phát heap, hàm tích hợp `len(x)`.
+  - Bộ kiểm thử mới [`tests/pass/31_pythonic_deep_syntax.ax`](tests/pass/31_pythonic_deep_syntax.ax) chạy qua 100% tất cả 9 bước; toàn bộ test suite pass 100%.
 
 ### Active / Blocked
 - (none)
