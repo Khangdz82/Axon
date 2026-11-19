@@ -5,9 +5,10 @@ use std::os
 
 fn json_skip_ws(doc: str, start: i64) -> i64 {
     n := str_len(doc)
+    doc_p := doc as i64
     mut i := start
     while i < n {
-        b := str_byte(doc, i)
+        b := ptr_read_u8(doc_p + i, 0)
         if b == 32 or b == 9 or b == 10 or b == 13 {
             i += 1
         } else {
@@ -18,38 +19,74 @@ fn json_skip_ws(doc: str, start: i64) -> i64 {
 }
 
 // Finds `"<key>"` followed by `:` outside string values and returns the byte index of the value start, or `-1`.
+// Fast-forward word scanning skips 8 bytes at a time when searching for quotes with zero allocations.
 fn json_locate_key_val(doc: str, key: str) -> i64 {
     n := str_len(doc)
     klen := str_len(key)
+    if klen <= 0 or n < klen + 3 {
+        return -1
+    }
+
+    doc_p := doc as i64
+    key_p := key as i64
+    k0 := ptr_read_u8(key_p, 0)
     mut i := 0
+
     while i < n {
-        b := str_byte(doc, i)
-        if b == 34 {
-            kstart := i + 1
-            mut j := kstart
-            while j < n {
-                bj := str_byte(doc, j)
-                if bj == 92 {
-                    j += 2
-                } else if bj == 34 {
+        // Fast-forward word scanning for quote (ASCII 34 = 0x22)
+        while i + 8 <= n {
+            w := ptr_read_i64(doc_p + i, 0)
+            q_xor := w ^ 0x2222222222222222
+            has_q := ((q_xor - 0x0101010101010101) & (q_xor ^ -1)) & 0x8080808080808080
+            if has_q != 0 {
+                break
+            }
+            i += 8
+        }
+
+        while i < n and ptr_read_u8(doc_p + i, 0) != 34 {
+            i += 1
+        }
+        if i >= n {
+            return -1
+        }
+
+        kstart := i + 1
+        // Check if candidate matches key length and closing quote
+        if kstart + klen < n and ptr_read_u8(doc_p + kstart + klen, 0) == 34 and ptr_read_u8(doc_p + kstart, 0) == k0 {
+            mut match_k := true
+            mut ki := 1
+            while ki < klen {
+                if ptr_read_u8(doc_p + kstart + ki, 0) != ptr_read_u8(key_p + ki, 0) {
+                    match_k = false
                     break
-                } else {
-                    j += 1
                 }
+                ki += 1
             }
-            if j >= n {
-                return -1
-            }
-            after_q := json_skip_ws(doc, j + 1)
-            if after_q < n and str_byte(doc, after_q) == 58 {
-                if (j - kstart) == klen and str_eq(str_slice(doc, kstart, j), key) {
+            if match_k {
+                after_q := json_skip_ws(doc, kstart + klen + 1)
+                if after_q < n and ptr_read_u8(doc_p + after_q, 0) == 58 {
                     return json_skip_ws(doc, after_q + 1)
                 }
             }
-            i = j + 1
-        } else {
-            i += 1
         }
+
+        // Skip to closing quote of this string token
+        mut j := kstart
+        while j < n {
+            bj := ptr_read_u8(doc_p + j, 0)
+            if bj == 92 {
+                j += 2
+            } else if bj == 34 {
+                break
+            } else {
+                j += 1
+            }
+        }
+        if j >= n {
+            return -1
+        }
+        i = j + 1
     }
     return -1
 }
@@ -59,14 +96,15 @@ fn json_get_str(doc: str, key: str) -> str ! i64 {
     if vpos < 0 or vpos >= str_len(doc) {
         return err(404)
     }
-    if str_byte(doc, vpos) != 34 {
+    doc_p := doc as i64
+    if ptr_read_u8(doc_p + vpos, 0) != 34 {
         return err(422)
     }
     n := str_len(doc)
     s_start := vpos + 1
     mut j := s_start
     while j < n {
-        bj := str_byte(doc, j)
+        bj := ptr_read_u8(doc_p + j, 0)
         if bj == 92 {
             j += 2
         } else if bj == 34 {
@@ -83,15 +121,20 @@ fn json_get_i64(doc: str, key: str) -> i64 ! i64 {
     if vpos < 0 or vpos >= str_len(doc) {
         return err(404)
     }
+    doc_p := doc as i64
     n := str_len(doc)
     mut j := vpos
-    if str_byte(doc, j) == 45 {
+    mut sign := 1
+    if ptr_read_u8(doc_p + j, 0) == 45 {
+        sign = -1
         j += 1
     }
     mut digits := 0
+    mut val := 0
     while j < n {
-        d := str_byte(doc, j)
+        d := ptr_read_u8(doc_p + j, 0)
         if d >= 48 and d <= 57 {
+            val = val * 10 + (d - 48)
             digits += 1
             j += 1
         } else {
@@ -101,7 +144,7 @@ fn json_get_i64(doc: str, key: str) -> i64 ! i64 {
     if digits == 0 {
         return err(422)
     }
-    return parse_i64(str_slice(doc, vpos, j))
+    return ok(val * sign)
 }
 
 fn json_get_bool(doc: str, key: str) -> bool ! i64 {
@@ -109,11 +152,12 @@ fn json_get_bool(doc: str, key: str) -> bool ! i64 {
     if vpos < 0 {
         return err(404)
     }
+    doc_p := doc as i64
     n := str_len(doc)
-    if vpos + 4 <= n and str_eq(str_slice(doc, vpos, vpos + 4), "true") {
+    if vpos + 4 <= n and ptr_read_u8(doc_p + vpos, 0) == 116 and ptr_read_u8(doc_p + vpos + 1, 0) == 114 and ptr_read_u8(doc_p + vpos + 2, 0) == 117 and ptr_read_u8(doc_p + vpos + 3, 0) == 101 {
         return ok(true)
     }
-    if vpos + 5 <= n and str_eq(str_slice(doc, vpos, vpos + 5), "false") {
+    if vpos + 5 <= n and ptr_read_u8(doc_p + vpos, 0) == 102 and ptr_read_u8(doc_p + vpos + 1, 0) == 97 and ptr_read_u8(doc_p + vpos + 2, 0) == 108 and ptr_read_u8(doc_p + vpos + 3, 0) == 115 and ptr_read_u8(doc_p + vpos + 4, 0) == 101 {
         return ok(false)
     }
     return err(422)

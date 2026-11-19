@@ -174,3 +174,139 @@ fn rmsnorm_2d[sym S, comptime D: usize](x: Tensor[f32, [S, D]], eps: f64) -> f64
 fn det_reduce_tensor_2d[sym B, sym S](x: Tensor[f32, [B, S]]) -> f64 {
     return det_sum_f32_ptr(tensor_ptr(x), tensor_numel(x))
 }
+
+// --- 5. FlashAttention-2 Tiled Online Softmax Kernel ---
+// Implements Tri Dao's FlashAttention-2 online running softmax algorithm:
+//   m_i = max(m_{i-1}, x)
+//   l_i = l_{i-1} * exp(m_{i-1} - m_i) + sum(exp(x - m_i))
+// Tiled across keys/values in cache blocks of 64 tokens.
+// O(1) extra memory: zero heap allocation of the S x S attention matrix.
+// Accelerated with hardware AVX2 FMA dot products (dlpack_dot_f32) and vector scale-add (dlpack_scale_add_f32).
+
+@no_alloc
+fn fast_exp_f32(x: f64) -> f64 {
+    if x <= -80.0 { return 0.0 }
+    if x >= 0.0 { return 1.0 }
+    inv_ln2 := 1.4426950408889634
+    ln2_hi := 0.6931471803691238
+    ln2_lo := 0.00000000019082149292705877
+    scaled := x * inv_ln2
+    mut k := 0
+    if scaled >= 0.0 {
+        k = (scaled + 0.5) as i64
+    } else {
+        k = (scaled - 0.5) as i64
+    }
+    kf := k as f64
+    r := (x - kf * ln2_hi) - kf * ln2_lo
+    mut p := 1.0 + r * 0.16666666666666666
+    p = 1.0 + r * 0.2 * p
+    p = 1.0 + r * 0.25 * p
+    p = 1.0 + r * 0.3333333333333333 * p
+    p = 1.0 + r * 0.5 * p
+    er := 1.0 + r * p
+    mut exp_scale := 1.0
+    mut ek := k
+    mut base := 2.0
+    if ek < 0 {
+        ek = 0 - ek
+        base = 0.5
+    }
+    while ek > 0 {
+        if (ek & 1) != 0 {
+            exp_scale = exp_scale * base
+        }
+        ek = ek >> 1
+        if ek > 0 {
+            base = base * base
+        }
+    }
+    return er * exp_scale
+}
+
+@no_alloc
+fn flash_attention_2_tiled(q: i64, k: i64, v: i64, out: i64, seq_len: i64, head_dim: i64) {
+    if seq_len <= 0 or head_dim <= 0 { return }
+
+    inv_sqrt_d := 1.0 / sqrt_f64(head_dim as f64)
+    stride_bytes := head_dim * 4
+    block_scores := mem_alloc_aligned(64 * 4 + 64)
+
+    mut qi := 0
+    while qi < seq_len {
+        q_row_ptr := q + qi * stride_bytes
+        out_row_ptr := out + qi * stride_bytes
+
+        mut d := 0
+        while d < head_dim {
+            ptr_write_f32(out_row_ptr, d, 0.0)
+            d += 1
+        }
+
+        mut m := -1000000.0
+        mut l := 0.0
+
+        mut block_start := 0
+        while block_start < seq_len {
+            mut block_len := 64
+            if block_start + block_len > seq_len {
+                block_len = seq_len - block_start
+            }
+
+            mut m_block := -1000000.0
+            mut bi := 0
+            while bi < block_len {
+                key_idx := block_start + bi
+                k_row_ptr := k + key_idx * stride_bytes
+                score := dlpack_dot_f32(q_row_ptr, k_row_ptr, head_dim) * inv_sqrt_d
+                ptr_write_f32(block_scores, bi, score)
+                if score > m_block {
+                    m_block = score
+                }
+                bi += 1
+            }
+
+            mut m_new := m
+            if m_block > m_new {
+                m_new = m_block
+            }
+            alpha := fast_exp_f32(m - m_new)
+            l = l * alpha
+
+            if alpha != 1.0 {
+                d = 0
+                while d < head_dim {
+                    cur_val := ptr_read_f32(out_row_ptr, d)
+                    ptr_write_f32(out_row_ptr, d, cur_val * alpha)
+                    d += 1
+                }
+            }
+
+            bi = 0
+            while bi < block_len {
+                score := ptr_read_f32(block_scores, bi)
+                p := fast_exp_f32(score - m_new)
+                l = l + p
+                key_idx := block_start + bi
+                v_row_ptr := v + key_idx * stride_bytes
+                dlpack_scale_add_f32(out_row_ptr, v_row_ptr, p, head_dim)
+                bi += 1
+            }
+
+            m = m_new
+            block_start += 64
+        }
+
+        inv_l := 1.0 / (l + 0.000000000001)
+        d = 0
+        while d < head_dim {
+            cur_o := ptr_read_f32(out_row_ptr, d)
+            ptr_write_f32(out_row_ptr, d, cur_o * inv_l)
+            d += 1
+        }
+
+        qi += 1
+    }
+
+    mem_free_aligned(block_scores)
+}
