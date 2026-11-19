@@ -186,7 +186,7 @@ fn det_reduce_tensor_2d[sym B, sym S](x: Tensor[f32, [B, S]]) -> f64 {
 @no_alloc
 fn fast_exp_f32(x: f64) -> f64 {
     if x <= -80.0 { return 0.0 }
-    if x >= 0.0 { return 1.0 }
+    if x >= 80.0 { return 554062238439351005257890000000000000.0 }
     inv_ln2 := 1.4426950408889634
     ln2_hi := 0.6931471803691238
     ln2_lo := 0.00000000019082149292705877
@@ -206,31 +206,39 @@ fn fast_exp_f32(x: f64) -> f64 {
     p = 1.0 + r * 0.5 * p
     er := 1.0 + r * p
     mut exp_scale := 1.0
-    mut ek := k
-    mut base := 2.0
-    if ek < 0 {
-        ek = 0 - ek
-        base = 0.5
-    }
-    while ek > 0 {
-        if (ek & 1) != 0 {
-            exp_scale = exp_scale * base
-        }
-        ek = ek >> 1
-        if ek > 0 {
-            base = base * base
-        }
+    if k >= 0 {
+        if (k & 1) != 0 { exp_scale = exp_scale * 2.0 }
+        if (k & 2) != 0 { exp_scale = exp_scale * 4.0 }
+        if (k & 4) != 0 { exp_scale = exp_scale * 16.0 }
+        if (k & 8) != 0 { exp_scale = exp_scale * 256.0 }
+        if (k & 16) != 0 { exp_scale = exp_scale * 65536.0 }
+        if (k & 32) != 0 { exp_scale = exp_scale * 4294967296.0 }
+        if (k & 64) != 0 { exp_scale = exp_scale * 18446744073709551616.0 }
+    } else {
+        ek := 0 - k
+        if (ek & 1) != 0 { exp_scale = exp_scale * 0.5 }
+        if (ek & 2) != 0 { exp_scale = exp_scale * 0.25 }
+        if (ek & 4) != 0 { exp_scale = exp_scale * 0.0625 }
+        if (ek & 8) != 0 { exp_scale = exp_scale * 0.00390625 }
+        if (ek & 16) != 0 { exp_scale = exp_scale * 0.0000152587890625 }
+        if (ek & 32) != 0 { exp_scale = exp_scale * 0.00000000023283064365386963 }
+        if (ek & 64) != 0 { exp_scale = exp_scale * 0.00000000000000000005421010862427522 }
     }
     return er * exp_scale
 }
 
 @no_alloc
-fn flash_attention_2_tiled(q: i64, k: i64, v: i64, out: i64, seq_len: i64, head_dim: i64) {
+fn flash_attention_2_tiled(q: i64, k: i64, v: i64, out: i64, seq_len: i64, head_dim: i64, scratch: i64 = 0) {
     if seq_len <= 0 or head_dim <= 0 { return }
 
     inv_sqrt_d := 1.0 / sqrt_f64(head_dim as f64)
     stride_bytes := head_dim * 4
-    block_scores := mem_alloc_aligned(64 * 4 + 64)
+    mut block_scores := scratch
+    mut must_free := false
+    if block_scores == 0 {
+        block_scores = mem_alloc_aligned(32 * 4 + 64)
+        must_free = true
+    }
 
     mut qi := 0
     while qi < seq_len {
@@ -245,10 +253,11 @@ fn flash_attention_2_tiled(q: i64, k: i64, v: i64, out: i64, seq_len: i64, head_
 
         mut m := -1000000.0
         mut l := 0.0
+        mut l_comp := 0.0
 
         mut block_start := 0
         while block_start < seq_len {
-            mut block_len := 64
+            mut block_len := 32
             if block_start + block_len > seq_len {
                 block_len = seq_len - block_start
             }
@@ -272,6 +281,7 @@ fn flash_attention_2_tiled(q: i64, k: i64, v: i64, out: i64, seq_len: i64, head_
             }
             alpha := fast_exp_f32(m - m_new)
             l = l * alpha
+            l_comp = l_comp * alpha
 
             if alpha != 1.0 {
                 d = 0
@@ -286,7 +296,11 @@ fn flash_attention_2_tiled(q: i64, k: i64, v: i64, out: i64, seq_len: i64, head_
             while bi < block_len {
                 score := ptr_read_f32(block_scores, bi)
                 p := fast_exp_f32(score - m_new)
-                l = l + p
+                y := p - l_comp
+                t := l + y
+                l_comp = (t - l) - y
+                l = t
+
                 key_idx := block_start + bi
                 v_row_ptr := v + key_idx * stride_bytes
                 dlpack_scale_add_f32(out_row_ptr, v_row_ptr, p, head_dim)
@@ -294,7 +308,7 @@ fn flash_attention_2_tiled(q: i64, k: i64, v: i64, out: i64, seq_len: i64, head_
             }
 
             m = m_new
-            block_start += 64
+            block_start += 32
         }
 
         inv_l := 1.0 / (l + 0.000000000001)
@@ -308,5 +322,7 @@ fn flash_attention_2_tiled(q: i64, k: i64, v: i64, out: i64, seq_len: i64, head_
         qi += 1
     }
 
-    mem_free_aligned(block_scores)
+    if must_free {
+        mem_free_aligned(block_scores)
+    }
 }

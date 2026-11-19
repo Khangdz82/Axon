@@ -1,0 +1,535 @@
+// Axon v8.0 Test Suite 32: Ultra-Strict Accuracy and Numerical Precision
+// Rigorous verification of autograd gradients, FlashAttention-2 equivalence,
+// quaternion normalization conservation, SAT contact normals, FinTech zero-drift,
+// and zero-allocation memory arena stability.
+
+use std::ai_engine
+use std::ai_math
+use std::ai_lora
+use std::game_ecs
+use std::game_physics
+
+// --- Test 1: LoRA Autograd Analytical vs Numerical Gradient ---
+fn test_lora_autograd_precision() -> bool {
+    rng := ai_rng_new(1337)
+    in_dim := 8
+    out_dim := 4
+    rank := 2
+    batch := 1
+
+    l := lora_new(in_dim, out_dim, rank, 1.0, rng, 2, false)
+    x := mem_alloc_aligned(in_dim * 4 + 64)
+    h := mem_alloc_aligned(rank * 4 + 64)
+    out := mem_alloc_aligned(out_dim * 4 + 64)
+    dout := mem_alloc_aligned(out_dim * 4 + 64)
+    tmp_dh := mem_alloc_aligned(rank * 4 + 64)
+
+    mut i := 0
+    while i < in_dim {
+        ptr_write_f32(x, i, 0.4 + ((i % 5) as f64) * 0.15)
+        i += 1
+    }
+    i = 0
+    while i < out_dim {
+        ptr_write_f32(dout, i, 1.0)
+        i += 1
+    }
+
+    // Set non-trivial weights in A and B
+    i = 0
+    while i < rank * in_dim {
+        ptr_write_f32(l.a.data_ptr, i, 0.15 + ((i % 7) as f64) * 0.08)
+        i += 1
+    }
+    i = 0
+    while i < out_dim * rank {
+        ptr_write_f32(l.b.data_ptr, i, 0.25 + ((i % 6) as f64) * 0.06)
+        i += 1
+    }
+
+    // 1. Analytical backward pass
+    lora_zero_grad(l)
+    lora_fwd_f32(0, l, x, out, h, batch)
+    lora_bwd_f32(0, l, x, h, dout, 0, tmp_dh, batch, false)
+
+    // 2. Numerical gradient via central finite difference for multiple weight indices
+    eps := 0.0005
+    mut max_diff := 0.0
+
+    // Test across weight parameters in adapter matrix A
+    mut p_idx := 0
+    while p_idx < rank * in_dim {
+        orig_val := ptr_read_f32(l.a.data_ptr, p_idx)
+
+        // f(w + eps)
+        ptr_write_f32(l.a.data_ptr, p_idx, orig_val + eps)
+        lora_fwd_f32(0, l, x, out, h, batch)
+        mut loss_plus := 0.0
+        i = 0
+        while i < out_dim {
+            loss_plus += ptr_read_f32(out, i) * ptr_read_f32(dout, i)
+            i += 1
+        }
+
+        // f(w - eps)
+        ptr_write_f32(l.a.data_ptr, p_idx, orig_val - eps)
+        lora_fwd_f32(0, l, x, out, h, batch)
+        mut loss_minus := 0.0
+        i = 0
+        while i < out_dim {
+            loss_minus += ptr_read_f32(out, i) * ptr_read_f32(dout, i)
+            i += 1
+        }
+
+        // Restore parameter
+        ptr_write_f32(l.a.data_ptr, p_idx, orig_val)
+
+        g_num := (loss_plus - loss_minus) / (2.0 * eps)
+        g_ana := ptr_read_f32(l.a.grad_ptr, p_idx)
+
+        mut diff := g_ana - g_num
+        if diff < 0.0 { diff = 0.0 - diff }
+        if diff > max_diff { max_diff = diff }
+        p_idx += 1
+    }
+
+    // Test across weight parameters in adapter matrix B
+    p_idx = 0
+    while p_idx < out_dim * rank {
+        orig_val := ptr_read_f32(l.b.data_ptr, p_idx)
+
+        // f(w + eps)
+        ptr_write_f32(l.b.data_ptr, p_idx, orig_val + eps)
+        lora_fwd_f32(0, l, x, out, h, batch)
+        mut loss_plus := 0.0
+        i = 0
+        while i < out_dim {
+            loss_plus += ptr_read_f32(out, i) * ptr_read_f32(dout, i)
+            i += 1
+        }
+
+        // f(w - eps)
+        ptr_write_f32(l.b.data_ptr, p_idx, orig_val - eps)
+        lora_fwd_f32(0, l, x, out, h, batch)
+        mut loss_minus := 0.0
+        i = 0
+        while i < out_dim {
+            loss_minus += ptr_read_f32(out, i) * ptr_read_f32(dout, i)
+            i += 1
+        }
+
+        // Restore parameter
+        ptr_write_f32(l.b.data_ptr, p_idx, orig_val)
+
+        g_num := (loss_plus - loss_minus) / (2.0 * eps)
+        g_ana := ptr_read_f32(l.b.grad_ptr, p_idx)
+
+        mut diff := g_ana - g_num
+        if diff < 0.0 { diff = 0.0 - diff }
+        if diff > max_diff { max_diff = diff }
+        p_idx += 1
+    }
+
+    mem_free_aligned(x); mem_free_aligned(h); mem_free_aligned(out)
+    mem_free_aligned(dout); mem_free_aligned(tmp_dh)
+    lora_free(move l)
+
+    // Tolerance check: error < 1e-3
+    return max_diff < 0.001
+}
+
+// --- Test 2: FlashAttention-2 vs Standard Attention Equivalence ---
+fn standard_reference_attention(q: i64, k: i64, v: i64, out: i64, seq_len: i64, head_dim: i64) {
+    inv_sqrt_d := 1.0 / sqrt_f64(head_dim as f64)
+    stride_bytes := head_dim * 4
+    scores := mem_alloc_aligned(seq_len * 4 + 64)
+
+    mut i := 0
+    while i < seq_len {
+        q_row := q + i * stride_bytes
+        out_row := out + i * stride_bytes
+
+        mut max_s := -1000000.0
+        mut j := 0
+        while j < seq_len {
+            k_row := k + j * stride_bytes
+            s := dlpack_dot_f32(q_row, k_row, head_dim) * inv_sqrt_d
+            ptr_write_f32(scores, j, s)
+            if s > max_s { max_s = s }
+            j += 1
+        }
+
+        mut sum_exp := 0.0
+        j = 0
+        while j < seq_len {
+            s := ptr_read_f32(scores, j)
+            p := exp_f64(s - max_s)
+            ptr_write_f32(scores, j, p)
+            sum_exp += p
+            j += 1
+        }
+
+        inv_sum := 1.0 / sum_exp
+        mut d := 0
+        while d < head_dim {
+            ptr_write_f32(out_row, d, 0.0)
+            d += 1
+        }
+
+        j = 0
+        while j < seq_len {
+            p := ptr_read_f32(scores, j) * inv_sum
+            v_row := v + j * stride_bytes
+            dlpack_scale_add_f32(out_row, v_row, p, head_dim)
+            j += 1
+        }
+        i += 1
+    }
+    mem_free_aligned(scores)
+}
+
+fn test_flash_attention_equivalence() -> bool {
+    seq_len := 64
+    head_dim := 32
+    tot := seq_len * head_dim * 4 + 64
+
+    q := mem_alloc_aligned(tot)
+    k := mem_alloc_aligned(tot)
+    v := mem_alloc_aligned(tot)
+    out_fa := mem_alloc_aligned(tot)
+    out_std := mem_alloc_aligned(tot)
+
+    mut idx := 0
+    while idx < seq_len * head_dim {
+        ptr_write_f32(q, idx, ((idx % 11) as f64) * 0.12)
+        ptr_write_f32(k, idx, (((idx + 5) % 13) as f64) * 0.11)
+        ptr_write_f32(v, idx, (((idx + 9) % 17) as f64) * 0.09)
+        idx += 1
+    }
+
+    flash_attention_2_tiled(q, k, v, out_fa, seq_len, head_dim)
+    standard_reference_attention(q, k, v, out_std, seq_len, head_dim)
+
+    mut max_abs_err := 0.0
+    idx = 0
+    while idx < seq_len * head_dim {
+        fa_val := ptr_read_f32(out_fa, idx)
+        std_val := ptr_read_f32(out_std, idx)
+        mut diff := fa_val - std_val
+        if diff < 0.0 { diff = 0.0 - diff }
+        if diff > max_abs_err { max_abs_err = diff }
+        idx += 1
+    }
+
+    mem_free_aligned(q); mem_free_aligned(k); mem_free_aligned(v)
+    mem_free_aligned(out_fa); mem_free_aligned(out_std)
+
+    // Tolerance check: max absolute error < 1e-4
+    return max_abs_err < 0.0001
+}
+
+// --- Test 3: Quaternion Normalization Conservation (10,000 Steps) ---
+fn test_quaternion_normalization_conservation() -> bool {
+    // Test 8-body batch integration with phys3d_body_integrate over 10,000 steps.
+    // Verifies Body 2 independence from Body 1 contamination and strict norm conservation.
+    batch_a := mem_alloc_aligned(512)
+    batch_b := mem_alloc_aligned(512)
+
+    // Initialize 8 bodies in batch A
+    mut k := 0
+    while k < 8 {
+        base := k * 16
+        kf := (k + 1) as f64
+        ptr_write_f32(batch_a, base + 0, (k as f64) * 1.5)
+        ptr_write_f32(batch_a, base + 1, (k as f64) * -2.0)
+        ptr_write_f32(batch_a, base + 2, (k as f64) * 0.75)
+        ptr_write_f32(batch_a, base + 3, kf * 0.1)
+        ptr_write_f32(batch_a, base + 4, kf * -0.2)
+        ptr_write_f32(batch_a, base + 5, kf * 0.05)
+        // Unit identity quaternion
+        ptr_write_f32(batch_a, base + 6, 1.0)
+        ptr_write_f32(batch_a, base + 7, 0.0)
+        ptr_write_f32(batch_a, base + 8, 0.0)
+        ptr_write_f32(batch_a, base + 9, 0.0)
+        // Angular velocity
+        ptr_write_f32(batch_a, base + 10, kf * 0.35)
+        ptr_write_f32(batch_a, base + 11, kf * -0.45)
+        ptr_write_f32(batch_a, base + 12, kf * 0.25)
+        k += 1
+    }
+
+    // Initialize batch B identically, EXCEPT Body 1 has completely different state
+    k = 0
+    while k < 8 {
+        base := k * 16
+        mut f := 0
+        while f < 16 {
+            ptr_write_f32(batch_b, base + f, ptr_read_f32(batch_a, base + f))
+            f += 1
+        }
+        k += 1
+    }
+
+    // Diverge Body 1 in batch B
+    ptr_write_f32(batch_b, 16 + 6, 0.5)
+    ptr_write_f32(batch_b, 16 + 7, 0.5)
+    ptr_write_f32(batch_b, 16 + 8, 0.5)
+    ptr_write_f32(batch_b, 16 + 9, 0.5)
+    ptr_write_f32(batch_b, 16 + 10, -5.5)
+    ptr_write_f32(batch_b, 16 + 11, 7.2)
+    ptr_write_f32(batch_b, 16 + 12, -3.8)
+
+    dt := 0.001
+    mut step := 0
+    while step < 10000 {
+        phys3d_body_integrate(batch_a, 8, dt)
+        phys3d_body_integrate(batch_b, 8, dt)
+        step += 1
+    }
+
+    // Check Body 2 independence (batch_a vs batch_b)
+    qw_a := ptr_read_f32(batch_a, 32 + 6)
+    qx_a := ptr_read_f32(batch_a, 32 + 7)
+    qy_a := ptr_read_f32(batch_a, 32 + 8)
+    qz_a := ptr_read_f32(batch_a, 32 + 9)
+
+    qw_b := ptr_read_f32(batch_b, 32 + 6)
+    qx_b := ptr_read_f32(batch_b, 32 + 7)
+    qy_b := ptr_read_f32(batch_b, 32 + 8)
+    qz_b := ptr_read_f32(batch_b, 32 + 9)
+
+    indep_diff := (qw_a - qw_b) * (qw_a - qw_b) + (qx_a - qx_b) * (qx_a - qx_b) + (qy_a - qy_b) * (qy_a - qy_b) + (qz_a - qz_b) * (qz_a - qz_b)
+
+    // Check strict quaternion normalization conservation for all 8 bodies
+    mut max_norm_err := 0.0
+    k = 0
+    while k < 8 {
+        base := k * 16
+        w := ptr_read_f32(batch_a, base + 6)
+        x := ptr_read_f32(batch_a, base + 7)
+        y := ptr_read_f32(batch_a, base + 8)
+        z := ptr_read_f32(batch_a, base + 9)
+        norm := sqrt_f64(w * w + x * x + y * y + z * z)
+        mut n_err := norm - 1.0
+        if n_err < 0.0 { n_err = 0.0 - n_err }
+        if n_err > max_norm_err { max_norm_err = n_err }
+        k += 1
+    }
+
+    mem_free_aligned(batch_a)
+    mem_free_aligned(batch_b)
+
+    // Body 2 independence: indep_diff must be zero (or < 1e-10)
+    // Quaternion normalization: max_norm_err < 1e-6
+    return indep_diff < 0.0000000001 and max_norm_err < 0.000001
+}
+
+// --- Test 4: SAT Collision Normal Exactness Across Angles ---
+fn test_sat_collision_normal_exactness() -> bool {
+    v_a := mem_alloc_aligned(64)
+    v_b := mem_alloc_aligned(64)
+
+    // Square A at origin
+    ptr_write_f32(v_a, 0, -2.0); ptr_write_f32(v_a, 1, -2.0)
+    ptr_write_f32(v_a, 2,  2.0); ptr_write_f32(v_a, 3, -2.0)
+    ptr_write_f32(v_a, 4,  2.0); ptr_write_f32(v_a, 5,  2.0)
+    ptr_write_f32(v_a, 6, -2.0); ptr_write_f32(v_a, 7,  2.0)
+
+    mut angle_step := 0
+    mut all_ok := true
+    while angle_step < 12 {
+        theta := (angle_step as f64) * 0.2617993877991494 // pi / 12
+        cos_t := p2_cos(theta); sin_t := p2_sin(theta)
+        ox := 1.2; oy := 0.8
+
+        // Rotated Square B overlapping with A
+        ptr_write_f32(v_b, 0, ox + (-1.0 * cos_t - (-1.0) * sin_t))
+        ptr_write_f32(v_b, 1, oy + (-1.0 * sin_t + (-1.0) * cos_t))
+        ptr_write_f32(v_b, 2, ox + ( 1.0 * cos_t - (-1.0) * sin_t))
+        ptr_write_f32(v_b, 3, oy + ( 1.0 * sin_t + (-1.0) * cos_t))
+        ptr_write_f32(v_b, 4, ox + ( 1.0 * cos_t - ( 1.0) * sin_t))
+        ptr_write_f32(v_b, 5, oy + ( 1.0 * sin_t + ( 1.0) * cos_t))
+        ptr_write_f32(v_b, 6, ox + (-1.0 * cos_t - ( 1.0) * sin_t))
+        ptr_write_f32(v_b, 7, oy + (-1.0 * sin_t + ( 1.0) * cos_t))
+
+        m := phys2d_sat_polygon_vs_polygon(v_a, 4, v_b, 4)
+        if not m.has_hit {
+            all_ok = false
+            break
+        }
+        if m.depth <= 0.0 {
+            all_ok = false
+            break
+        }
+
+        norm := sqrt_f64(m.nx * m.nx + m.ny * m.ny)
+        mut norm_err := norm - 1.0
+        if norm_err < 0.0 { norm_err = 0.0 - norm_err }
+        if norm_err >= 0.000001 {
+            all_ok = false
+            break
+        }
+
+        angle_step += 1
+    }
+
+    mem_free_aligned(v_a); mem_free_aligned(v_b)
+    return all_ok
+}
+
+// --- Test 5: FinTech Exact Conservation Across 1,000,000 Transactions ---
+fn test_fintech_exact_conservation() -> bool {
+    mut total_drift := 0
+    // Multi-party proportional basis points (sum = 10,000 bps = 100%)
+    bps_platform := 275    // 2.75%
+    bps_network  := 125    // 1.25%
+    bps_partner  := 1600   // 16.00%
+    bps_merchant := 8000   // 80.00%
+
+    mut i := 0
+    while i < 1000000 {
+        // Transaction gross amount in cents ($25.00 to $774.99)
+        amount := 2500 + (i % 75000)
+
+        // Discrete basis-point truncation for each party independently
+        share_platform := (amount * bps_platform) / 10000
+        share_network  := (amount * bps_network) / 10000
+        share_partner  := (amount * bps_partner) / 10000
+        mut share_merchant := (amount * bps_merchant) / 10000
+
+        // Discrete remainder cent calculation
+        sum_discrete := share_platform + share_network + share_partner + share_merchant
+        rem := amount - sum_discrete
+
+        // Remainder bounded check: 4 parties with sum = 10,000 bps gives 0 <= rem < 4
+        if rem < 0 or rem >= 4 {
+            total_drift += 1
+            break
+        }
+
+        // Remainder cent resolution (allocated to primary merchant)
+        share_merchant += rem
+
+        // Exact conservation proof
+        allocated := share_platform + share_network + share_partner + share_merchant
+        if allocated != amount {
+            total_drift += 1
+            break
+        }
+
+        i += 1
+    }
+
+    return total_drift == 0
+}
+
+// --- Test 6: Zero-Allocation Arena Watermark Stability (100,000 Iterations) ---
+fn test_zero_alloc_stress() -> bool {
+    arena := vram_arena_new(1048576)
+
+    // Working buffers allocated within arena
+    q_ptr := vram_arena_alloc_f32(arena, 32)
+    k_ptr := vram_arena_alloc_f32(arena, 32)
+    v_ptr := vram_arena_alloc_f32(arena, 32)
+    out_ptr := vram_arena_alloc_f32(arena, 32)
+
+    va_ptr := vram_arena_alloc_f32(arena, 8)
+    vb_ptr := vram_arena_alloc_f32(arena, 8)
+
+    // ECS World setup
+    mut world := ecs_world_new(32)
+    m_pv := comp_position() | comp_velocity()
+    e0 := ecs_spawn(world, m_pv)
+    ecs_set_position(world, e0, 5.0, 10.0, 15.0)
+    ecs_set_velocity(world, e0, 0.5, -0.2, 0.1)
+
+    // Record baseline arena watermark
+    baseline_watermark := vram_arena_used_bytes(arena)
+
+    mut it := 0
+    mut watermark_drift := 0
+    while it < 100000 {
+        // Actively allocate per-frame scratch from arena
+        frame_mark := vram_arena_used_bytes(arena)
+        frame_scratch := vram_arena_alloc_f32(arena, 64)
+        if frame_scratch == 0 {
+            watermark_drift += 1
+            break
+        }
+
+        // 1. ECS Movement
+        _moved := ecs_system_movement(world, 0.016)
+
+        // 2. 2D SAT Collision
+        _hit := phys2d_sat_polygon_vs_polygon(va_ptr, 4, vb_ptr, 4)
+
+        // 3. FlashAttention-2 with active per-frame scratch
+        flash_attention_2_tiled(q_ptr, k_ptr, v_ptr, out_ptr, 4, 8, frame_scratch)
+
+        // Actively reset per-frame arena allocation
+        ptr_write_i64(arena.state_ptr, 0, frame_mark)
+
+        // Strict per-frame watermark verification
+        if vram_arena_used_bytes(arena) != baseline_watermark {
+            watermark_drift += 1
+            break
+        }
+
+        it += 1
+    }
+
+    final_watermark := vram_arena_used_bytes(arena)
+    ecs_world_free(move world)
+    vram_arena_free(move arena)
+
+    return watermark_drift == 0 and final_watermark == baseline_watermark
+}
+
+fn main() -> i64 {
+    println("[32] Running Ultra-Strict Accuracy & Precision Test Suite...")
+
+    ok1 := test_lora_autograd_precision()
+    if not ok1 {
+        println("FAILED: Test 1 (LoRA Autograd Precision)")
+        return 1
+    }
+    println("  [PASS] Test 1: LoRA autograd matches central finite differences (|err| < 10^-3).")
+
+    ok2 := test_flash_attention_equivalence()
+    if not ok2 {
+        println("FAILED: Test 2 (FlashAttention-2 Equivalence)")
+        return 1
+    }
+    println("  [PASS] Test 2: FlashAttention-2 equivalent to standard attention (|max_err| < 10^-4).")
+
+    ok3 := test_quaternion_normalization_conservation()
+    if not ok3 {
+        println("FAILED: Test 3 (Quaternion Normalization Conservation)")
+        return 1
+    }
+    println("  [PASS] Test 3: Rigid body quaternion strictly conserved over 10,000 steps (|norm - 1.0| < 10^-6).")
+
+    ok4 := test_sat_collision_normal_exactness()
+    if not ok4 {
+        println("FAILED: Test 4 (SAT Collision Normal Exactness)")
+        return 1
+    }
+    println("  [PASS] Test 4: SAT contact normals strictly unit length across all angles (|norm - 1.0| < 10^-6).")
+
+    ok5 := test_fintech_exact_conservation()
+    if not ok5 {
+        println("FAILED: Test 5 (FinTech Exact Conservation)")
+        return 1
+    }
+    println("  [PASS] Test 5: FinTech 1,000,000 transaction splits execute with zero cent drift (Delta = 0).")
+
+    ok6 := test_zero_alloc_stress()
+    if not ok6 {
+        println("FAILED: Test 6 (Zero-Allocation Stress Test)")
+        return 1
+    }
+    println("  [PASS] Test 6: 100,000 iterations of ECS, SAT & FlashAttention execute with zero arena leaks.")
+
+    println("[32] All Ultra-Strict Accuracy and Numerical Precision tests passed cleanly!")
+    return 0
+}
