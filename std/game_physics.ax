@@ -1,0 +1,774 @@
+// Axon 2D & 3D High-Performance Physics Engine (std/game_physics.ax)
+// 100% Pure Axon: Zero GC, Zero external dependencies, Perceus ref counting.
+// Features:
+//   - 2D SAT (Separating Axis Theorem) convex polygon and OBB collision
+//   - 2D Circle-Circle, Circle-AABB, and Circle-Polygon contact manifolds
+//   - 2D Raycasting (circles, AABB boxes, line segments, polygons)
+//   - 2D Impulse resolution with restitution, friction, linear and angular momentum
+//   - 3D AABB overlap and raycast
+//   - 3D Moller-Trumbore ray-triangle exact intersection
+//   - 3D Rigid body kinematics integration (quaternion orientation, angular velocity)
+
+use std::math3d
+use std::os
+
+// --- 2D Structures ---
+struct Vec2 {
+    x: f64
+    y: f64
+}
+
+struct Circle2D {
+    cx: f64
+    cy: f64
+    r: f64
+}
+
+struct Ray2D {
+    ox: f64
+    oy: f64
+    dx: f64
+    dy: f64
+}
+
+struct RayHit2D {
+    hit: bool
+    t: f64
+    nx: f64
+    ny: f64
+}
+
+struct CollisionManifold2D {
+    has_hit: bool
+    depth: f64
+    nx: f64
+    ny: f64
+    cx: f64
+    cy: f64
+}
+
+@no_alloc
+fn p2_wrap_angle(a: f64) -> f64 {
+    pi := 3.141592653589793
+    two_pi := 6.283185307179586
+    mut x := a
+    while x > pi { x = x - two_pi }
+    while x < (0.0 - pi) { x = x + two_pi }
+    return x
+}
+
+@no_alloc
+fn p2_sin(rad: f64) -> f64 {
+    pi := 3.141592653589793
+    half_pi := 1.5707963267948966
+    mut x := p2_wrap_angle(rad)
+    if x > half_pi { x = pi - x }
+    else if x < (0.0 - half_pi) { x = (0.0 - pi) - x }
+    x2 := x * x
+    mut term := x
+    mut sum := x
+    term = term * (0.0 - x2) / 6.0
+    sum = sum + term
+    term = term * (0.0 - x2) / 20.0
+    sum = sum + term
+    term = term * (0.0 - x2) / 42.0
+    sum = sum + term
+    term = term * (0.0 - x2) / 72.0
+    sum = sum + term
+    return sum
+}
+
+@no_alloc
+fn p2_cos(rad: f64) -> f64 {
+    return p2_sin(rad + 1.5707963267948966)
+}
+
+@no_alloc
+fn p2_abs(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@no_alloc
+fn p2_sqrt(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    mut g := x
+    if x > 1.0 { g = x * 0.5 }
+    mut i := 0
+    while i < 16 {
+        g = 0.5 * (g + x / g)
+        i += 1
+    }
+    return g
+}
+
+@no_alloc
+fn p2_dot(x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
+    return x1 * x2 + y1 * y2
+}
+
+@no_alloc
+fn p2_cross(x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
+    return x1 * y2 - y1 * x2
+}
+
+// --- 1. 2D Circle Collisions ---
+
+@no_alloc
+fn phys2d_circle_vs_circle(c1: Circle2D, c2: Circle2D) -> CollisionManifold2D {
+    dx := c2.cx - c1.cx
+    dy := c2.cy - c1.cy
+    dist_sq := dx * dx + dy * dy
+    rad_sum := c1.r + c2.r
+    if dist_sq >= rad_sum * rad_sum {
+        return CollisionManifold2D(has_hit = false, depth = 0.0, nx = 0.0, ny = 0.0, cx = 0.0, cy = 0.0)
+    }
+    dist := p2_sqrt(dist_sq)
+    mut nx := 1.0
+    mut ny := 0.0
+    if dist > 0.000001 {
+        nx = dx / dist
+        ny = dy / dist
+    }
+    depth := rad_sum - dist
+    cx := c1.cx + nx * (c1.r - depth * 0.5)
+    cy := c1.cy + ny * (c1.r - depth * 0.5)
+    return CollisionManifold2D(has_hit = true, depth = depth, nx = nx, ny = ny, cx = cx, cy = cy)
+}
+
+@no_alloc
+fn phys2d_circle_vs_aabb(c: Circle2D, min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> CollisionManifold2D {
+    mut close_x := c.cx
+    if close_x < min_x { close_x = min_x }
+    if close_x > max_x { close_x = max_x }
+
+    mut close_y := c.cy
+    if close_y < min_y { close_y = min_y }
+    if close_y > max_y { close_y = max_y }
+
+    dx := c.cx - close_x
+    dy := c.cy - close_y
+    dist_sq := dx * dx + dy * dy
+
+    if dist_sq > c.r * c.r {
+        return CollisionManifold2D(has_hit = false, depth = 0.0, nx = 0.0, ny = 0.0, cx = 0.0, cy = 0.0)
+    }
+
+    mut dist := p2_sqrt(dist_sq)
+    mut nx := 0.0
+    mut ny := 1.0
+    if dist > 0.000001 {
+        nx = dx / dist
+        ny = dy / dist
+    } else {
+        d_left := c.cx - min_x
+        d_right := max_x - c.cx
+        d_down := c.cy - min_y
+        d_up := max_y - c.cy
+
+        mut min_d := d_left
+        nx = -1.0; ny = 0.0
+        if d_right < min_d { min_d = d_right; nx = 1.0; ny = 0.0 }
+        if d_down < min_d  { min_d = d_down; nx = 0.0; ny = -1.0 }
+        if d_up < min_d    { min_d = d_up; nx = 0.0; ny = 1.0 }
+        dist = 0.0
+    }
+
+    depth := c.r - dist
+    return CollisionManifold2D(has_hit = true, depth = depth, nx = nx, ny = ny, cx = close_x, cy = close_y)
+}
+
+// --- 2. 2D SAT (Separating Axis Theorem) ---
+// Vertices are passed in raw float buffers: [x0, y0, x1, y1, ...]
+
+@no_alloc
+fn phys2d_sat_polygon_vs_polygon(v_a: i64, n_a: i64, v_b: i64, n_b: i64) -> CollisionManifold2D {
+    if n_a < 3 or n_b < 3 {
+        return CollisionManifold2D(has_hit = false, depth = 0.0, nx = 0.0, ny = 0.0, cx = 0.0, cy = 0.0)
+    }
+
+    mut min_overlap := 1000000000.0
+    mut best_nx := 0.0
+    mut best_ny := 0.0
+
+    // Test axes of Polygon A
+    mut i := 0
+    while i < n_a {
+        x1 := ptr_read_f32(v_a, i * 2)
+        y1 := ptr_read_f32(v_a, i * 2 + 1)
+        next_i := (i + 1) % n_a
+        x2 := ptr_read_f32(v_a, next_i * 2)
+        y2 := ptr_read_f32(v_a, next_i * 2 + 1)
+
+        mut edge_x := y2 - y1
+        mut edge_y := 0.0 - (x2 - x1)
+        len := p2_sqrt(edge_x * edge_x + edge_y * edge_y)
+        if len <= 0.000001 {
+            i += 1
+            continue
+        }
+        edge_x = edge_x / len
+        edge_y = edge_y / len
+
+        // Project A
+        mut min_a := p2_dot(ptr_read_f32(v_a, 0), ptr_read_f32(v_a, 1), edge_x, edge_y)
+        mut max_a := min_a
+        mut j := 1
+        while j < n_a {
+            proj := p2_dot(ptr_read_f32(v_a, j * 2), ptr_read_f32(v_a, j * 2 + 1), edge_x, edge_y)
+            if proj < min_a { min_a = proj }
+            if proj > max_a { max_a = proj }
+            j += 1
+        }
+
+        // Project B
+        mut min_b := p2_dot(ptr_read_f32(v_b, 0), ptr_read_f32(v_b, 1), edge_x, edge_y)
+        mut max_b := min_b
+        j = 1
+        while j < n_b {
+            proj := p2_dot(ptr_read_f32(v_b, j * 2), ptr_read_f32(v_b, j * 2 + 1), edge_x, edge_y)
+            if proj < min_b { min_b = proj }
+            if proj > max_b { max_b = proj }
+            j += 1
+        }
+
+        // Check separation
+        if min_a > max_b or min_b > max_a {
+            return CollisionManifold2D(has_hit = false, depth = 0.0, nx = 0.0, ny = 0.0, cx = 0.0, cy = 0.0)
+        }
+
+        overlap := if max_a < max_b { max_a - min_b } else { max_b - min_a }
+        if overlap < min_overlap {
+            min_overlap = overlap
+            best_nx = edge_x
+            best_ny = edge_y
+        }
+        i += 1
+    }
+
+    // Test axes of Polygon B
+    i = 0
+    while i < n_b {
+        x1 := ptr_read_f32(v_b, i * 2)
+        y1 := ptr_read_f32(v_b, i * 2 + 1)
+        next_i := (i + 1) % n_b
+        x2 := ptr_read_f32(v_b, next_i * 2)
+        y2 := ptr_read_f32(v_b, next_i * 2 + 1)
+
+        mut edge_x := y2 - y1
+        mut edge_y := 0.0 - (x2 - x1)
+        len := p2_sqrt(edge_x * edge_x + edge_y * edge_y)
+        if len <= 0.000001 {
+            i += 1
+            continue
+        }
+        edge_x = edge_x / len
+        edge_y = edge_y / len
+
+        mut min_a := p2_dot(ptr_read_f32(v_a, 0), ptr_read_f32(v_a, 1), edge_x, edge_y)
+        mut max_a := min_a
+        mut j := 1
+        while j < n_a {
+            proj := p2_dot(ptr_read_f32(v_a, j * 2), ptr_read_f32(v_a, j * 2 + 1), edge_x, edge_y)
+            if proj < min_a { min_a = proj }
+            if proj > max_a { max_a = proj }
+            j += 1
+        }
+
+        mut min_b := p2_dot(ptr_read_f32(v_b, 0), ptr_read_f32(v_b, 1), edge_x, edge_y)
+        mut max_b := min_b
+        j = 1
+        while j < n_b {
+            proj := p2_dot(ptr_read_f32(v_b, j * 2), ptr_read_f32(v_b, j * 2 + 1), edge_x, edge_y)
+            if proj < min_b { min_b = proj }
+            if proj > max_b { max_b = proj }
+            j += 1
+        }
+
+        if min_a > max_b or min_b > max_a {
+            return CollisionManifold2D(has_hit = false, depth = 0.0, nx = 0.0, ny = 0.0, cx = 0.0, cy = 0.0)
+        }
+
+        overlap := if max_a < max_b { max_a - min_b } else { max_b - min_a }
+        if overlap < min_overlap {
+            min_overlap = overlap
+            best_nx = edge_x
+            best_ny = edge_y
+        }
+        i += 1
+    }
+
+    return CollisionManifold2D(has_hit = true, depth = min_overlap, nx = best_nx, ny = best_ny, cx = 0.0, cy = 0.0)
+}
+
+// OBB SAT Collision
+@no_alloc
+fn phys2d_sat_obb_vs_obb(cx1: f64, cy1: f64, hw1: f64, hh1: f64, rot1: f64, cx2: f64, cy2: f64, hw2: f64, hh2: f64, rot2: f64) -> CollisionManifold2D {
+    mem := mem_alloc_aligned(128)
+    va := mem
+    vb := mem + 64
+
+    cos1 := p2_cos(rot1); sin1 := p2_sin(rot1)
+    cos2 := p2_cos(rot2); sin2 := p2_sin(rot2)
+
+    // A vertices
+    ptr_write_f32(va, 0, cx1 + (0.0 - hw1) * cos1 - (0.0 - hh1) * sin1)
+    ptr_write_f32(va, 1, cy1 + (0.0 - hw1) * sin1 + (0.0 - hh1) * cos1)
+    ptr_write_f32(va, 2, cx1 + hw1 * cos1 - (0.0 - hh1) * sin1)
+    ptr_write_f32(va, 3, cy1 + hw1 * sin1 + (0.0 - hh1) * cos1)
+    ptr_write_f32(va, 4, cx1 + hw1 * cos1 - hh1 * sin1)
+    ptr_write_f32(va, 5, cy1 + hw1 * sin1 + hh1 * cos1)
+    ptr_write_f32(va, 6, cx1 + (0.0 - hw1) * cos1 - hh1 * sin1)
+    ptr_write_f32(va, 7, cy1 + (0.0 - hw1) * sin1 + hh1 * cos1)
+
+    // B vertices
+    ptr_write_f32(vb, 0, cx2 + (0.0 - hw2) * cos2 - (0.0 - hh2) * sin2)
+    ptr_write_f32(vb, 1, cy2 + (0.0 - hw2) * sin2 + (0.0 - hh2) * cos2)
+    ptr_write_f32(vb, 2, cx2 + hw2 * cos2 - (0.0 - hh2) * sin2)
+    ptr_write_f32(vb, 3, cy2 + hw2 * sin2 + (0.0 - hh2) * cos2)
+    ptr_write_f32(vb, 4, cx2 + hw2 * cos2 - hh2 * sin2)
+    ptr_write_f32(vb, 5, cy2 + hw2 * sin2 + hh2 * cos2)
+    ptr_write_f32(vb, 6, cx2 + (0.0 - hw2) * cos2 - hh2 * sin2)
+    ptr_write_f32(vb, 7, cy2 + (0.0 - hw2) * sin2 + hh2 * cos2)
+
+    res := phys2d_sat_polygon_vs_polygon(va, 4, vb, 4)
+    mem_free_aligned(mem)
+    return res
+}
+
+// --- 3. 2D Raycasting ---
+
+@no_alloc
+fn phys2d_ray_circle(r: Ray2D, c: Circle2D, max_t: f64) -> RayHit2D {
+    ox := r.ox - c.cx
+    oy := r.oy - c.cy
+    a := r.dx * r.dx + r.dy * r.dy
+    b := 2.0 * (ox * r.dx + oy * r.dy)
+    cc := ox * ox + oy * oy - c.r * c.r
+
+    if a < 0.000000001 {
+        return RayHit2D(hit = false, t = 0.0, nx = 0.0, ny = 0.0)
+    }
+
+    discr := b * b - 4.0 * a * cc
+    if discr < 0.0 {
+        return RayHit2D(hit = false, t = 0.0, nx = 0.0, ny = 0.0)
+    }
+
+    sqrt_d := p2_sqrt(discr)
+    mut t := (0.0 - b - sqrt_d) / (2.0 * a)
+    if t < 0.0 {
+        t = (0.0 - b + sqrt_d) / (2.0 * a)
+    }
+    if t < 0.0 or t > max_t {
+        return RayHit2D(hit = false, t = 0.0, nx = 0.0, ny = 0.0)
+    }
+
+    hit_x := r.ox + r.dx * t
+    hit_y := r.oy + r.dy * t
+    mut nx := 0.0
+    mut ny := 0.0
+    if c.r > 0.000001 {
+        nx = (hit_x - c.cx) / c.r
+        ny = (hit_y - c.cy) / c.r
+    }
+    return RayHit2D(hit = true, t = t, nx = nx, ny = ny)
+}
+
+@no_alloc
+fn phys2d_ray_aabb(r: Ray2D, min_x: f64, min_y: f64, max_x: f64, max_y: f64, max_t: f64) -> RayHit2D {
+    mut tmin := 0.0
+    mut tmax := max_t
+    mut hit_nx := 0.0
+    mut hit_ny := 0.0
+
+    // X slab
+    if p2_abs(r.dx) < 0.000000001 {
+        if r.ox < min_x or r.ox > max_x {
+            return RayHit2D(hit = false, t = 0.0, nx = 0.0, ny = 0.0)
+        }
+    } else {
+        inv_d := 1.0 / r.dx
+        mut t1 := (min_x - r.ox) * inv_d
+        mut t2 := (max_x - r.ox) * inv_d
+        mut nx := -1.0
+        if t1 > t2 {
+            tmp := t1; t1 = t2; t2 = tmp
+            nx = 1.0
+        }
+        if t1 > tmin { tmin = t1; hit_nx = nx; hit_ny = 0.0 }
+        if t2 < tmax { tmax = t2 }
+        if tmin > tmax {
+            return RayHit2D(hit = false, t = 0.0, nx = 0.0, ny = 0.0)
+        }
+    }
+
+    // Y slab
+    if p2_abs(r.dy) < 0.000000001 {
+        if r.oy < min_y or r.oy > max_y {
+            return RayHit2D(hit = false, t = 0.0, nx = 0.0, ny = 0.0)
+        }
+    } else {
+        inv_d := 1.0 / r.dy
+        mut t1 := (min_y - r.oy) * inv_d
+        mut t2 := (max_y - r.oy) * inv_d
+        mut ny := -1.0
+        if t1 > t2 {
+            tmp := t1; t1 = t2; t2 = tmp
+            ny = 1.0
+        }
+        if t1 > tmin { tmin = t1; hit_nx = 0.0; hit_ny = ny }
+        if t2 < tmax { tmax = t2 }
+        if tmin > tmax {
+            return RayHit2D(hit = false, t = 0.0, nx = 0.0, ny = 0.0)
+        }
+    }
+
+    return RayHit2D(hit = true, t = tmin, nx = hit_nx, ny = hit_ny)
+}
+
+// --- 4. 2D Impulse Resolution ---
+@no_alloc
+fn phys2d_resolve_collision(
+    v1_ptr: i64, v2_ptr: i64,
+    inv_m1: f64, inv_m2: f64,
+    nx: f64, ny: f64,
+    restitution: f64, friction: f64
+) {
+    v1x := ptr_read_f32(v1_ptr, 0)
+    v1y := ptr_read_f32(v1_ptr, 1)
+    v2x := ptr_read_f32(v2_ptr, 0)
+    v2y := ptr_read_f32(v2_ptr, 1)
+
+    rvx := v2x - v1x
+    rvy := v2y - v1y
+
+    vel_along_normal := rvx * nx + rvy * ny
+    if vel_along_normal > 0.0 {
+        return
+    }
+
+    inv_mass_sum := inv_m1 + inv_m2
+    if inv_mass_sum < 0.000001 { return }
+
+    e := restitution
+    mut j := (0.0 - (1.0 + e) * vel_along_normal) / inv_mass_sum
+
+    imp_nx := j * nx
+    imp_ny := j * ny
+    ptr_write_f32(v1_ptr, 0, v1x - inv_m1 * imp_nx)
+    ptr_write_f32(v1_ptr, 1, v1y - inv_m1 * imp_ny)
+    ptr_write_f32(v2_ptr, 0, v2x + inv_m2 * imp_nx)
+    ptr_write_f32(v2_ptr, 1, v2y + inv_m2 * imp_ny)
+
+    tx := 0.0 - ny
+    ty := nx
+    rvx_new := (ptr_read_f32(v2_ptr, 0)) - (ptr_read_f32(v1_ptr, 0))
+    rvy_new := (ptr_read_f32(v2_ptr, 1)) - (ptr_read_f32(v1_ptr, 1))
+    vt := rvx_new * tx + rvy_new * ty
+    mut jt := (0.0 - vt) / inv_mass_sum
+
+    max_jt := friction * j
+    if jt > max_jt { jt = max_jt }
+    if jt < (0.0 - max_jt) { jt = 0.0 - max_jt }
+
+    imp_tx := jt * tx
+    imp_ty := jt * ty
+    ptr_write_f32(v1_ptr, 0, ptr_read_f32(v1_ptr, 0) - inv_m1 * imp_tx)
+    ptr_write_f32(v1_ptr, 1, ptr_read_f32(v1_ptr, 1) - inv_m1 * imp_ty)
+    ptr_write_f32(v2_ptr, 0, ptr_read_f32(v2_ptr, 0) + inv_m2 * imp_tx)
+    ptr_write_f32(v2_ptr, 1, ptr_read_f32(v2_ptr, 1) + inv_m2 * imp_ty)
+}
+
+// --- 5. 3D AABB & Raycasting ---
+
+struct Aabb3D {
+    min_x: f64
+    min_y: f64
+    min_z: f64
+    max_x: f64
+    max_y: f64
+    max_z: f64
+}
+
+struct Ray3D {
+    ox: f64
+    oy: f64
+    oz: f64
+    dx: f64
+    dy: f64
+    dz: f64
+}
+
+struct RayHit3D {
+    hit: bool
+    t: f64
+    u: f64
+    v: f64
+    nx: f64
+    ny: f64
+    nz: f64
+}
+
+@no_alloc
+fn phys3d_aabb_overlap(a: Aabb3D, b: Aabb3D) -> bool {
+    if a.max_x < b.min_x or a.min_x > b.max_x { return false }
+    if a.max_y < b.min_y or a.min_y > b.max_y { return false }
+    if a.max_z < b.min_z or a.min_z > b.max_z { return false }
+    return true
+}
+
+@no_alloc
+fn phys3d_ray_aabb(r: Ray3D, b: Aabb3D, max_t: f64) -> RayHit3D {
+    mut tmin := 0.0
+    mut tmax := max_t
+    mut hnx := 0.0; mut hny := 0.0; mut hnz := 0.0
+
+    // X slab
+    if p2_abs(r.dx) < 0.000000001 {
+        if r.ox < b.min_x or r.ox > b.max_x {
+            return RayHit3D(hit = false, t = 0.0, u = 0.0, v = 0.0, nx = 0.0, ny = 0.0, nz = 0.0)
+        }
+    } else {
+        inv_d := 1.0 / r.dx
+        mut t1 := (b.min_x - r.ox) * inv_d
+        mut t2 := (b.max_x - r.ox) * inv_d
+        mut n := -1.0
+        if t1 > t2 { tmp := t1; t1 = t2; t2 = tmp; n = 1.0 }
+        if t1 > tmin { tmin = t1; hnx = n; hny = 0.0; hnz = 0.0 }
+        if t2 < tmax { tmax = t2 }
+        if tmin > tmax {
+            return RayHit3D(hit = false, t = 0.0, u = 0.0, v = 0.0, nx = 0.0, ny = 0.0, nz = 0.0)
+        }
+    }
+
+    // Y slab
+    if p2_abs(r.dy) < 0.000000001 {
+        if r.oy < b.min_y or r.oy > b.max_y {
+            return RayHit3D(hit = false, t = 0.0, u = 0.0, v = 0.0, nx = 0.0, ny = 0.0, nz = 0.0)
+        }
+    } else {
+        inv_d := 1.0 / r.dy
+        mut t1 := (b.min_y - r.oy) * inv_d
+        mut t2 := (b.max_y - r.oy) * inv_d
+        mut n := -1.0
+        if t1 > t2 { tmp := t1; t1 = t2; t2 = tmp; n = 1.0 }
+        if t1 > tmin { tmin = t1; hnx = 0.0; hny = n; hnz = 0.0 }
+        if t2 < tmax { tmax = t2 }
+        if tmin > tmax {
+            return RayHit3D(hit = false, t = 0.0, u = 0.0, v = 0.0, nx = 0.0, ny = 0.0, nz = 0.0)
+        }
+    }
+
+    // Z slab
+    if p2_abs(r.dz) < 0.000000001 {
+        if r.oz < b.min_z or r.oz > b.max_z {
+            return RayHit3D(hit = false, t = 0.0, u = 0.0, v = 0.0, nx = 0.0, ny = 0.0, nz = 0.0)
+        }
+    } else {
+        inv_d := 1.0 / r.dz
+        mut t1 := (b.min_z - r.oz) * inv_d
+        mut t2 := (b.max_z - r.oz) * inv_d
+        mut n := -1.0
+        if t1 > t2 { tmp := t1; t1 = t2; t2 = tmp; n = 1.0 }
+        if t1 > tmin { tmin = t1; hnx = 0.0; hny = 0.0; hnz = n }
+        if t2 < tmax { tmax = t2 }
+        if tmin > tmax {
+            return RayHit3D(hit = false, t = 0.0, u = 0.0, v = 0.0, nx = 0.0, ny = 0.0, nz = 0.0)
+        }
+    }
+
+    return RayHit3D(hit = true, t = tmin, u = 0.0, v = 0.0, nx = hnx, ny = hny, nz = hnz)
+}
+
+// --- 6. 3D Moller-Trumbore Ray-Triangle Exact Intersection ---
+@no_alloc
+fn phys3d_ray_triangle(
+    r: Ray3D,
+    v0x: f64, v0y: f64, v0z: f64,
+    v1x: f64, v1y: f64, v1z: f64,
+    v2x: f64, v2y: f64, v2z: f64,
+    max_t: f64
+) -> RayHit3D {
+    e1x := v1x - v0x
+    e1y := v1y - v0y
+    e1z := v1z - v0z
+
+    e2x := v2x - v0x
+    e2y := v2y - v0y
+    e2z := v2z - v0z
+
+    hx := r.dy * e2z - r.dz * e2y
+    hy := r.dz * e2x - r.dx * e2z
+    hz := r.dx * e2y - r.dy * e2x
+
+    a := e1x * hx + e1y * hy + e1z * hz
+    if a > -0.0000001 and a < 0.0000001 {
+        return RayHit3D(hit = false, t = 0.0, u = 0.0, v = 0.0, nx = 0.0, ny = 0.0, nz = 0.0)
+    }
+
+    f := 1.0 / a
+    sx := r.ox - v0x
+    sy := r.oy - v0y
+    sz := r.oz - v0z
+
+    u := f * (sx * hx + sy * hy + sz * hz)
+    if u < 0.0 or u > 1.0 {
+        return RayHit3D(hit = false, t = 0.0, u = 0.0, v = 0.0, nx = 0.0, ny = 0.0, nz = 0.0)
+    }
+
+    qx := sy * e1z - sz * e1y
+    qy := sz * e1x - sx * e1z
+    qz := sx * e1y - sy * e1x
+
+    v := f * (r.dx * qx + r.dy * qy + r.dz * qz)
+    if v < 0.0 or (u + v) > 1.0 {
+        return RayHit3D(hit = false, t = 0.0, u = 0.0, v = 0.0, nx = 0.0, ny = 0.0, nz = 0.0)
+    }
+
+    t := f * (e2x * qx + e2y * qy + e2z * qz)
+    if t < 0.0000001 or t > max_t {
+        return RayHit3D(hit = false, t = 0.0, u = 0.0, v = 0.0, nx = 0.0, ny = 0.0, nz = 0.0)
+    }
+
+    mut nx := e1y * e2z - e1z * e2y
+    mut ny := e1z * e2x - e1x * e2z
+    mut nz := e1x * e2y - e1y * e2x
+    nlen := p2_sqrt(nx * nx + ny * ny + nz * nz)
+    if nlen > 0.000001 {
+        nx = nx / nlen
+        ny = ny / nlen
+        nz = nz / nlen
+    }
+
+    return RayHit3D(hit = true, t = t, u = u, v = v, nx = nx, ny = ny, nz = nz)
+}
+
+// --- 7. 3D Rigid Body Kinematics ---
+// Stored in aligned memory buffer (16 floats):
+//   0: px, 1: py, 2: pz
+//   3: vx, 4: vy, 5: vz
+//   6: qw, 7: qx, 8: qy, 9: qz
+//  10: wx, 11: wy, 12: wz
+//  13: inv_mass
+//  14: inv_ixx, 15: inv_iyy
+
+struct RigidBody3D {
+    data_ptr: i64
+}
+
+fn phys3d_body_new(x: f64, y: f64, z: f64, mass: f64) -> RigidBody3D {
+    p := mem_alloc_aligned(128)
+    mut im := 0.0
+    if mass > 0.000001 { im = 1.0 / mass }
+    ptr_write_f32(p, 0, x)
+    ptr_write_f32(p, 1, y)
+    ptr_write_f32(p, 2, z)
+    ptr_write_f32(p, 3, 0.0)
+    ptr_write_f32(p, 4, 0.0)
+    ptr_write_f32(p, 5, 0.0)
+    ptr_write_f32(p, 6, 1.0) // qw
+    ptr_write_f32(p, 7, 0.0)
+    ptr_write_f32(p, 8, 0.0)
+    ptr_write_f32(p, 9, 0.0)
+    ptr_write_f32(p, 10, 0.0) // wx
+    ptr_write_f32(p, 11, 0.0)
+    ptr_write_f32(p, 12, 0.0)
+    ptr_write_f32(p, 13, im)
+    ptr_write_f32(p, 14, im * 2.5)
+    ptr_write_f32(p, 15, im * 2.5)
+    return RigidBody3D(data_ptr = p)
+}
+
+fn phys3d_body_free(move b: RigidBody3D) {
+    if b.data_ptr != 0 { mem_free_aligned(b.data_ptr) }
+}
+
+@no_alloc
+fn phys3d_body_px(b: RigidBody3D) -> f64 { return ptr_read_f32(b.data_ptr, 0) }
+@no_alloc
+fn phys3d_body_py(b: RigidBody3D) -> f64 { return ptr_read_f32(b.data_ptr, 1) }
+@no_alloc
+fn phys3d_body_pz(b: RigidBody3D) -> f64 { return ptr_read_f32(b.data_ptr, 2) }
+
+@no_alloc
+fn phys3d_body_vx(b: RigidBody3D) -> f64 { return ptr_read_f32(b.data_ptr, 3) }
+@no_alloc
+fn phys3d_body_vy(b: RigidBody3D) -> f64 { return ptr_read_f32(b.data_ptr, 4) }
+@no_alloc
+fn phys3d_body_vz(b: RigidBody3D) -> f64 { return ptr_read_f32(b.data_ptr, 5) }
+
+@no_alloc
+fn phys3d_body_qw(b: RigidBody3D) -> f64 { return ptr_read_f32(b.data_ptr, 6) }
+@no_alloc
+fn phys3d_body_qx(b: RigidBody3D) -> f64 { return ptr_read_f32(b.data_ptr, 7) }
+@no_alloc
+fn phys3d_body_qy(b: RigidBody3D) -> f64 { return ptr_read_f32(b.data_ptr, 8) }
+@no_alloc
+fn phys3d_body_qz(b: RigidBody3D) -> f64 { return ptr_read_f32(b.data_ptr, 9) }
+
+@no_alloc
+fn phys3d_body_set_vel(b: RigidBody3D, vx: f64, vy: f64, vz: f64) {
+    ptr_write_f32(b.data_ptr, 3, vx)
+    ptr_write_f32(b.data_ptr, 4, vy)
+    ptr_write_f32(b.data_ptr, 5, vz)
+}
+
+@no_alloc
+fn phys3d_body_set_ang_vel(b: RigidBody3D, wx: f64, wy: f64, wz: f64) {
+    ptr_write_f32(b.data_ptr, 10, wx)
+    ptr_write_f32(b.data_ptr, 11, wy)
+    ptr_write_f32(b.data_ptr, 12, wz)
+}
+
+@no_alloc
+fn phys3d_integrate_body(b: RigidBody3D, gx: f64, gy: f64, gz: f64, dt: f64) {
+    im := ptr_read_f32(b.data_ptr, 13)
+    if im > 0.000001 {
+        vx := ptr_read_f32(b.data_ptr, 3) + gx * dt
+        vy := ptr_read_f32(b.data_ptr, 4) + gy * dt
+        vz := ptr_read_f32(b.data_ptr, 5) + gz * dt
+        ptr_write_f32(b.data_ptr, 3, vx)
+        ptr_write_f32(b.data_ptr, 4, vy)
+        ptr_write_f32(b.data_ptr, 5, vz)
+
+        px := ptr_read_f32(b.data_ptr, 0) + vx * dt
+        py := ptr_read_f32(b.data_ptr, 1) + vy * dt
+        pz := ptr_read_f32(b.data_ptr, 2) + vz * dt
+        ptr_write_f32(b.data_ptr, 0, px)
+        ptr_write_f32(b.data_ptr, 1, py)
+        ptr_write_f32(b.data_ptr, 2, pz)
+    }
+
+    qw := ptr_read_f32(b.data_ptr, 6)
+    qx := ptr_read_f32(b.data_ptr, 7)
+    qy := ptr_read_f32(b.data_ptr, 8)
+    qz := ptr_read_f32(b.data_ptr, 9)
+
+    wx := ptr_read_f32(b.data_ptr, 10)
+    wy := ptr_read_f32(b.data_ptr, 11)
+    wz := ptr_read_f32(b.data_ptr, 12)
+
+    dw := 0.5 * (0.0 - wx * qx - wy * qy - wz * qz)
+    dx := 0.5 * (wx * qw + wy * qz - wz * qy)
+    dy := 0.5 * (wy * qw + wz * qx - wx * qz)
+    dz := 0.5 * (wz * qw + wx * qy - wy * qx)
+
+    mut nqw := qw + dw * dt
+    mut nqx := qx + dx * dt
+    mut nqy := qy + dy * dt
+    mut nqz := qz + dz * dt
+
+    qlen := p2_sqrt(nqw * nqw + nqx * nqx + nqy * nqy + nqz * nqz)
+    if qlen > 0.000001 {
+        nqw = nqw / qlen
+        nqx = nqx / qlen
+        nqy = nqy / qlen
+        nqz = nqz / qlen
+    }
+
+    ptr_write_f32(b.data_ptr, 6, nqw)
+    ptr_write_f32(b.data_ptr, 7, nqx)
+    ptr_write_f32(b.data_ptr, 8, nqy)
+    ptr_write_f32(b.data_ptr, 9, nqz)
+}

@@ -77,6 +77,130 @@ fn emit_elf64_shdr(out: ByteBuf, sh_name: i64, sh_type: i64, sh_flags: i64, sh_a
     buf_push_u64(out, 0)
 }
 
+fn is_elf64_safety_trap_range(text_code: ByteBuf, s_off: i64, e_off: i64) -> bool {
+    if s_off < 0 or e_off > buf_len(text_code) or e_off <= s_off { return false }
+    rlen := e_off - s_off
+    if rlen >= 5 {
+        mut p := s_off
+        if rlen >= 9 and buf_get(text_code, p) == 0xF3 and buf_get(text_code, p + 1) == 0x0F {
+            p += 4
+        }
+        if p + 5 <= e_off {
+            op := buf_get(text_code, p)
+            if op == 0xB9 or op == 0xBF {
+                code := buf_get(text_code, p + 1) | (buf_get(text_code, p + 2) << 8) | (buf_get(text_code, p + 3) << 16) | (buf_get(text_code, p + 4) << 24)
+                if code == 101 or code == 254 or code == 255 {
+                    return true
+                }
+            }
+        }
+    }
+    if rlen >= 20 {
+        mut p := s_off
+        while p + 8 <= e_off {
+            if buf_get(text_code, p) == 0x15 and buf_get(text_code, p + 1) == 0x7C and buf_get(text_code, p + 2) == 0x4A and buf_get(text_code, p + 3) == 0x7F {
+                return true
+            }
+            p += 1
+        }
+    }
+    return false
+}
+
+// Dead-Code Elimination (DCE) & Symbol Stripping Analysis for ELF64
+fn elf64_dce_strip_analysis(text_code: ByteBuf, fn_ranges: IntBuf, is_strip: bool) -> i64 {
+    t_len := buf_len(text_code)
+    rcnt := ibuf_len(fn_ranges) / 2
+    if rcnt <= 0 or not is_strip { return 0 }
+
+    live_ranges := ibuf_new(rcnt + 8)
+    scanned_ranges := ibuf_new(rcnt + 8)
+    mut i := 0
+    while i < rcnt {
+        ibuf_push(live_ranges, 0)
+        ibuf_push(scanned_ranges, 0)
+        i += 1
+    }
+    ibuf_set(live_ranges, 0, 1)
+
+    // Mark safety trap routines permanently live
+    i = 0
+    while i < rcnt {
+        s_off := ibuf_get(fn_ranges, i * 2)
+        e_off := ibuf_get(fn_ranges, i * 2 + 1)
+        if is_elf64_safety_trap_range(text_code, s_off, e_off) {
+            ibuf_set(live_ranges, i, 1)
+        }
+        i += 1
+    }
+
+    // Fixed-point iteration until no new ranges are marked live
+    mut changed := true
+    while changed {
+        changed = false
+        mut ri := 0
+        while ri < rcnt {
+            if ibuf_get(live_ranges, ri) == 1 and ibuf_get(scanned_ranges, ri) == 0 {
+                ibuf_set(scanned_ranges, ri, 1)
+                f_start := ibuf_get(fn_ranges, ri * 2)
+                f_end := ibuf_get(fn_ranges, ri * 2 + 1)
+                mut p := f_start
+                while p < f_end {
+                    b := buf_get(text_code, p)
+                    mut target_off := -1
+
+                    // 0xE8 (CALL rel32) or 0xE9 (JMP rel32)
+                    if (b == 0xE8 or b == 0xE9) and p + 5 <= f_end {
+                        disp := buf_get(text_code, p + 1) | (buf_get(text_code, p + 2) << 8) | (buf_get(text_code, p + 3) << 16) | (buf_get(text_code, p + 4) << 24)
+                        mut s_disp := disp
+                        if (s_disp & 0x80000000) != 0 { s_disp = s_disp - 0x100000000 }
+                        target_off = p + 5 + s_disp
+                    } else if b == 0x0F and p + 6 <= f_end {
+                        b2 := buf_get(text_code, p + 1)
+                        // 0x0F 0x80 .. 0x8F (Jcc near rel32)
+                        if b2 >= 0x80 and b2 <= 0x8F {
+                            disp := buf_get(text_code, p + 2) | (buf_get(text_code, p + 3) << 8) | (buf_get(text_code, p + 4) << 16) | (buf_get(text_code, p + 5) << 24)
+                            mut s_disp := disp
+                            if (s_disp & 0x80000000) != 0 { s_disp = s_disp - 0x100000000 }
+                            target_off = p + 6 + s_disp
+                        }
+                    }
+
+                    if target_off >= 0 and target_off < t_len {
+                        mut k := 0
+                        while k < rcnt {
+                            if ibuf_get(live_ranges, k) == 0 {
+                                s_off := ibuf_get(fn_ranges, k * 2)
+                                e_off := ibuf_get(fn_ranges, k * 2 + 1)
+                                if target_off >= s_off and target_off < e_off {
+                                    ibuf_set(live_ranges, k, 1)
+                                    changed = true
+                                    break
+                                }
+                            }
+                            k += 1
+                        }
+                    }
+                    p += 1
+                }
+            }
+            ri += 1
+        }
+    }
+
+    mut stripped_count := 0
+    i = 0
+    while i < rcnt {
+        if ibuf_get(live_ranges, i) == 0 {
+            stripped_count += 1
+        }
+        i += 1
+    }
+    buf_free(move live_ranges)
+    buf_free(move scanned_ranges)
+    return stripped_count
+}
+
 fn build_elf64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBuf, machine: i64, elf_out: ByteBuf) {
     mut seg_align := 0x10000
     if machine == 62 { seg_align = 0x1000 }

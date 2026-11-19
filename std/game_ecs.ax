@@ -1,0 +1,679 @@
+// Axon Archetype-Based Entity Component System (ECS) (std/game_ecs.ax)
+// 100% Pure Axon: Zero GC, SoA (Structure of Arrays) layout, Perceus ref counting.
+// High performance archetype table storage, cache-aligned entity arrays, component masks,
+// O(1) swap-remove despawning, and vectorizable system query iterations.
+
+use std::os
+
+// --- Component Bitmasks (64-bit mask) ---
+fn comp_none() -> i64        { return 0 }
+fn comp_position() -> i64    { return 1 }       // Bit 0: 3D position (x, y, z)
+fn comp_velocity() -> i64    { return 2 }       // Bit 1: 3D velocity (vx, vy, vz)
+fn comp_renderable() -> i64  { return 4 }       // Bit 2: color (i64), size (f32)
+fn comp_collider() -> i64    { return 8 }       // Bit 3: radius (f32), layer (i64)
+fn comp_rigid_body() -> i64  { return 16 }      // Bit 4: inv_mass, restitution, friction, drag
+fn comp_tag() -> i64         { return 32 }      // Bit 5: tag_id (i64), user_data (i64)
+fn comp_health() -> i64      { return 64 }      // Bit 6: current_hp, max_hp
+
+// Archetype layout in `arch_ptr` (16 words per archetype, up to 64 archetypes):
+//   0: mask
+//   1: count
+//   2: capacity
+//   3: entities_ptr (capacity * 8 bytes)
+//   4: pos_ptr (capacity * 12 bytes: f32 x, y, z)
+//   5: vel_ptr (capacity * 12 bytes: f32 vx, vy, vz)
+//   6: render_ptr (capacity * 16 bytes: i64 color, f32 size)
+//   7: collider_ptr (capacity * 16 bytes: f32 radius, i64 layer)
+//   8: rigid_ptr (capacity * 16 bytes: f32 inv_mass, rest, fric, drag)
+//   9: tag_ptr (capacity * 16 bytes: i64 tag, i64 user_data)
+//  10: health_ptr (capacity * 8 bytes: f32 hp, f32 max_hp)
+
+struct EcsWorld {
+    meta_ptr: i64
+    data_ptr: i64
+    arch_ptr: i64
+}
+
+fn ecs_world_new(max_entities: i64 = 65536) -> EcsWorld {
+    mut me := max_entities
+    if me < 128 { me = 128 }
+    
+    mp := mem_alloc_aligned(64)
+    ptr_write_i64(mp, 0, 1)  // [0] next entity id
+    ptr_write_i64(mp, 1, 0)  // [1] live count
+    ptr_write_i64(mp, 2, 0)  // [2] archetype count
+    ptr_write_i64(mp, 3, me) // [3] max entities
+    ptr_write_i64(mp, 4, 0)  // [4] free count
+
+    // data_ptr holds:
+    // [0 .. me] = entity_arch
+    // [me .. 2*me] = entity_row
+    // [2*me .. 3*me] = entity_gen
+    // [3*me .. 4*me] = free_queue
+    dp := mem_alloc_aligned(me * 32 + 64)
+    mut i := 0
+    while i < me {
+        ptr_write_i64(dp, i, -1)
+        ptr_write_i64(dp, me + i, -1)
+        ptr_write_i64(dp, me * 2 + i, 0)
+        ptr_write_i64(dp, me * 3 + i, 0)
+        i += 1
+    }
+
+    ap := mem_alloc_aligned(64 * 16 * 8 + 64)
+    i = 0
+    while i < 64 * 16 {
+        ptr_write_i64(ap, i, 0)
+        i += 1
+    }
+
+    return EcsWorld(meta_ptr = mp, data_ptr = dp, arch_ptr = ap)
+}
+
+fn ecs_world_free(move w: EcsWorld) {
+    if w.arch_ptr != 0 {
+        arch_cnt := ptr_read_i64(w.meta_ptr, 2)
+        mut i := 0
+        while i < arch_cnt {
+            base := i * 16
+            mut k := 3
+            while k <= 10 {
+                p := ptr_read_i64(w.arch_ptr, base + k)
+                if p != 0 { mem_free_aligned(p) }
+                k += 1
+            }
+            i += 1
+        }
+        mem_free_aligned(w.arch_ptr)
+    }
+    if w.data_ptr != 0 { mem_free_aligned(w.data_ptr) }
+    if w.meta_ptr != 0 { mem_free_aligned(w.meta_ptr) }
+}
+
+fn ecs_find_or_create_archetype(world: EcsWorld, mask: i64) -> i64 {
+    cnt := ptr_read_i64(world.meta_ptr, 2)
+    mut i := 0
+    while i < cnt {
+        if ptr_read_i64(world.arch_ptr, i * 16) == mask {
+            return i
+        }
+        i += 1
+    }
+
+    if cnt >= 64 { return -1 }
+
+    arch_idx := cnt
+    base := arch_idx * 16
+    cap := 64
+
+    e_ptr := mem_alloc_aligned(cap * 8 + 64)
+    mut p_ptr := 0
+    mut v_ptr := 0
+    mut r_ptr := 0
+    mut c_ptr := 0
+    mut rg_ptr := 0
+    mut t_ptr := 0
+    mut h_ptr := 0
+
+    if (mask & comp_position()) != 0 {
+        p_ptr = mem_alloc_aligned(cap * 12 + 64)
+    }
+    if (mask & comp_velocity()) != 0 {
+        v_ptr = mem_alloc_aligned(cap * 12 + 64)
+    }
+    if (mask & comp_renderable()) != 0 {
+        r_ptr = mem_alloc_aligned(cap * 16 + 64)
+    }
+    if (mask & comp_collider()) != 0 {
+        c_ptr = mem_alloc_aligned(cap * 16 + 64)
+    }
+    if (mask & comp_rigid_body()) != 0 {
+        rg_ptr = mem_alloc_aligned(cap * 16 + 64)
+    }
+    if (mask & comp_tag()) != 0 {
+        t_ptr = mem_alloc_aligned(cap * 16 + 64)
+    }
+    if (mask & comp_health()) != 0 {
+        h_ptr = mem_alloc_aligned(cap * 8 + 64)
+    }
+
+    ptr_write_i64(world.arch_ptr, base, mask)
+    ptr_write_i64(world.arch_ptr, base + 1, 0)
+    ptr_write_i64(world.arch_ptr, base + 2, cap)
+    ptr_write_i64(world.arch_ptr, base + 3, e_ptr)
+    ptr_write_i64(world.arch_ptr, base + 4, p_ptr)
+    ptr_write_i64(world.arch_ptr, base + 5, v_ptr)
+    ptr_write_i64(world.arch_ptr, base + 6, r_ptr)
+    ptr_write_i64(world.arch_ptr, base + 7, c_ptr)
+    ptr_write_i64(world.arch_ptr, base + 8, rg_ptr)
+    ptr_write_i64(world.arch_ptr, base + 9, t_ptr)
+    ptr_write_i64(world.arch_ptr, base + 10, h_ptr)
+
+    ptr_write_i64(world.meta_ptr, 2, cnt + 1)
+    return arch_idx
+}
+
+fn ecs_ensure_arch_cap(world: EcsWorld, arch_idx: i64) {
+    base := arch_idx * 16
+    cnt := ptr_read_i64(world.arch_ptr, base + 1)
+    cap := ptr_read_i64(world.arch_ptr, base + 2)
+    if cnt < cap { return }
+
+    new_cap := cap * 2
+    mask := ptr_read_i64(world.arch_ptr, base)
+
+    old_e := ptr_read_i64(world.arch_ptr, base + 3)
+    new_e := mem_alloc_aligned(new_cap * 8 + 64)
+    mut i := 0
+    while i < cnt {
+        ptr_write_i64(new_e, i, ptr_read_i64(old_e, i))
+        i += 1
+    }
+    mem_free_aligned(old_e)
+    ptr_write_i64(world.arch_ptr, base + 3, new_e)
+
+    if (mask & comp_position()) != 0 {
+        old_p := ptr_read_i64(world.arch_ptr, base + 4)
+        new_p := mem_alloc_aligned(new_cap * 12 + 64)
+        i = 0
+        while i < cnt * 3 {
+            ptr_write_f32(new_p, i, ptr_read_f32(old_p, i))
+            i += 1
+        }
+        mem_free_aligned(old_p)
+        ptr_write_i64(world.arch_ptr, base + 4, new_p)
+    }
+
+    if (mask & comp_velocity()) != 0 {
+        old_v := ptr_read_i64(world.arch_ptr, base + 5)
+        new_v := mem_alloc_aligned(new_cap * 12 + 64)
+        i = 0
+        while i < cnt * 3 {
+            ptr_write_f32(new_v, i, ptr_read_f32(old_v, i))
+            i += 1
+        }
+        mem_free_aligned(old_v)
+        ptr_write_i64(world.arch_ptr, base + 5, new_v)
+    }
+
+    if (mask & comp_renderable()) != 0 {
+        old_r := ptr_read_i64(world.arch_ptr, base + 6)
+        new_r := mem_alloc_aligned(new_cap * 16 + 64)
+        i = 0
+        while i < cnt * 2 {
+            ptr_write_i64(new_r, i, ptr_read_i64(old_r, i))
+            i += 1
+        }
+        mem_free_aligned(old_r)
+        ptr_write_i64(world.arch_ptr, base + 6, new_r)
+    }
+
+    if (mask & comp_collider()) != 0 {
+        old_c := ptr_read_i64(world.arch_ptr, base + 7)
+        new_c := mem_alloc_aligned(new_cap * 16 + 64)
+        i = 0
+        while i < cnt * 2 {
+            ptr_write_i64(new_c, i, ptr_read_i64(old_c, i))
+            i += 1
+        }
+        mem_free_aligned(old_c)
+        ptr_write_i64(world.arch_ptr, base + 7, new_c)
+    }
+
+    if (mask & comp_rigid_body()) != 0 {
+        old_rg := ptr_read_i64(world.arch_ptr, base + 8)
+        new_rg := mem_alloc_aligned(new_cap * 16 + 64)
+        i = 0
+        while i < cnt * 4 {
+            ptr_write_f32(new_rg, i, ptr_read_f32(old_rg, i))
+            i += 1
+        }
+        mem_free_aligned(old_rg)
+        ptr_write_i64(world.arch_ptr, base + 8, new_rg)
+    }
+
+    if (mask & comp_tag()) != 0 {
+        old_t := ptr_read_i64(world.arch_ptr, base + 9)
+        new_t := mem_alloc_aligned(new_cap * 16 + 64)
+        i = 0
+        while i < cnt * 2 {
+            ptr_write_i64(new_t, i, ptr_read_i64(old_t, i))
+            i += 1
+        }
+        mem_free_aligned(old_t)
+        ptr_write_i64(world.arch_ptr, base + 9, new_t)
+    }
+
+    if (mask & comp_health()) != 0 {
+        old_h := ptr_read_i64(world.arch_ptr, base + 10)
+        new_h := mem_alloc_aligned(new_cap * 8 + 64)
+        i = 0
+        while i < cnt * 2 {
+            ptr_write_f32(new_h, i, ptr_read_f32(old_h, i))
+            i += 1
+        }
+        mem_free_aligned(old_h)
+        ptr_write_i64(world.arch_ptr, base + 10, new_h)
+    }
+
+    ptr_write_i64(world.arch_ptr, base + 2, new_cap)
+}
+
+fn ecs_spawn(world: EcsWorld, mask: i64) -> i64 {
+    arch_idx := ecs_find_or_create_archetype(world, mask)
+    if arch_idx < 0 { return -1 }
+    ecs_ensure_arch_cap(world, arch_idx)
+
+    me := ptr_read_i64(world.meta_ptr, 3)
+    free_cnt := ptr_read_i64(world.meta_ptr, 4)
+    mut ent_id := -1
+
+    if free_cnt > 0 {
+        ent_id = ptr_read_i64(world.data_ptr, me * 3 + free_cnt - 1)
+        ptr_write_i64(world.meta_ptr, 4, free_cnt - 1)
+    } else {
+        next_id := ptr_read_i64(world.meta_ptr, 0)
+        if next_id >= me { return -1 }
+        ent_id = next_id
+        ptr_write_i64(world.meta_ptr, 0, next_id + 1)
+    }
+
+    base := arch_idx * 16
+    row := ptr_read_i64(world.arch_ptr, base + 1)
+    ptr_write_i64(world.arch_ptr, base + 1, row + 1)
+
+    e_ptr := ptr_read_i64(world.arch_ptr, base + 3)
+    ptr_write_i64(e_ptr, row, ent_id)
+
+    ptr_write_i64(world.data_ptr, ent_id, arch_idx)
+    ptr_write_i64(world.data_ptr, me + ent_id, row)
+
+    live_cnt := ptr_read_i64(world.meta_ptr, 1)
+    ptr_write_i64(world.meta_ptr, 1, live_cnt + 1)
+
+    return ent_id
+}
+
+fn ecs_despawn(world: EcsWorld, entity_id: i64) -> bool {
+    me := ptr_read_i64(world.meta_ptr, 3)
+    if entity_id <= 0 or entity_id >= me { return false }
+    arch_idx := ptr_read_i64(world.data_ptr, entity_id)
+    if arch_idx < 0 { return false }
+
+    row := ptr_read_i64(world.data_ptr, me + entity_id)
+    base := arch_idx * 16
+    count := ptr_read_i64(world.arch_ptr, base + 1)
+    last_row := count - 1
+
+    if row < last_row {
+        e_ptr := ptr_read_i64(world.arch_ptr, base + 3)
+        last_ent := ptr_read_i64(e_ptr, last_row)
+        ptr_write_i64(e_ptr, row, last_ent)
+        ptr_write_i64(world.data_ptr, me + last_ent, row)
+
+        mask := ptr_read_i64(world.arch_ptr, base)
+        if (mask & comp_position()) != 0 {
+            p_ptr := ptr_read_i64(world.arch_ptr, base + 4)
+            ptr_write_f32(p_ptr, row * 3,     ptr_read_f32(p_ptr, last_row * 3))
+            ptr_write_f32(p_ptr, row * 3 + 1, ptr_read_f32(p_ptr, last_row * 3 + 1))
+            ptr_write_f32(p_ptr, row * 3 + 2, ptr_read_f32(p_ptr, last_row * 3 + 2))
+        }
+        if (mask & comp_velocity()) != 0 {
+            v_ptr := ptr_read_i64(world.arch_ptr, base + 5)
+            ptr_write_f32(v_ptr, row * 3,     ptr_read_f32(v_ptr, last_row * 3))
+            ptr_write_f32(v_ptr, row * 3 + 1, ptr_read_f32(v_ptr, last_row * 3 + 1))
+            ptr_write_f32(v_ptr, row * 3 + 2, ptr_read_f32(v_ptr, last_row * 3 + 2))
+        }
+        if (mask & comp_renderable()) != 0 {
+            r_ptr := ptr_read_i64(world.arch_ptr, base + 6)
+            ptr_write_i64(r_ptr, row * 2,     ptr_read_i64(r_ptr, last_row * 2))
+            ptr_write_i64(r_ptr, row * 2 + 1, ptr_read_i64(r_ptr, last_row * 2 + 1))
+        }
+        if (mask & comp_collider()) != 0 {
+            c_ptr := ptr_read_i64(world.arch_ptr, base + 7)
+            ptr_write_i64(c_ptr, row * 2,     ptr_read_i64(c_ptr, last_row * 2))
+            ptr_write_i64(c_ptr, row * 2 + 1, ptr_read_i64(c_ptr, last_row * 2 + 1))
+        }
+        if (mask & comp_rigid_body()) != 0 {
+            rg_ptr := ptr_read_i64(world.arch_ptr, base + 8)
+            ptr_write_f32(rg_ptr, row * 4,     ptr_read_f32(rg_ptr, last_row * 4))
+            ptr_write_f32(rg_ptr, row * 4 + 1, ptr_read_f32(rg_ptr, last_row * 4 + 1))
+            ptr_write_f32(rg_ptr, row * 4 + 2, ptr_read_f32(rg_ptr, last_row * 4 + 2))
+            ptr_write_f32(rg_ptr, row * 4 + 3, ptr_read_f32(rg_ptr, last_row * 4 + 3))
+        }
+        if (mask & comp_tag()) != 0 {
+            t_ptr := ptr_read_i64(world.arch_ptr, base + 9)
+            ptr_write_i64(t_ptr, row * 2,     ptr_read_i64(t_ptr, last_row * 2))
+            ptr_write_i64(t_ptr, row * 2 + 1, ptr_read_i64(t_ptr, last_row * 2 + 1))
+        }
+        if (mask & comp_health()) != 0 {
+            h_ptr := ptr_read_i64(world.arch_ptr, base + 10)
+            ptr_write_f32(h_ptr, row * 2,     ptr_read_f32(h_ptr, last_row * 2))
+            ptr_write_f32(h_ptr, row * 2 + 1, ptr_read_f32(h_ptr, last_row * 2 + 1))
+        }
+    }
+
+    ptr_write_i64(world.arch_ptr, base + 1, count - 1)
+    ptr_write_i64(world.data_ptr, entity_id, -1)
+    ptr_write_i64(world.data_ptr, me + entity_id, -1)
+    gen := ptr_read_i64(world.data_ptr, me * 2 + entity_id)
+    ptr_write_i64(world.data_ptr, me * 2 + entity_id, gen + 1)
+
+    free_cnt := ptr_read_i64(world.meta_ptr, 4)
+    if free_cnt < me {
+        ptr_write_i64(world.data_ptr, me * 3 + free_cnt, entity_id)
+        ptr_write_i64(world.meta_ptr, 4, free_cnt + 1)
+    }
+
+    live_cnt := ptr_read_i64(world.meta_ptr, 1)
+    ptr_write_i64(world.meta_ptr, 1, live_cnt - 1)
+    return true
+}
+
+@no_alloc
+fn ecs_is_alive(world: EcsWorld, entity_id: i64) -> bool {
+    me := ptr_read_i64(world.meta_ptr, 3)
+    if entity_id <= 0 or entity_id >= me { return false }
+    return ptr_read_i64(world.data_ptr, entity_id) >= 0
+}
+
+@no_alloc
+fn ecs_get_mask(world: EcsWorld, entity_id: i64) -> i64 {
+    if not ecs_is_alive(world, entity_id) { return 0 }
+    arch_idx := ptr_read_i64(world.data_ptr, entity_id)
+    return ptr_read_i64(world.arch_ptr, arch_idx * 16)
+}
+
+@no_alloc
+fn ecs_set_position(world: EcsWorld, entity: i64, x: f64, y: f64, z: f64) {
+    if not ecs_is_alive(world, entity) { return }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    p_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 4)
+    if p_ptr != 0 {
+        ptr_write_f32(p_ptr, row * 3,     x)
+        ptr_write_f32(p_ptr, row * 3 + 1, y)
+        ptr_write_f32(p_ptr, row * 3 + 2, z)
+    }
+}
+
+@no_alloc
+fn ecs_get_pos_x(world: EcsWorld, entity: i64) -> f64 {
+    if not ecs_is_alive(world, entity) { return 0.0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    p_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 4)
+    if p_ptr == 0 { return 0.0 }
+    return ptr_read_f32(p_ptr, row * 3)
+}
+
+@no_alloc
+fn ecs_get_pos_y(world: EcsWorld, entity: i64) -> f64 {
+    if not ecs_is_alive(world, entity) { return 0.0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    p_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 4)
+    if p_ptr == 0 { return 0.0 }
+    return ptr_read_f32(p_ptr, row * 3 + 1)
+}
+
+@no_alloc
+fn ecs_get_pos_z(world: EcsWorld, entity: i64) -> f64 {
+    if not ecs_is_alive(world, entity) { return 0.0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    p_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 4)
+    if p_ptr == 0 { return 0.0 }
+    return ptr_read_f32(p_ptr, row * 3 + 2)
+}
+
+@no_alloc
+fn ecs_set_velocity(world: EcsWorld, entity: i64, vx: f64, vy: f64, vz: f64) {
+    if not ecs_is_alive(world, entity) { return }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    v_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 5)
+    if v_ptr != 0 {
+        ptr_write_f32(v_ptr, row * 3,     vx)
+        ptr_write_f32(v_ptr, row * 3 + 1, vy)
+        ptr_write_f32(v_ptr, row * 3 + 2, vz)
+    }
+}
+
+@no_alloc
+fn ecs_get_vel_x(world: EcsWorld, entity: i64) -> f64 {
+    if not ecs_is_alive(world, entity) { return 0.0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    v_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 5)
+    if v_ptr == 0 { return 0.0 }
+    return ptr_read_f32(v_ptr, row * 3)
+}
+
+@no_alloc
+fn ecs_get_vel_y(world: EcsWorld, entity: i64) -> f64 {
+    if not ecs_is_alive(world, entity) { return 0.0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    v_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 5)
+    if v_ptr == 0 { return 0.0 }
+    return ptr_read_f32(v_ptr, row * 3 + 1)
+}
+
+@no_alloc
+fn ecs_get_vel_z(world: EcsWorld, entity: i64) -> f64 {
+    if not ecs_is_alive(world, entity) { return 0.0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    v_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 5)
+    if v_ptr == 0 { return 0.0 }
+    return ptr_read_f32(v_ptr, row * 3 + 2)
+}
+
+@no_alloc
+fn ecs_set_render(world: EcsWorld, entity: i64, color: i64, size: f64) {
+    if not ecs_is_alive(world, entity) { return }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    r_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 6)
+    if r_ptr != 0 {
+        ptr_write_i64(r_ptr, row * 2, color)
+        // Store size in 2nd slot using raw bits
+        s_scratch := world.meta_ptr + 48
+        ptr_write_i64(s_scratch, 0, 0)
+        ptr_write_f32(s_scratch, 0, size)
+        bits := ptr_read_i64(s_scratch, 0)
+        ptr_write_i64(r_ptr, row * 2 + 1, bits)
+    }
+}
+
+@no_alloc
+fn ecs_get_render_color(world: EcsWorld, entity: i64) -> i64 {
+    if not ecs_is_alive(world, entity) { return 0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    r_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 6)
+    if r_ptr == 0 { return 0 }
+    return ptr_read_i64(r_ptr, row * 2)
+}
+
+@no_alloc
+fn ecs_set_collider(world: EcsWorld, entity: i64, radius: f64, layer: i64) {
+    if not ecs_is_alive(world, entity) { return }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    c_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 7)
+    if c_ptr != 0 {
+        s_scratch := world.meta_ptr + 48
+        ptr_write_i64(s_scratch, 0, 0)
+        ptr_write_f32(s_scratch, 0, radius)
+        bits := ptr_read_i64(s_scratch, 0)
+        ptr_write_i64(c_ptr, row * 2, bits)
+        ptr_write_i64(c_ptr, row * 2 + 1, layer)
+    }
+}
+
+@no_alloc
+fn ecs_set_rigid_body(world: EcsWorld, entity: i64, mass: f64, restitution: f64, friction: f64, drag: f64) {
+    if not ecs_is_alive(world, entity) { return }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    rg_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 8)
+    if rg_ptr != 0 {
+        mut inv_m := 0.0
+        if mass > 0.000001 { inv_m = 1.0 / mass }
+        ptr_write_f32(rg_ptr, row * 4,     inv_m)
+        ptr_write_f32(rg_ptr, row * 4 + 1, restitution)
+        ptr_write_f32(rg_ptr, row * 4 + 2, friction)
+        ptr_write_f32(rg_ptr, row * 4 + 3, drag)
+    }
+}
+
+@no_alloc
+fn ecs_set_tag(world: EcsWorld, entity: i64, tag: i64, user_data: i64) {
+    if not ecs_is_alive(world, entity) { return }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    t_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 9)
+    if t_ptr != 0 {
+        ptr_write_i64(t_ptr, row * 2,     tag)
+        ptr_write_i64(t_ptr, row * 2 + 1, user_data)
+    }
+}
+
+@no_alloc
+fn ecs_get_tag(world: EcsWorld, entity: i64) -> i64 {
+    if not ecs_is_alive(world, entity) { return 0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    t_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 9)
+    if t_ptr == 0 { return 0 }
+    return ptr_read_i64(t_ptr, row * 2)
+}
+
+@no_alloc
+fn ecs_set_health(world: EcsWorld, entity: i64, hp: f64, max_hp: f64) {
+    if not ecs_is_alive(world, entity) { return }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    h_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 10)
+    if h_ptr != 0 {
+        ptr_write_f32(h_ptr, row * 2,     hp)
+        ptr_write_f32(h_ptr, row * 2 + 1, max_hp)
+    }
+}
+
+@no_alloc
+fn ecs_get_health(world: EcsWorld, entity: i64) -> f64 {
+    if not ecs_is_alive(world, entity) { return 0.0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    h_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 10)
+    if h_ptr == 0 { return 0.0 }
+    return ptr_read_f32(h_ptr, row * 2)
+}
+
+// Counts total entities matching `req_mask` and not having `excl_mask`.
+@no_alloc
+fn ecs_count_matching(world: EcsWorld, req_mask: i64, excl_mask: i64 = 0) -> i64 {
+    arch_cnt := ptr_read_i64(world.meta_ptr, 2)
+    mut total := 0
+    mut i := 0
+    while i < arch_cnt {
+        base := i * 16
+        m := ptr_read_i64(world.arch_ptr, base)
+        if (m & req_mask) == req_mask and (m & excl_mask) == 0 {
+            total = total + ptr_read_i64(world.arch_ptr, base + 1)
+        }
+        i += 1
+    }
+    return total
+}
+
+// --- High-Performance Systems ---
+// Movement System: updates positions along velocities across all matching archetypes.
+@no_alloc
+fn ecs_system_movement(world: EcsWorld, dt: f64) -> i64 {
+    req := comp_position() | comp_velocity()
+    arch_cnt := ptr_read_i64(world.meta_ptr, 2)
+    mut updated := 0
+    mut a := 0
+    while a < arch_cnt {
+        base := a * 16
+        m := ptr_read_i64(world.arch_ptr, base)
+        if (m & req) == req {
+            cnt := ptr_read_i64(world.arch_ptr, base + 1)
+            p_ptr := ptr_read_i64(world.arch_ptr, base + 4)
+            v_ptr := ptr_read_i64(world.arch_ptr, base + 5)
+            mut r := 0
+            while r < cnt {
+                off := r * 3
+                px := ptr_read_f32(p_ptr, off)
+                py := ptr_read_f32(p_ptr, off + 1)
+                pz := ptr_read_f32(p_ptr, off + 2)
+                vx := ptr_read_f32(v_ptr, off)
+                vy := ptr_read_f32(v_ptr, off + 1)
+                vz := ptr_read_f32(v_ptr, off + 2)
+
+                ptr_write_f32(p_ptr, off,     px + vx * dt)
+                ptr_write_f32(p_ptr, off + 1, py + vy * dt)
+                ptr_write_f32(p_ptr, off + 2, pz + vz * dt)
+                r += 1
+            }
+            updated = updated + cnt
+        }
+        a += 1
+    }
+    return updated
+}
+
+// Gravity System: accelerates velocities by (gx, gy, gz) for entities with rigid bodies.
+@no_alloc
+fn ecs_system_gravity(world: EcsWorld, gx: f64, gy: f64, gz: f64, dt: f64) -> i64 {
+    req := comp_velocity() | comp_rigid_body()
+    arch_cnt := ptr_read_i64(world.meta_ptr, 2)
+    mut count := 0
+    mut a := 0
+    while a < arch_cnt {
+        base := a * 16
+        m := ptr_read_i64(world.arch_ptr, base)
+        if (m & req) == req {
+            cnt := ptr_read_i64(world.arch_ptr, base + 1)
+            v_ptr := ptr_read_i64(world.arch_ptr, base + 5)
+            rg_ptr := ptr_read_i64(world.arch_ptr, base + 8)
+            mut r := 0
+            while r < cnt {
+                inv_m := ptr_read_f32(rg_ptr, r * 4)
+                if inv_m > 0.000001 {
+                    off := r * 3
+                    vx := ptr_read_f32(v_ptr, off)
+                    vy := ptr_read_f32(v_ptr, off + 1)
+                    vz := ptr_read_f32(v_ptr, off + 2)
+                    ptr_write_f32(v_ptr, off,     vx + gx * dt)
+                    ptr_write_f32(v_ptr, off + 1, vy + gy * dt)
+                    ptr_write_f32(v_ptr, off + 2, vz + gz * dt)
+                }
+                r += 1
+            }
+            count = count + cnt
+        }
+        a += 1
+    }
+    return count
+}

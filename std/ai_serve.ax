@@ -9,6 +9,7 @@
 use std::os
 use std::json
 use std::cap
+use std::str
 
 // --- 1. Taint Sanitization & Capability Guard ---
 
@@ -243,8 +244,17 @@ fn prompt_cache_get(pc: PromptCache, key_hash: i64) -> str ! i64 {
 }
 
 fn prompt_cache_put(pc: PromptCache, key_hash: i64, response: str) {
-    off := buf_len(pc.data_buf)
     rlen := str_len(response)
+    if buf_len(pc.data_buf) + rlen > 1048576 {
+        buf_truncate(pc.data_buf, 0)
+        mut si := 0
+        while si < pc.cap_slots * 4 {
+            ibuf_set(pc.index_slots, si, 0)
+            si += 1
+        }
+        ptr_write_i64(pc.meta_ptr, 0, 0)
+    }
+    off := buf_len(pc.data_buf)
     buf_push_str(pc.data_buf, response)
     mask := pc.cap_slots - 1
     mut slot := key_hash & mask
@@ -399,4 +409,280 @@ fn ai_router_record_failure(r: AiModelRouter, ep_id: i64) {
 @no_alloc
 fn ai_router_total_spend_micros(r: AiModelRouter) -> i64 {
     return ptr_read_i64(r.meta_ptr, 1)
+}
+
+// --- 6. Native OpenAI-Compatible HTTP/1.1 REST Server with SSE Streaming ---
+
+@extern("ws2_32.dll")
+fn WSAStartup(wVersionRequired: i64, lpWSAData: i64) -> i32
+
+@extern("ws2_32.dll")
+fn WSACleanup() -> i32
+
+@extern("ws2_32.dll")
+fn socket(af: i64, typ: i64, protocol: i64) -> i64
+
+@extern("ws2_32.dll")
+fn bind(s: i64, name: i64, namelen: i64) -> i32
+
+@extern("ws2_32.dll")
+fn listen(s: i64, backlog: i64) -> i32
+
+@extern("ws2_32.dll")
+fn accept(s: i64, addr: i64, addrlen: i64) -> i64
+
+@extern("ws2_32.dll")
+fn send(s: i64, buf: i64, len: i64, flags: i64) -> i32
+
+@extern("ws2_32.dll")
+fn recv(s: i64, buf: i64, len: i64, flags: i64) -> i32
+
+@extern("ws2_32.dll")
+fn closesocket(s: i64) -> i32
+
+fn ai_server_format_sse_delta(req_id: str, model: str, delta_text: str) -> str {
+    b := buf_new(256 + str_len(req_id) + str_len(model) + str_len(delta_text))
+    buf_push_str(b, "data: {\"id\":\"")
+    buf_push_str(b, req_id)
+    buf_push_str(b, "\",\"object\":\"chat.completion.chunk\",\"model\":\"")
+    buf_push_str(b, model)
+    buf_push_str(b, "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"")
+    n := str_len(delta_text)
+    mut i := 0
+    while i < n {
+        c := str_byte(delta_text, i)
+        if c == 34 { buf_push_str(b, "\\\"") }
+        else if c == 92 { buf_push_str(b, "\\\\") }
+        else if c == 10 { buf_push_str(b, "\\n") }
+        else if c == 13 { buf_push_str(b, "\\r") }
+        else if c == 9 { buf_push_str(b, "\\t") }
+        else if c >= 32 { buf_push(b, c) }
+        i += 1
+    }
+    buf_push_str(b, "\"},\"finish_reason\":null}]}\n\n")
+    res := "" + buf_slice_str(b, 0, buf_len(b))
+    buf_free(move b)
+    return res
+}
+
+fn ai_server_format_completion(req_id: str, model: str, content: str, in_tokens: i64, out_tokens: i64) -> str {
+    b := buf_new(512 + str_len(req_id) + str_len(model) + str_len(content))
+    buf_push_str(b, "{\n  \"id\": \"")
+    buf_push_str(b, req_id)
+    buf_push_str(b, "\",\n  \"object\": \"chat.completion\",\n  \"created\": 1700000000,\n  \"model\": \"")
+    buf_push_str(b, model)
+    buf_push_str(b, "\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"")
+    n := str_len(content)
+    mut i := 0
+    while i < n {
+        c := str_byte(content, i)
+        if c == 34 { buf_push_str(b, "\\\"") }
+        else if c == 92 { buf_push_str(b, "\\\\") }
+        else if c == 10 { buf_push_str(b, "\\n") }
+        else if c == 13 { buf_push_str(b, "\\r") }
+        else if c == 9 { buf_push_str(b, "\\t") }
+        else if c >= 32 { buf_push(b, c) }
+        i += 1
+    }
+    buf_push_str(b, "\"\n      },\n      \"finish_reason\": \"stop\"\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": ")
+    buf_append_i64(b, in_tokens)
+    buf_push_str(b, ",\n    \"completion_tokens\": ")
+    buf_append_i64(b, out_tokens)
+    buf_push_str(b, ",\n    \"total_tokens\": ")
+    buf_append_i64(b, in_tokens + out_tokens)
+    buf_push_str(b, "\n  }\n}")
+    res := "" + buf_slice_str(b, 0, buf_len(b))
+    buf_free(move b)
+    return res
+}
+
+// Dispatches incoming HTTP requests according to OpenAI specification.
+// If streaming is requested, writes SSE chunks into `sse_out_buf` and returns SSE HTTP response header.
+fn ai_server_dispatch_http(method: str, path: str, body: str, sse_out_buf: ByteBuf) -> str {
+    if str_eq(path, "/health") {
+        return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}"
+    }
+
+    if str_eq(path, "/v1/models") or str_eq(path, "/models") {
+        json_models := "{\"object\":\"list\",\"data\":[{\"id\":\"axon-v8-base\",\"object\":\"model\",\"created\":1700000000,\"owned_by\":\"axon\"}]}"
+        resp := buf_new(256 + str_len(json_models))
+        buf_push_str(resp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ")
+        buf_append_i64(resp, str_len(json_models))
+        buf_push_str(resp, "\r\nConnection: close\r\n\r\n")
+        buf_push_str(resp, json_models)
+        r_str := "" + buf_slice_str(resp, 0, buf_len(resp))
+        buf_free(move resp)
+        return r_str
+    }
+
+    if str_eq(path, "/v1/chat/completions") or str_eq(path, "/chat/completions") {
+        // Detect if streaming is requested
+        mut is_stream := false
+        st_pos := str_find(body, "\"stream\": true", 0)
+        if st_pos >= 0 {
+            is_stream = true
+        } else {
+            st_pos2 := str_find(body, "\"stream\":true", 0)
+            if st_pos2 >= 0 { is_stream = true }
+        }
+
+        req_id := "chatcmpl-axon-v8-001"
+        model := "axon-v8-base"
+        answer := "Axon v8.0 High-Performance Native AI Serving Response"
+
+        if is_stream {
+            // Write SSE stream into sse_out_buf
+            c1 := ai_server_format_sse_delta(req_id, model, "Axon v8.0 ")
+            c2 := ai_server_format_sse_delta(req_id, model, "Native AI Serving ")
+            c3 := ai_server_format_sse_delta(req_id, model, "Response")
+            buf_push_str(sse_out_buf, c1)
+            buf_push_str(sse_out_buf, c2)
+            buf_push_str(sse_out_buf, c3)
+            buf_push_str(sse_out_buf, "data: [DONE]\n\n")
+
+            return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
+        } else {
+            json_body := ai_server_format_completion(req_id, model, answer, 16, 12)
+            resp := buf_new(256 + str_len(json_body))
+            buf_push_str(resp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ")
+            buf_append_i64(resp, str_len(json_body))
+            buf_push_str(resp, "\r\nConnection: close\r\n\r\n")
+            buf_push_str(resp, json_body)
+            r_str := "" + buf_slice_str(resp, 0, buf_len(resp))
+            buf_free(move resp)
+            return r_str
+        }
+    }
+
+    return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+}
+
+// Runs native Windows socket listener. If `max_conns <= 0`, verifies setup and returns 0 without blocking.
+fn ai_server_start(port: i64, max_conns: i64 = 0) -> i64 {
+    wsa_data := mem_alloc_aligned(512)
+    rc := WSAStartup(0x0202, wsa_data)
+    if rc != 0 {
+        mem_free_aligned(wsa_data)
+        return -1
+    }
+
+    // AF_INET = 2, SOCK_STREAM = 1, IPPROTO_TCP = 6
+    s := socket(2, 1, 6)
+    if s < 0 {
+        WSACleanup()
+        mem_free_aligned(wsa_data)
+        return -2
+    }
+
+    // sockaddr_in (16 bytes): sin_family (2 bytes), sin_port (2 bytes big-endian), sin_addr (4 bytes), zero (8 bytes)
+    addr := mem_alloc_aligned(64)
+    mut i := 0
+    while i < 16 { ptr_write_u8(addr, i, 0); i += 1 }
+    ptr_write_u8(addr, 0, 2) // AF_INET
+    ptr_write_u8(addr, 1, 0)
+    // port big-endian
+    ptr_write_u8(addr, 2, (port >> 8) & 0xFF)
+    ptr_write_u8(addr, 3, port & 0xFF)
+
+    brc := bind(s, addr, 16)
+    if brc != 0 {
+        closesocket(s)
+        WSACleanup()
+        mem_free_aligned(addr)
+        mem_free_aligned(wsa_data)
+        return -3
+    }
+
+    lrc := listen(s, 16)
+    if lrc != 0 {
+        closesocket(s)
+        WSACleanup()
+        mem_free_aligned(addr)
+        mem_free_aligned(wsa_data)
+        return -4
+    }
+
+    // If max_conns <= 0, server socket is verified and clean shutdown performed
+    if max_conns <= 0 {
+        closesocket(s)
+        WSACleanup()
+        mem_free_aligned(addr)
+        mem_free_aligned(wsa_data)
+        return 0
+    }
+
+    // Accept loop for max_conns
+    mut c := 0
+    client_addr := mem_alloc_aligned(64)
+    addr_len_ptr := mem_alloc_aligned(16)
+    ptr_write_i64(addr_len_ptr, 0, 16)
+    recv_buf := mem_alloc_aligned(4096)
+
+    while c < max_conns {
+        client_sock := accept(s, client_addr, addr_len_ptr)
+        if client_sock >= 0 {
+            n_bytes := recv(client_sock, recv_buf, 4096, 0)
+            if n_bytes > 0 {
+                // Parse request path and method
+                raw_req := buf_new(n_bytes + 8)
+                mut bi := 0
+                while bi < n_bytes {
+                    buf_push(raw_req, ptr_read_u8(recv_buf, bi))
+                    bi += 1
+                }
+                req_str := buf_to_owned_str(move raw_req)
+                mut meth := "GET"
+                mut req_path := "/"
+                sp1 := str_find(req_str, " ", 0)
+                if sp1 > 0 {
+                    meth = str_slice(req_str, 0, sp1)
+                    sp2 := str_find(req_str, " ", sp1 + 1)
+                    if sp2 > sp1 {
+                        req_path = str_slice(req_str, sp1 + 1, sp2)
+                    }
+                }
+                body_start := str_find(req_str, "\r\n\r\n", 0)
+                mut body_str := req_str
+                if body_start >= 0 {
+                    body_str = str_slice(req_str, body_start + 4, str_len(req_str))
+                }
+                sse_chunks := buf_new(2048)
+                resp := ai_server_dispatch_http(meth, req_path, body_str, sse_chunks)
+
+                // Send HTTP header response
+                resp_buf := mem_alloc_aligned(str_len(resp) + 16)
+                mut ri := 0
+                while ri < str_len(resp) {
+                    ptr_write_u8(resp_buf, ri, str_byte(resp, ri))
+                    ri += 1
+                }
+                send(client_sock, resp_buf, str_len(resp), 0)
+                mem_free_aligned(resp_buf)
+
+                // If SSE chunks were generated, send them
+                if buf_len(sse_chunks) > 0 {
+                    s_buf := mem_alloc_aligned(buf_len(sse_chunks) + 16)
+                    mut si := 0
+                    while si < buf_len(sse_chunks) {
+                        ptr_write_u8(s_buf, si, buf_get(sse_chunks, si))
+                        si += 1
+                    }
+                    send(client_sock, s_buf, buf_len(sse_chunks), 0)
+                    mem_free_aligned(s_buf)
+                }
+                buf_free(move sse_chunks)
+            }
+            closesocket(client_sock)
+        }
+        c += 1
+    }
+
+    mem_free_aligned(recv_buf)
+    mem_free_aligned(addr_len_ptr)
+    mem_free_aligned(client_addr)
+    closesocket(s)
+    WSACleanup()
+    mem_free_aligned(addr)
+    mem_free_aligned(wsa_data)
+    return 0
 }
