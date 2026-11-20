@@ -2,52 +2,64 @@
 # Usage: powershell -ExecutionPolicy Bypass -File tools/install_mcp.ps1 [-Target claude|cursor|all]
 
 param(
+    [ValidateSet("all", "claude", "cursor")]
     [string]$Target = "all"
 )
 
 $ErrorActionPreference = "Stop"
 
-$ProjectRoot = (Get-Item $PSScriptRoot).Parent.FullName
+$ProjectRoot = (Get-Item -LiteralPath $PSScriptRoot).Parent.FullName
 $AxcPath = Join-Path $ProjectRoot "bin\axc.exe"
-if (-not (Test-Path $AxcPath)) {
+if (-not (Test-Path -LiteralPath $AxcPath)) {
     $AxcPath = Join-Path $env:USERPROFILE ".axon\bin\axc.exe"
 }
-if (-not (Test-Path $AxcPath)) {
+if (-not (Test-Path -LiteralPath $AxcPath)) {
     throw "axc.exe not found at $AxcPath or ~/.axon/bin/axc.exe"
 }
 
-$AxcPath = (Resolve-Path $AxcPath).Path
+$AxcPath = (Resolve-Path -LiteralPath $AxcPath).Path
 Write-Host "[*] Found Axon Compiler at: $AxcPath" -ForegroundColor Cyan
 
-function Register-McpConfig($configPath, $name) {
+function Register-McpConfig([string]$configPath, [string]$name) {
     $configDir = Split-Path -Parent $configPath
-    if (-not (Test-Path $configDir)) {
+    if (-not (Test-Path -LiteralPath $configDir)) {
         New-Item -ItemType Directory -Path $configDir -Force | Out-Null
     }
 
-    $cfg = @{}
-    if (Test-Path $configPath) {
-        try {
-            $raw = Get-Content $configPath -Raw
-            if ($raw.Trim().Length -gt 0) {
-                $cfg = $raw | ConvertFrom-Json -AsHashtable
+    $cfg = [PSCustomObject]@{}
+    if (Test-Path -LiteralPath $configPath) {
+        $raw = [System.IO.File]::ReadAllText($configPath, [System.Text.Encoding]::UTF8)
+        if ($raw.Trim().Length -gt 0) {
+            try {
+                $parsed = $raw | ConvertFrom-Json
+                if ($null -eq $parsed -or $parsed -isnot [PSCustomObject]) {
+                    throw "Root JSON value is not an object."
+                }
+                $cfg = $parsed
+            } catch {
+                throw "Refusing to overwrite invalid JSON config at '$configPath': $($_.Exception.Message). Fix or back up the file manually first."
             }
-        } catch {
-            $cfg = @{}
         }
+        $backupPath = "$configPath.bak"
+        Copy-Item -LiteralPath $configPath -Destination $backupPath -Force
+        Write-Host "[*] Backed up existing $name config to $backupPath" -ForegroundColor DarkGray
     }
 
-    if (-not $cfg.ContainsKey("mcpServers")) {
-        $cfg["mcpServers"] = @{}
+    if (-not ($cfg.PSObject.Properties.Name -contains "mcpServers") -or $null -eq $cfg.mcpServers) {
+        $cfg | Add-Member -NotePropertyName "mcpServers" -NotePropertyValue ([PSCustomObject]@{}) -Force
+    } elseif ($cfg.mcpServers -isnot [PSCustomObject]) {
+        throw "Refusing to overwrite '$configPath': 'mcpServers' is not a JSON object."
     }
 
-    $cfg["mcpServers"]["axon"] = @{
+    $axonEntry = [PSCustomObject]@{
         command = $AxcPath
         args = @("mcp")
     }
+    $cfg.mcpServers | Add-Member -NotePropertyName "axon" -NotePropertyValue $axonEntry -Force
 
-    $jsonStr = $cfg | ConvertTo-Json -Depth 10
-    Set-Content -Path $configPath -Value $jsonStr -Force
+    $jsonStr = ($cfg | ConvertTo-Json -Depth 16) + "`n"
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($configPath, $jsonStr, $utf8NoBom)
     Write-Host "[+] Successfully registered Axon MCP Server in $name ($configPath)" -ForegroundColor Green
 }
 

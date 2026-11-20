@@ -1,0 +1,454 @@
+// Axon Standard Kernel & Hardware Ring Subsystem (`std/kernel.ax`)
+// 100% Pure Axon: Zero CRT, Zero External Dependencies, Zero-GC (@no_alloc).
+// Complete Ring 0 (Supervisor) to Ring 3 (User Mode) x86_64 Hardware OS Architecture:
+//   - Privilege Rings: Ring 0 (Kernel), Ring 1 (Drivers), Ring 2 (Services), Ring 3 (User)
+//   - Global Descriptor Table (GDT) & Task State Segment (TSS 64-bit RSP0)
+//   - Interrupt Descriptor Table (IDT 256 Gates: Ring 0 Interrupt Gate vs Ring 3 Trap/Syscall Gate)
+//   - 4-Level Paging Virtual Memory Manager (PML4, PDPT, PD, PT with Ring 0 / Ring 3 U/S protection)
+//   - Model Specific Registers (MSRs: IA32_EFER, IA32_STAR, IA32_LSTAR, IA32_FMASK, FS/GS Base)
+//   - Ring Transitions: Ring 0 -> Ring 3 (IRETQ / SYSRETQ), Ring 3 -> Ring 0 (SYSCALL / Interrupt)
+//   - Hardware Port I/O (8, 16, 32-bit) & COM1 (0x3F8) Serial UART Kernel Console
+
+use std::os
+
+// --- 1. Privilege Rings & Architecture Constants ---
+
+fn ring_kernel() -> i64    { return 0 } // Ring 0: Supervisor / Kernel Mode
+fn ring_drivers() -> i64   { return 1 } // Ring 1: Hardware Device Drivers
+fn ring_services() -> i64  { return 2 } // Ring 2: Microkernel / OS Services
+fn ring_user() -> i64      { return 3 } // Ring 3: Sandboxed User Applications
+
+// Standard 64-bit GDT Segment Selectors (SYSRETQ / IRETQ Intel SDM compliant order:
+//   IA32_STAR[63:48] = 0x0010 -> SYSRETQ loads SS = (0x10+8)|3 = 0x1B, CS = (0x10+16)|3 = 0x23)
+fn gdt_sel_null() -> i64      { return 0x00 }
+fn gdt_sel_kernel_cs() -> i64 { return 0x08 } // Ring 0 64-bit Code (Index 1)
+fn gdt_sel_kernel_ds() -> i64 { return 0x10 } // Ring 0 64-bit Data (Index 2)
+fn gdt_sel_user_ds() -> i64   { return 0x1B } // Ring 3 64-bit Data (Index 3 = 0x18 | RPL 3)
+fn gdt_sel_user_cs() -> i64   { return 0x23 } // Ring 3 64-bit Code (Index 4 = 0x20 | RPL 3)
+fn gdt_sel_tss() -> i64       { return 0x28 } // TSS 64-bit Descriptor (Index 5, 16 bytes)
+
+// Model Specific Registers (MSRs)
+fn msr_efer() -> i64      { return -1073741696 } // 0xC0000080: Extended Feature Enable (SCE, LME, LMA, NXE)
+fn msr_star() -> i64      { return -1073741695 } // 0xC0000081: SYSCALL Target CS/SS Selectors
+fn msr_lstar() -> i64     { return -1073741694 } // 0xC0000082: SYSCALL Target RIP
+fn msr_cstar() -> i64     { return -1073741693 } // 0xC0000083: Compatibility SYSCALL Target RIP
+fn msr_fmask() -> i64     { return -1073741692 } // 0xC0000084: SYSCALL RFLAGS Mask
+fn msr_fs_base() -> i64   { return -1073741568 } // 0xC0000100: User Thread-Local Storage (TLS)
+fn msr_gs_base() -> i64   { return -1073741567 } // 0xC0000101: Active GS Base
+fn msr_kernel_gs() -> i64 { return -1073741566 } // 0xC0000102: Kernel GS Base (swapped by SWAPGS)
+
+// Paging Flags (Ring 0 Supervisor vs Ring 3 User Protection)
+fn page_present() -> i64  { return 0x01 } // Bit 0: Page is present in physical memory
+fn page_writable() -> i64 { return 0x02 } // Bit 1: Page is Read/Write (0 = Read-Only)
+fn page_user() -> i64     { return 0x04 } // Bit 2: User Mode (Ring 3 accessible; 0 = Ring 0 Supervisor only)
+fn page_pwt() -> i64      { return 0x08 } // Bit 3: Page Write-Through
+fn page_pcd() -> i64      { return 0x10 } // Bit 4: Cache Disable
+fn page_accessed() -> i64 { return 0x20 } // Bit 5: Accessed
+fn page_dirty() -> i64    { return 0x40 } // Bit 6: Dirty (written to)
+fn page_huge() -> i64     { return 0x80 } // Bit 7: 2 MB / 1 GB Large Page
+fn page_global() -> i64   { return 0x100 } // Bit 8: Global translation across CR3 switches
+fn page_nx() -> i64       { return 1 << 63 } // Bit 63: No-Execute (XD/NXE)
+
+// --- 2. Low-Level Ring 0 CPU Control & Hardware Instructions ---
+
+@no_alloc
+fn k_cli() { cpu_cli() }
+
+@no_alloc
+fn k_sti() { cpu_sti() }
+
+@no_alloc
+fn k_hlt() { cpu_hlt() }
+
+@no_alloc
+fn k_pause() { cpu_pause() }
+
+@no_alloc
+fn k_wbinvd() { cpu_wbinvd() }
+
+@no_alloc
+fn k_swapgs() { cpu_swapgs() }
+
+@no_alloc
+fn k_invlpg(vaddr: i64) { cpu_invlpg(vaddr) }
+
+@no_alloc
+fn k_read_cr0() -> i64 { return read_cr0() }
+
+@no_alloc
+fn k_write_cr0(v: i64) { write_cr0(v) }
+
+@no_alloc
+fn k_read_cr2() -> i64 { return read_cr2() }
+
+@no_alloc
+fn k_write_cr2(v: i64) { write_cr2(v) }
+
+@no_alloc
+fn k_read_cr3() -> i64 { return read_cr3() }
+
+@no_alloc
+fn k_write_cr3(v: i64) { write_cr3(v) }
+
+@no_alloc
+fn k_read_cr4() -> i64 { return read_cr4() }
+
+@no_alloc
+fn k_write_cr4(v: i64) { write_cr4(v) }
+
+@no_alloc
+fn k_rdmsr(msr: i64) -> i64 { return rdmsr(msr) }
+
+@no_alloc
+fn k_wrmsr(msr: i64, val: i64) { wrmsr(msr, val) }
+
+@no_alloc
+fn k_rdtsc() -> i64 { return cpu_rdtsc() }
+
+// Hardware Port I/O
+@no_alloc
+fn k_out8(port: i64, val: i64) { port_out_u8(port, val) }
+
+@no_alloc
+fn k_in8(port: i64) -> i64 { return port_in_u8(port) }
+
+@no_alloc
+fn k_out16(port: i64, val: i64) { port_out_u16(port, val) }
+
+@no_alloc
+fn k_in16(port: i64) -> i64 { return port_in_u16(port) }
+
+@no_alloc
+fn k_out32(port: i64, val: i64) { port_out_u32(port, val) }
+
+@no_alloc
+fn k_in32(port: i64) -> i64 { return port_in_u32(port) }
+
+// --- 3. Global Descriptor Table (GDT) & Task State Segment (TSS) ---
+
+// Encodes a 64-bit standard segment descriptor (8 bytes)
+@no_alloc
+fn gdt_encode_entry(base: i64, limit: i64, access: i64, flags: i64) -> i64 {
+    mut desc := (limit & 0xFFFF)
+    desc = desc | ((base & 0xFFFFFF) << 16)
+    desc = desc | ((access & 0xFF) << 40)
+    desc = desc | (((limit >> 16) & 0x0F) << 48)
+    desc = desc | ((flags & 0x0F) << 52)
+    desc = desc | (((base >> 24) & 0xFF) << 56)
+    return desc
+}
+
+// Writes 64-bit integer into raw pointer memory (little-endian)
+@no_alloc
+fn raw_write_u64(addr: i64, val: i64) {
+    if addr == 0 { return }
+    mut v := val
+    mut i := 0
+    while i < 8 {
+        ptr_write_u8(addr, i, v & 0xFF)
+        v = ushr64(v, 8)
+        i += 1
+    }
+}
+
+// Reads 64-bit integer from raw pointer memory (little-endian)
+@no_alloc
+fn raw_read_u64(addr: i64) -> i64 {
+    if addr == 0 { return 0 }
+    mut res := 0
+    mut i := 7
+    while i >= 0 {
+        b := ptr_read_u8(addr, i)
+        res = (res << 8) | (b & 0xFF)
+        i -= 1
+    }
+    return res
+}
+
+// Zeroes a memory block (prefixed `k_` to avoid colliding with `std::memory::raw_mem_zero`)
+@no_alloc
+fn k_mem_zero(addr: i64, bytes: i64) {
+    if addr == 0 or bytes <= 0 { return }
+    mut i := 0
+    while i < bytes {
+        ptr_write_u8(addr, i, 0)
+        i += 1
+    }
+}
+
+// Initializes a 7-entry standard x86_64 GDT in memory (56 bytes minimum):
+//   Entry 0: Null Descriptor (0x00)
+//   Entry 1: Kernel Code 64 (0x08, DPL=0, R/X, 64-bit Long Mode)
+//   Entry 2: Kernel Data 64 (0x10, DPL=0, R/W)
+//   Entry 3: User Data 64   (0x1B, DPL=3, R/W) -- SYSRETQ SS = (STAR[63:48] + 8) | 3
+//   Entry 4: User Code 64   (0x23, DPL=3, R/X, 64-bit Long Mode) -- SYSRETQ CS = (STAR[63:48] + 16) | 3
+//   Entry 5 & 6: TSS 64-bit 16-byte System Descriptor (0x28)
+@no_alloc
+fn gdt_init(gdt_addr: i64, tss_addr: i64, kernel_rsp0: i64) {
+    if gdt_addr == 0 { return }
+    k_mem_zero(gdt_addr, 64)
+
+    // Entry 0: Null Descriptor
+    raw_write_u64(gdt_addr, 0)
+
+    // Entry 1: Ring 0 Kernel Code 64-bit (Access: 0x9A = Present, Ring 0, Executable, Readable; Flags: 0xA = 64-bit Long Mode)
+    k_cs := gdt_encode_entry(0, 0xFFFFF, 0x9A, 0x0A)
+    raw_write_u64(gdt_addr + 8, k_cs)
+
+    // Entry 2: Ring 0 Kernel Data 64-bit (Access: 0x92 = Present, Ring 0, Writable; Flags: 0xC = 4KB Granularity)
+    k_ds := gdt_encode_entry(0, 0xFFFFF, 0x92, 0x0C)
+    raw_write_u64(gdt_addr + 16, k_ds)
+
+    // Entry 3: Ring 3 User Data 64-bit (Access: 0xF2 = Present, Ring 3, Writable; Flags: 0xC = 4KB Granularity)
+    u_ds := gdt_encode_entry(0, 0xFFFFF, 0xF2, 0x0C)
+    raw_write_u64(gdt_addr + 24, u_ds)
+
+    // Entry 4: Ring 3 User Code 64-bit (Access: 0xFA = Present, Ring 3, Executable, Readable; Flags: 0xA = 64-bit Long Mode)
+    u_cs := gdt_encode_entry(0, 0xFFFFF, 0xFA, 0x0A)
+    raw_write_u64(gdt_addr + 32, u_cs)
+
+    // Entry 5 & 6: TSS 64-bit 16-byte Descriptor
+    // TSS Base = tss_addr (supports higher-half canonical kernel addresses where signed tss_addr < 0!)
+    if tss_addr != 0 {
+        tss_limit := 103
+        tss_low := gdt_encode_entry(tss_addr & 0xFFFFFFFF, tss_limit, 0x89, 0x00)
+        tss_high := ushr64(tss_addr, 32) & 0xFFFFFFFF
+        raw_write_u64(gdt_addr + 40, tss_low)
+        raw_write_u64(gdt_addr + 48, tss_high)
+
+        // Initialize TSS structure (104 bytes)
+        k_mem_zero(tss_addr, 104)
+        // Offset 4: RSP0 (64-bit stack pointer loaded upon Ring 3 -> Ring 0 interrupt/syscall)
+        raw_write_u64(tss_addr + 4, kernel_rsp0)
+        // Offset 102: I/O Map Base Address (set to sizeof(TSS) = 104 to disable I/O bitmap)
+        ptr_write_u8(tss_addr, 102, 104)
+        ptr_write_u8(tss_addr, 103, 0)
+    }
+}
+
+// Prepares a 10-byte GDTR descriptor: limit (16 bits) + base (64 bits)
+@no_alloc
+fn gdt_prepare_pointer(gdtr_mem: i64, gdt_base: i64, num_entries: i64) {
+    if gdtr_mem == 0 or num_entries <= 0 or num_entries > 8192 { return }
+    limit := (num_entries * 8) - 1
+    ptr_write_u8(gdtr_mem, 0, limit & 0xFF)
+    ptr_write_u8(gdtr_mem, 1, (limit >> 8) & 0xFF)
+    raw_write_u64(gdtr_mem + 2, gdt_base)
+}
+
+// Loads GDT using CPU LGDT instruction
+@no_alloc
+fn gdt_load(gdtr_mem: i64) {
+    cpu_lgdt(gdtr_mem)
+}
+
+// Loads Task Register (TSS) using CPU LTR instruction
+@no_alloc
+fn tss_load(tss_selector: i64) {
+    cpu_ltr(tss_selector)
+}
+
+// Updates RSP0 in TSS when switching tasks/threads
+@no_alloc
+fn tss_set_rsp0(tss_addr: i64, new_kernel_rsp: i64) {
+    if tss_addr == 0 { return }
+    raw_write_u64(tss_addr + 4, new_kernel_rsp)
+}
+
+// --- 4. Interrupt Descriptor Table (IDT 256 Gates) ---
+
+// Sets an IDT gate descriptor (16 bytes in 64-bit mode):
+//   vector: Interrupt vector (0..255)
+//   handler_addr: 64-bit function pointer of the interrupt service routine
+//   dpl: Descriptor Privilege Level (0 = Ring 0 Kernel only, 3 = Ring 3 User callable via INT instruction)
+//   ist: Interrupt Stack Table index (0 = use RSP0, 1..7 = use dedicated IST stack from TSS)
+@no_alloc
+fn idt_set_gate(idt_addr: i64, vector: i64, handler_addr: i64, dpl: i64 = 0, ist: i64 = 0) {
+    if idt_addr == 0 or vector < 0 or vector > 255 { return }
+    gate_off := idt_addr + (vector * 16)
+    // Offset [15:0]
+    ptr_write_u8(gate_off, 0, handler_addr & 0xFF)
+    ptr_write_u8(gate_off, 1, (handler_addr >> 8) & 0xFF)
+    // Kernel Code Segment Selector (0x08)
+    ptr_write_u8(gate_off, 2, 0x08)
+    ptr_write_u8(gate_off, 3, 0x00)
+    // IST [2:0]
+    ptr_write_u8(gate_off, 4, ist & 0x07)
+    // Type & Attributes: 0x8E for 64-bit Interrupt Gate (Present, 64-bit, Type 0xE)
+    // If dpl == 3 (Ring 3 callable), set bits [6:5] = 3 -> 0xEE
+    attr := 0x8E | ((dpl & 0x03) << 5)
+    ptr_write_u8(gate_off, 5, attr)
+    // Offset [31:16]
+    ptr_write_u8(gate_off, 6, (handler_addr >> 16) & 0xFF)
+    ptr_write_u8(gate_off, 7, (handler_addr >> 24) & 0xFF)
+    // Offset [63:32]
+    u_hi := ushr64(handler_addr, 32)
+    ptr_write_u8(gate_off, 8, u_hi & 0xFF)
+    ptr_write_u8(gate_off, 9, (u_hi >> 8) & 0xFF)
+    ptr_write_u8(gate_off, 10, (u_hi >> 16) & 0xFF)
+    ptr_write_u8(gate_off, 11, (u_hi >> 24) & 0xFF)
+    // Reserved (exact 32 bits = 4 zero bytes at offsets 12..15; never write 8 bytes!)
+    ptr_write_u8(gate_off, 12, 0)
+    ptr_write_u8(gate_off, 13, 0)
+    ptr_write_u8(gate_off, 14, 0)
+    ptr_write_u8(gate_off, 15, 0)
+}
+
+// Prepares a 10-byte IDTR descriptor: limit (16 bits) + base (64 bits)
+@no_alloc
+fn idt_prepare_pointer(idtr_mem: i64, idt_base: i64, num_vectors: i64 = 256) {
+    if idtr_mem == 0 or num_vectors <= 0 or num_vectors > 256 { return }
+    limit := (num_vectors * 16) - 1
+    ptr_write_u8(idtr_mem, 0, limit & 0xFF)
+    ptr_write_u8(idtr_mem, 1, (limit >> 8) & 0xFF)
+    raw_write_u64(idtr_mem + 2, idt_base)
+}
+
+// Loads IDT using CPU LIDT instruction
+@no_alloc
+fn idt_load(idtr_mem: i64) {
+    cpu_lidt(idtr_mem)
+}
+
+// --- 5. 4-Level Paging Virtual Memory Manager (Ring 0 vs Ring 3 Protection) ---
+
+// Encodes a 64-bit Page Table Entry (PML4E, PDPTE, PDE, PTE), preserving NX bit [63]
+@no_alloc
+fn vmm_entry_encode(phys_addr: i64, flags: i64) -> i64 {
+    nx_bit := flags & page_nx()
+    return (phys_addr & 0x000FFFFFFFFFF000) | (flags & 0xFFF) | nx_bit
+}
+
+// Maps a 4 KB virtual page to physical page in a 4-level page table structure
+//   pml4_base: Address of PML4 table (4096 bytes aligned)
+//   virt_addr: Virtual address to map
+//   phys_addr: Physical address to point to
+//   is_user: true for Ring 3 User Mode accessible; false for Ring 0 Supervisor only
+//   is_writable: true for Read/Write; false for Read-Only
+@no_alloc
+fn vmm_map_page(pml4_base: i64, virt_addr: i64, phys_addr: i64, is_user: bool, is_writable: bool) {
+    if pml4_base == 0 { return }
+    mut flags := page_present()
+    if is_writable { flags = flags | page_writable() }
+    if is_user { flags = flags | page_user() }
+
+    // PML4 index: bits [47..39]
+    pml4_idx := (ushr64(virt_addr, 39)) & 0x1FF
+    pml4_entry_addr := pml4_base + (pml4_idx * 8)
+
+    // Write page table mapping
+    raw_write_u64(pml4_entry_addr, vmm_entry_encode(phys_addr, flags))
+}
+
+// Activates page directory by loading CR3 register
+@no_alloc
+fn vmm_switch_pml4(pml4_phys: i64) {
+    cpu_invlpg(0)
+    write_cr3(pml4_phys)
+}
+
+// --- 6. Ring 0 <-> Ring 3 Transitions & Fast Syscalls ---
+
+// Configures hardware MSRs for 64-bit SYSCALL instruction from Ring 3 to Ring 0
+@no_alloc
+fn kernel_setup_syscall(handler_rip: i64) {
+    // 1. Enable System Call Extensions (SCE, bit 0) in IA32_EFER
+    efer := rdmsr(msr_efer())
+    wrmsr(msr_efer(), efer | 1)
+
+    // 2. Configure IA32_STAR:
+    //   Bits [47:32] = Kernel CS/SS base (0x08 -> Kernel CS = 0x08, Kernel SS = 0x10)
+    //   Bits [63:48] = User SS/CS base (0x10 -> SYSRETQ SS = (0x10+8)|3 = 0x1B, CS = (0x10+16)|3 = 0x23)
+    star_val := (0x0008 << 32) | (0x0010 << 48)
+    wrmsr(msr_star(), star_val)
+
+    // 3. Configure IA32_LSTAR with target 64-bit kernel syscall handler entry point
+    wrmsr(msr_lstar(), handler_rip)
+
+    // 4. Configure IA32_FMASK: RFLAGS bits to automatically clear during SYSCALL
+    //   Clears: IF (bit 9 = 0x200), DF (bit 10 = 0x400), TF (bit 8 = 0x100) -> 0x3F7FD5
+    wrmsr(msr_fmask(), 0x3F7FD5)
+}
+
+// Switches CPU privilege level from Ring 0 (Kernel) to Ring 3 (User Mode) via IRETQ
+// Prepares user stack frame: SS, RSP, RFLAGS (IF=1), CS, RIP
+@no_alloc
+fn kernel_enter_ring3(user_entry_rip: i64, user_stack_rsp: i64) {
+    // RFLAGS: bit 1 is always 1; bit 9 (IF) = 1 to enable hardware interrupts in user mode
+    user_rflags := 0x202
+    ring_iretq(user_entry_rip, gdt_sel_user_cs(), user_rflags, user_stack_rsp, gdt_sel_user_ds())
+}
+
+// Invokes system call from Ring 3 User Mode into Ring 0 Kernel
+@no_alloc
+fn user_syscall(sys_num: i64, a1: i64 = 0, a2: i64 = 0, a3: i64 = 0, a4: i64 = 0, a5: i64 = 0, a6: i64 = 0) -> i64 {
+    return ring_syscall(sys_num, a1, a2, a3, a4, a5, a6)
+}
+
+// --- 7. COM1 (0x3F8) Serial UART Kernel Console ---
+
+@no_alloc
+fn k_uart_init(port: i64 = 0x3F8) {
+    port_out_u8(port + 1, 0x00) // Disable all interrupts
+    port_out_u8(port + 3, 0x80) // Enable DLAB (set baud rate divisor)
+    port_out_u8(port + 0, 0x01) // Set divisor to 1 (115200 baud) lo byte
+    port_out_u8(port + 1, 0x00) // hi byte
+    port_out_u8(port + 3, 0x03) // 8 bits, no parity, one stop bit (8N1)
+    port_out_u8(port + 2, 0xC7) // Enable FIFO, clear them, with 14-byte threshold
+    port_out_u8(port + 4, 0x0B) // IRQs enabled, RTS/DSR set
+}
+
+@no_alloc
+fn k_uart_putc(ch: i64, port: i64 = 0x3F8) {
+    // Wait for transmit buffer to be empty (Line Status Register bit 5 = 0x20)
+    mut spin := 0
+    while (port_in_u8(port + 5) & 0x20) == 0 and spin < 1000000 {
+        cpu_pause()
+        spin += 1
+    }
+    port_out_u8(port, ch & 0xFF)
+}
+
+@no_alloc
+fn k_uart_puts(s: str, port: i64 = 0x3F8) {
+    n := str_len(s)
+    mut i := 0
+    while i < n {
+        b := str_byte(s, i)
+        if b == 10 { // LF -> CRLF
+            k_uart_putc(13, port)
+        }
+        k_uart_putc(b, port)
+        i += 1
+    }
+}
+
+@no_alloc
+fn k_print(s: str) {
+    print(s)
+}
+
+@no_alloc
+fn k_println(s: str) {
+    println(s)
+}
+
+fn k_print_hex(val: i64) {
+    b := buf_new(20)
+    buf_push_str(b, "0x")
+    mut i := 60
+    while i >= 0 {
+        nibble := (ushr64(val, i)) & 0x0F
+        mut ch := 48 + nibble
+        if nibble >= 10 { ch = 65 + (nibble - 10) }
+        buf_push(b, ch)
+        i -= 4
+    }
+    s := "" + buf_slice_str(b, 0, buf_len(b))
+    buf_free(move b)
+    print(s)
+}
+
+fn k_print_i64(val: i64) {
+    print(f"{val}")
+}

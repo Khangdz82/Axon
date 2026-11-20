@@ -8,6 +8,38 @@
 
 ## Official Self-Hosted Releases (`v5.0` -> `v1.0.0`)
 
+- [x] **Release `v1.1.0`: Ring 0 to Ring 3 Bare-Metal OS Kernel Architecture, Multiboot2 & Zero-OS Freestanding Toolchain (`std/kernel.ax`), Standard Memory Subsystem (`std/memory.ax`)** (COMPLETED & VERIFIED)
+  - [x] **Hardware & Privilege Intrinsics across Rings 0–3:**
+    - Ring 0 CPU execution: `cpu_cli`, `cpu_sti`, `cpu_hlt`, `cpu_pause`, `cpu_wbinvd`, `cpu_invlpg`, `cpu_swapgs`.
+    - Ring 0 Control Registers: `read_cr0`, `write_cr0`, `read_cr2`, `write_cr2`, `read_cr3`, `write_cr3`, `read_cr4`, `write_cr4`.
+    - Model Specific Registers (MSRs): `rdmsr`, `wrmsr` (`IA32_EFER`, `IA32_STAR`, `IA32_LSTAR`, `IA32_FMASK`, `FS/GS Base`).
+    - Descriptor Tables & Task State: `cpu_lidt` (IDT), `cpu_lgdt` (GDT), `cpu_ltr` (TSS 64-bit selector).
+    - Hardware I/O Ports: `port_out_u8`, `port_in_u8`, `port_out_u16`, `port_in_u16`, `port_out_u32`, `port_in_u32`.
+    - Ring 0 <-> Ring 3 Transitions: `ring_iretq` (5-slot hardware stack frame + IRETQ), `ring_sysretq` (SYSRETQ), `ring_syscall` (64-bit SYSCALL with System V ABI).
+  - [x] **Zero-GC Kernel Subsystem Library (`std/kernel.ax`):**
+    - 64-bit GDT Manager: NULL, Kernel Code (0x08), Kernel Data (0x10), User Data (0x1B, DPL=3), User Code (0x23, DPL=3), TSS (0x28) (Intel SDM `SYSRETQ`/`IRETQ` order).
+    - 64-bit TSS Manager: Configures RSP0 kernel interrupt stack for Ring 3 -> Ring 0 privilege switches.
+    - IDT 256 Gates: Vector 14 (#PF) Ring 0 Interrupt Gate (0x8E, DPL=0), Vector 128 (0x80) Ring 3 Trap Gate (0xEE, DPL=3).
+    - 4-Level Paging Protection: Supervisor (Ring 0–2) vs User Mode (Ring 3) with hardware `PAGE_USER` protection bits.
+    - COM1 Serial UART Console (0x3F8, 115200 8N1): Direct kernel I/O for debugging in headless hypervisors & hardware.
+  - [x] **Standard Memory Subsystem Library (`std/memory.ax`):**
+    - Process Memory Management: `mem_open_process(pid, access)`, `mem_open_current_process()`, `mem_open_process_by_name(name)`, `mem_close_process(proc)`.
+    - Typed Primitive Read/Write: `u8..u64`, `i8..i64`, `f32`, `f64`, null-terminated strings, and `ByteBuf` byte vectors with boundary validation.
+    - Multi-Level Pointer Chasing: `mem_read_ptr_chain(proc, base, offsets)` for traversing deep pointer paths (`[[[base + off1] + off2] + off3]`).
+    - Virtual Memory Management: `mem_virtual_alloc(proc, size, protect, base)`, `mem_virtual_protect(proc, addr, size, protect)`, `mem_virtual_free(proc, addr)`.
+    - Pattern & Signature Scanning: Fast AOB scanning (`mem_scan_pattern`) and IDA-style wildcard signatures (`mem_scan_ida_sig`, e.g. `"48 89 5C 24 ? 57 48 83"`).
+    - Shared Memory IPC: Pagefile-backed memory-mapped files (`shm_open_or_create`, `shm_open_existing`, `shm_read_*`, `shm_write_*`, `shm_close`).
+    - High-Performance Raw Local Memory: Zero-overhead pointer access (`raw_mem_read_*`, `raw_mem_write_*`, `raw_mem_zero`, `raw_mem_copy`).
+  - [x] **Kernel Image Generators:**
+    - `axc build <src> --target unikernel-x64 -o kernel.elf`: Emits Multiboot2 (`0xE85250D6`) ELF64 image bootable via GRUB2 & QEMU.
+    - `axc build <src> --target freestanding-x64 -o kernel.elf`: Emits direct Zero-OS Ring 0 ELF64 image starting at 1 MB physical RAM.
+  - [x] **Production Verification & Repo Standardization:**
+    - Production Kernel Example: [`examples/kernel_ring0_to_ring3.ax`](examples/kernel_ring0_to_ring3.ax) (verified compiling to native `.exe`, `unikernel-x64` `.elf`, and `freestanding-x64` `.elf`).
+    - Kernel Unit Tests: [`tests/pass/35_kernel_ring0_to_ring3_primitives.ax`](tests/pass/35_kernel_ring0_to_ring3_primitives.ax) (5/5 tests passing).
+    - Memory Unit Tests: [`tests/pass/36_memory_subsystem_read_write_open.ax`](tests/pass/36_memory_subsystem_read_write_open.ax) (6/6 tests passing).
+    - Codebase Clean: Removed redundant temporary test files (`*.tmp`, `.orig`, stray test binaries), updated `.gitignore`.
+    - Deterministic compiler bootstrap: Stage 2 == Stage 3 SHA256 verified.
+
 - [x] **Release `v1.0.0`: Official Production Release, Browser WASM32 Playground, 34-Module Stdlib & Rigorous `B1–B10` Verification** (COMPLETED & VERIFIED)
   - [x] **Interactive Browser Playground ([`playground/index.html`](playground/index.html)):** Standalone zero-dependency HTML/JS recursive-descent compiler emitting valid W3C WebAssembly + `0xFD SIMD128` + `wasi_snapshot_preview1` with Live Canvas2D & binary opcode inspector:
     - `particles` (`1M SIMD128`): `1,740 B` (`1.70 KB`, `26` `0xFD` opcodes, `5.15 ms` WASI run), `errors` (`T ! Error`): `1,215 B` (`1.19 KB`), `ai` (Linear+ReLU+Softmax): `2,095 B` (`2.05 KB`), `game` (2D arcade): `1,726 B` (`1.69 KB`) — `4/4` `WebAssembly.validate = true`, `rc = 0`.

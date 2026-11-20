@@ -12,16 +12,27 @@ struct CompressResult {
     comp_len: i64
 }
 
+fn lz_read_u32_le(p: i64) -> i64 {
+    b0 := ptr_read_u8(p, 0)
+    b1 := ptr_read_u8(p + 1, 0)
+    b2 := ptr_read_u8(p + 2, 0)
+    b3 := ptr_read_u8(p + 3, 0)
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
 fn lz_hash4(b: ByteBuf, pos: i64) -> i64 {
+    if pos < 0 or pos + 4 > buf_len(b) {
+        return 0
+    }
     bp := (b as i64) + 16 + pos
-    v := ptr_read_i64(bp, 0) & 0xFFFFFFFF
+    v := lz_read_u32_le(bp)
     h := (v *% 2654435761) & 0xFFFFFFFF
     return ushr64(h, 18) & 4095 // 4096 hash slots
 }
 
 fn compress_bytes(src: ByteBuf) -> ByteBuf {
     n := buf_len(src)
-    if n <= 0 {
+    if n <= 0 or n > 67108864 {
         empty_out := buf_new(4)
         buf_push(empty_out, 0)
         buf_push(empty_out, 0)
@@ -43,8 +54,11 @@ fn compress_bytes(src: ByteBuf) -> ByteBuf {
     out := buf_new(n + n / 4 + 64)
     out_p := (out as i64) + 16
     
-    // Store original 32-bit length in little endian
-    ptr_write_i64(out_p, 0, n & 0xFFFFFFFF)
+    // Store original 32-bit length in little endian (exact 4 bytes, no OOB)
+    ptr_write_u8(out_p, 0, n & 255)
+    ptr_write_u8(out_p + 1, 0, (n >> 8) & 255)
+    ptr_write_u8(out_p + 2, 0, (n >> 16) & 255)
+    ptr_write_u8(out_p + 3, 0, (n >> 24) & 255)
     mut out_pos := 4
 
     mut ip := 0
@@ -56,9 +70,9 @@ fn compress_bytes(src: ByteBuf) -> ByteBuf {
         ibuf_set(ht, slot, ip)
 
         if ref_pos >= 0 and ip - ref_pos < 65535 and ip - ref_pos > 0 {
-            // Check 4-byte match in single 32-bit comparison
-            v_ref := ptr_read_i64(src_p + ref_pos, 0) & 0xFFFFFFFF
-            v_ip  := ptr_read_i64(src_p + ip, 0) & 0xFFFFFFFF
+            // Exact 4-byte match comparison without 8-byte over-read
+            v_ref := lz_read_u32_le(src_p + ref_pos)
+            v_ip  := lz_read_u32_le(src_p + ip)
 
             if v_ref == v_ip {
                 // Find full match length using 8-byte word comparisons
@@ -182,9 +196,22 @@ fn decompress_bytes(comp: ByteBuf) -> ByteBuf ! i64 {
     }
 
     comp_p := (comp as i64) + 16
-    orig_len := ptr_read_i64(comp_p, 0) & 0xFFFFFFFF
+    orig_len := lz_read_u32_le(comp_p)
 
     if orig_len < 0 or orig_len > 67108864 {
+        return err(400)
+    }
+    if orig_len == 0 {
+        if cn != 4 { return err(400) }
+        return ok(buf_new(1))
+    }
+    if cn <= 4 {
+        return err(400)
+    }
+    // Reject decompression bombs before allocating output memory:
+    // every valid LZ4 block byte emits strictly <= 255 bytes (+ constant initial match).
+    max_possible := (cn - 4) * 256 + 64
+    if orig_len > max_possible {
         return err(400)
     }
 
@@ -242,6 +269,10 @@ fn decompress_bytes(comp: ByteBuf) -> ByteBuf ! i64 {
         }
 
         if ip >= cn {
+            if (token & 15) != 0 {
+                buf_free(move out)
+                return err(400)
+            }
             break
         }
 

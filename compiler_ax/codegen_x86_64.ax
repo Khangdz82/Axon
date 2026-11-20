@@ -119,14 +119,6 @@ fn cg_intern_ct_lut(cg: CodegenCtx, goff: i64) -> i64 {
 }
 
 fn emit_bounds_check_ax(cg: CodegenCtx, idx_slot: i64, tbl_slot: i64, idx_nid: i64) {
-    if ast_kind(cg.nodes, idx_nid) == nk_ident() {
-        el_slen := ibuf_get(cg.state, 13)
-        if el_slen > 0 and ast_get(cg.nodes, idx_nid, 2) == el_slen {
-            if pool_str_eq2(cg.pool, ast_get(cg.nodes, idx_nid, 1), el_slen, ibuf_get(cg.state, 12)) {
-                return
-            }
-        }
-    }
     c := cg.code
     mc_load_rax(c, idx_slot, 0)
     mc_cmp_rax_slot(c, tbl_slot, 1)
@@ -239,6 +231,15 @@ fn emit_scalar_binop_ax(cg: CodegenCtx, op: i64, lslot: i64, loff: i64, rslot: i
             else if op == op_gt() { setcc = 0x97 }
             else if op == op_gte() { setcc = 0x93 }
             mc_b3(c, 0x0F, setcc, 0xC0)
+            // IEEE-754 NaN handling: UCOMISD sets PF=1, ZF=1, CF=1 on NaN.
+            // `==`, `<`, `<=` must return false when PF=1; `!=` must return true when PF=1.
+            if op == op_eq() or op == op_lt() or op == op_lte() {
+                mc_b3(c, 0x0F, 0x9B, 0xC2) // SETNP DL
+                mc_b2(c, 0x20, 0xD0)       // AND AL, DL
+            } else if op == op_neq() {
+                mc_b3(c, 0x0F, 0x9A, 0xC2) // SETP DL
+                mc_b2(c, 0x08, 0xD0)       // OR AL, DL
+            }
             mc_b3(c, 0x0F, 0xB6, 0xC0)
             mc_store_rax(c, dst, 0)
             return dst
@@ -250,9 +251,11 @@ fn emit_scalar_binop_ax(cg: CodegenCtx, op: i64, lslot: i64, loff: i64, rslot: i
         return dst
     }
 
+    shd := ibuf_get(cg.state, 0)
     if common_ty == ty_dec() and (op == op_mul() or op == op_div()) {
         if op == op_mul() {
             mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1)
+            if shd == 1 { cg_jmp_fn(cg, 0x80, h_sec_trap()) }
             mc_b3(c, 0x48, 0xC7, 0xC1)
             mc_u32(c, 10000)
             mc_b2(c, 0x48, 0x99)
@@ -262,14 +265,20 @@ fn emit_scalar_binop_ax(cg: CodegenCtx, op: i64, lslot: i64, loff: i64, rslot: i
             cg_jmp_fn(cg, 0x84, h_sec_trap())
             mc_b3(c, 0x48, 0x69, 0xC0)
             mc_u32(c, 10000)
+            if shd == 1 { cg_jmp_fn(cg, 0x80, h_sec_trap()) }
+            mc_b4(c, 0x48, 0x83, 0xF9, 0xFF)
+            jne_dok := mc_jcc8(c, 0x75)
+            mc_b2(c, 0x48, 0xBA)
+            mc_u64(c, 1 << 63)
+            mc_b3(c, 0x48, 0x39, 0xD0)
+            cg_jmp_fn(cg, 0x84, h_sec_trap())
+            mc_patch_jcc8(c, jne_dok, buf_len(c))
             mc_b2(c, 0x48, 0x99)
             mc_b3(c, 0x48, 0xF7, 0xF9)
         }
         mc_store_rax(c, dst, 0)
         return dst
     }
-
-    shd := ibuf_get(cg.state, 0)
     if op == op_add() {
         mc_b3(c, 0x48, 0x01, 0xC8)
         if shd == 1 { cg_jmp_fn(cg, 0x80, h_sec_trap()) }
@@ -843,6 +852,9 @@ fn emit_expr_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, eni
                 mc_b3(c, 0x48, 0x31, 0xC8)
             } else {
                 mc_b3(c, 0x48, 0xF7, 0xD8)
+                if ibuf_get(cg.state, 0) == 1 {
+                    cg_jmp_fn(cg, 0x80, h_sec_trap())
+                }
             }
             mc_store_rax(c, dst, 0)
             return er_pack(dst, ity)
@@ -1217,6 +1229,8 @@ fn emit_expr_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, eni
         dst := cg_alloc_slots(cg, 1)
         if tty == ty_intbuf() {
             mc_load_r8(c, tslot, 0)
+            mc_b3(c, 0x4D, 0x85, 0xC0)
+            cg_jmp_fn(cg, 0x84, h_sec_trap())
             mc_load_rcx(c, islot, 0)
             mc_b3(c, 0x49, 0x3B, 0x08)
             cg_jmp_fn(cg, 0x83, h_sec_trap())
@@ -1226,6 +1240,8 @@ fn emit_expr_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, eni
         }
         if tty == ty_bytebuf() {
             mc_load_r8(c, tslot, 0)
+            mc_b3(c, 0x4D, 0x85, 0xC0)
+            cg_jmp_fn(cg, 0x84, h_sec_trap())
             mc_load_rcx(c, islot, 0)
             mc_b3(c, 0x49, 0x3B, 0x08)
             cg_jmp_fn(cg, 0x83, h_sec_trap())
@@ -1284,8 +1300,14 @@ fn emit_expr_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, eni
                 col_cnt = soa_active_col_count(cg.sym, sidx)
             }
         }
-        stride := col_cnt * elem_bytes
+        mut stride := col_cnt * elem_bytes
+        if stride < 4 { stride = 4 }
+        max_tbl_cnt := (1073741824 - 256) / stride
         mc_load_rax(c, cslot, 0)
+        mc_b2(c, 0x48, 0xBA)
+        mc_u64(c, max_tbl_cnt)
+        mc_b3(c, 0x48, 0x39, 0xD0)
+        cg_jmp_fn(cg, 0x87, h_sec_trap())
         mc_b3(c, 0x48, 0x69, 0xD0)
         mc_u32(c, stride)
         mc_b3(c, 0x48, 0x81, 0xC2)
@@ -1453,8 +1475,8 @@ fn emit_soa_simd_foreach_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks:
             // `VFMADD231PS ZMM2, ZMM1, ZMM0` (`62 F2 75 48 B8 D0`)
             mc_b4(c, 0x62, 0xF2, 0x75, 0x48); mc_b2(c, 0xB8, 0xD0)
         } else {
-            // `VMULPS ZMM2, ZMM2, ZMM0` (`62 F1 68 48 59 D0`)
-            mc_b4(c, 0x62, 0xF1, 0x68, 0x48); mc_b2(c, 0x59, 0xD0)
+            // `VMULPS ZMM2, ZMM2, ZMM0` (`62 F1 6C 48 59 D0`, EVEX.P1 bit2 must be 1!)
+            mc_b4(c, 0x62, 0xF1, 0x6C, 0x48); mc_b2(c, 0x59, 0xD0)
         }
         // `VMOVUPS [RDI + RAX], ZMM2` (`62 F1 7C 48 11 14 07`)
         mc_b4(c, 0x62, 0xF1, 0x7C, 0x48); mc_b3(c, 0x11, 0x14, 0x07)
@@ -2204,7 +2226,25 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
             tty := er_ty(tr)
             islot := er_slot(ir)
             rslot := er_slot(rr)
-            if ty_tag(tty) == 21 {
+            if tty == ty_intbuf() {
+                mc_load_r8(c, tslot, 0)
+                mc_b3(c, 0x4D, 0x85, 0xC0)
+                cg_jmp_fn(cg, 0x84, h_sec_trap())
+                mc_load_rcx(c, islot, 0)
+                mc_b3(c, 0x49, 0x3B, 0x08)
+                cg_jmp_fn(cg, 0x83, h_sec_trap())
+                mc_load_rax(c, rslot, 0)
+                mc_b4(c, 0x49, 0x89, 0x44, 0xC8); mc_b1(c, 0x10)
+            } else if tty == ty_bytebuf() {
+                mc_load_r8(c, tslot, 0)
+                mc_b3(c, 0x4D, 0x85, 0xC0)
+                cg_jmp_fn(cg, 0x84, h_sec_trap())
+                mc_load_rcx(c, islot, 0)
+                mc_b3(c, 0x49, 0x3B, 0x08)
+                cg_jmp_fn(cg, 0x83, h_sec_trap())
+                mc_load_rax(c, rslot, 0)
+                mc_b4(c, 0x41, 0x88, 0x44, 0x08); mc_b1(c, 0x10)
+            } else if ty_tag(tty) == 21 {
                 mc_load_rdx(c, tslot, 1)
                 mc_b3(c, 0x48, 0x89, 0xD0); mc_b1(c, 0x25); mc_u32(c, 0xFFFFF)
                 mc_b3(c, 0x48, 0x89, 0xD1); mc_b4(c, 0x48, 0xC1, 0xE9, 0x14); mc_b2(c, 0x81, 0xE1); mc_u32(c, 0xFFFFF)
@@ -2331,10 +2371,7 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
 
         prev_el_soff := ibuf_get(cg.state, 12)
         prev_el_slen := ibuf_get(cg.state, 13)
-        if ast_kind(cg.nodes, end_nid) == nk_field() and pool_str_eq_lit(cg.pool, ast_get(cg.nodes, end_nid, 2), ast_get(cg.nodes, end_nid, 3), "len") {
-            ibuf_set(cg.state, 12, vsoff)
-            ibuf_set(cg.state, 13, vslen)
-        }
+        // Always retain runtime bounds checking (no unsound name-based elision)
 
         prev_cont := ibuf_get(cg.state, 10)
         prev_bmark := ibuf_get(cg.state, 11)
@@ -2489,17 +2526,6 @@ fn compile_single_fn_ax(cg: CodegenCtx, fidx: i64) {
     ibuf_set(cg.state, 23, 0)
     ibuf_set(cg.state, 24, 0)
     ibuf_set(cg.state, 25, 0)
-
-    pl_off := ast_get(cg.nodes, fnid, 3)
-    mut rpi := 0
-    while rpi < p_cnt {
-        pn := ibuf_get(cg.extra, pl_off + rpi)
-        if ast_kind(cg.nodes, ast_get(cg.nodes, pn, 4)) == nk_ty_refined() {
-            ibuf_set(cg.state, 12, ast_get(cg.nodes, pn, 1))
-            ibuf_set(cg.state, 13, ast_get(cg.nodes, pn, 2))
-        }
-        rpi += 1
-    }
 
     // Prolog: `ENDBR64; PUSH RBP; MOV RBP, RSP` + 4 KB Guard-Page Stack Probe (on Win64)
     mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
@@ -3033,18 +3059,16 @@ fn compile_module_x86_64_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
     }
 
     mut shield_on := 0
-    if os_mode <= 1 {
-        if force_shield {
-            shield_on = 1
-        } else {
-            mut fi := 0
-            while fi < f_cnt {
-                if ibuf_get(live, fi) == 1 and (ibuf_get(sym, f_base + fi * 10 + 9) & (fnflag_shield() | fnflag_whitebox())) != 0 {
-                    shield_on = 1
-                    break
-                }
-                fi += 1
+    if force_shield {
+        shield_on = 1
+    } else {
+        mut fi := 0
+        while fi < f_cnt {
+            if ibuf_get(live, fi) == 1 and (ibuf_get(sym, f_base + fi * 10 + 9) & (fnflag_shield() | fnflag_whitebox())) != 0 {
+                shield_on = 1
+                break
             }
+            fi += 1
         }
     }
 
@@ -3161,7 +3185,7 @@ fn compile_module_x86_64_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
     buf_free(move coff_syms)
 
     // Eliminate PE `.text` slack space when `@shield` is enabled by filling to 512-byte boundary with `0xCC` (`INT3`)
-    if shield_on == 1 and buf_len(cg.code) > 0 {
+    if os_mode <= 1 and shield_on == 1 and buf_len(cg.code) > 0 {
         while (buf_len(cg.code) & 511) != 0 {
             buf_push(cg.code, 0xCC)
         }
@@ -3316,9 +3340,13 @@ fn compile_module_x86_64_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
         }
         build_macho64_executable(cg.code, cg.rdata, data_sec, false, out_buf)
     } else {
-        // Bare-Metal / Unikernel `Multiboot2` x86_64
+        // Bare-Metal / Unikernel `Multiboot2` or Freestanding x86_64
         lay := ibuf_new(8)
-        unikernel_compute_layout(buf_len(cg.code), buf_len(cg.rdata), lay)
+        if target_id == tgt_unikernel_x64() {
+            unikernel_compute_layout(buf_len(cg.code), buf_len(cg.rdata), lay)
+        } else {
+            freestanding_compute_layout(buf_len(cg.code), buf_len(cg.rdata), lay)
+        }
         text_va := ibuf_get(lay, 0)
         rdata_va := ibuf_get(lay, 1)
         data_va := ibuf_get(lay, 2)
@@ -3342,7 +3370,11 @@ fn compile_module_x86_64_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
             buf_put_u32(cg.code, disp_pos, target_va - (text_va + next_rip))
             xi += 1
         }
-        build_unikernel_multiboot2(cg.code, cg.rdata, data_sec, out_buf)
+        if target_id == tgt_unikernel_x64() {
+            build_unikernel_multiboot2(cg.code, cg.rdata, data_sec, out_buf)
+        } else {
+            build_freestanding_x64_kernel(cg.code, cg.rdata, data_sec, out_buf)
+        }
     }
 
     buf_free(move data_sec)

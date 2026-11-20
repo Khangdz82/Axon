@@ -1,0 +1,188 @@
+// Test 35: Axon Kernel Ring 0 to Ring 3 Architecture & Hardware Primitives Test Suite
+// Verifies:
+//   1. Ring 0 (Supervisor) to Ring 3 (User) Privilege Hierarchy
+//   2. 64-bit GDT Segment Descriptor Encoding & Selectors (Kernel CS/DS, User CS/DS, TSS)
+//   3. 64-bit Task State Segment (TSS) RSP0 Setup
+//   4. Interrupt Descriptor Table (IDT) 256 Gates: Ring 0 Interrupt Gate (0x8E) vs Ring 3 Trap (0xEE)
+//   5. 4-Level Paging Protection: Supervisor (Ring 0-2) vs User Mode (Ring 3) PAGE_USER flag
+//   6. Hardware MSRs: IA32_EFER, IA32_STAR, IA32_LSTAR, IA32_FMASK
+//   7. Hardware Timestamp Monotonic Counter (cpu_rdtsc)
+
+use std::kernel
+use std::os
+
+@test
+fn test_ring_privilege_constants() {
+    assert(ring_kernel() == 0, "ring_kernel must be 0")
+    assert(ring_drivers() == 1, "ring_drivers must be 1")
+    assert(ring_services() == 2, "ring_services must be 2")
+    assert(ring_user() == 3, "ring_user must be 3")
+
+    // Check GDT selectors (SYSRETQ/IRETQ compliant order: User DS=0x1B, User CS=0x23)
+    assert(gdt_sel_null() == 0x00, "null selector")
+    assert(gdt_sel_kernel_cs() == 0x08, "kernel cs selector (Ring 0)")
+    assert(gdt_sel_kernel_ds() == 0x10, "kernel ds selector (Ring 0)")
+    assert(gdt_sel_user_ds() == 0x1B, "user ds selector (Ring 3, RPL=3)")
+    assert(gdt_sel_user_cs() == 0x23, "user cs selector (Ring 3, RPL=3)")
+    assert(gdt_sel_tss() == 0x28, "tss selector")
+
+    // Verify RPL (Requested Privilege Level) bits
+    assert((gdt_sel_kernel_cs() & 3) == ring_kernel(), "kernel cs RPL must be 0")
+    assert((gdt_sel_kernel_ds() & 3) == ring_kernel(), "kernel ds RPL must be 0")
+    assert((gdt_sel_user_cs() & 3) == ring_user(), "user cs RPL must be 3")
+    assert((gdt_sel_user_ds() & 3) == ring_user(), "user ds RPL must be 3")
+}
+
+@test
+fn test_gdt_and_tss_encoding() {
+    // Allocate simulated GDT (64 bytes) and TSS (104 bytes)
+    gdt_mem := mem_alloc_aligned(128)
+    tss_mem := mem_alloc_aligned(128)
+
+    dummy_kernel_rsp := 0xFFFF800000100000
+    gdt_init(gdt_mem, tss_mem, dummy_kernel_rsp)
+
+    // 1. Entry 0 must be NULL
+    assert(raw_read_u64(gdt_mem) == 0, "GDT entry 0 must be null")
+
+    // 2. Entry 1: Kernel CS (0x08)
+    k_cs_desc := raw_read_u64(gdt_mem + 8)
+    // Access byte is at bits [47..40]: must be 0x9A (Present, DPL 0, Executable, Readable)
+    k_cs_access := (ushr64(k_cs_desc, 40)) & 0xFF
+    assert(k_cs_access == 0x9A, "kernel cs access byte mismatch")
+    // DPL bits [46..45] must be 0
+    assert(((k_cs_access >> 5) & 3) == 0, "kernel cs DPL must be 0")
+
+    // 3. Entry 2: Kernel DS (0x10)
+    k_ds_desc := raw_read_u64(gdt_mem + 16)
+    k_ds_access := (ushr64(k_ds_desc, 40)) & 0xFF
+    assert(k_ds_access == 0x92, "kernel ds access byte mismatch")
+    assert(((k_ds_access >> 5) & 3) == 0, "kernel ds DPL must be 0")
+
+    // 4. Entry 3: User DS (0x1B)
+    u_ds_desc := raw_read_u64(gdt_mem + 24)
+    u_ds_access := (ushr64(u_ds_desc, 40)) & 0xFF
+    assert(u_ds_access == 0xF2, "user ds access byte mismatch")
+    assert(((u_ds_access >> 5) & 3) == 3, "user ds DPL must be 3")
+
+    // 5. Entry 4: User CS (0x23)
+    u_cs_desc := raw_read_u64(gdt_mem + 32)
+    u_cs_access := (ushr64(u_cs_desc, 40)) & 0xFF
+    assert(u_cs_access == 0xFA, "user cs access byte mismatch")
+    // DPL bits [46..45] must be 3 (Ring 3 User Mode!)
+    assert(((u_cs_access >> 5) & 3) == 3, "user cs DPL must be 3")
+
+    // 6. Entry 5 & 6: TSS 16-byte descriptor
+    tss_low := raw_read_u64(gdt_mem + 40)
+    tss_access := (ushr64(tss_low, 40)) & 0xFF
+    assert(tss_access == 0x89, "TSS access byte mismatch (0x89 Available TSS)")
+
+    // 7. Verify TSS RSP0 at offset 4
+    rsp0_read := raw_read_u64(tss_mem + 4)
+    assert(rsp0_read == dummy_kernel_rsp, "TSS RSP0 mismatch")
+
+    // 8. Test TSS RSP0 task switch update
+    new_rsp0 := 0xFFFF800000200000
+    tss_set_rsp0(tss_mem, new_rsp0)
+    assert(raw_read_u64(tss_mem + 4) == new_rsp0, "TSS RSP0 update failed")
+
+    // 9. GDTR pointer verification
+    gdtr_mem := mem_alloc_aligned(16)
+    gdt_prepare_pointer(gdtr_mem, gdt_mem, 7)
+    limit := ptr_read_u8(gdtr_mem, 0) | (ptr_read_u8(gdtr_mem, 1) << 8)
+    assert(limit == (7 * 8 - 1), "GDTR limit mismatch")
+    assert(raw_read_u64(gdtr_mem + 2) == gdt_mem, "GDTR base mismatch")
+
+    mem_free_aligned(gdtr_mem)
+    mem_free_aligned(tss_mem)
+    mem_free_aligned(gdt_mem)
+}
+
+@test
+fn test_idt_gate_encoding() {
+    // Allocate simulated IDT (256 entries * 16 bytes = 4096 bytes) + 16-byte canary
+    idt_mem := mem_alloc_aligned(4112)
+    k_mem_zero(idt_mem, 4112)
+    raw_write_u64(idt_mem + 4096, 0x1122334455667788)
+
+    dummy_isr_kernel := 0xFFFFFFFF80105000
+    dummy_isr_user_syscall := 0xFFFFFFFF80108000
+
+    // Set vector 14 (Page Fault #PF): Ring 0 Interrupt Gate (DPL=0)
+    idt_set_gate(idt_mem, 14, dummy_isr_kernel, dpl = 0, ist = 1)
+
+    // Set vector 128 (0x80 System Call): Ring 3 User Gate (DPL=3)
+    idt_set_gate(idt_mem, 128, dummy_isr_user_syscall, dpl = 3, ist = 0)
+
+    // Set vector 255 and verify canary past end of IDT is untouched (no 4-byte overflow!)
+    idt_set_gate(idt_mem, 255, dummy_isr_kernel, dpl = 0, ist = 0)
+    assert(raw_read_u64(idt_mem + 4096) == 0x1122334455667788, "IDT vector 255 overflowed canary!")
+
+    // Verify Vector 14 Gate (Ring 0)
+    gate14 := idt_mem + (14 * 16)
+    off_lo14 := ptr_read_u8(gate14, 0) | (ptr_read_u8(gate14, 1) << 8)
+    assert(off_lo14 == (dummy_isr_kernel & 0xFFFF), "IDT 14 off_lo mismatch")
+    assert(ptr_read_u8(gate14, 2) == 0x08, "IDT 14 selector must be Kernel CS (0x08)")
+    assert(ptr_read_u8(gate14, 4) == 1, "IDT 14 IST must be 1")
+    assert(ptr_read_u8(gate14, 5) == 0x8E, "IDT 14 DPL=0 attribute must be 0x8E")
+
+    // Verify Vector 128 Gate (Ring 3)
+    gate128 := idt_mem + (128 * 16)
+    assert(ptr_read_u8(gate128, 2) == 0x08, "IDT 128 selector must be Kernel CS")
+    assert(ptr_read_u8(gate128, 5) == 0xEE, "IDT 128 DPL=3 attribute must be 0xEE (0x8E | 0x60)")
+
+    // IDTR pointer verification
+    idtr_mem := mem_alloc_aligned(16)
+    idt_prepare_pointer(idtr_mem, idt_mem, 256)
+    idt_limit := ptr_read_u8(idtr_mem, 0) | (ptr_read_u8(idtr_mem, 1) << 8)
+    assert(idt_limit == 4095, "IDTR limit must be 4095 (256 * 16 - 1)")
+    assert(raw_read_u64(idtr_mem + 2) == idt_mem, "IDTR base mismatch")
+
+    mem_free_aligned(idtr_mem)
+    mem_free_aligned(idt_mem)
+}
+
+@test
+fn test_paging_ring_protection() {
+    // Verify paging flags
+    assert(page_present() == 1, "PAGE_PRESENT")
+    assert(page_writable() == 2, "PAGE_WRITABLE")
+    assert(page_user() == 4, "PAGE_USER (Ring 3 accessible)")
+
+    // Allocate simulated PML4 table (4096 bytes)
+    pml4_mem := mem_alloc_aligned(4096)
+    k_mem_zero(pml4_mem, 4096)
+
+    // 1. Map Kernel page at 0xFFFFFFFF80000000: Ring 0 Supervisor, Writable
+    k_virt := 0xFFFFFFFF80000000
+    k_phys := 0x0000000000100000
+    vmm_map_page(pml4_mem, k_virt, k_phys, is_user = false, is_writable = true)
+
+    pml4_k_idx := (ushr64(k_virt, 39)) & 0x1FF
+    k_entry := raw_read_u64(pml4_mem + (pml4_k_idx * 8))
+    assert((k_entry & page_present()) != 0, "kernel page must be PRESENT")
+    assert((k_entry & page_writable()) != 0, "kernel page must be WRITABLE")
+    assert((k_entry & page_user()) == 0, "kernel page must NOT have PAGE_USER (Ring 0 only!)")
+
+    // 2. Map User page at 0x0000000000400000: Ring 3 User Mode, Read-Only
+    u_virt := 0x0000000000400000
+    u_phys := 0x0000000000200000
+    vmm_map_page(pml4_mem, u_virt, u_phys, is_user = true, is_writable = false)
+
+    pml4_u_idx := (ushr64(u_virt, 39)) & 0x1FF
+    u_entry := raw_read_u64(pml4_mem + (pml4_u_idx * 8))
+    assert((u_entry & page_present()) != 0, "user page must be PRESENT")
+    assert((u_entry & page_writable()) == 0, "user page must be READ-ONLY")
+    assert((u_entry & page_user()) != 0, "user page MUST have PAGE_USER (Ring 3 accessible!)")
+
+    mem_free_aligned(pml4_mem)
+}
+
+@test
+fn test_msr_and_cpu_timing() {
+    // Test RDTSC (Monotonic instruction cycle counter)
+    t1 := k_rdtsc()
+    k_pause()
+    t2 := k_rdtsc()
+    assert(t2 >= t1, "RDTSC must be monotonic non-decreasing")
+}

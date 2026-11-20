@@ -117,21 +117,7 @@ fn estimate_prompt_tokens(s: str) -> i64 {
 }
 
 // --- 3. Zero-Reflection JSON Builders & SSE Streaming Delta Parser ---
-
-fn json_push_escaped(out: ByteBuf, s: str) {
-    n := str_len(s)
-    mut i := 0
-    while i < n {
-        b := str_byte(s, i)
-        if b == 34 { buf_push_str(out, "\\\"") }
-        else if b == 92 { buf_push_str(out, "\\\\") }
-        else if b == 10 { buf_push_str(out, "\\n") }
-        else if b == 13 { buf_push_str(out, "\\r") }
-        else if b == 9 { buf_push_str(out, "\\t") }
-        else if b >= 32 { buf_push(out, b) }
-        i += 1
-    }
-}
+// Uses RFC-8259 `json_push_escaped` imported from `std::json`.
 
 // Builds OpenAI / Ollama / vLLM / llama.cpp / Groq `/v1/chat/completions` JSON payload.
 fn ai_build_openai_chat_req(out: ByteBuf, model: str, system_prompt: str, user_prompt: str, max_tokens: i64, stream: bool) {
@@ -187,12 +173,19 @@ struct PromptCache {
     index_slots: IntBuf // [slot * 4]: [occupied(0/1), key_hash, data_off, data_len]
     data_buf: ByteBuf
     cap_slots: i64
+    data_cap: i64
     meta_ptr: i64       // [0]=write_cursor_slot, [1]=hits, [2]=misses
 }
 
 fn prompt_cache_new(cap_slots: i64 = 128, data_bytes: i64 = 65536) -> PromptCache {
+    mut req_slots := cap_slots
+    if req_slots < 16 { req_slots = 16 }
+    if req_slots > 65536 { req_slots = 65536 }
     mut c := 16
-    while c < cap_slots { c = c << 1 }
+    while c < req_slots and c < 65536 { c = c << 1 }
+    mut db := data_bytes
+    if db < 4096 { db = 4096 }
+    if db > 67108864 { db = 67108864 }
     idx := ibuf_new(c * 4)
     mut i := 0
     while i < c * 4 {
@@ -200,10 +193,12 @@ fn prompt_cache_new(cap_slots: i64 = 128, data_bytes: i64 = 65536) -> PromptCach
         i += 1
     }
     mp := mem_alloc_aligned(64)
-    ptr_write_i64(mp, 0, 0)
-    ptr_write_i64(mp, 1, 0)
-    ptr_write_i64(mp, 2, 0)
-    return PromptCache(index_slots = idx, data_buf = buf_new(data_bytes), cap_slots = c, meta_ptr = mp)
+    if mp != 0 {
+        ptr_write_i64(mp, 0, 0)
+        ptr_write_i64(mp, 1, 0)
+        ptr_write_i64(mp, 2, 0)
+    }
+    return PromptCache(index_slots = idx, data_buf = buf_new(db), cap_slots = c, data_cap = db, meta_ptr = mp)
 }
 
 fn prompt_cache_free(move pc: PromptCache) {
@@ -216,10 +211,16 @@ fn prompt_cache_key(model: str, system_prompt: str, user_prompt: str) -> i64 {
     h1 := fnv1a_64(model)
     h2 := fnv1a_64(system_prompt)
     h3 := fnv1a_64(user_prompt)
-    return (h1 *% 1099511628211) ^ (h2 *% 0x517CC1B727220A95) ^ h3
+    mut x := (h1 *% 0x9E3779B97F4A7C15) ^ ((str_len(model) +% 1) *% 0xBF58476D1CE4E5B9)
+    x = (x ^ (h2 *% 0x517CC1B727220A95) ^ ((str_len(system_prompt) +% 3) *% 0x94D049BB133111EB))
+    x = (x ^ ushr64(x, 30)) *% 0xBF58476D1CE4E5B9
+    x = x ^ (h3 *% 1099511628211) ^ (str_len(user_prompt) *% 0x9E3779B97F4A7C15)
+    x = (x ^ ushr64(x, 27)) *% 0x94D049BB133111EB
+    return x ^ ushr64(x, 31)
 }
 
 fn prompt_cache_get(pc: PromptCache, key_hash: i64) -> str ! i64 {
+    if pc.meta_ptr == 0 or pc.cap_slots <= 0 { return err(500) }
     mask := pc.cap_slots - 1
     mut slot := key_hash & mask
     mut probes := 0
@@ -233,8 +234,12 @@ fn prompt_cache_get(pc: PromptCache, key_hash: i64) -> str ! i64 {
         if ibuf_get(pc.index_slots, base + 1) == key_hash {
             off := ibuf_get(pc.index_slots, base + 2)
             dlen := ibuf_get(pc.index_slots, base + 3)
-            ptr_write_i64(pc.meta_ptr, 1, ptr_read_i64(pc.meta_ptr, 1) + 1)
-            return ok(buf_slice_str(pc.data_buf, off, off + dlen))
+            if off >= 0 and dlen >= 0 and off <= buf_len(pc.data_buf) and dlen <= buf_len(pc.data_buf) - off {
+                ptr_write_i64(pc.meta_ptr, 1, ptr_read_i64(pc.meta_ptr, 1) + 1)
+                // Return an owned string copy to prevent UAF / cross-tenant overwrite on cache reset
+                return ok("" + buf_slice_str(pc.data_buf, off, off + dlen))
+            }
+            return err(404)
         }
         slot = (slot + 1) & mask
         probes += 1
@@ -244,8 +249,12 @@ fn prompt_cache_get(pc: PromptCache, key_hash: i64) -> str ! i64 {
 }
 
 fn prompt_cache_put(pc: PromptCache, key_hash: i64, response: str) {
+    if pc.meta_ptr == 0 or pc.cap_slots <= 0 { return }
     rlen := str_len(response)
-    if buf_len(pc.data_buf) + rlen > 1048576 {
+    if rlen <= 0 or rlen > pc.data_cap {
+        return
+    }
+    if buf_len(pc.data_buf) > pc.data_cap - rlen {
         buf_truncate(pc.data_buf, 0)
         mut si := 0
         while si < pc.cap_slots * 4 {
@@ -294,17 +303,23 @@ fn prompt_cache_put(pc: PromptCache, key_hash: i64, response: str) {
 
 struct AiModelRouter {
     endpoints: IntBuf
+    max_endpoints: i64
     meta_ptr: i64 // [0]=ep_count, [1]=total_spend_micros, [2]=total_in_tokens, [3]=total_out_tokens
 }
 
 fn ai_router_new(max_endpoints: i64 = 16) -> AiModelRouter {
-    eb := ibuf_new(max_endpoints * 8 + 8)
+    mut me := max_endpoints
+    if me < 1 { me = 1 }
+    if me > 4096 { me = 4096 }
+    eb := ibuf_new(me * 8 + 8)
     mp := mem_alloc_aligned(64)
-    ptr_write_i64(mp, 0, 0)
-    ptr_write_i64(mp, 1, 0)
-    ptr_write_i64(mp, 2, 0)
-    ptr_write_i64(mp, 3, 0)
-    return AiModelRouter(endpoints = eb, meta_ptr = mp)
+    if mp != 0 {
+        ptr_write_i64(mp, 0, 0)
+        ptr_write_i64(mp, 1, 0)
+        ptr_write_i64(mp, 2, 0)
+        ptr_write_i64(mp, 3, 0)
+    }
+    return AiModelRouter(endpoints = eb, max_endpoints = me, meta_ptr = mp)
 }
 
 fn ai_router_free(move r: AiModelRouter) {
@@ -313,10 +328,16 @@ fn ai_router_free(move r: AiModelRouter) {
 }
 
 fn ai_router_add_endpoint(r: AiModelRouter, tier: i64, cost_in_per_1m_micros: i64, cost_out_per_1m_micros: i64, max_ctx: i64, min_complexity: i64, init_latency_ms: i64) -> i64 {
+    if r.meta_ptr == 0 { return -1 }
     eid := ptr_read_i64(r.meta_ptr, 0)
+    if eid >= r.max_endpoints { return -1 }
+    mut cin := cost_in_per_1m_micros
+    if cin < 0 { cin = 0 }
+    mut cout := cost_out_per_1m_micros
+    if cout < 0 { cout = 0 }
     ibuf_push(r.endpoints, tier)
-    ibuf_push(r.endpoints, cost_in_per_1m_micros)
-    ibuf_push(r.endpoints, cost_out_per_1m_micros)
+    ibuf_push(r.endpoints, cin)
+    ibuf_push(r.endpoints, cout)
     ibuf_push(r.endpoints, max_ctx)
     ibuf_push(r.endpoints, min_complexity)
     ibuf_push(r.endpoints, init_latency_ms)
@@ -328,14 +349,24 @@ fn ai_router_add_endpoint(r: AiModelRouter, tier: i64, cost_in_per_1m_micros: i6
 
 @no_alloc
 fn ai_router_estimate_cost_micros(r: AiModelRouter, ep_id: i64, in_tokens: i64, est_out_tokens: i64) -> i64 {
+    if r.meta_ptr == 0 { return 0 }
     cnt := ptr_read_i64(r.meta_ptr, 0)
     if ep_id < 0 or ep_id >= cnt {
         return 0
     }
+    mut itok := in_tokens
+    mut otok := est_out_tokens
+    if itok < 0 { itok = 0 }
+    if otok < 0 { otok = 0 }
+    if itok > 1000000000 { itok = 1000000000 }
+    if otok > 1000000000 { otok = 1000000000 }
     base := ep_id * 8
     cin := ibuf_get(r.endpoints, base + 1)
     cout := ibuf_get(r.endpoints, base + 2)
-    return (in_tokens * cin + est_out_tokens * cout) / 1000000
+    // Overflow-safe split: (tok / 1000000) * c + ((tok % 1000000) * c) / 1000000
+    c_in := (itok / 1000000) * cin + ((itok % 1000000) * cin) / 1000000
+    c_out := (otok / 1000000) * cout + ((otok % 1000000) * cout) / 1000000
+    return c_in + c_out
 }
 
 // Selects the lowest-cost healthy endpoint meeting context, complexity, and budget constraints.
@@ -441,24 +472,14 @@ fn recv(s: i64, buf: i64, len: i64, flags: i64) -> i32
 fn closesocket(s: i64) -> i32
 
 fn ai_server_format_sse_delta(req_id: str, model: str, delta_text: str) -> str {
-    b := buf_new(256 + str_len(req_id) + str_len(model) + str_len(delta_text))
+    cap := 256 + (str_len(req_id) + str_len(model) + str_len(delta_text)) * 6
+    b := buf_new(cap)
     buf_push_str(b, "data: {\"id\":\"")
-    buf_push_str(b, req_id)
+    json_push_escaped(b, req_id)
     buf_push_str(b, "\",\"object\":\"chat.completion.chunk\",\"model\":\"")
-    buf_push_str(b, model)
+    json_push_escaped(b, model)
     buf_push_str(b, "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"")
-    n := str_len(delta_text)
-    mut i := 0
-    while i < n {
-        c := str_byte(delta_text, i)
-        if c == 34 { buf_push_str(b, "\\\"") }
-        else if c == 92 { buf_push_str(b, "\\\\") }
-        else if c == 10 { buf_push_str(b, "\\n") }
-        else if c == 13 { buf_push_str(b, "\\r") }
-        else if c == 9 { buf_push_str(b, "\\t") }
-        else if c >= 32 { buf_push(b, c) }
-        i += 1
-    }
+    json_push_escaped(b, delta_text)
     buf_push_str(b, "\"},\"finish_reason\":null}]}\n\n")
     res := "" + buf_slice_str(b, 0, buf_len(b))
     buf_free(move b)
@@ -466,24 +487,14 @@ fn ai_server_format_sse_delta(req_id: str, model: str, delta_text: str) -> str {
 }
 
 fn ai_server_format_completion(req_id: str, model: str, content: str, in_tokens: i64, out_tokens: i64) -> str {
-    b := buf_new(512 + str_len(req_id) + str_len(model) + str_len(content))
+    cap := 512 + (str_len(req_id) + str_len(model) + str_len(content)) * 6
+    b := buf_new(cap)
     buf_push_str(b, "{\n  \"id\": \"")
-    buf_push_str(b, req_id)
+    json_push_escaped(b, req_id)
     buf_push_str(b, "\",\n  \"object\": \"chat.completion\",\n  \"created\": 1700000000,\n  \"model\": \"")
-    buf_push_str(b, model)
+    json_push_escaped(b, model)
     buf_push_str(b, "\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"")
-    n := str_len(content)
-    mut i := 0
-    while i < n {
-        c := str_byte(content, i)
-        if c == 34 { buf_push_str(b, "\\\"") }
-        else if c == 92 { buf_push_str(b, "\\\\") }
-        else if c == 10 { buf_push_str(b, "\\n") }
-        else if c == 13 { buf_push_str(b, "\\r") }
-        else if c == 9 { buf_push_str(b, "\\t") }
-        else if c >= 32 { buf_push(b, c) }
-        i += 1
-    }
+    json_push_escaped(b, content)
     buf_push_str(b, "\"\n      },\n      \"finish_reason\": \"stop\"\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": ")
     buf_append_i64(b, in_tokens)
     buf_push_str(b, ",\n    \"completion_tokens\": ")
@@ -500,13 +511,19 @@ fn ai_server_format_completion(req_id: str, model: str, content: str, in_tokens:
 // If streaming is requested, writes SSE chunks into `sse_out_buf` and returns SSE HTTP response header.
 fn ai_server_dispatch_http(method: str, path: str, body: str, sse_out_buf: ByteBuf) -> str {
     if str_eq(path, "/health") {
-        return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}"
+        if not str_eq(method, "GET") {
+            return "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        }
+        return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}"
     }
 
     if str_eq(path, "/v1/models") or str_eq(path, "/models") {
+        if not str_eq(method, "GET") {
+            return "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        }
         json_models := "{\"object\":\"list\",\"data\":[{\"id\":\"axon-v8-base\",\"object\":\"model\",\"created\":1700000000,\"owned_by\":\"axon\"}]}"
         resp := buf_new(256 + str_len(json_models))
-        buf_push_str(resp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ")
+        buf_push_str(resp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nContent-Length: ")
         buf_append_i64(resp, str_len(json_models))
         buf_push_str(resp, "\r\nConnection: close\r\n\r\n")
         buf_push_str(resp, json_models)
@@ -516,15 +533,11 @@ fn ai_server_dispatch_http(method: str, path: str, body: str, sse_out_buf: ByteB
     }
 
     if str_eq(path, "/v1/chat/completions") or str_eq(path, "/chat/completions") {
-        // Detect if streaming is requested
-        mut is_stream := false
-        st_pos := str_find(body, "\"stream\": true", 0)
-        if st_pos >= 0 {
-            is_stream = true
-        } else {
-            st_pos2 := str_find(body, "\"stream\":true", 0)
-            if st_pos2 >= 0 { is_stream = true }
+        if not str_eq(method, "POST") {
+            return "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         }
+        // Parse `stream` strictly from JSON body
+        is_stream := json_get_bool(body, "stream") or false
 
         req_id := "chatcmpl-axon-v8-001"
         model := "axon-v8-base"
@@ -540,11 +553,11 @@ fn ai_server_dispatch_http(method: str, path: str, body: str, sse_out_buf: ByteB
             buf_push_str(sse_out_buf, c3)
             buf_push_str(sse_out_buf, "data: [DONE]\n\n")
 
-            return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
+            return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
         } else {
             json_body := ai_server_format_completion(req_id, model, answer, 16, 12)
             resp := buf_new(256 + str_len(json_body))
-            buf_push_str(resp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ")
+            buf_push_str(resp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nContent-Length: ")
             buf_append_i64(resp, str_len(json_body))
             buf_push_str(resp, "\r\nConnection: close\r\n\r\n")
             buf_push_str(resp, json_body)
@@ -557,9 +570,25 @@ fn ai_server_dispatch_http(method: str, path: str, body: str, sse_out_buf: ByteB
     return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 }
 
-// Runs native Windows socket listener. If `max_conns <= 0`, verifies setup and returns 0 without blocking.
+fn ai_server_send_all(sock: i64, ptr: i64, total_len: i64) -> bool {
+    if ptr == 0 or total_len <= 0 { return true }
+    mut sent := 0
+    while sent < total_len {
+        n := send(sock, ptr + sent, total_len - sent, 0) as i64
+        if n <= 0 { return false }
+        sent += n
+    }
+    return true
+}
+
+// Runs native Windows socket listener bound to loopback 127.0.0.1 by default.
+// If `max_conns <= 0`, verifies setup and returns 0 without blocking.
 fn ai_server_start(port: i64, max_conns: i64 = 0) -> i64 {
+    if port < 0 or port > 65535 {
+        return -5
+    }
     wsa_data := mem_alloc_aligned(512)
+    if wsa_data == 0 { return -1 }
     rc := WSAStartup(0x0202, wsa_data)
     if rc != 0 {
         mem_free_aligned(wsa_data)
@@ -574,8 +603,14 @@ fn ai_server_start(port: i64, max_conns: i64 = 0) -> i64 {
         return -2
     }
 
-    // sockaddr_in (16 bytes): sin_family (2 bytes), sin_port (2 bytes big-endian), sin_addr (4 bytes), zero (8 bytes)
+    // sockaddr_in (16 bytes): bind to 127.0.0.1 loopback by default (least exposure)
     addr := mem_alloc_aligned(64)
+    if addr == 0 {
+        closesocket(s)
+        WSACleanup()
+        mem_free_aligned(wsa_data)
+        return -3
+    }
     mut i := 0
     while i < 16 { ptr_write_u8(addr, i, 0); i += 1 }
     ptr_write_u8(addr, 0, 2) // AF_INET
@@ -583,6 +618,11 @@ fn ai_server_start(port: i64, max_conns: i64 = 0) -> i64 {
     // port big-endian
     ptr_write_u8(addr, 2, (port >> 8) & 0xFF)
     ptr_write_u8(addr, 3, port & 0xFF)
+    // 127.0.0.1 (loopback)
+    ptr_write_u8(addr, 4, 127)
+    ptr_write_u8(addr, 5, 0)
+    ptr_write_u8(addr, 6, 0)
+    ptr_write_u8(addr, 7, 1)
 
     brc := bind(s, addr, 16)
     if brc != 0 {
@@ -615,15 +655,24 @@ fn ai_server_start(port: i64, max_conns: i64 = 0) -> i64 {
     mut c := 0
     client_addr := mem_alloc_aligned(64)
     addr_len_ptr := mem_alloc_aligned(16)
-    ptr_write_i64(addr_len_ptr, 0, 16)
-    recv_buf := mem_alloc_aligned(4096)
+    recv_buf := mem_alloc_aligned(32768)
+    if client_addr == 0 or addr_len_ptr == 0 or recv_buf == 0 {
+        if client_addr != 0 { mem_free_aligned(client_addr) }
+        if addr_len_ptr != 0 { mem_free_aligned(addr_len_ptr) }
+        if recv_buf != 0 { mem_free_aligned(recv_buf) }
+        closesocket(s)
+        WSACleanup()
+        mem_free_aligned(addr)
+        mem_free_aligned(wsa_data)
+        return -6
+    }
 
     while c < max_conns {
+        ptr_write_i64(addr_len_ptr, 0, 16)
         client_sock := accept(s, client_addr, addr_len_ptr)
         if client_sock >= 0 {
-            n_bytes := recv(client_sock, recv_buf, 4096, 0)
-            if n_bytes > 0 {
-                // Parse request path and method
+            n_bytes := recv(client_sock, recv_buf, 32768, 0) as i64
+            if n_bytes > 0 and n_bytes <= 32768 {
                 raw_req := buf_new(n_bytes + 8)
                 mut bi := 0
                 while bi < n_bytes {
@@ -631,50 +680,63 @@ fn ai_server_start(port: i64, max_conns: i64 = 0) -> i64 {
                     bi += 1
                 }
                 req_str := buf_to_owned_str(move raw_req)
-                mut meth := "GET"
-                mut req_path := "/"
-                sp1 := str_find(req_str, " ", 0)
+                // Restrict request-line parsing strictly to the first CRLF line
+                line_end := str_find(req_str, "\r\n", 0)
+                req_line := if line_end > 0 { str_slice(req_str, 0, line_end) } else { "" }
+                mut meth := ""
+                mut req_path := ""
+                sp1 := str_find(req_line, " ", 0)
                 if sp1 > 0 {
-                    meth = str_slice(req_str, 0, sp1)
-                    sp2 := str_find(req_str, " ", sp1 + 1)
-                    if sp2 > sp1 {
-                        req_path = str_slice(req_str, sp1 + 1, sp2)
+                    meth = str_slice(req_line, 0, sp1)
+                    sp2 := str_find(req_line, " ", sp1 + 1)
+                    if sp2 > sp1 + 1 {
+                        req_path = str_slice(req_line, sp1 + 1, sp2)
                     }
                 }
+                // Only extract body after valid header terminator `\r\n\r\n` (never parse headers as body)
                 body_start := str_find(req_str, "\r\n\r\n", 0)
-                mut body_str := req_str
+                mut body_str := ""
                 if body_start >= 0 {
                     body_str = str_slice(req_str, body_start + 4, str_len(req_str))
                 }
-                sse_chunks := buf_new(2048)
-                resp := ai_server_dispatch_http(meth, req_path, body_str, sse_chunks)
-
-                // Send HTTP header response
-                resp_buf := mem_alloc_aligned(str_len(resp) + 16)
-                mut ri := 0
-                while ri < str_len(resp) {
-                    ptr_write_u8(resp_buf, ri, str_byte(resp, ri))
-                    ri += 1
+                sse_chunks := buf_new(8192)
+                mut resp := "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                if str_len(meth) > 0 and str_len(req_path) > 0 and body_start >= 0 {
+                    resp = ai_server_dispatch_http(meth, req_path, body_str, sse_chunks)
                 }
-                send(client_sock, resp_buf, str_len(resp), 0)
-                mem_free_aligned(resp_buf)
 
-                // If SSE chunks were generated, send them
-                if buf_len(sse_chunks) > 0 {
-                    s_buf := mem_alloc_aligned(buf_len(sse_chunks) + 16)
-                    mut si := 0
-                    while si < buf_len(sse_chunks) {
-                        ptr_write_u8(s_buf, si, buf_get(sse_chunks, si))
-                        si += 1
+                // Send HTTP header response completely
+                rlen := str_len(resp)
+                resp_buf := mem_alloc_aligned(rlen + 16)
+                if resp_buf != 0 {
+                    mut ri := 0
+                    while ri < rlen {
+                        ptr_write_u8(resp_buf, ri, str_byte(resp, ri))
+                        ri += 1
                     }
-                    send(client_sock, s_buf, buf_len(sse_chunks), 0)
-                    mem_free_aligned(s_buf)
+                    _ok1 := ai_server_send_all(client_sock, resp_buf, rlen)
+                    mem_free_aligned(resp_buf)
+                }
+
+                // If SSE chunks were generated, send them completely
+                slen := buf_len(sse_chunks)
+                if slen > 0 {
+                    s_buf := mem_alloc_aligned(slen + 16)
+                    if s_buf != 0 {
+                        mut si := 0
+                        while si < slen {
+                            ptr_write_u8(s_buf, si, buf_get(sse_chunks, si))
+                            si += 1
+                        }
+                        _ok2 := ai_server_send_all(client_sock, s_buf, slen)
+                        mem_free_aligned(s_buf)
+                    }
                 }
                 buf_free(move sse_chunks)
             }
             closesocket(client_sock)
+            c += 1
         }
-        c += 1
     }
 
     mem_free_aligned(recv_buf)

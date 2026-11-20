@@ -151,7 +151,7 @@ fn push_use_nodes(mod_queue: IntBuf, extra: IntBuf, u_off: i64, u_cnt: i64) {
 // Loads, tokenizes, parses, resolves multi-segment `use` imports AND `@cImport("header.h")` declarations,
 // and records per-file source buffers in `(files_meta, src_arena)` for `file:line:col` diagnostics!
 // On failure, writes `[err_code, err_span]` into `err_out[0..1]` and returns `false`.
-fn load_and_merge_program_v7(in_path: str, pool: ByteBuf, nodes: IntBuf, extra: IntBuf, files_meta: IntBuf, src_arena: ByteBuf, err_out: IntBuf) -> bool {
+fn load_and_merge_program_v7(in_path: str, pool: ByteBuf, nodes: IntBuf, extra: IntBuf, files_meta: IntBuf, src_arena: ByteBuf, err_out: IntBuf, sandbox_mcp: bool = false) -> bool {
     entry_src := fs_read_file(in_path) or buf_new(0)
     if buf_len(entry_src) == 0 {
         ibuf_set(err_out, 0, 30)
@@ -205,9 +205,11 @@ fn load_and_merge_program_v7(in_path: str, pool: ByteBuf, nodes: IntBuf, extra: 
     entry_dir := get_parent_dir_prefix(path_scratch, in_path)
     install_dir := get_install_root_prefix(path_scratch)
 
+    mut load_ok := true
+
     // 1. Recursively load & parse multi-segment `use` `.ax` modules
     mut qi := 0
-    while qi < ibuf_len(mod_queue) {
+    while load_ok and qi < ibuf_len(mod_queue) {
         un := ibuf_get(mod_queue, qi)
         qi += 1
         seg_off := ast_get(nodes, un, 5)
@@ -237,65 +239,66 @@ fn load_and_merge_program_v7(in_path: str, pool: ByteBuf, nodes: IntBuf, extra: 
                         ibuf_set(err_out, 0, 10)
                         ibuf_set(err_out, 1, ml_sp)
                         buf_free(move mtoks)
-                        return false
-                    }
-                    parser_init(mtoks, nodes, extra)
-                    ibuf_set(nodes, 15, mfid)
-                    mprog := parse_program_into_ast(mtoks, pool, nodes, extra)
-                    mp_errs := ibuf_get(nodes, 2)
-                    mp_sp := ibuf_get(nodes, 3)
-                    buf_free(move mtoks)
-                    if mp_errs > 0 {
-                        ibuf_set(err_out, 0, 20)
-                        ibuf_set(err_out, 1, mp_sp)
-                        return false
-                    }
+                        load_ok = false
+                    } else {
+                        parser_init(mtoks, nodes, extra)
+                        ibuf_set(nodes, 15, mfid)
+                        mprog := parse_program_into_ast(mtoks, pool, nodes, extra)
+                        mp_errs := ibuf_get(nodes, 2)
+                        mp_sp := ibuf_get(nodes, 3)
+                        buf_free(move mtoks)
+                        if mp_errs > 0 {
+                            ibuf_set(err_out, 0, 20)
+                            ibuf_set(err_out, 1, mp_sp)
+                            load_ok = false
+                        } else {
+                            push_use_nodes(mod_queue, extra, ast_get(nodes, mprog, 1), ast_get(nodes, mprog, 2))
+                            push_extra_slice(all_cimports, extra, ibuf_get(nodes, 10), ibuf_get(nodes, 11))
+                            push_extra_slice(all_comptimes, extra, ibuf_get(nodes, 12), ibuf_get(nodes, 13))
 
-                    push_use_nodes(mod_queue, extra, ast_get(nodes, mprog, 1), ast_get(nodes, mprog, 2))
-                    push_extra_slice(all_cimports, extra, ibuf_get(nodes, 10), ibuf_get(nodes, 11))
-                    push_extra_slice(all_comptimes, extra, ibuf_get(nodes, 12), ibuf_get(nodes, 13))
+                            ms_off := ast_get(nodes, mprog, 3)
+                            ms_cnt := ast_get(nodes, mprog, 4)
+                            mut k := 0
+                            while k < ms_cnt {
+                                sn := ibuf_get(extra, ms_off + k)
+                                if not has_decl_named(pool, nodes, all_structs, ast_get(nodes, sn, 1), ast_get(nodes, sn, 2)) {
+                                    ibuf_push(all_structs, sn)
+                                }
+                                k += 1
+                            }
 
-                    ms_off := ast_get(nodes, mprog, 3)
-                    ms_cnt := ast_get(nodes, mprog, 4)
-                    mut k := 0
-                    while k < ms_cnt {
-                        sn := ibuf_get(extra, ms_off + k)
-                        if not has_decl_named(pool, nodes, all_structs, ast_get(nodes, sn, 1), ast_get(nodes, sn, 2)) {
-                            ibuf_push(all_structs, sn)
-                        }
-                        k += 1
-                    }
+                            mi_off := ast_get(nodes, mprog, 5)
+                            mi_cnt := ast_get(nodes, mprog, 6)
+                            k = 0
+                            while k < mi_cnt {
+                                inid := ibuf_get(extra, mi_off + k)
+                                if not has_decl_named(pool, nodes, all_ifaces, ast_get(nodes, inid, 1), ast_get(nodes, inid, 2)) {
+                                    ibuf_push(all_ifaces, inid)
+                                }
+                                k += 1
+                            }
 
-                    mi_off := ast_get(nodes, mprog, 5)
-                    mi_cnt := ast_get(nodes, mprog, 6)
-                    k = 0
-                    while k < mi_cnt {
-                        inid := ibuf_get(extra, mi_off + k)
-                        if not has_decl_named(pool, nodes, all_ifaces, ast_get(nodes, inid, 1), ast_get(nodes, inid, 2)) {
-                            ibuf_push(all_ifaces, inid)
-                        }
-                        k += 1
-                    }
-
-                    mf_off := ibuf_get(nodes, 8)
-                    mf_cnt := ibuf_get(nodes, 9)
-                    k = 0
-                    while k < mf_cnt {
-                        fnid := ibuf_get(extra, mf_off + k)
-                        fn_soff := ast_get(nodes, fnid, 1)
-                        fn_slen := ast_get(nodes, fnid, 2)
-                        if not pool_str_eq_lit(pool, fn_soff, fn_slen, "main") {
-                            if not has_decl_named(pool, nodes, all_funcs, fn_soff, fn_slen) {
-                                ibuf_push(all_funcs, fnid)
+                            mf_off := ibuf_get(nodes, 8)
+                            mf_cnt := ibuf_get(nodes, 9)
+                            k = 0
+                            while k < mf_cnt {
+                                fnid := ibuf_get(extra, mf_off + k)
+                                fn_soff := ast_get(nodes, fnid, 1)
+                                fn_slen := ast_get(nodes, fnid, 2)
+                                if not pool_str_eq_lit(pool, fn_soff, fn_slen, "main") {
+                                    if not has_decl_named(pool, nodes, all_funcs, fn_soff, fn_slen) {
+                                        ibuf_push(all_funcs, fnid)
+                                    }
+                                }
+                                k += 1
                             }
                         }
-                        k += 1
                     }
                 } else {
                     buf_free(move msrc)
                     ibuf_set(err_out, 0, 30)
                     ibuf_set(err_out, 1, ast_span(nodes, un))
-                    return false
+                    load_ok = false
                 }
             }
         }
@@ -303,7 +306,7 @@ fn load_and_merge_program_v7(in_path: str, pool: ByteBuf, nodes: IntBuf, extra: 
 
     // 2. Process all `@cImport("header.h", link = "...")` declarations directly into Axon AST!
     mut ci := 0
-    while ci < ibuf_len(all_cimports) {
+    while load_ok and ci < ibuf_len(all_cimports) {
         cin := ibuf_get(all_cimports, ci)
         ci += 1
         h_soff := ast_get(nodes, cin, 1)
@@ -312,51 +315,71 @@ fn load_and_merge_program_v7(in_path: str, pool: ByteBuf, nodes: IntBuf, extra: 
         l_slen := ast_get(nodes, cin, 4)
         hp1 := buf_slice_str(pool, h_soff, h_soff + h_slen)
 
-        hs0 := buf_len(path_scratch)
-        buf_push_str(path_scratch, entry_dir)
-        buf_push_str(path_scratch, hp1)
-        hs1 := buf_len(path_scratch)
-        buf_push(path_scratch, 0)
-        hp2 := buf_slice_str(path_scratch, hs0, hs1)
-
-        hsrc := fs_read_file(hp1) or (fs_read_file(hp2) or buf_new(64))
-        if buf_len(hsrc) == 0 {
-            buf_free(move hsrc)
+        // When invoked from MCP sandbox, block path traversal / UNC / arbitrary host reads in @cImport!
+        if sandbox_mcp and not mcp_is_safe_path(hp1) {
             ibuf_set(err_out, 0, 30)
             ibuf_set(err_out, 1, ast_span(nodes, cin))
-            return false
-        }
-        hfid := diag_register_file(pool, files_meta, src_arena, hp1, hsrc)
-        c_structs := ibuf_new(64)
-        c_funcs := ibuf_new(128)
-        c_consts := ibuf_new(128)
-        parse_c_header_into_program(hsrc, pool, nodes, extra, l_soff, l_slen, hfid, c_structs, c_funcs, c_consts)
-        buf_free(move hsrc)
+            load_ok = false
+        } else {
+            hs0 := buf_len(path_scratch)
+            buf_push_str(path_scratch, entry_dir)
+            buf_push_str(path_scratch, hp1)
+            hs1 := buf_len(path_scratch)
+            buf_push(path_scratch, 0)
+            hp2 := buf_slice_str(path_scratch, hs0, hs1)
 
-        mut cs := 0
-        while cs < ibuf_len(c_structs) {
-            sn := ibuf_get(c_structs, cs)
-            if not has_decl_named(pool, nodes, all_structs, ast_get(nodes, sn, 1), ast_get(nodes, sn, 2)) {
-                ibuf_push(all_structs, sn)
+            hsrc := fs_read_file(hp1) or (fs_read_file(hp2) or buf_new(64))
+            if buf_len(hsrc) == 0 {
+                buf_free(move hsrc)
+                ibuf_set(err_out, 0, 30)
+                ibuf_set(err_out, 1, ast_span(nodes, cin))
+                load_ok = false
+            } else {
+                hfid := diag_register_file(pool, files_meta, src_arena, hp1, hsrc)
+                c_structs := ibuf_new(2048)
+                c_funcs := ibuf_new(2048)
+                c_consts := ibuf_new(2048)
+                parse_c_header_into_program(hsrc, pool, nodes, extra, l_soff, l_slen, hfid, c_structs, c_funcs, c_consts)
+                buf_free(move hsrc)
+
+                mut cs := 0
+                while cs < ibuf_len(c_structs) {
+                    sn := ibuf_get(c_structs, cs)
+                    if not has_decl_named(pool, nodes, all_structs, ast_get(nodes, sn, 1), ast_get(nodes, sn, 2)) {
+                        ibuf_push(all_structs, sn)
+                    }
+                    cs += 1
+                }
+                mut cf := 0
+                while cf < ibuf_len(c_funcs) {
+                    fnid := ibuf_get(c_funcs, cf)
+                    if not has_decl_named(pool, nodes, all_funcs, ast_get(nodes, fnid, 1), ast_get(nodes, fnid, 2)) {
+                        ibuf_push(all_funcs, fnid)
+                    }
+                    cf += 1
+                }
+                mut cc := 0
+                while cc < ibuf_len(c_consts) {
+                    ibuf_push(all_comptimes, ibuf_get(c_consts, cc))
+                    cc += 1
+                }
+                buf_free(move c_consts)
+                buf_free(move c_funcs)
+                buf_free(move c_structs)
             }
-            cs += 1
         }
-        mut cf := 0
-        while cf < ibuf_len(c_funcs) {
-            fnid := ibuf_get(c_funcs, cf)
-            if not has_decl_named(pool, nodes, all_funcs, ast_get(nodes, fnid, 1), ast_get(nodes, fnid, 2)) {
-                ibuf_push(all_funcs, fnid)
-            }
-            cf += 1
-        }
-        mut cc := 0
-        while cc < ibuf_len(c_consts) {
-            ibuf_push(all_comptimes, ibuf_get(c_consts, cc))
-            cc += 1
-        }
-        buf_free(move c_consts)
-        buf_free(move c_funcs)
-        buf_free(move c_structs)
+    }
+
+    if not load_ok {
+        buf_free(move path_scratch)
+        buf_free(move loaded_mods)
+        buf_free(move mod_queue)
+        buf_free(move all_comptimes)
+        buf_free(move all_cimports)
+        buf_free(move all_funcs)
+        buf_free(move all_ifaces)
+        buf_free(move all_structs)
+        return false
     }
 
     ibuf_set(err_out, 2, entry_hash)
@@ -429,15 +452,48 @@ fn compile_for_target_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBu
     return compile_module_x86_64_v7(pool, nodes, extra, sym, target_id, is_shared, test_mode, force_shield, simd_override, static_libs, out_buf, is_dce)
 }
 
+fn mcp_is_win_reserved_stem(p: str, start: i64, end_pos: i64) -> bool {
+    mut stem_end := start
+    while stem_end < end_pos and str_byte(p, stem_end) != 46 {
+        stem_end += 1
+    }
+    slen := stem_end - start
+    if slen == 3 {
+        c0 := str_byte(p, start)
+        c1 := str_byte(p, start + 1)
+        c2 := str_byte(p, start + 2)
+        u0 := if c0 >= 97 and c0 <= 122 { c0 - 32 } else { c0 }
+        u1 := if c1 >= 97 and c1 <= 122 { c1 - 32 } else { c1 }
+        u2 := if c2 >= 97 and c2 <= 122 { c2 - 32 } else { c2 }
+        if u0 == 67 and u1 == 79 and u2 == 78 { return true } // CON
+        if u0 == 80 and u1 == 82 and u2 == 78 { return true } // PRN
+        if u0 == 65 and u1 == 85 and u2 == 88 { return true } // AUX
+        if u0 == 78 and u1 == 85 and u2 == 76 { return true } // NUL
+    } else if slen == 4 {
+        c0 := str_byte(p, start)
+        c1 := str_byte(p, start + 1)
+        c2 := str_byte(p, start + 2)
+        c3 := str_byte(p, start + 3)
+        u0 := if c0 >= 97 and c0 <= 122 { c0 - 32 } else { c0 }
+        u1 := if c1 >= 97 and c1 <= 122 { c1 - 32 } else { c1 }
+        u2 := if c2 >= 97 and c2 <= 122 { c2 - 32 } else { c2 }
+        if c3 >= 49 and c3 <= 57 {
+            if u0 == 67 and u1 == 79 and u2 == 77 { return true } // COM1..COM9
+            if u0 == 76 and u1 == 80 and u2 == 84 { return true } // LPT1..LPT9
+        }
+    }
+    return false
+}
+
 fn mcp_is_safe_path(p: str) -> bool {
     n := str_len(p)
     if n <= 0 or n >= 260 {
         return false
     }
 
-    // Must not start with `/` or `\`
+    // Must not start with `/`, `\`, or `-` (prevents absolute paths & CLI flag injection)
     b0 := str_byte(p, 0)
-    if b0 == 47 or b0 == 92 {
+    if b0 == 47 or b0 == 92 or b0 == 45 {
         return false
     }
 
@@ -468,33 +524,24 @@ fn mcp_is_safe_path(p: str) -> bool {
         return false
     }
 
-    // Check for Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
-    mut last_sep := -1
+    // Check EVERY path segment for exact Windows reserved device stems (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+    // Allows legitimate files like `std/compress.ax` and `compiler_ax/comptime.ax`!
+    mut seg_s := 0
     mut bi := 0
-    while bi < n {
-        b := str_byte(p, bi)
-        if b == 47 or b == 92 { last_sep = bi }
+    while bi <= n {
+        if bi == n or str_byte(p, bi) == 47 or str_byte(p, bi) == 92 {
+            if bi > seg_s and mcp_is_win_reserved_stem(p, seg_s, bi) {
+                return false
+            }
+            seg_s = bi + 1
+        }
         bi += 1
-    }
-    base_start := last_sep + 1
-    base_len := n - base_start
-    if base_len >= 3 {
-        c0 := str_byte(p, base_start)
-        c1 := str_byte(p, base_start + 1)
-        c2 := str_byte(p, base_start + 2)
-        u0 := if c0 >= 97 and c0 <= 122 { c0 - 32 } else { c0 }
-        u1 := if c1 >= 97 and c1 <= 122 { c1 - 32 } else { c1 }
-        u2 := if c2 >= 97 and c2 <= 122 { c2 - 32 } else { c2 }
-        if u0 == 67 and u1 == 79 and u2 == 78 { return false } // CON
-        if u0 == 80 and u1 == 82 and u2 == 78 { return false } // PRN
-        if u0 == 65 and u1 == 85 and u2 == 88 { return false } // AUX
-        if u0 == 78 and u1 == 85 and u2 == 76 { return false } // NUL
-        if (u0 == 67 and u1 == 79 and u2 == 77) or (u0 == 76 and u1 == 80 and u2 == 84) { return false } // COM / LPT
     }
 
     return true
 }
 
+// Strict whitelist for MCP `args` (prevents shell injection AND compiler flag injection like `-o` / `--link-lib`)
 fn mcp_is_safe_args(a: str) -> bool {
     n := str_len(a)
     if n > 256 {
@@ -502,31 +549,55 @@ fn mcp_is_safe_args(a: str) -> bool {
     }
     mut i := 0
     while i < n {
-        b := str_byte(a, i)
-        is_alnum := (b >= 97 and b <= 122) or (b >= 65 and b <= 90) or (b >= 48 and b <= 57)
-        is_safe_punct := (b == 32 or b == 45 or b == 95 or b == 61 or b == 46 or b == 47 or b == 92)
-        if not is_alnum and not is_safe_punct {
-            return false
+        while i < n and str_byte(a, i) == 32 { i += 1 }
+        if i >= n { break }
+        tok_s := i
+        while i < n and str_byte(a, i) != 32 {
+            b := str_byte(a, i)
+            is_alnum := (b >= 97 and b <= 122) or (b >= 65 and b <= 90) or (b >= 48 and b <= 57)
+            is_safe_ch := (b == 45 or b == 95 or b == 61 or b == 46)
+            if not is_alnum and not is_safe_ch {
+                return false
+            }
+            if b == 46 and i + 1 < n and str_byte(a, i + 1) == 46 {
+                return false
+            }
+            i += 1
         }
-        i += 1
+        tok := str_slice(a, tok_s, i)
+        if str_len(tok) > 0 and str_byte(tok, 0) == 45 {
+            // Only explicitly whitelisted safe compiler runtime flags are allowed
+            is_ok_flag := (tok == "--simd=scalar" or tok == "--simd=sse2" or tok == "--simd=avx2" or tok == "--simd=avx512" or tok == "--shield" or tok == "--dce")
+            if not is_ok_flag {
+                return false
+            }
+        }
     }
     return true
 }
 
+fn mcp_format_ms_rem(out: ByteBuf, el_us: i64) {
+    el_ms := el_us / 1000
+    el_rem := (el_us % 1000) / 10
+    buf_push_str(out, f"{el_ms}.")
+    if el_rem < 10 { buf_push(out, 48) }
+    buf_push_str(out, f"{el_rem}")
+}
+
 // In-memory JSON check helper used by both `axc check --json` and `axc mcp` (`axon_check`)
-fn check_file_to_json_buf(in_path: str, out_json: ByteBuf) -> bool {
+fn check_file_to_json_buf(in_path: str, out_json: ByteBuf, sandbox_mcp: bool = false) -> bool {
     t0 := clock_ns()
     pool := buf_new(4194304)
     nodes := ibuf_new(2097152)
     extra := ibuf_new(2097152)
     sym := ibuf_new(1048576)
-    files_meta := ibuf_new(512)
+    files_meta := ibuf_new(1024)
     src_arena := buf_new(4194304)
     err_out := ibuf_new(8)
     ibuf_push(err_out, 0); ibuf_push(err_out, 0); ibuf_push(err_out, 0)
 
     mut ok_res := true
-    if not load_and_merge_program_v7(in_path, pool, nodes, extra, files_meta, src_arena, err_out) {
+    if not load_and_merge_program_v7(in_path, pool, nodes, extra, files_meta, src_arena, err_out, sandbox_mcp) {
         el_us := (clock_ns() - t0) / 1000
         diag_format_json_report(pool, files_meta, src_arena, in_path, false, ibuf_get(err_out, 0), ibuf_get(err_out, 1), el_us, out_json)
         ok_res = false
@@ -551,13 +622,16 @@ fn check_file_to_json_buf(in_path: str, out_json: ByteBuf) -> bool {
 
 fn run_mcp_server_stdio() -> i32 {
     line_buf := buf_new(65536)
+    self_buf := buf_new(512)
+    self_exe := mcp_self_exe_path(self_buf)
+    install_root := mcp_install_root_dir(self_buf)
     while true {
         nread := ax_stdin_line(line_buf)
         if nread < 0 {
             break
         }
         if nread > 0 {
-            scratch := buf_new(8192)
+            scratch := buf_new(65536)
             line := buf_slice_str(line_buf, 0, nread)
             // Only process JSON object lines (`{...}`); skip LSP `Content-Length:` header lines cleanly
             mut first_ch := 0
@@ -588,7 +662,7 @@ fn run_mcp_server_stdio() -> i32 {
                         code_str := mcp_json_get_str(line, "code", scratch)
                         mut fpath := mcp_json_get_str(line, "path", scratch)
                         if str_len(code_str) > 0 {
-                            cbuf := buf_new(str_len(code_str))
+                            cbuf := buf_new(str_len(code_str) + 8)
                             buf_push_str(cbuf, code_str)
                             _w := fs_write_file(".axon_mcp_tmp.ax", cbuf) or 0
                             buf_free(move cbuf)
@@ -598,7 +672,7 @@ fn run_mcp_server_stdio() -> i32 {
                             mcp_emit_tool_text_resp(raw_id, true, "Invalid or missing `path` / `code`")
                         } else {
                             jrep := buf_new(65536)
-                            ok_c := check_file_to_json_buf(fpath, jrep)
+                            ok_c := check_file_to_json_buf(fpath, jrep, true)
                             mcp_emit_tool_text_resp(raw_id, not ok_c, buf_slice_str(jrep, 0, buf_len(jrep)))
                             buf_free(move jrep)
                         }
@@ -606,7 +680,7 @@ fn run_mcp_server_stdio() -> i32 {
                         code_str := mcp_json_get_str(line, "code", scratch)
                         mut fpath := mcp_json_get_str(line, "path", scratch)
                         if str_len(code_str) > 0 {
-                            cbuf := buf_new(str_len(code_str))
+                            cbuf := buf_new(str_len(code_str) + 8)
                             buf_push_str(cbuf, code_str)
                             _w := fs_write_file(".axon_mcp_test_tmp.ax", cbuf) or 0
                             buf_free(move cbuf)
@@ -618,18 +692,23 @@ fn run_mcp_server_stdio() -> i32 {
                         } else if str_len(args_str) > 0 and not mcp_is_safe_args(args_str) {
                             mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe characters in `args`")
                         } else {
-                            cmd_run := buf_new(str_len(fpath) + 64)
-                            buf_push_str(cmd_run, "bin\\axc.exe test ")
+                            cmd_run := buf_new(str_len(self_exe) + str_len(fpath) + 64)
+                            buf_push_str(cmd_run, "\"")
+                            buf_push_str(cmd_run, self_exe)
+                            buf_push_str(cmd_run, "\" test ")
                             buf_push_str(cmd_run, fpath)
-                            out_text := mcp_exec_capture_file(buf_slice_str(cmd_run, 0, buf_len(cmd_run)), ".axon_mcp_test_out.tmp")
+                            rc_buf := ibuf_new(2); ibuf_push(rc_buf, 0)
+                            out_text := mcp_exec_capture_with_rc(buf_slice_str(cmd_run, 0, buf_len(cmd_run)), ".axon_mcp_test_out.tmp", rc_buf)
+                            rc := ibuf_get(rc_buf, 0)
+                            buf_free(move rc_buf)
                             buf_free(move cmd_run)
-                            mcp_emit_tool_text_resp(raw_id, false, out_text)
+                            mcp_emit_tool_text_resp(raw_id, rc != 0, out_text)
                         }
                     } else if tname == "axon_run" {
                         code_str := mcp_json_get_str(line, "code", scratch)
                         mut fpath := mcp_json_get_str(line, "path", scratch)
                         if str_len(code_str) > 0 {
-                            cbuf := buf_new(str_len(code_str))
+                            cbuf := buf_new(str_len(code_str) + 8)
                             buf_push_str(cbuf, code_str)
                             _w := fs_write_file(".axon_mcp_run_tmp.ax", cbuf) or 0
                             buf_free(move cbuf)
@@ -641,16 +720,21 @@ fn run_mcp_server_stdio() -> i32 {
                         } else if str_len(args_str) > 0 and not mcp_is_safe_args(args_str) {
                             mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe characters in `args`")
                         } else {
-                            cmd_run := buf_new(str_len(fpath) + str_len(args_str) + 64)
-                            buf_push_str(cmd_run, "bin\\axc.exe run ")
+                            cmd_run := buf_new(str_len(self_exe) + str_len(fpath) + str_len(args_str) + 64)
+                            buf_push_str(cmd_run, "\"")
+                            buf_push_str(cmd_run, self_exe)
+                            buf_push_str(cmd_run, "\" run ")
                             buf_push_str(cmd_run, fpath)
                             if str_len(args_str) > 0 {
                                 buf_push_str(cmd_run, " ")
                                 buf_push_str(cmd_run, args_str)
                             }
-                            out_text := mcp_exec_capture_file(buf_slice_str(cmd_run, 0, buf_len(cmd_run)), ".axon_mcp_run_out.tmp")
+                            rc_buf := ibuf_new(2); ibuf_push(rc_buf, 0)
+                            out_text := mcp_exec_capture_with_rc(buf_slice_str(cmd_run, 0, buf_len(cmd_run)), ".axon_mcp_run_out.tmp", rc_buf)
+                            rc := ibuf_get(rc_buf, 0)
+                            buf_free(move rc_buf)
                             buf_free(move cmd_run)
-                            mcp_emit_tool_text_resp(raw_id, false, out_text)
+                            mcp_emit_tool_text_resp(raw_id, rc != 0, out_text)
                         }
                     } else if tname == "axon_eval" {
                         expr_str := mcp_json_get_str(line, "expr", scratch)
@@ -670,14 +754,22 @@ fn run_mcp_server_stdio() -> i32 {
                             }
                             _w := fs_write_file(".axon_mcp_eval_tmp.ax", ebuf) or 0
                             buf_free(move ebuf)
-                            out_text := mcp_exec_capture_file("bin\\axc.exe run .axon_mcp_eval_tmp.ax", ".axon_mcp_eval_out.tmp")
-                            mcp_emit_tool_text_resp(raw_id, false, out_text)
+                            ecmd := buf_new(str_len(self_exe) + 64)
+                            buf_push_str(ecmd, "\"")
+                            buf_push_str(ecmd, self_exe)
+                            buf_push_str(ecmd, "\" run .axon_mcp_eval_tmp.ax")
+                            rc_buf := ibuf_new(2); ibuf_push(rc_buf, 0)
+                            out_text := mcp_exec_capture_with_rc(buf_slice_str(ecmd, 0, buf_len(ecmd)), ".axon_mcp_eval_out.tmp", rc_buf)
+                            rc := ibuf_get(rc_buf, 0)
+                            buf_free(move rc_buf)
+                            buf_free(move ecmd)
+                            mcp_emit_tool_text_resp(raw_id, rc != 0, out_text)
                         }
                     } else if tname == "axon_ast" {
                         code_str := mcp_json_get_str(line, "code", scratch)
                         mut fpath := mcp_json_get_str(line, "path", scratch)
                         if str_len(code_str) > 0 {
-                            cbuf := buf_new(str_len(code_str))
+                            cbuf := buf_new(str_len(code_str) + 8)
                             buf_push_str(cbuf, code_str)
                             _w := fs_write_file(".axon_mcp_ast_tmp.ax", cbuf) or 0
                             buf_free(move cbuf)
@@ -692,17 +784,17 @@ fn run_mcp_server_stdio() -> i32 {
                             pool := buf_new(2097152)
                             nodes := ibuf_new(1048576)
                             extra := ibuf_new(1048576)
-                            fmeta := ibuf_new(256)
+                            fmeta := ibuf_new(1024)
                             sarena := buf_new(2097152)
                             eout := ibuf_new(8)
                             ibuf_push(eout, 0); ibuf_push(eout, 0); ibuf_push(eout, 0)
-                            if not load_and_merge_program_v7(fpath, pool, nodes, extra, fmeta, sarena, eout) {
+                            if not load_and_merge_program_v7(fpath, pool, nodes, extra, fmeta, sarena, eout, true) {
                                 jerr := buf_new(65536)
                                 diag_format_json_report(pool, fmeta, sarena, fpath, false, ibuf_get(eout, 0), ibuf_get(eout, 1), 0, jerr)
                                 mcp_emit_tool_text_resp(raw_id, true, buf_slice_str(jerr, 0, buf_len(jerr)))
                                 buf_free(move jerr)
                             } else {
-                                ast_rep := buf_new(16384)
+                                ast_rep := buf_new(32768)
                                 mcp_dump_ast_tree(pool, nodes, extra, ast_rep)
                                 mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(ast_rep, 0, buf_len(ast_rep)))
                                 buf_free(move ast_rep)
@@ -718,7 +810,7 @@ fn run_mcp_server_stdio() -> i32 {
                         code_str := mcp_json_get_str(line, "code", scratch)
                         mut fpath := mcp_json_get_str(line, "path", scratch)
                         if str_len(code_str) > 0 {
-                            cbuf := buf_new(str_len(code_str))
+                            cbuf := buf_new(str_len(code_str) + 8)
                             buf_push_str(cbuf, code_str)
                             _w := fs_write_file(".axon_mcp_sym_tmp.ax", cbuf) or 0
                             buf_free(move cbuf)
@@ -734,11 +826,11 @@ fn run_mcp_server_stdio() -> i32 {
                             nodes := ibuf_new(1048576)
                             extra := ibuf_new(1048576)
                             sym := ibuf_new(524288)
-                            fmeta := ibuf_new(256)
+                            fmeta := ibuf_new(1024)
                             sarena := buf_new(2097152)
                             eout := ibuf_new(8)
                             ibuf_push(eout, 0); ibuf_push(eout, 0); ibuf_push(eout, 0)
-                            if not load_and_merge_program_v7(fpath, pool, nodes, extra, fmeta, sarena, eout) {
+                            if not load_and_merge_program_v7(fpath, pool, nodes, extra, fmeta, sarena, eout, true) {
                                 jerr := buf_new(65536)
                                 diag_format_json_report(pool, fmeta, sarena, fpath, false, ibuf_get(eout, 0), ibuf_get(eout, 1), 0, jerr)
                                 mcp_emit_tool_text_resp(raw_id, true, buf_slice_str(jerr, 0, buf_len(jerr)))
@@ -749,7 +841,7 @@ fn run_mcp_server_stdio() -> i32 {
                                 mcp_emit_tool_text_resp(raw_id, true, buf_slice_str(jerr, 0, buf_len(jerr)))
                                 buf_free(move jerr)
                             } else {
-                                sym_rep := buf_new(16384)
+                                sym_rep := buf_new(65536)
                                 mcp_dump_symbols(pool, sym, sym_rep)
                                 mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(sym_rep, 0, buf_len(sym_rep)))
                                 buf_free(move sym_rep)
@@ -764,24 +856,27 @@ fn run_mcp_server_stdio() -> i32 {
                         }
                     } else if tname == "axon_asm" {
                         fpath := mcp_json_get_str(line, "path", scratch)
+                        tstr := mcp_json_get_str(line, "target", scratch)
+                        mut tid := tgt_win_x64()
+                        mut target_valid := true
+                        if str_len(tstr) > 0 {
+                            pt := parse_target_flag(tstr)
+                            if pt >= 0 { tid = pt } else { target_valid = false }
+                        }
                         if not mcp_is_safe_path(fpath) {
                             mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe path")
+                        } else if not target_valid {
+                            mcp_emit_tool_text_resp(raw_id, true, f"Invalid or unknown target `{tstr}`")
                         } else {
-                            tstr := mcp_json_get_str(line, "target", scratch)
-                            mut tid := tgt_win_x64()
-                            if str_len(tstr) > 0 {
-                                pt := parse_target_flag(tstr)
-                                if pt >= 0 { tid = pt }
-                            }
                             pool := buf_new(2097152)
                             nodes := ibuf_new(1048576)
                             extra := ibuf_new(1048576)
                             sym := ibuf_new(524288)
-                            fmeta := ibuf_new(256)
+                            fmeta := ibuf_new(1024)
                             sarena := buf_new(2097152)
                             eout := ibuf_new(8)
                             ibuf_push(eout, 0); ibuf_push(eout, 0); ibuf_push(eout, 0)
-                            if not load_and_merge_program_v7(fpath, pool, nodes, extra, fmeta, sarena, eout) {
+                            if not load_and_merge_program_v7(fpath, pool, nodes, extra, fmeta, sarena, eout, true) {
                                 mcp_emit_tool_text_resp(raw_id, true, "Failed to load/parse Axon source file")
                             } else if not analyze_semantics_and_perceus(pool, nodes, extra, sym) {
                                 jerr := buf_new(65536)
@@ -845,7 +940,7 @@ fn run_mcp_server_stdio() -> i32 {
                         code_str := mcp_json_get_str(line, "code", scratch)
                         mut fpath := mcp_json_get_str(line, "path", scratch)
                         if str_len(code_str) > 0 {
-                            cbuf := buf_new(str_len(code_str))
+                            cbuf := buf_new(str_len(code_str) + 8)
                             buf_push_str(cbuf, code_str)
                             _w := fs_write_file(".axon_mcp_bench_tmp.ax", cbuf) or 0
                             buf_free(move cbuf)
@@ -857,26 +952,31 @@ fn run_mcp_server_stdio() -> i32 {
                         } else if str_len(args_str) > 0 and not mcp_is_safe_args(args_str) {
                             mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe characters in `args`")
                         } else {
-                            cmd_run := buf_new(str_len(fpath) + 64)
-                            buf_push_str(cmd_run, "bin\\axc.exe run ")
+                            cmd_run := buf_new(str_len(self_exe) + str_len(fpath) + 64)
+                            buf_push_str(cmd_run, "\"")
+                            buf_push_str(cmd_run, self_exe)
+                            buf_push_str(cmd_run, "\" run ")
                             buf_push_str(cmd_run, fpath)
+                            rc_buf := ibuf_new(2); ibuf_push(rc_buf, 0)
                             t_b0 := clock_ns()
-                            out_text := mcp_exec_capture_file(buf_slice_str(cmd_run, 0, buf_len(cmd_run)), ".axon_mcp_bench_out.tmp")
+                            out_text := mcp_exec_capture_with_rc(buf_slice_str(cmd_run, 0, buf_len(cmd_run)), ".axon_mcp_bench_out.tmp", rc_buf)
                             t_b1 := clock_ns()
+                            rc := ibuf_get(rc_buf, 0)
+                            buf_free(move rc_buf)
                             buf_free(move cmd_run)
                             el_us := (t_b1 - t_b0) / 1000
-                            el_ms := el_us / 1000
-                            el_rem := (el_us % 1000) / 10
-                            rep_bench := buf_new(str_len(out_text) + 256)
-                            buf_push_str(rep_bench, f"=== Axon Benchmark Result ===\nTarget: {fpath}\nElapsed wall-clock: {el_ms}.{el_rem} ms ({el_us} us)\n\nProgram Output:\n")
+                            rep_bench := buf_new(str_len(out_text) + str_len(fpath) + 512)
+                            buf_push_str(rep_bench, f"=== Axon Benchmark Result ===\nTarget: {fpath}\nElapsed wall-clock: ")
+                            mcp_format_ms_rem(rep_bench, el_us)
+                            buf_push_str(rep_bench, f" ms ({el_us} us)\n\nProgram Output:\n")
                             buf_push_str(rep_bench, out_text)
-                            mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(rep_bench, 0, buf_len(rep_bench)))
+                            mcp_emit_tool_text_resp(raw_id, rc != 0, buf_slice_str(rep_bench, 0, buf_len(rep_bench)))
                             buf_free(move rep_bench)
                         }
                     } else if tname == "axon_docs" {
                         query := mcp_json_get_str(line, "query", scratch)
                         mod_name := mcp_json_get_str(line, "module", scratch)
-                        rep := buf_new(16384)
+                        rep := buf_new(65536)
                         mcp_search_stdlib(query, mod_name, rep)
                         mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(rep, 0, buf_len(rep)))
                         buf_free(move rep)
@@ -884,7 +984,7 @@ fn run_mcp_server_stdio() -> i32 {
                         code_str := mcp_json_get_str(line, "code", scratch)
                         mut fpath := mcp_json_get_str(line, "path", scratch)
                         if str_len(code_str) > 0 {
-                            cbuf := buf_new(str_len(code_str))
+                            cbuf := buf_new(str_len(code_str) + 8)
                             buf_push_str(cbuf, code_str)
                             _w := fs_write_file(".axon_mcp_leak_tmp.ax", cbuf) or 0
                             buf_free(move cbuf)
@@ -900,11 +1000,11 @@ fn run_mcp_server_stdio() -> i32 {
                             nodes := ibuf_new(1048576)
                             extra := ibuf_new(1048576)
                             sym := ibuf_new(524288)
-                            fmeta := ibuf_new(256)
+                            fmeta := ibuf_new(1024)
                             sarena := buf_new(2097152)
                             eout := ibuf_new(8)
                             ibuf_push(eout, 0); ibuf_push(eout, 0); ibuf_push(eout, 0)
-                            if not load_and_merge_program_v7(fpath, pool, nodes, extra, fmeta, sarena, eout) {
+                            if not load_and_merge_program_v7(fpath, pool, nodes, extra, fmeta, sarena, eout, true) {
                                 jerr := buf_new(65536)
                                 diag_format_json_report(pool, fmeta, sarena, fpath, false, ibuf_get(eout, 0), ibuf_get(eout, 1), 0, jerr)
                                 mcp_emit_tool_text_resp(raw_id, true, buf_slice_str(jerr, 0, buf_len(jerr)))
@@ -933,18 +1033,18 @@ fn run_mcp_server_stdio() -> i32 {
                                     ni += 1
                                 }
 
-                                cmd_run := buf_new(str_len(fpath) + 64)
-                                buf_push_str(cmd_run, "bin\\axc.exe run ")
+                                cmd_run := buf_new(str_len(self_exe) + str_len(fpath) + 64)
+                                buf_push_str(cmd_run, "\"")
+                                buf_push_str(cmd_run, self_exe)
+                                buf_push_str(cmd_run, "\" run ")
                                 buf_push_str(cmd_run, fpath)
                                 t_b0 := clock_ns()
                                 out_text := mcp_exec_capture_file(buf_slice_str(cmd_run, 0, buf_len(cmd_run)), ".axon_mcp_leak_out.tmp")
                                 t_b1 := clock_ns()
                                 buf_free(move cmd_run)
                                 el_us := (t_b1 - t_b0) / 1000
-                                el_ms := el_us / 1000
-                                el_rem := (el_us % 1000) / 10
 
-                                rep := buf_new(str_len(out_text) + 512)
+                                rep := buf_new(str_len(out_text) + str_len(fpath) + 1024)
                                 buf_push_str(rep, "=== Axon Perceus 0-GC Leak & Memory Verification ===\n")
                                 buf_push_str(rep, f"Target: {fpath}\n")
                                 buf_push_str(rep, "Status: CLEAN (Zero Leaks Verified)\n\n")
@@ -953,7 +1053,9 @@ fn run_mcp_server_stdio() -> i32 {
                                 buf_push_str(rep, f"  - @no_alloc Invariants: {no_alloc_cnt} verified (0 heap allocations allowed)\n")
                                 buf_push_str(rep, f"  - FBIP In-Place Reuses: {move_cnt} destructive moves verified (0 duplicate frees)\n")
                                 buf_push_str(rep, "  - Reference Cycles: IMPOSSIBLE (Perceus DAG ownership guarantees acyclic heap)\n\n")
-                                buf_push_str(rep, f"Execution Run ({el_ms}.{el_rem} ms):\n")
+                                buf_push_str(rep, "Execution Run (")
+                                mcp_format_ms_rem(rep, el_us)
+                                buf_push_str(rep, " ms):\n")
                                 buf_push_str(rep, out_text)
                                 mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(rep, 0, buf_len(rep)))
                                 buf_free(move rep)
@@ -970,7 +1072,7 @@ fn run_mcp_server_stdio() -> i32 {
                         code_str := mcp_json_get_str(line, "code", scratch)
                         mut fpath := mcp_json_get_str(line, "path", scratch)
                         if str_len(code_str) > 0 {
-                            cbuf := buf_new(str_len(code_str))
+                            cbuf := buf_new(str_len(code_str) + 8)
                             buf_push_str(cbuf, code_str)
                             _w := fs_write_file(".axon_mcp_sec_tmp.ax", cbuf) or 0
                             buf_free(move cbuf)
@@ -986,11 +1088,11 @@ fn run_mcp_server_stdio() -> i32 {
                             nodes := ibuf_new(1048576)
                             extra := ibuf_new(1048576)
                             sym := ibuf_new(524288)
-                            fmeta := ibuf_new(256)
+                            fmeta := ibuf_new(1024)
                             sarena := buf_new(2097152)
                             eout := ibuf_new(8)
                             ibuf_push(eout, 0); ibuf_push(eout, 0); ibuf_push(eout, 0)
-                            if not load_and_merge_program_v7(fpath, pool, nodes, extra, fmeta, sarena, eout) {
+                            if not load_and_merge_program_v7(fpath, pool, nodes, extra, fmeta, sarena, eout, true) {
                                 jerr := buf_new(65536)
                                 diag_format_json_report(pool, fmeta, sarena, fpath, false, ibuf_get(eout, 0), ibuf_get(eout, 1), 0, jerr)
                                 mcp_emit_tool_text_resp(raw_id, true, buf_slice_str(jerr, 0, buf_len(jerr)))
@@ -1019,7 +1121,7 @@ fn run_mcp_server_stdio() -> i32 {
                                     ni += 1
                                 }
 
-                                rep := buf_new(1024)
+                                rep := buf_new(str_len(fpath) + 1536)
                                 buf_push_str(rep, "=== Axon Cybersecurity Static Audit Report ===\n")
                                 buf_push_str(rep, f"Target: {fpath}\n")
                                 if shield_cnt > 0 or f_cnt == 1 {
@@ -1052,47 +1154,59 @@ fn run_mcp_server_stdio() -> i32 {
                     } else if tname == "axon_cimport_inspect" {
                         hdr_code := mcp_json_get_str(line, "header_code", scratch)
                         mut fpath := mcp_json_get_str(line, "path", scratch)
-                        mut src := buf_new(0)
                         if str_len(hdr_code) > 0 {
-                            src = buf_new(str_len(hdr_code))
+                            src := buf_new(str_len(hdr_code) + 8)
                             buf_push_str(src, hdr_code)
                             if str_len(fpath) == 0 { fpath = "inline.h" }
+                            rep := buf_new(32768)
+                            mcp_inspect_c_header(src, fpath, rep)
+                            mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(rep, 0, buf_len(rep)))
+                            buf_free(move rep)
+                            buf_free(move src)
                         } else if str_len(fpath) > 0 {
                             if not mcp_is_safe_path(fpath) {
                                 mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe path")
                             } else {
-                                src = fs_read_file(fpath) or buf_new(0)
+                                src := fs_read_file(fpath) or buf_new(0)
+                                if buf_len(src) == 0 {
+                                    mcp_emit_tool_text_resp(raw_id, true, "Missing or unreadable C header file. Provide `path` or `header_code`.")
+                                } else {
+                                    rep := buf_new(32768)
+                                    mcp_inspect_c_header(src, fpath, rep)
+                                    mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(rep, 0, buf_len(rep)))
+                                    buf_free(move rep)
+                                }
+                                buf_free(move src)
                             }
-                        }
-                        if buf_len(src) == 0 {
-                            mcp_emit_tool_text_resp(raw_id, true, "Missing or unreadable C header file/code. Provide `path` or `header_code`.")
                         } else {
-                            rep := buf_new(8192)
-                            mcp_inspect_c_header(src, fpath, rep)
-                            mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(rep, 0, buf_len(rep)))
-                            buf_free(move rep)
+                            mcp_emit_tool_text_resp(raw_id, true, "Missing or unreadable C header file/code. Provide `path` or `header_code`.")
                         }
-                        buf_free(move src)
                     } else if tname == "axon_build" {
                         fpath := mcp_json_get_str(line, "path", scratch)
+                        tstr := mcp_json_get_str(line, "target", scratch)
+                        want_shield := mcp_json_get_bool(line, "shield")
+                        mut tid := tgt_win_x64()
+                        mut target_valid := true
+                        if str_len(tstr) > 0 {
+                            pt := parse_target_flag(tstr)
+                            if pt >= 0 { tid = pt } else { target_valid = false }
+                        }
                         if not mcp_is_safe_path(fpath) {
                             mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe path")
+                        } else if str_len(args_str) > 0 and not mcp_is_safe_args(args_str) {
+                            mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe characters in `args`")
+                        } else if not target_valid {
+                            mcp_emit_tool_text_resp(raw_id, true, f"Invalid or unknown target `{tstr}`")
                         } else {
-                            tstr := mcp_json_get_str(line, "target", scratch)
-                            mut tid := tgt_win_x64()
-                            if str_len(tstr) > 0 {
-                                pt := parse_target_flag(tstr)
-                                if pt >= 0 { tid = pt }
-                            }
                             pool := buf_new(4194304)
                             nodes := ibuf_new(2097152)
                             extra := ibuf_new(2097152)
                             sym := ibuf_new(1048576)
-                            fmeta := ibuf_new(512)
+                            fmeta := ibuf_new(1024)
                             sarena := buf_new(4194304)
                             eout := ibuf_new(8)
                             ibuf_push(eout, 0); ibuf_push(eout, 0); ibuf_push(eout, 0)
-                            if not load_and_merge_program_v7(fpath, pool, nodes, extra, fmeta, sarena, eout) {
+                            if not load_and_merge_program_v7(fpath, pool, nodes, extra, fmeta, sarena, eout, true) {
                                 mcp_emit_tool_text_resp(raw_id, true, "Failed to load/parse Axon source file")
                             } else if not analyze_semantics_and_perceus(pool, nodes, extra, sym) {
                                 jerr := buf_new(65536)
@@ -1104,7 +1218,7 @@ fn run_mcp_server_stdio() -> i32 {
                                 opath := derive_output_path_v7(pbuf, fpath, tid, false)
                                 bout := buf_new(8388608)
                                 elibs := ibuf_new(4)
-                                _fc := compile_for_target_v7(pool, nodes, extra, sym, tid, false, false, false, -1, elibs, bout)
+                                _fc := compile_for_target_v7(pool, nodes, extra, sym, tid, false, false, want_shield, -1, elibs, bout)
                                 wr := fs_write_file(opath, bout) or -1
                                 buf_free(move elibs)
                                 buf_free(move bout)
@@ -1126,7 +1240,15 @@ fn run_mcp_server_stdio() -> i32 {
                     } else if tname == "axon_targets" {
                         mcp_emit_tool_text_resp(raw_id, false, "Targets: win-x64, linux-x64, linux-arm64, macos-arm64, macos-x64, wasm32, unikernel-x64, freestanding-x64, freestanding-riscv64, spirv, ptx")
                     } else if tname == "axon_spec" {
-                        sp_buf := fs_read_file("AXON_LLM_SPEC.md") or buf_new(0)
+                        mut sp_buf := fs_read_file("AXON_LLM_SPEC.md") or buf_new(0)
+                        if buf_len(sp_buf) == 0 and str_len(install_root) > 0 {
+                            buf_free(move sp_buf)
+                            sp_p := buf_new(str_len(install_root) + 32)
+                            buf_push_str(sp_p, install_root)
+                            buf_push_str(sp_p, "AXON_LLM_SPEC.md")
+                            sp_buf = fs_read_file(buf_slice_str(sp_p, 0, buf_len(sp_p))) or buf_new(0)
+                            buf_free(move sp_p)
+                        }
                         if buf_len(sp_buf) > 0 {
                             mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(sp_buf, 0, buf_len(sp_buf)))
                         } else {
@@ -1135,57 +1257,60 @@ fn run_mcp_server_stdio() -> i32 {
                         buf_free(move sp_buf)
                     } else if tname == "axon_fmt" {
                         mut code_str := mcp_json_get_str(line, "code", scratch)
-                        mut fpath := mcp_json_get_str(line, "path", scratch)
+                        fpath := mcp_json_get_str(line, "path", scratch)
                         write_back := mcp_json_get_bool(line, "write")
-                        if str_len(code_str) == 0 and str_len(fpath) > 0 {
-                            if not mcp_is_safe_path(fpath) {
-                                mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe path")
-                            } else {
+                        // ALWAYS validate `fpath` whenever provided (prevents arbitrary write when `code` + `path` + `write:true` are all sent!)
+                        if str_len(fpath) > 0 and not mcp_is_safe_path(fpath) {
+                            mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe path")
+                        } else if write_back and (str_len(fpath) < 4 or str_slice(fpath, str_len(fpath) - 3, str_len(fpath)) != ".ax") {
+                            mcp_emit_tool_text_resp(raw_id, true, "Refusing to write non-`.ax` file in `axon_fmt`")
+                        } else {
+                            if str_len(code_str) == 0 and str_len(fpath) > 0 {
                                 f_buf := fs_read_file(fpath) or buf_new(0)
                                 if buf_len(f_buf) > 0 {
                                     code_str = "" + buf_slice_str(f_buf, 0, buf_len(f_buf))
                                 }
                                 buf_free(move f_buf)
                             }
-                        }
-                        if str_len(code_str) == 0 {
-                            mcp_emit_tool_text_resp(raw_id, true, "Missing `code` or readable `path` to format")
-                        } else {
-                            fmt_out := buf_new(str_len(code_str) + 128)
-                            axon_format_code(code_str, fmt_out)
-                            if write_back and str_len(fpath) > 0 {
-                                _w := fs_write_file(fpath, fmt_out) or -1
-                                if _w >= 0 {
-                                    mcp_emit_tool_text_resp(raw_id, false, f"Successfully formatted and wrote `{fpath}` ({_w} bytes)")
-                                } else {
-                                    mcp_emit_tool_text_resp(raw_id, true, f"Failed to write formatted code to `{fpath}`")
-                                }
+                            if str_len(code_str) == 0 {
+                                mcp_emit_tool_text_resp(raw_id, true, "Missing `code` or readable `path` to format")
                             } else {
-                                mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(fmt_out, 0, buf_len(fmt_out)))
+                                fmt_out := buf_new(str_len(code_str) * 4 + 1024)
+                                axon_format_code(code_str, fmt_out)
+                                if write_back and str_len(fpath) > 0 {
+                                    _w := fs_write_file(fpath, fmt_out) or -1
+                                    if _w >= 0 {
+                                        mcp_emit_tool_text_resp(raw_id, false, f"Successfully formatted and wrote `{fpath}` ({_w} bytes)")
+                                    } else {
+                                        mcp_emit_tool_text_resp(raw_id, true, f"Failed to write formatted code to `{fpath}`")
+                                    }
+                                } else {
+                                    mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(fmt_out, 0, buf_len(fmt_out)))
+                                }
+                                buf_free(move fmt_out)
                             }
-                            buf_free(move fmt_out)
                         }
                     } else if tname == "axon_fix" {
                         mut code_str := mcp_json_get_str(line, "code", scratch)
-                        mut fpath := mcp_json_get_str(line, "path", scratch)
-                        if str_len(code_str) == 0 and str_len(fpath) > 0 {
-                            if not mcp_is_safe_path(fpath) {
-                                mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe path")
-                            } else {
+                        fpath := mcp_json_get_str(line, "path", scratch)
+                        if str_len(fpath) > 0 and not mcp_is_safe_path(fpath) {
+                            mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe path")
+                        } else {
+                            if str_len(code_str) == 0 and str_len(fpath) > 0 {
                                 f_buf := fs_read_file(fpath) or buf_new(0)
                                 if buf_len(f_buf) > 0 {
                                     code_str = "" + buf_slice_str(f_buf, 0, buf_len(f_buf))
                                 }
                                 buf_free(move f_buf)
                             }
-                        }
-                        if str_len(code_str) == 0 {
-                            mcp_emit_tool_text_resp(raw_id, true, "Missing `code` or readable `path` to repair")
-                        } else {
-                            fix_out := buf_new(str_len(code_str) + 1024)
-                            mcp_auto_repair_code(code_str, fpath, fix_out)
-                            mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(fix_out, 0, buf_len(fix_out)))
-                            buf_free(move fix_out)
+                            if str_len(code_str) == 0 {
+                                mcp_emit_tool_text_resp(raw_id, true, "Missing `code` or readable `path` to repair")
+                            } else {
+                                fix_out := buf_new(str_len(code_str) + str_len(fpath) + 4096)
+                                mcp_auto_repair_code(code_str, fpath, fix_out)
+                                mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(fix_out, 0, buf_len(fix_out)))
+                                buf_free(move fix_out)
+                            }
                         }
                     } else {
                         mcp_emit_tool_text_resp(raw_id, true, f"Unknown MCP tool `{tname}`")
@@ -1195,6 +1320,7 @@ fn run_mcp_server_stdio() -> i32 {
             buf_free(move scratch)
         }
     }
+    buf_free(move self_buf)
     buf_free(move line_buf)
     return 0
 }
@@ -1348,7 +1474,7 @@ fn main() -> i32 {
     if str_len(out_path) == 0 {
         if cmd == "run" or cmd == "test" {
             s0 := buf_len(path_buf)
-            buf_push_str(path_buf, ".axon_run_tmp.exe")
+            buf_push_str(path_buf, ".\\.axon_run_tmp.exe")
             s1 := buf_len(path_buf)
             buf_push(path_buf, 0)
             out_path = buf_slice_str(path_buf, s0, s1)
@@ -1360,7 +1486,7 @@ fn main() -> i32 {
     nodes := ibuf_new(2097152)
     extra := ibuf_new(2097152)
     sym := ibuf_new(1048576)
-    files_meta := ibuf_new(512)
+    files_meta := ibuf_new(1024)
     src_arena := buf_new(4194304)
     err_out := ibuf_new(8)
     ibuf_push(err_out, 0); ibuf_push(err_out, 0); ibuf_push(err_out, 0)
@@ -1424,7 +1550,12 @@ fn main() -> i32 {
     }
 
     if cmd == "run" or cmd == "test" {
-        rc := ax_os_exec(out_path)
+        qbuf := buf_new(str_len(out_path) + 8)
+        buf_push_str(qbuf, "\"")
+        buf_push_str(qbuf, out_path)
+        buf_push_str(qbuf, "\"")
+        rc := ax_os_exec(buf_slice_str(qbuf, 0, buf_len(qbuf)))
+        buf_free(move qbuf)
         if rc != 0 {
             return 1
         }

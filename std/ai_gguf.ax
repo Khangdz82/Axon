@@ -105,6 +105,10 @@ fn gguf_open(path: str) -> GgufFile ! i64 {
 
     tc := gguf_read_u64(raw, 8)
     kvc := gguf_read_u64(raw, 16)
+    if tc < 0 or kvc < 0 or kvc > 1000000 or kvc > (blen - 24) / 12 {
+        buf_free(move raw)
+        return err(422)
+    }
 
     mut off := 24
 
@@ -120,12 +124,16 @@ fn gguf_open(path: str) -> GgufFile ! i64 {
         off += 4
 
         if v_type == gguf_val_u8() or v_type == gguf_val_i8() or v_type == gguf_val_bool() {
+            if off + 1 > blen { buf_free(move raw); return err(422) }
             off += 1
         } else if v_type == gguf_val_u16() or v_type == gguf_val_i16() {
+            if off + 2 > blen { buf_free(move raw); return err(422) }
             off += 2
         } else if v_type == gguf_val_u32() or v_type == gguf_val_i32() or v_type == gguf_val_f32() {
+            if off + 4 > blen { buf_free(move raw); return err(422) }
             off += 4
         } else if v_type == gguf_val_u64() or v_type == gguf_val_i64() or v_type == gguf_val_f64() {
+            if off + 8 > blen { buf_free(move raw); return err(422) }
             off += 8
         } else if v_type == gguf_val_string() {
             if off + 8 > blen { buf_free(move raw); return err(422) }
@@ -159,12 +167,22 @@ fn gguf_open(path: str) -> GgufFile ! i64 {
                     ai += 1
                 }
                 if ai < arr_len { buf_free(move raw); return err(422) }
+            } else {
+                buf_free(move raw)
+                return err(422)
             }
+        } else {
+            buf_free(move raw)
+            return err(422)
         }
         ki += 1
     }
     if ki < kvc { buf_free(move raw); return err(422) }
 
+    if tc > 1000000 or off > blen or tc > (blen - off) / 32 {
+        buf_free(move raw)
+        return err(422)
+    }
     t_meta := ibuf_new(tc * 8 + 16)
 
     // Parse Tensor Info Table
@@ -192,7 +210,7 @@ fn gguf_open(path: str) -> GgufFile ! i64 {
         while di < n_dims and off + 8 <= blen {
             dim := gguf_read_u64(raw, off)
             off += 8
-            if dim <= 0 or dim > 10000000000 {
+            if dim <= 0 or dim > 1073741824 or dim > (1073741824 / total_elements) {
                 buf_free(move raw)
                 buf_free(move t_meta)
                 return err(422)
@@ -212,6 +230,11 @@ fn gguf_open(path: str) -> GgufFile ! i64 {
         t_type := gguf_read_u32(raw, off)
         t_offset := gguf_read_u64(raw, off + 4)
         off += 12
+        if t_offset < 0 or t_offset > blen {
+            buf_free(move raw)
+            buf_free(move t_meta)
+            return err(422)
+        }
 
         ibuf_push(t_meta, name_start)
         ibuf_push(t_meta, name_len)
@@ -274,19 +297,22 @@ fn gguf_find_tensor(gf: GgufFile, name: str) -> i64 {
 }
 
 fn gguf_tensor_type(gf: GgufFile, tensor_idx: i64) -> i64 {
+    if tensor_idx < 0 or tensor_idx >= gf.tensor_count { return -1 }
     return ibuf_get(gf.tensor_meta, tensor_idx * 8 + 5)
 }
 
 fn gguf_tensor_elements(gf: GgufFile, tensor_idx: i64) -> i64 {
+    if tensor_idx < 0 or tensor_idx >= gf.tensor_count { return 0 }
     return ibuf_get(gf.tensor_meta, tensor_idx * 8 + 7)
 }
 
 // --- Dequantization Kernels ---
 
 // 1. F16 -> F32 Dequantization Kernel
-@no_alloc
 fn gguf_dequant_f16(raw_buf: ByteBuf, in_offset: i64, num_elements: i64, out_f32_ptr: i64) {
+    if out_f32_ptr == 0 or num_elements <= 0 or in_offset < 0 { return }
     scratch := mem_alloc_aligned(16)
+    if scratch == 0 { return }
     mut i := 0
     while i < num_elements {
         off := in_offset + i * 2
@@ -302,9 +328,10 @@ fn gguf_dequant_f16(raw_buf: ByteBuf, in_offset: i64, num_elements: i64, out_f32
 // Block layout:
 //   [0..2]  d: fp16 scale
 //   [2..34] 32 signed int8 quants
-@no_alloc
 fn gguf_dequant_q8_0(raw_buf: ByteBuf, in_offset: i64, num_elements: i64, out_f32_ptr: i64) {
+    if out_f32_ptr == 0 or num_elements <= 0 or in_offset < 0 { return }
     scratch := mem_alloc_aligned(16)
+    if scratch == 0 { return }
     num_blocks := num_elements / 32
     mut b := 0
     while b < num_blocks {
@@ -330,10 +357,11 @@ fn gguf_dequant_q8_0(raw_buf: ByteBuf, in_offset: i64, num_elements: i64, out_f3
 //   d: fp16 (2 bytes)
 //   dmin: fp16 (2 bytes)
 //   scales: 12 bytes (6-bit packed scales and mins for 8 sub-blocks of 32 weights)
-//   qs: 128 bytes (256 4-bit nibbles)
-@no_alloc
+//   qs: 128 bytes (256 4-bit nibbles, 4 chunks of 64: 32 low nibbles + 32 high nibbles)
 fn gguf_dequant_q4_k(raw_buf: ByteBuf, in_offset: i64, num_elements: i64, out_f32_ptr: i64) {
+    if out_f32_ptr == 0 or num_elements <= 0 or in_offset < 0 { return }
     scratch := mem_alloc_aligned(16)
+    if scratch == 0 { return }
     num_superblocks := num_elements / 256
     mut sb := 0
     while sb < num_superblocks {
@@ -343,31 +371,53 @@ fn gguf_dequant_q4_k(raw_buf: ByteBuf, in_offset: i64, num_elements: i64, out_f3
         d := fp16_to_f32(scratch, d_u16)
         dmin := fp16_to_f32(scratch, dmin_u16)
 
-        qs_off := b_off + 16 // nibbles start at offset 16
+        sc_off := b_off + 4
+        qs_off := b_off + 16
         out_sb := sb * 256
 
-        // Dequantize 8 sub-blocks of 32 elements each
-        mut sub := 0
-        while sub < 8 {
-            // Simplified sub-block scale unpacked from scales array
-            sc_idx := b_off + 4 + (sub / 2) * 3
-            mut sc := (buf_get(raw_buf, sc_idx) >> ((sub % 2) * 4)) & 0x0F
-            if sc == 0 { sc = 1 }
-            scale_val := d * (sc as f64)
-            min_val := dmin
+        // Standard GGML Q4_K unpacking: 4 chunks of 64 weights (2 sub-blocks of 32 each)
+        mut chunk := 0
+        while chunk < 4 {
+            sub0 := chunk * 2
+            sub1 := sub0 + 1
 
-            sub_out := out_sb + sub * 32
-            sub_qs := qs_off + sub * 16 // 16 bytes = 32 nibbles
+            mut sc0 := 0
+            mut m0 := 0
+            if sub0 < 4 {
+                sc0 = buf_get(raw_buf, sc_off + sub0) & 63
+                m0 = buf_get(raw_buf, sc_off + sub0 + 4) & 63
+            } else {
+                sc0 = (buf_get(raw_buf, sc_off + sub0 + 4) & 0x0F) | ((buf_get(raw_buf, sc_off + sub0 - 4) >> 6) << 4)
+                m0 = (buf_get(raw_buf, sc_off + sub0 + 4) >> 4) | ((buf_get(raw_buf, sc_off + sub0) >> 6) << 4)
+            }
+
+            mut sc1 := 0
+            mut m1 := 0
+            if sub1 < 4 {
+                sc1 = buf_get(raw_buf, sc_off + sub1) & 63
+                m1 = buf_get(raw_buf, sc_off + sub1 + 4) & 63
+            } else {
+                sc1 = (buf_get(raw_buf, sc_off + sub1 + 4) & 0x0F) | ((buf_get(raw_buf, sc_off + sub1 - 4) >> 6) << 4)
+                m1 = (buf_get(raw_buf, sc_off + sub1 + 4) >> 4) | ((buf_get(raw_buf, sc_off + sub1) >> 6) << 4)
+            }
+
+            d0 := d * (sc0 as f64)
+            min0 := dmin * (m0 as f64)
+            d1 := d * (sc1 as f64)
+            min1 := dmin * (m1 as f64)
+
+            c_qs := qs_off + chunk * 32
+            c_out := out_sb + chunk * 64
             mut j := 0
-            while j < 16 {
-                byte_val := buf_get(raw_buf, sub_qs + j)
-                q0 := byte_val & 0x0F
-                q1 := (byte_val >> 4) & 0x0F
-                ptr_write_f32(out_f32_ptr, sub_out + j * 2,     (q0 as f64) * scale_val - min_val)
-                ptr_write_f32(out_f32_ptr, sub_out + j * 2 + 1, (q1 as f64) * scale_val - min_val)
+            while j < 32 {
+                byte_val := buf_get(raw_buf, c_qs + j)
+                q_lo := byte_val & 0x0F
+                q_hi := (byte_val >> 4) & 0x0F
+                ptr_write_f32(out_f32_ptr, c_out + j,      (q_lo as f64) * d0 - min0)
+                ptr_write_f32(out_f32_ptr, c_out + 32 + j, (q_hi as f64) * d1 - min1)
                 j += 1
             }
-            sub += 1
+            chunk += 1
         }
         sb += 1
     }
@@ -376,14 +426,19 @@ fn gguf_dequant_q4_k(raw_buf: ByteBuf, in_offset: i64, num_elements: i64, out_f3
 
 // Universal tensor dequantization dispatcher:
 // Reads tensor from GGUF file buffer and converts to float32 array at `out_f32_ptr`.
-@no_alloc
-fn gguf_dequant_tensor(gf: GgufFile, tensor_idx: i64, out_f32_ptr: i64) -> bool {
-    if tensor_idx < 0 or tensor_idx >= gf.tensor_count { return false }
+fn gguf_dequant_tensor(gf: GgufFile, tensor_idx: i64, out_f32_ptr: i64, out_cap_floats: i64 = -1) -> bool {
+    if out_f32_ptr == 0 or tensor_idx < 0 or tensor_idx >= gf.tensor_count { return false }
     base := tensor_idx * 8
     dtype := ibuf_get(gf.tensor_meta, base + 5)
     rel_off := ibuf_get(gf.tensor_meta, base + 6)
     numel := ibuf_get(gf.tensor_meta, base + 7)
+    if numel <= 0 or numel > 1073741824 { return false }
+    if out_cap_floats >= 0 and numel > out_cap_floats { return false }
 
+    raw_len := buf_len(gf.raw)
+    if gf.data_start < 0 or gf.data_start > raw_len or rel_off < 0 or rel_off > raw_len - gf.data_start {
+        return false
+    }
     abs_off := gf.data_start + rel_off
 
     mut req_bytes := 0
@@ -392,20 +447,22 @@ fn gguf_dequant_tensor(gf: GgufFile, tensor_idx: i64, out_f32_ptr: i64) -> bool 
     } else if dtype == ggml_type_f16() {
         req_bytes = numel * 2
     } else if dtype == ggml_type_q8_0() {
+        if (numel % 32) != 0 { return false }
         req_bytes = (numel / 32) * 34
     } else if dtype == ggml_type_q4_k() {
+        if (numel % 256) != 0 { return false }
         req_bytes = (numel / 256) * 144
     } else {
         return false
     }
 
-    raw_len := buf_len(gf.raw)
-    if abs_off < 0 or req_bytes < 0 or abs_off + req_bytes > raw_len {
+    if req_bytes < 0 or req_bytes > raw_len - abs_off {
         return false
     }
 
     if dtype == ggml_type_f32() {
         scratch := mem_alloc_aligned(16)
+        if scratch == 0 { return false }
         mut i := 0
         while i < numel {
             off := abs_off + i * 4
@@ -433,7 +490,12 @@ fn gguf_dequant_tensor(gf: GgufFile, tensor_idx: i64, out_f32_ptr: i64) -> bool 
 // --- Mock GGUF File Generator for Testing ---
 // Creates a valid GGUF v3 file containing metadata, tensor descriptors, and real quantized payload.
 fn gguf_create_mock_file(path: str, tensor_name: str, tensor_type: i64, num_elements: i64) -> i64 ! i64 {
-    out := buf_new(4096)
+    if num_elements <= 0 or num_elements > 67108864 { return err(400) }
+    mut payload_cap := num_elements * 4
+    if tensor_type == ggml_type_f16() { payload_cap = num_elements * 2 }
+    else if tensor_type == ggml_type_q8_0() { payload_cap = (num_elements / 32 + 1) * 34 }
+    else if tensor_type == ggml_type_q4_k() { payload_cap = (num_elements / 256 + 1) * 144 }
+    out := buf_new(256 + str_len(tensor_name) + payload_cap)
 
     // 1. Header
     buf_push_u32(out, gguf_magic()) // magic "GGUF"
@@ -453,9 +515,14 @@ fn gguf_create_mock_file(path: str, tensor_name: str, tensor_type: i64, num_elem
     // 3. Tensor Descriptor Table
     buf_push_u64(out, str_len(tensor_name))
     buf_push_str(out, tensor_name)
-    buf_push_u32(out, 2)            // n_dimensions = 2
-    buf_push_u64(out, 32)           // dim 0 = 32
-    buf_push_u64(out, num_elements / 32) // dim 1
+    if num_elements >= 32 and (num_elements % 32) == 0 {
+        buf_push_u32(out, 2)            // n_dimensions = 2
+        buf_push_u64(out, 32)           // dim 0 = 32
+        buf_push_u64(out, num_elements / 32) // dim 1
+    } else {
+        buf_push_u32(out, 1)            // n_dimensions = 1
+        buf_push_u64(out, num_elements)
+    }
     buf_push_u32(out, tensor_type)  // dtype
     buf_push_u64(out, 0)            // offset = 0
 
@@ -509,5 +576,8 @@ fn gguf_create_mock_file(path: str, tensor_name: str, tensor_type: i64, num_elem
         }
     }
 
-    return fs_write_file(path, out)
+    wr := fs_write_file(path, out) or -1
+    buf_free(move out)
+    if wr < 0 { return err(500) }
+    return ok(wr)
 }

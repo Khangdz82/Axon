@@ -38,7 +38,8 @@ fn llama_read_u64_le(raw: ByteBuf, off: i64) -> i64 {
 }
 
 fn llama_parse_gguf_header(raw: ByteBuf) -> LlamaGgufHeader {
-    if buf_len(raw) < 24 {
+    blen := buf_len(raw)
+    if blen < 24 {
         return LlamaGgufHeader(valid = false, version = 0, tensor_count = 0, kv_count = 0)
     }
     // "GGUF" magic = 0x46554747 in little-endian
@@ -47,8 +48,14 @@ fn llama_parse_gguf_header(raw: ByteBuf) -> LlamaGgufHeader {
         return LlamaGgufHeader(valid = false, version = 0, tensor_count = 0, kv_count = 0)
     }
     ver := llama_read_u32_le(raw, 4)
+    if ver != 2 and ver != 3 {
+        return LlamaGgufHeader(valid = false, version = 0, tensor_count = 0, kv_count = 0)
+    }
     tc := llama_read_u64_le(raw, 8)
     kvc := llama_read_u64_le(raw, 16)
+    if tc < 0 or kvc < 0 or tc > 1000000 or kvc > 1000000 {
+        return LlamaGgufHeader(valid = false, version = 0, tensor_count = 0, kv_count = 0)
+    }
     return LlamaGgufHeader(valid = true, version = ver, tensor_count = tc, kv_count = kvc)
 }
 
@@ -57,15 +64,17 @@ fn llama_parse_gguf_header(raw: ByteBuf) -> LlamaGgufHeader {
 // RMSNorm: out[i] = (x[i] / sqrt(mean(x^2) + eps)) * weight[i]
 @no_alloc
 fn llama_rmsnorm(x_ptr: i64, weight_ptr: i64, out_ptr: i64, dim: i64, eps: f64 = 0.00001) {
-    if dim <= 0 { return }
-    avx_rmsnorm_f32(x_ptr, weight_ptr, out_ptr, dim, eps)
+    if dim <= 0 or x_ptr == 0 or weight_ptr == 0 or out_ptr == 0 { return }
+    mut safe_eps := eps
+    if safe_eps < 0.000000000001 { safe_eps = 0.000000000001 }
+    avx_rmsnorm_f32(x_ptr, weight_ptr, out_ptr, dim, safe_eps)
 }
 
 // Rotary Position Embedding (RoPE) for Attention Query and Key
 // Rotates pairs of elements: [x0, x1] -> [x0*cos - x1*sin, x0*sin + x1*cos]
 @no_alloc
 fn llama_apply_rope(vec_ptr: i64, pos: i64, head_dim: i64, theta_base: f64 = 10000.0) {
-    if head_dim <= 0 or theta_base <= 1.0 { return }
+    if vec_ptr == 0 or head_dim <= 0 or theta_base <= 1.0 { return }
     ln_theta := log2_f64(theta_base) * 0.6931471805599453
     mut i := 0
     while i + 1 < head_dim {
@@ -91,7 +100,7 @@ fn llama_apply_rope(vec_ptr: i64, pos: i64, head_dim: i64, theta_base: f64 = 100
 // SwiGLU Fused Feed-Forward Activation: out = silu(gate) * up
 @no_alloc
 fn llama_swiglu(gate_ptr: i64, up_ptr: i64, out_ptr: i64, dim: i64) {
-    if dim <= 0 { return }
+    if dim <= 0 or gate_ptr == 0 or up_ptr == 0 or out_ptr == 0 { return }
     avx_swiglu_f32(gate_ptr, up_ptr, out_ptr, dim)
 }
 
@@ -106,10 +115,24 @@ struct LlamaKvCache {
 }
 
 fn llama_kv_cache_new(max_seq: i64, num_kv_heads: i64, head_dim: i64) -> LlamaKvCache {
+    if max_seq <= 0 or num_kv_heads <= 0 or head_dim <= 0 or max_seq > 1048576 or num_kv_heads > 4096 or head_dim > 16384 {
+        return LlamaKvCache(k_mem = 0, v_mem = 0, max_seq_len = 0, kv_dim = 0, cur_pos = 0)
+    }
+    if num_kv_heads > 268435456 / head_dim {
+        return LlamaKvCache(k_mem = 0, v_mem = 0, max_seq_len = 0, kv_dim = 0, cur_pos = 0)
+    }
     dim := num_kv_heads * head_dim
+    if max_seq > 268435456 / dim {
+        return LlamaKvCache(k_mem = 0, v_mem = 0, max_seq_len = 0, kv_dim = 0, cur_pos = 0)
+    }
     total_floats := max_seq * dim
     k_ptr := mem_alloc_aligned(total_floats * 4 + 64)
     v_ptr := mem_alloc_aligned(total_floats * 4 + 64)
+    if k_ptr == 0 or v_ptr == 0 {
+        if k_ptr != 0 { mem_free_aligned(k_ptr) }
+        if v_ptr != 0 { mem_free_aligned(v_ptr) }
+        return LlamaKvCache(k_mem = 0, v_mem = 0, max_seq_len = 0, kv_dim = 0, cur_pos = 0)
+    }
     
     mut i := 0
     while i < total_floats {
@@ -129,6 +152,7 @@ fn llama_kv_cache_new(max_seq: i64, num_kv_heads: i64, head_dim: i64) -> LlamaKv
 
 @no_alloc
 fn llama_kv_store(mut cache: LlamaKvCache, pos: i64, k_in_ptr: i64, v_in_ptr: i64) {
+    if cache.k_mem == 0 or cache.v_mem == 0 or k_in_ptr == 0 or v_in_ptr == 0 or cache.kv_dim <= 0 { return }
     if pos < 0 or pos >= cache.max_seq_len { return }
     off := pos * cache.kv_dim
     mut i := 0
@@ -149,7 +173,7 @@ fn llama_kv_store(mut cache: LlamaKvCache, pos: i64, k_in_ptr: i64, v_in_ptr: i6
 // Greedy Argmax Sampling
 @no_alloc
 fn llama_sample_greedy(logits_ptr: i64, vocab_size: i64) -> i64 {
-    if vocab_size <= 0 { return 0 }
+    if logits_ptr == 0 or vocab_size <= 0 { return 0 }
     mut max_val := ptr_read_f32(logits_ptr, 0)
     mut max_token := 0
     mut i := 1
@@ -166,7 +190,7 @@ fn llama_sample_greedy(logits_ptr: i64, vocab_size: i64) -> i64 {
 
 // Temperature-Scaled Softmax Sampling with Sorted Top-P (Nucleus) Filtering
 fn llama_sample_top_p(logits_ptr: i64, vocab_size: i64, temperature: f64 = 0.7, top_p: f64 = 0.9, rng_seed: f64 = 0.42) -> i64 {
-    if vocab_size <= 0 { return 0 }
+    if logits_ptr == 0 or vocab_size <= 0 or vocab_size > 16777216 { return 0 }
     if temperature <= 0.001 {
         return llama_sample_greedy(logits_ptr, vocab_size)
     }
@@ -184,6 +208,7 @@ fn llama_sample_top_p(logits_ptr: i64, vocab_size: i64, temperature: f64 = 0.7, 
 
     // 2. Softmax normalization sum + index buffer for descending logit heapsort
     idx_ptr := mem_alloc_aligned(vocab_size * 8 + 64)
+    if idx_ptr == 0 { return llama_sample_greedy(logits_ptr, vocab_size) }
     mut sum_exp := 0.0
     i = 0
     while i < vocab_size {
@@ -192,12 +217,12 @@ fn llama_sample_top_p(logits_ptr: i64, vocab_size: i64, temperature: f64 = 0.7, 
         sum_exp = sum_exp + exp_f64(v)
         i += 1
     }
+    if sum_exp <= 0.0 {
+        mem_free_aligned(idx_ptr)
+        return llama_sample_greedy(logits_ptr, vocab_size)
+    }
 
-    // 3. Build min-heap by logit so extracting top yields descending logit order (for Nucleus Top-P)
-    // Using bottom-up max-heap on negative score (i.e. min at root -> sort ascending on extract -> descending order!)
-    // Actually: build min-heap directly so heap-sort places SMALLEST at back and LARGEST first?
-    // Even simpler: build max-heap? Popping max K times until cum >= top_p stops early in O(K log V)!
-    // YES! O(V + K log V) partial heapsort with early exit once nucleus >= top_p!
+    // 3. Build max-heap by logit for O(V + K log V) partial heapsort
     mut start := (vocab_size / 2) - 1
     while start >= 0 {
         mut root := start
@@ -223,12 +248,16 @@ fn llama_sample_top_p(logits_ptr: i64, vocab_size: i64, temperature: f64 = 0.7, 
         start -= 1
     }
 
-    // Extract top elements into a nucleus list stored in tail of idx_ptr or separate buffer until cum >= top_p
+    // Extract top elements into a nucleus list until cum >= top_p
     mut clamped_p := top_p
-    if clamped_p <= 0.0 { clamped_p = 0.0001 }
+    if not (clamped_p > 0.0) { clamped_p = 0.0001 }
     if clamped_p > 1.0 { clamped_p = 1.0 }
 
     nuc_idx := mem_alloc_aligned(vocab_size * 8 + 64)
+    if nuc_idx == 0 {
+        mem_free_aligned(idx_ptr)
+        return llama_sample_greedy(logits_ptr, vocab_size)
+    }
     mut heap_n := vocab_size
     mut nuc_len := 0
     mut nuc_mass := 0.0
@@ -273,7 +302,7 @@ fn llama_sample_top_p(logits_ptr: i64, vocab_size: i64, temperature: f64 = 0.7, 
 
     // 4. Sample uniformly inside the truncated nucleus [0, nuc_mass)
     mut u := rng_seed
-    if u < 0.0 { u = 0.0 }
+    if not (u >= 0.0) { u = 0.0 }
     if u > 0.999999 { u = 0.999999 }
     target_cum := nuc_mass * u
 
@@ -306,7 +335,6 @@ fn llama_kv_cache_free(move cache: LlamaKvCache) {
 }
 
 // FlashAttention-2 wrapper with exact numerical stability and compensated running sum
-@no_alloc
 fn llama_flash_attention(q_ptr: i64, k_ptr: i64, v_ptr: i64, out_ptr: i64, seq_len: i64, head_dim: i64) {
     flash_attention_2_tiled(q_ptr, k_ptr, v_ptr, out_ptr, seq_len, head_dim)
 }

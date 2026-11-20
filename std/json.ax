@@ -7,6 +7,7 @@ fn json_skip_ws(doc: str, start: i64) -> i64 {
     n := str_len(doc)
     doc_p := doc as i64
     mut i := start
+    if i < 0 { i = 0 }
     while i < n {
         b := ptr_read_u8(doc_p + i, 0)
         if b == 32 or b == 9 or b == 10 or b == 13 {
@@ -16,6 +17,10 @@ fn json_skip_ws(doc: str, start: i64) -> i64 {
         }
     }
     return i
+}
+
+fn json_is_delim(b: i64) -> bool {
+    return b == 32 or b == 9 or b == 10 or b == 13 or b == 44 or b == 125 or b == 93
 }
 
 // Finds `"<key>"` followed by `:` outside string values and returns the byte index of the value start, or `-1`.
@@ -34,10 +39,11 @@ fn json_locate_key_val(doc: str, key: str) -> i64 {
 
     while i < n {
         // Fast-forward word scanning for quote (ASCII 34 = 0x22)
+        // Uses wrapping subtraction (`-%`) so high UTF-8 bytes (>= 0x80) never trip `--shield`.
         while i + 8 <= n {
             w := ptr_read_i64(doc_p + i, 0)
             q_xor := w ^ 0x2222222222222222
-            has_q := ((q_xor - 0x0101010101010101) & (q_xor ^ -1)) & 0x8080808080808080
+            has_q := ((q_xor -% 0x0101010101010101) & (q_xor ^ -1)) & 0x8080808080808080
             if has_q != 0 {
                 break
             }
@@ -52,7 +58,7 @@ fn json_locate_key_val(doc: str, key: str) -> i64 {
         }
 
         kstart := i + 1
-        // Check if candidate matches key length and closing quote
+        // Check if candidate matches key length and unescaped closing quote
         if kstart + klen < n and ptr_read_u8(doc_p + kstart + klen, 0) == 34 and ptr_read_u8(doc_p + kstart, 0) == k0 {
             mut match_k := true
             mut ki := 1
@@ -64,9 +70,18 @@ fn json_locate_key_val(doc: str, key: str) -> i64 {
                 ki += 1
             }
             if match_k {
-                after_q := json_skip_ws(doc, kstart + klen + 1)
-                if after_q < n and ptr_read_u8(doc_p + after_q, 0) == 58 {
-                    return json_skip_ws(doc, after_q + 1)
+                // Verify the closing quote at kstart + klen is NOT escaped by an odd run of backslashes
+                mut bs := 0
+                mut bp := kstart + klen - 1
+                while bp >= kstart and ptr_read_u8(doc_p + bp, 0) == 92 {
+                    bs += 1
+                    bp -= 1
+                }
+                if (bs & 1) == 0 {
+                    after_q := json_skip_ws(doc, kstart + klen + 1)
+                    if after_q < n and ptr_read_u8(doc_p + after_q, 0) == 58 {
+                        return json_skip_ws(doc, after_q + 1)
+                    }
                 }
             }
         }
@@ -124,20 +139,27 @@ fn json_get_i64(doc: str, key: str) -> i64 ! i64 {
     doc_p := doc as i64
     n := str_len(doc)
     mut j := vpos
-    mut sign := 1
+    mut is_neg := false
     if ptr_read_u8(doc_p + j, 0) == 45 {
-        sign = -1
+        is_neg = true
         j += 1
     }
     mut digits := 0
-    mut val := 0
+    // Accumulate in negative space so full signed 64-bit range [INT64_MIN, INT64_MAX]
+    // parses cleanly without overflowing under `--shield`.
+    mut acc := 0
     while j < n {
         d := ptr_read_u8(doc_p + j, 0)
         if d >= 48 and d <= 57 {
-            if digits >= 18 or val > 922337203685477580 {
+            dig := d - 48
+            if acc < -922337203685477580 {
                 return err(422)
             }
-            val = val * 10 + (d - 48)
+            if acc == -922337203685477580 {
+                if is_neg and dig > 8 { return err(422) }
+                if not is_neg and dig > 7 { return err(422) }
+            }
+            acc = acc * 10 - dig
             digits += 1
             j += 1
         } else {
@@ -147,7 +169,13 @@ fn json_get_i64(doc: str, key: str) -> i64 ! i64 {
     if digits == 0 {
         return err(422)
     }
-    return ok(val * sign)
+    if j < n and not json_is_delim(ptr_read_u8(doc_p + j, 0)) {
+        return err(422)
+    }
+    if is_neg {
+        return ok(acc)
+    }
+    return ok(0 - acc)
 }
 
 fn json_get_bool(doc: str, key: str) -> bool ! i64 {
@@ -158,10 +186,16 @@ fn json_get_bool(doc: str, key: str) -> bool ! i64 {
     doc_p := doc as i64
     n := str_len(doc)
     if vpos + 4 <= n and ptr_read_u8(doc_p + vpos, 0) == 116 and ptr_read_u8(doc_p + vpos + 1, 0) == 114 and ptr_read_u8(doc_p + vpos + 2, 0) == 117 and ptr_read_u8(doc_p + vpos + 3, 0) == 101 {
-        return ok(true)
+        if vpos + 4 == n or json_is_delim(ptr_read_u8(doc_p + vpos + 4, 0)) {
+            return ok(true)
+        }
+        return err(422)
     }
     if vpos + 5 <= n and ptr_read_u8(doc_p + vpos, 0) == 102 and ptr_read_u8(doc_p + vpos + 1, 0) == 97 and ptr_read_u8(doc_p + vpos + 2, 0) == 108 and ptr_read_u8(doc_p + vpos + 3, 0) == 115 and ptr_read_u8(doc_p + vpos + 4, 0) == 101 {
-        return ok(false)
+        if vpos + 5 == n or json_is_delim(ptr_read_u8(doc_p + vpos + 5, 0)) {
+            return ok(false)
+        }
+        return err(422)
     }
     return err(422)
 }

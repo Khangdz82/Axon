@@ -260,8 +260,23 @@ fn update_axon_lockfile(entry_path: str, src_hash: i64) {
 
 fn cmd_init_project(name_arg: str) -> i32 {
     mut pkg_name := name_arg
-    if str_len(pkg_name) == 0 or pkg_name == "." {
+    if str_len(pkg_name) == 0 or pkg_name == "." or str_len(pkg_name) > 64 {
         pkg_name = "axon_app"
+    } else {
+        mut valid_pkg := true
+        mut pi := 0
+        while pi < str_len(pkg_name) {
+            pb := str_byte(pkg_name, pi)
+            is_ok := (pb >= 97 and pb <= 122) or (pb >= 65 and pb <= 90) or (pb >= 48 and pb <= 57) or pb == 95 or pb == 45
+            if not is_ok {
+                valid_pkg = false
+                break
+            }
+            pi += 1
+        }
+        if not valid_pkg {
+            pkg_name = "axon_app"
+        }
     }
 
     // Refuse to clobber existing `axon.toml`
@@ -302,11 +317,46 @@ fn cmd_init_project(name_arg: str) -> i32 {
     return 0
 }
 
+fn mcp_buf_cap(b: ByteBuf) -> i64 {
+    return ptr_read_i64(b as i64, 1)
+}
+
+fn mcp_self_exe_path(out_buf: ByteBuf) -> str {
+    argv0 := args_get(0)
+    s0 := buf_len(out_buf)
+    if str_len(argv0) > 0 {
+        buf_push_str(out_buf, argv0)
+    } else {
+        buf_push_str(out_buf, "bin\\axc.exe")
+    }
+    s1 := buf_len(out_buf)
+    buf_push(out_buf, 0)
+    return buf_slice_str(out_buf, s0, s1)
+}
+
+fn mcp_install_root_dir(out_buf: ByteBuf) -> str {
+    argv0 := args_get(0)
+    mut sp := str_len(argv0) - 1
+    while sp >= 0 {
+        b := str_byte(argv0, sp)
+        if b == 47 or b == 92 { break }
+        sp -= 1
+    }
+    if sp < 0 { return "" }
+    s0 := buf_len(out_buf)
+    buf_push_str(out_buf, str_slice(argv0, 0, sp + 1))
+    buf_push_str(out_buf, "../")
+    s1 := buf_len(out_buf)
+    buf_push(out_buf, 0)
+    return buf_slice_str(out_buf, s0, s1)
+}
+
 // --- MCP JSON-RPC 2.0 Lightweight Zero-Dependency Parser & Emitter ---
 // Extracts `"key":"value"` string value from a JSON line into `scratch`.
 fn mcp_json_get_str(line: str, key: str, scratch: ByteBuf) -> str {
     n := str_len(line)
     klen := str_len(key)
+    cap := mcp_buf_cap(scratch)
     mut i := 0
     while i + klen + 3 < n {
         if str_byte(line, i) == 34 {
@@ -329,11 +379,15 @@ fn mcp_json_get_str(line: str, key: str, scratch: ByteBuf) -> str {
                         p += 1
                         s0 := buf_len(scratch)
                         while p < n and str_byte(line, p) != 34 {
+                            if buf_len(scratch) + 4 >= cap { break }
                             if str_byte(line, p) == 92 and p + 1 < n {
                                 p += 1
                                 esc := str_byte(line, p)
                                 if esc == 110 { buf_push(scratch, 10) }
+                                else if esc == 114 { buf_push(scratch, 13) }
                                 else if esc == 116 { buf_push(scratch, 9) }
+                                else if esc == 98 { buf_push(scratch, 8) }
+                                else if esc == 102 { buf_push(scratch, 12) }
                                 else { buf_push(scratch, esc) }
                             } else {
                                 buf_push(scratch, str_byte(line, p))
@@ -341,7 +395,7 @@ fn mcp_json_get_str(line: str, key: str, scratch: ByteBuf) -> str {
                             p += 1
                         }
                         s1 := buf_len(scratch)
-                        buf_push(scratch, 0)
+                        if buf_len(scratch) + 1 < cap { buf_push(scratch, 0) }
                         return buf_slice_str(scratch, s0, s1)
                     }
                 }
@@ -352,9 +406,10 @@ fn mcp_json_get_str(line: str, key: str, scratch: ByteBuf) -> str {
     return ""
 }
 
-// Extracts raw JSON `"id": <token>` literal (`1`, `"req-1"`, etc.) so responses echo the exact ID type!
+// Extracts raw JSON `"id": <token>` literal strictly validated as JSON int, JSON string (<=128B), or null.
 fn mcp_json_get_raw_id(line: str, scratch: ByteBuf) -> str {
     n := str_len(line)
+    cap := mcp_buf_cap(scratch)
     mut i := 0
     while i + 5 < n {
         if str_byte(line, i) == 34 and str_byte(line, i + 1) == 105 and str_byte(line, i + 2) == 100 and str_byte(line, i + 3) == 34 {
@@ -365,27 +420,71 @@ fn mcp_json_get_raw_id(line: str, scratch: ByteBuf) -> str {
                 while p < n and (str_byte(line, p) == 32 or str_byte(line, p) == 9) { p += 1 }
                 s0 := buf_len(scratch)
                 if p < n and str_byte(line, p) == 34 {
+                    if buf_len(scratch) + 136 >= cap { return "null" }
                     buf_push(scratch, 34)
                     p += 1
-                    while p < n and str_byte(line, p) != 34 {
-                        buf_push(scratch, str_byte(line, p))
+                    mut slen := 0
+                    mut closed := false
+                    mut valid_s := true
+                    while p < n {
+                        b := str_byte(line, p)
+                        if b == 34 {
+                            buf_push(scratch, 34)
+                            closed = true
+                            break
+                        }
+                        if b < 32 or slen >= 128 {
+                            valid_s = false
+                            break
+                        }
+                        if b == 92 {
+                            if p + 1 >= n { valid_s = false; break }
+                            nb := str_byte(line, p + 1)
+                            if nb < 32 { valid_s = false; break }
+                            buf_push(scratch, 92)
+                            buf_push(scratch, nb)
+                            p += 2
+                            slen += 2
+                        } else {
+                            buf_push(scratch, b)
+                            p += 1
+                            slen += 1
+                        }
+                    }
+                    if closed and valid_s {
+                        s1 := buf_len(scratch)
+                        buf_push(scratch, 0)
+                        return buf_slice_str(scratch, s0, s1)
+                    }
+                    return "null"
+                } else {
+                    if buf_len(scratch) + 32 >= cap { return "null" }
+                    mut valid_num := true
+                    mut digits := 0
+                    if p < n and str_byte(line, p) == 45 {
+                        buf_push(scratch, 45)
                         p += 1
                     }
-                    buf_push(scratch, 34)
-                } else {
                     while p < n {
                         b := str_byte(line, p)
                         if b == 44 or b == 125 or b == 32 or b == 9 or b == 10 or b == 13 {
                             break
                         }
-                        buf_push(scratch, b)
+                        if b >= 48 and b <= 57 and digits < 20 {
+                            buf_push(scratch, b)
+                            digits += 1
+                        } else {
+                            valid_num = false
+                            break
+                        }
                         p += 1
                     }
-                }
-                s1 := buf_len(scratch)
-                if s1 > s0 {
-                    buf_push(scratch, 0)
-                    return buf_slice_str(scratch, s0, s1)
+                    if valid_num and digits > 0 {
+                        s1 := buf_len(scratch)
+                        buf_push(scratch, 0)
+                        return buf_slice_str(scratch, s0, s1)
+                    }
+                    return "null"
                 }
             }
         }
@@ -516,11 +615,16 @@ fn mcp_ast_kind_str(k: i64) -> str {
 
 fn mcp_dump_ast_tree(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, out: ByteBuf) {
     total_nodes := ibuf_len(nodes) / 8
+    cap := mcp_buf_cap(out)
     buf_push_str(out, "=== Axon Abstract Syntax Tree (AST) ===\n")
     buf_push_str(out, f"Total AST nodes: {total_nodes}\n\n")
     mut nid := 2
     mut printed := 0
     while nid < total_nodes and printed < 150 {
+        if buf_len(out) + 512 >= cap {
+            buf_push_str(out, "... (output truncated)\n")
+            return
+        }
         k := ast_kind(nodes, nid)
         if k > 0 {
             ks := mcp_ast_kind_str(k)
@@ -530,8 +634,9 @@ fn mcp_dump_ast_tree(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, out: ByteBuf) 
             buf_push_str(out, f"[{nid}] {ks} (line {l}, col {col})")
             if k == nk_fn() or k == nk_struct() or k == nk_ident() or k == nk_call() or k == nk_var_decl() or k == nk_field() {
                 soff := ast_get(nodes, nid, 1)
-                slen := ast_get(nodes, nid, 2)
+                mut slen := ast_get(nodes, nid, 2)
                 if soff >= 0 and slen > 0 and soff + slen <= buf_len(pool) {
+                    if slen > 128 { slen = 128 }
                     name := buf_slice_str(pool, soff, soff + slen)
                     buf_push_str(out, f" name: \"{name}\"")
                 }
@@ -540,8 +645,9 @@ fn mcp_dump_ast_tree(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, out: ByteBuf) 
                 buf_push_str(out, f" val: {val}")
             } else if k == nk_str() {
                 soff := ast_get(nodes, nid, 1)
-                slen := ast_get(nodes, nid, 2)
+                mut slen := ast_get(nodes, nid, 2)
                 if soff >= 0 and slen > 0 and soff + slen <= buf_len(pool) {
+                    if slen > 128 { slen = 128 }
                     sval := buf_slice_str(pool, soff, soff + slen)
                     buf_push_str(out, f" val: \"{sval}\"")
                 }
@@ -551,24 +657,30 @@ fn mcp_dump_ast_tree(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, out: ByteBuf) 
         }
         nid += 1
     }
-    if total_nodes > 150 {
+    if total_nodes > 150 and buf_len(out) + 128 < cap {
         buf_push_str(out, f"... and {total_nodes - 150} more AST nodes.\n")
     }
 }
 
 fn mcp_dump_symbols(pool: ByteBuf, sym: IntBuf, out: ByteBuf) {
+    cap := mcp_buf_cap(out)
     buf_push_str(out, "=== Axon Symbol Table ===\n")
     f_base := ibuf_get(sym, 7)
     f_cnt := ibuf_get(sym, 8)
     buf_push_str(out, f"Functions ({f_cnt}):\n")
     mut fi := 0
     while fi < f_cnt {
+        if buf_len(out) + 384 >= cap {
+            buf_push_str(out, "  ... (truncated)\n")
+            return
+        }
         fo := f_base + fi * 10
         fn_soff := ibuf_get(sym, fo)
-        fn_slen := ibuf_get(sym, fo + 1)
+        mut fn_slen := ibuf_get(sym, fo + 1)
         param_cnt := ibuf_get(sym, fo + 4)
         flags := ibuf_get(sym, fo + 9)
         if fn_soff >= 0 and fn_slen > 0 and fn_soff + fn_slen <= buf_len(pool) {
+            if fn_slen > 128 { fn_slen = 128 }
             fname := buf_slice_str(pool, fn_soff, fn_soff + fn_slen)
             buf_push_str(out, f"  fn {fname}({param_cnt} params)")
             if (flags & fnflag_shield()) != 0 { buf_push_str(out, " [@shield]") }
@@ -587,11 +699,16 @@ fn mcp_dump_symbols(pool: ByteBuf, sym: IntBuf, out: ByteBuf) {
     buf_push_str(out, f"\nStructs & Tables ({s_cnt}):\n")
     mut si := 0
     while si < s_cnt {
+        if buf_len(out) + 256 >= cap {
+            buf_push_str(out, "  ... (truncated)\n")
+            return
+        }
         so := s_base + si * 6
         soff := ibuf_get(sym, so)
-        slen := ibuf_get(sym, so + 1)
+        mut slen := ibuf_get(sym, so + 1)
         fields_cnt := ibuf_get(sym, so + 4)
         if soff >= 0 and slen > 0 and soff + slen <= buf_len(pool) {
+            if slen > 128 { slen = 128 }
             sname := buf_slice_str(pool, soff, soff + slen)
             buf_push_str(out, f"  struct {sname} ({fields_cnt} fields)\n")
         }
@@ -600,14 +717,19 @@ fn mcp_dump_symbols(pool: ByteBuf, sym: IntBuf, out: ByteBuf) {
 
     i_base := ibuf_get(sym, 5)
     i_cnt := ibuf_get(sym, 6)
-    if i_cnt > 0 {
+    if i_cnt > 0 and buf_len(out) + 256 < cap {
         buf_push_str(out, f"\nInterfaces ({i_cnt}):\n")
         mut ii := 0
         while ii < i_cnt {
+            if buf_len(out) + 256 >= cap {
+                buf_push_str(out, "  ... (truncated)\n")
+                return
+            }
             io := i_base + ii * 4
             ioff := ibuf_get(sym, io)
-            ilen := ibuf_get(sym, io + 1)
+            mut ilen := ibuf_get(sym, io + 1)
             if ioff >= 0 and ilen > 0 and ioff + ilen <= buf_len(pool) {
+                if ilen > 128 { ilen = 128 }
                 iname := buf_slice_str(pool, ioff, ioff + ilen)
                 buf_push_str(out, f"  interface {iname}\n")
             }
@@ -616,26 +738,42 @@ fn mcp_dump_symbols(pool: ByteBuf, sym: IntBuf, out: ByteBuf) {
     }
 }
 
-fn mcp_exec_capture_file(cmd_line: str, out_file: str) -> str {
-    cbuf := buf_new(str_len(cmd_line) + 128)
+fn mcp_exec_capture_with_rc(cmd_line: str, out_file: str, rc_out: IntBuf) -> str {
+    // Clear stale capture file before running child command
+    empty_b := buf_new(4)
+    _cl := fs_write_file(out_file, empty_b) or 0
+    buf_free(move empty_b)
+
+    cbuf := buf_new(str_len(cmd_line) + str_len(out_file) + 128)
     buf_push_str(cbuf, "cmd.exe /c \"")
     buf_push_str(cbuf, cmd_line)
-    buf_push_str(cbuf, " > ")
+    buf_push_str(cbuf, " > \"")
     buf_push_str(cbuf, out_file)
-    buf_push_str(cbuf, " 2>&1\"")
+    buf_push_str(cbuf, "\" 2>&1\"")
     c_str := buf_slice_str(cbuf, 0, buf_len(cbuf))
-    _rc := ax_os_exec(c_str)
+    rc := ax_os_exec(c_str)
     buf_free(move cbuf)
+    if ibuf_len(rc_out) > 0 { ibuf_set(rc_out, 0, rc) }
 
     fbuf := fs_read_file(out_file) or buf_new(0)
     mut res := ""
-    if buf_len(fbuf) > 0 {
-        res = "" + buf_slice_str(fbuf, 0, buf_len(fbuf))
+    mut flen := buf_len(fbuf)
+    if flen > 65536 { flen = 65536 }
+    if flen > 0 {
+        res = "" + buf_slice_str(fbuf, 0, flen)
     } else {
         res = "(no output)"
     }
     buf_free(move fbuf)
     return res
+}
+
+fn mcp_exec_capture_file(cmd_line: str, out_file: str) -> str {
+    rc_buf := ibuf_new(2)
+    ibuf_push(rc_buf, 0)
+    out := mcp_exec_capture_with_rc(cmd_line, out_file, rc_buf)
+    buf_free(move rc_buf)
+    return out
 }
 
 fn str_starts_with_tok(s: str, prefix: str) -> bool {
@@ -662,10 +800,28 @@ fn mcp_read_std_module(mod_name: str) -> ByteBuf {
     s2 := buf_slice_str(p2, 0, buf_len(p2))
     b2 := fs_read_file(s2) or buf_new(0)
     buf_free(move p2)
-    return b2
+    if buf_len(b2) > 0 { return b2 }
+    buf_free(move b2)
+
+    p3 := buf_new(str_len(mod_name) + 512)
+    root := mcp_install_root_dir(p3)
+    if str_len(root) > 0 {
+        s0 := buf_len(p3)
+        buf_push_str(p3, root)
+        buf_push_str(p3, "std/")
+        buf_push_str(p3, mod_name)
+        buf_push_str(p3, ".ax")
+        s3 := buf_slice_str(p3, s0, buf_len(p3))
+        b3 := fs_read_file(s3) or buf_new(0)
+        buf_free(move p3)
+        return b3
+    }
+    buf_free(move p3)
+    return buf_new(0)
 }
 
 fn mcp_search_stdlib(query: str, mod_filter: str, out: ByteBuf) {
+    cap := mcp_buf_cap(out)
     buf_push_str(out, "=== Axon Standard Library API Documentation ===\n")
     if str_len(mod_filter) > 0 {
         buf_push_str(out, f"Filter Module: std::{mod_filter}\n\n")
@@ -673,13 +829,17 @@ fn mcp_search_stdlib(query: str, mod_filter: str, out: ByteBuf) {
         buf_push_str(out, f"Search Query: \"{query}\"\n\n")
     }
 
-    modules := "ai ai_autograd ai_engine ai_gguf ai_local ai_lora ai_math ai_nn ai_quant ai_serve async_io audio cap cli collections compress crdt crypto css cuda data decimal encoding faiss game game2d game3d game_ecs game_physics game_render html http iot json llama log math math3d npu numpy onnx os path quant rand regex ringbuf safetensors semiconductor sklearn str taint terminal test_kit tiktoken time tokenizers torch transformers ui ui_js ui_layout ui_render ui_signal ui_tailwind uuid vllm"
+    modules := "ai ai_autograd ai_engine ai_gguf ai_local ai_lora ai_math ai_nn ai_quant ai_serve async_io audio cap cli collections compress crdt crypto css cuda data decimal encoding faiss game game2d game3d game_ecs game_physics game_render html http iot json kernel llama log math math3d memory npu numpy onnx os path quant rand regex ringbuf safetensors semiconductor sklearn str taint terminal test_kit tiktoken time tokenizers torch transformers ui ui_js ui_layout ui_render ui_signal ui_tailwind uuid vllm"
     
     mut m_pos := 0
     mod_len := str_len(modules)
     mut matches_found := 0
 
     while m_pos < mod_len {
+        if buf_len(out) + 512 >= cap {
+            buf_push_str(out, "(Output truncated due to buffer limit)\n")
+            break
+        }
         while m_pos < mod_len and str_byte(modules, m_pos) == 32 { m_pos += 1 }
         if m_pos >= mod_len { break }
         s_m := m_pos
@@ -690,9 +850,6 @@ fn mcp_search_stdlib(query: str, mod_filter: str, out: ByteBuf) {
         mut scan_this_mod := false
         if str_len(mod_filter) > 0 {
             if cur_mod == mod_filter { scan_this_mod = true }
-        } else if str_len(query) > 0 {
-            if repl_str_contains(cur_mod, query) { scan_this_mod = true }
-            else { scan_this_mod = true }
         } else {
             scan_this_mod = true
         }
@@ -706,6 +863,7 @@ fn mcp_search_stdlib(query: str, mod_filter: str, out: ByteBuf) {
                 mut mod_matches := 0
 
                 while line_start < sz {
+                    if buf_len(out) + 512 >= cap { break }
                     mut line_end := line_start
                     while line_end < sz and buf_get(m_src, line_end) != 10 and buf_get(m_src, line_end) != 13 {
                         line_end += 1
@@ -714,7 +872,9 @@ fn mcp_search_stdlib(query: str, mod_filter: str, out: ByteBuf) {
                         line := buf_slice_str(m_src, line_start, line_end)
                         mut ls := 0
                         while ls < str_len(line) and (str_byte(line, ls) == 32 or str_byte(line, ls) == 9) { ls += 1 }
-                        trimmed := str_slice(line, ls, str_len(line))
+                        mut end_t := str_len(line)
+                        if end_t - ls > 256 { end_t = ls + 256 }
+                        trimmed := str_slice(line, ls, end_t)
                         
                         mut is_decl := str_starts_with_tok(trimmed, "fn ") or str_starts_with_tok(trimmed, "pub fn ") or str_starts_with_tok(trimmed, "struct ") or str_starts_with_tok(trimmed, "@no_alloc") or str_starts_with_tok(trimmed, "@shield")
                         mut hit := false
@@ -745,18 +905,20 @@ fn mcp_search_stdlib(query: str, mod_filter: str, out: ByteBuf) {
                         line_start += 1
                     }
                 }
-                if header_printed {
+                if header_printed and buf_len(out) + 16 < cap {
                     buf_push_str(out, "\n")
                 }
             }
             buf_free(move m_src)
         }
         if matches_found >= 60 and str_len(mod_filter) == 0 {
-            buf_push_str(out, f"(Results limited to first {matches_found} matches. Use `module: \"<name>\"` to see all declarations of a specific module)\n")
+            if buf_len(out) + 256 < cap {
+                buf_push_str(out, f"(Results limited to first {matches_found} matches. Use `module: \"<name>\"` to see all declarations of a specific module)\n")
+            }
             break
         }
     }
-    if matches_found == 0 {
+    if matches_found == 0 and buf_len(out) + 256 < cap {
         buf_push_str(out, "No matching stdlib declarations found for query. Run with `module: \"<name>\"` or check `axon_spec`.\n")
     }
 }
@@ -769,9 +931,9 @@ fn mcp_inspect_c_header(src: ByteBuf, hdr_name: str, out: ByteBuf) {
     pool := buf_new(524288)
     nodes := ibuf_new(262144)
     extra := ibuf_new(262144)
-    out_structs := ibuf_new(256)
-    out_funcs := ibuf_new(256)
-    out_consts := ibuf_new(256)
+    out_structs := ibuf_new(2048)
+    out_funcs := ibuf_new(2048)
+    out_consts := ibuf_new(2048)
 
     parse_c_header_into_program(src, pool, nodes, extra, 0, 0, 1, out_structs, out_funcs, out_consts)
 
@@ -854,6 +1016,7 @@ fn cmd_install_mcp_config(sub: str) -> i32 {
 
 fn axon_format_code(src: str, out: ByteBuf) {
     n := str_len(src)
+    cap := mcp_buf_cap(out)
     mut i := 0
     mut indent := 0
     mut prev_was_empty := false
@@ -866,10 +1029,10 @@ fn axon_format_code(src: str, out: ByteBuf) {
         line_len := line_end - i
         raw_line := str_slice(src, i, line_end)
 
+        // Advance past exactly ONE line ending (`\r\n`, `\n`, or `\r`) so blank lines are preserved!
         i = line_end
-        while i < n and (str_byte(src, i) == 10 or str_byte(src, i) == 13) {
-            i += 1
-        }
+        if i < n and str_byte(src, i) == 13 { i += 1 }
+        if i < n and str_byte(src, i) == 10 { i += 1 }
 
         mut ls := 0
         while ls < line_len and (str_byte(raw_line, ls) == 32 or str_byte(raw_line, ls) == 9) {
@@ -877,7 +1040,7 @@ fn axon_format_code(src: str, out: ByteBuf) {
         }
 
         if ls >= line_len {
-            if not prev_was_empty and buf_len(out) > 0 {
+            if not prev_was_empty and buf_len(out) > 0 and buf_len(out) + 2 < cap {
                 buf_push(out, 10)
                 prev_was_empty = true
             }
@@ -890,15 +1053,19 @@ fn axon_format_code(src: str, out: ByteBuf) {
             le -= 1
         }
         trimmed := str_slice(raw_line, ls, le)
+        tlen := str_len(trimmed)
 
-        mut starts_with_close := false
-        if str_len(trimmed) > 0 and str_byte(trimmed, 0) == 125 {
-            starts_with_close = true
+        mut leading_closes := 0
+        while leading_closes < tlen and str_byte(trimmed, leading_closes) == 125 {
+            leading_closes += 1
         }
 
-        mut cur_indent := indent
-        if starts_with_close and cur_indent > 0 {
-            cur_indent -= 1
+        mut cur_indent := indent - leading_closes
+        if cur_indent < 0 { cur_indent = 0 }
+        if cur_indent > 32 { cur_indent = 32 }
+
+        if buf_len(out) + cur_indent * 4 + tlen + 2 >= cap {
+            break
         }
 
         mut sp_i := 0
@@ -911,7 +1078,6 @@ fn axon_format_code(src: str, out: ByteBuf) {
         mut esc := false
         mut is_comment := false
         mut ci := 0
-        tlen := str_len(trimmed)
 
         while ci < tlen {
             b := str_byte(trimmed, ci)
@@ -923,9 +1089,7 @@ fn axon_format_code(src: str, out: ByteBuf) {
                 if b == 123 {
                     indent += 1
                 } else if b == 125 {
-                    if not starts_with_close and indent > 0 {
-                        indent -= 1
-                    }
+                    if indent > 0 { indent -= 1 }
                 }
             }
 
@@ -944,10 +1108,6 @@ fn axon_format_code(src: str, out: ByteBuf) {
             ci += 1
         }
 
-        if starts_with_close and indent > 0 {
-            indent -= 1
-        }
-
         buf_push(out, 10)
     }
 }
@@ -960,7 +1120,7 @@ fn cmd_format_file(fpath: str, write_back: bool) -> i32 {
         return 1
     }
     src_str := buf_slice_str(src_buf, 0, buf_len(src_buf))
-    out := buf_new(str_len(src_str) + 256)
+    out := buf_new(str_len(src_str) * 4 + 1024)
     axon_format_code(src_str, out)
     if write_back {
         w := fs_write_file(fpath, out) or -1
@@ -978,13 +1138,13 @@ fn cmd_format_file(fpath: str, write_back: bool) -> i32 {
 }
 
 fn mcp_auto_repair_code(in_src: str, fpath: str, out: ByteBuf) {
-    t_buf := buf_new(str_len(in_src))
+    t_buf := buf_new(str_len(in_src) + 8)
     buf_push_str(t_buf, in_src)
     _w := fs_write_file(".axon_mcp_fix_tmp.ax", t_buf) or 0
     buf_free(move t_buf)
 
-    jrep := buf_new(4096)
-    ok_c := check_file_to_json_buf(".axon_mcp_fix_tmp.ax", jrep)
+    jrep := buf_new(65536)
+    ok_c := check_file_to_json_buf(".axon_mcp_fix_tmp.ax", jrep, true)
     
     if ok_c {
         buf_push_str(out, "=== Axon AI Auto-Repair Tool (axon_fix) ===\n")
@@ -995,7 +1155,7 @@ fn mcp_auto_repair_code(in_src: str, fpath: str, out: ByteBuf) {
     }
 
     rep_str := buf_slice_str(jrep, 0, buf_len(jrep))
-    scratch := buf_new(1024)
+    scratch := buf_new(8192)
     code := mcp_json_get_str(rep_str, "code", scratch)
     msg := mcp_json_get_str(rep_str, "message", scratch)
     sline := mcp_json_get_str(rep_str, "source_line", scratch)
@@ -1069,7 +1229,7 @@ fn mcp_auto_repair_code(in_src: str, fpath: str, out: ByteBuf) {
 }
 
 fn mcp_emit_initialize_resp(raw_id: str) {
-    out := buf_new(1024)
+    out := buf_new(str_len(raw_id) + 1024)
     buf_push_str(out, "{\"jsonrpc\":\"2.0\",\"id\":")
     buf_push_str(out, raw_id)
     buf_push_str(out, ",\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"axon-mcp\",\"version\":\"1.0.0\"}}}")
@@ -1078,7 +1238,7 @@ fn mcp_emit_initialize_resp(raw_id: str) {
 }
 
 fn mcp_emit_tools_list_resp(raw_id: str) {
-    out := buf_new(28672)
+    out := buf_new(str_len(raw_id) + 28672)
     buf_push_str(out, "{\"jsonrpc\":\"2.0\",\"id\":")
     buf_push_str(out, raw_id)
     buf_push_str(out, ",\"result\":{\"tools\":[")
@@ -1105,7 +1265,8 @@ fn mcp_emit_tools_list_resp(raw_id: str) {
 }
 
 fn mcp_emit_tool_text_resp(raw_id: str, is_err: bool, text_body: str) {
-    out := buf_new(str_len(text_body) + 512)
+    // 6x worst-case escaping (`\u00XX`) + raw_id + JSON envelope
+    out := buf_new(str_len(text_body) * 6 + str_len(raw_id) + 512)
     buf_push_str(out, "{\"jsonrpc\":\"2.0\",\"id\":")
     buf_push_str(out, raw_id)
     buf_push_str(out, ",\"result\":{\"isError\":")
@@ -1120,7 +1281,7 @@ fn mcp_emit_tool_text_resp(raw_id: str, is_err: bool, text_body: str) {
 // --- Language Server Protocol (LSP JSON-RPC 2.0 stdio server) ---
 
 fn lsp_emit_response(raw_id: str, result_json: str) {
-    out := buf_new(str_len(result_json) + 256)
+    out := buf_new(str_len(result_json) + str_len(raw_id) + 256)
     buf_push_str(out, "{\"jsonrpc\":\"2.0\",\"id\":")
     buf_push_str(out, raw_id)
     buf_push_str(out, ",\"result\":")
@@ -1131,7 +1292,7 @@ fn lsp_emit_response(raw_id: str, result_json: str) {
     print("Content-Length: ")
     print(f"{str_len(payload)}")
     print("\r\n\r\n")
-    println(payload)
+    print(payload)
     buf_free(move out)
 }
 
@@ -1158,7 +1319,7 @@ fn run_lsp_server_stdio() -> i32 {
             break
         }
         if nread > 0 {
-            scratch := buf_new(8192)
+            scratch := buf_new(65536)
             line := buf_slice_str(line_buf, 0, nread)
             mut first_ch := 0
             mut li := 0
@@ -1279,7 +1440,7 @@ fn run_repl_loop() -> i32 {
             continue
         }
 
-        tmp_src := buf_new(1024)
+        tmp_src := buf_new(str_len(cmd) + 256)
         buf_push_str(tmp_src, "fn main() -> i32 {\n    ")
         if repl_str_contains(cmd, "println") or repl_str_contains(cmd, "return") or repl_str_contains(cmd, "mut ") or repl_str_contains(cmd, "while ") or repl_str_contains(cmd, "if ") {
             buf_push_str(tmp_src, cmd)
@@ -1289,10 +1450,17 @@ fn run_repl_loop() -> i32 {
             buf_push_str(tmp_src, cmd)
             buf_push_str(tmp_src, "}\")\n    return 0\n}\n")
         }
-        _w := fs_write_file(".axon_repl_tmp.ax", tmp_src)
+        _w := fs_write_file(".axon_repl_tmp.ax", tmp_src) or 0
         buf_free(move tmp_src)
 
-        _rc := ax_os_exec("bin\\axc.exe run .axon_repl_tmp.ax")
+        rcmd := buf_new(512)
+        self_exe := mcp_self_exe_path(rcmd)
+        s0 := buf_len(rcmd)
+        buf_push_str(rcmd, "\"")
+        buf_push_str(rcmd, self_exe)
+        buf_push_str(rcmd, "\" run .axon_repl_tmp.ax")
+        _rc := ax_os_exec(buf_slice_str(rcmd, s0, buf_len(rcmd)))
+        buf_free(move rcmd)
     }
     buf_free(move line_buf)
     return 0

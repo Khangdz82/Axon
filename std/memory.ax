@@ -1,0 +1,1071 @@
+// Axon Standard Process, Virtual & Shared Memory Subsystem (`std/memory.ax`)
+// 100% Pure Axon: Zero External Toolchains, Zero CRT, High-Performance Systems & Game Security API.
+// Features:
+//   1. Process Memory: Open target process by PID or name, read/write typed primitives (u8..u64, i8..i64, f32, f64, str, ByteBuf).
+//   2. Pointer Chains: Multi-level pointer dereferencing / offset chasing (`[[[base + off1] + off2] + off3]`).
+//   3. Virtual Memory: Remote & local page allocation (`VirtualAllocEx`), deallocation (`VirtualFreeEx`), and protection (`VirtualProtectEx`).
+//   4. Signature / Pattern Scanning (AOB Scan): Fast wildcard signature search (IDA-style `"48 89 5C 24 ?? 57"`).
+//   5. Shared Memory (IPC): Pagefile-backed memory-mapped inter-process communication (`shm_open_or_create`, `shm_read`, `shm_write`).
+//   6. Direct Raw Memory: High-speed local memory access for bare-metal, unikernels, and internal hooks.
+
+use std::os
+
+// --- 1. Memory & Process Constants ---
+
+// Process Access Rights
+fn proc_all_access() -> i64        { return 0x1F0FFF }
+fn proc_vm_read() -> i64           { return 0x000010 }
+fn proc_vm_write() -> i64          { return 0x000020 }
+fn proc_vm_operation() -> i64      { return 0x000008 }
+fn proc_query_information() -> i64 { return 0x000400 }
+
+// Page Protections
+fn page_noaccess() -> i64          { return 0x01 }
+fn page_readonly() -> i64          { return 0x02 }
+fn page_readwrite() -> i64         { return 0x04 }
+fn page_writecopy() -> i64         { return 0x08 }
+fn page_execute() -> i64           { return 0x10 }
+fn page_execute_read() -> i64      { return 0x20 }
+fn page_execute_readwrite() -> i64 { return 0x40 }
+fn page_guard() -> i64             { return 0x100 }
+
+// Memory Allocation Types
+fn mem_commit() -> i64   { return 0x1000 }
+fn mem_reserve() -> i64  { return 0x2000 }
+fn mem_decommit() -> i64 { return 0x4000 }
+fn mem_release() -> i64  { return 0x8000 }
+
+// Shared Memory Access
+fn file_map_all_access() -> i64 { return 0xF001F }
+fn file_map_read() -> i64       { return 0x00004 }
+fn file_map_write() -> i64      { return 0x00002 }
+
+// --- 2. Data Structures ---
+
+struct ProcessMem {
+    handle: i64,
+    pid: i64,
+    is_local: bool,
+}
+
+struct SharedMem {
+    handle: i64,
+    ptr: i64,
+    size: i64,
+    name: str,
+    read_only: bool,
+}
+
+// Helper to convert ByteBuf to str safely
+@no_alloc
+fn mem_align_up(val: i64, align: i64) -> i64 {
+    if align <= 1 { return val }
+    return (val + align - 1) & (0 - align)
+}
+
+fn mem_buf_to_str(move b: ByteBuf) -> str {
+    s := "" + buf_slice_str(b, 0, buf_len(b))
+    buf_free(move b)
+    return s
+}
+
+@no_alloc
+fn raw_mem_zero(addr: i64, size: i64) {
+    if addr == 0 or size <= 0 { return }
+    mut i := 0
+    while i < size {
+        ptr_write_u8(addr, i, 0)
+        i += 1
+    }
+}
+
+// Overlap-safe copy (memmove semantics)
+@no_alloc
+fn raw_mem_copy(dst: i64, src: i64, size: i64) {
+    if dst == 0 or src == 0 or size <= 0 or dst == src { return }
+    if dst > src and (dst - src) < size {
+        mut i := size - 1
+        while i >= 0 {
+            ptr_write_u8(dst, i, ptr_read_u8(src, i))
+            i -= 1
+        }
+    } else {
+        mut i := 0
+        while i < size {
+            ptr_write_u8(dst, i, ptr_read_u8(src, i))
+            i += 1
+        }
+    }
+}
+
+fn mem_has_nul(s: str) -> bool {
+    n := str_len(s)
+    mut i := 0
+    while i < n {
+        if str_byte(s, i) == 0 { return true }
+        i += 1
+    }
+    return false
+}
+
+// 1. Process & Virtual Memory Win32 API
+struct Win32ProcApi {
+    k32: i64,
+    p_open_proc: i64,
+    p_read_mem: i64,
+    p_write_mem: i64,
+    p_alloc_ex: i64,
+    p_free_ex: i64,
+    p_protect_ex: i64,
+    p_close: i64,
+}
+
+fn get_win32_proc_api() -> Win32ProcApi {
+    k32 := dll_load("kernel32.dll")
+    return Win32ProcApi(
+        k32 = k32,
+        p_open_proc = dll_sym(k32, "OpenProcess"),
+        p_read_mem = dll_sym(k32, "ReadProcessMemory"),
+        p_write_mem = dll_sym(k32, "WriteProcessMemory"),
+        p_alloc_ex = dll_sym(k32, "VirtualAllocEx"),
+        p_free_ex = dll_sym(k32, "VirtualFreeEx"),
+        p_protect_ex = dll_sym(k32, "VirtualProtectEx"),
+        p_close = dll_sym(k32, "CloseHandle"),
+    )
+}
+
+// 2. Toolhelp Snapshot Win32 API
+struct Win32ToolApi {
+    k32: i64,
+    p_get_pid: i64,
+    p_get_curr_proc: i64,
+    p_create_snap: i64,
+    p_proc_first: i64,
+    p_proc_next: i64,
+    p_close: i64,
+}
+
+fn get_win32_tool_api() -> Win32ToolApi {
+    k32 := dll_load("kernel32.dll")
+    return Win32ToolApi(
+        k32 = k32,
+        p_get_pid = dll_sym(k32, "GetCurrentProcessId"),
+        p_get_curr_proc = dll_sym(k32, "GetCurrentProcess"),
+        p_create_snap = dll_sym(k32, "CreateToolhelp32Snapshot"),
+        p_proc_first = dll_sym(k32, "Process32First"),
+        p_proc_next = dll_sym(k32, "Process32Next"),
+        p_close = dll_sym(k32, "CloseHandle"),
+    )
+}
+
+// 3. Shared Memory / File Mapping Win32 API
+struct Win32ShmApi {
+    k32: i64,
+    p_create_map: i64,
+    p_open_map: i64,
+    p_map_view: i64,
+    p_unmap_view: i64,
+    p_close: i64,
+}
+
+fn get_win32_shm_api() -> Win32ShmApi {
+    k32 := dll_load("kernel32.dll")
+    return Win32ShmApi(
+        k32 = k32,
+        p_create_map = dll_sym(k32, "CreateFileMappingA"),
+        p_open_map = dll_sym(k32, "OpenFileMappingA"),
+        p_map_view = dll_sym(k32, "MapViewOfFile"),
+        p_unmap_view = dll_sym(k32, "UnmapViewOfFile"),
+        p_close = dll_sym(k32, "CloseHandle"),
+    )
+}
+
+// --- 3. Process Opening & Lifecycle Management ---
+
+// Opens a process by its Process ID (PID)
+fn mem_open_process(pid: i64, access: i64 = 0x1F0FFF) -> ProcessMem ! i64 {
+    if pid <= 0 { return err(400) }
+    api := get_win32_proc_api()
+    if api.p_open_proc == 0 { return err(501) }
+
+    args := mem_alloc_aligned(64)
+    if args == 0 { return err(500) }
+    ptr_write_i64(args, 0, access)
+    ptr_write_i64(args, 1, 0) // bInheritHandle = FALSE
+    ptr_write_i64(args, 2, pid)
+    h_proc := c_call_v(api.p_open_proc, 3, args)
+    mem_free_aligned(args)
+
+    if h_proc == 0 { return err(404) }
+    return ok(ProcessMem(handle = h_proc, pid = pid, is_local = false))
+}
+
+// Opens the current process via pseudo-handle (-1)
+fn mem_open_current_process() -> ProcessMem {
+    api := get_win32_tool_api()
+    mut pid := 0
+    if api.p_get_pid != 0 {
+        args := mem_alloc_aligned(64)
+        if args != 0 {
+            pid = c_call_v(api.p_get_pid, 0, args)
+            mem_free_aligned(args)
+        }
+    }
+    return ProcessMem(handle = -1, pid = pid, is_local = true)
+}
+
+// Finds process PID by executable name using Toolhelp32 snapshot
+fn mem_find_pid_by_name(exe_name: str) -> i64 ! i64 {
+    if str_len(exe_name) == 0 { return err(400) }
+    api := get_win32_tool_api()
+    if api.p_create_snap == 0 or api.p_proc_first == 0 or api.p_proc_next == 0 {
+        return err(501)
+    }
+
+    args := mem_alloc_aligned(64)
+    if args == 0 { return err(500) }
+    // CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS = 0x02, 0)
+    ptr_write_i64(args, 0, 2)
+    ptr_write_i64(args, 1, 0)
+    snap := c_call_v(api.p_create_snap, 2, args)
+    if snap == 0 or snap == -1 {
+        mem_free_aligned(args)
+        return err(404)
+    }
+
+    // PROCESSENTRY32 struct size: 304 bytes on Win64 (dwSize = 304 at offset 0)
+    pe_size := 304
+    pe := mem_alloc_aligned(pe_size + 16)
+    if pe == 0 {
+        ptr_write_i64(args, 0, snap)
+        c_call_v(api.p_close, 1, args)
+        mem_free_aligned(args)
+        return err(500)
+    }
+    raw_mem_zero(pe, pe_size + 16)
+    // Set dwSize = 304 (DWORD at offset 0)
+    ptr_write_u8(pe, 0, pe_size & 0xFF)
+    ptr_write_u8(pe, 1, (pe_size >> 8) & 0xFF)
+
+    ptr_write_i64(args, 0, snap)
+    ptr_write_i64(args, 1, pe)
+    mut ok_proc := c_call_v(api.p_proc_first, 2, args)
+
+    mut found_pid := -1
+    while ok_proc != 0 {
+        // th32ProcessID is at offset 8 (DWORD)
+        pid := ptr_read_u8(pe, 8) | (ptr_read_u8(pe, 9) << 8) | (ptr_read_u8(pe, 10) << 16) | (ptr_read_u8(pe, 11) << 24)
+
+        // szExeFile is at offset 44 on Win64 (after 4B alignment pad + 8B th32DefaultHeapID + 5*4B DWORDs)
+        mut name_buf := buf_new(260)
+        mut ci := 0
+        while ci < 260 {
+            ch := ptr_read_u8(pe, 44 + ci)
+            if ch == 0 { break }
+            buf_push(name_buf, ch)
+            ci += 1
+        }
+        curr_name := mem_buf_to_str(move name_buf)
+
+        if str_eq(curr_name, exe_name) {
+            found_pid = pid
+            break
+        }
+
+        ptr_write_i64(args, 0, snap)
+        ptr_write_i64(args, 1, pe)
+        ok_proc = c_call_v(api.p_proc_next, 2, args)
+    }
+
+    // CloseHandle(snap)
+    ptr_write_i64(args, 0, snap)
+    c_call_v(api.p_close, 1, args)
+
+    mem_free_aligned(pe)
+    mem_free_aligned(args)
+
+    if found_pid >= 0 {
+        return ok(found_pid)
+    }
+    return err(404)
+}
+
+// Opens a process by its executable name
+fn mem_open_process_by_name(exe_name: str, access: i64 = 0x1F0FFF) -> ProcessMem ! i64 {
+    pid := mem_find_pid_by_name(exe_name) or return err(404)
+    return mem_open_process(pid, access)
+}
+
+// Closes an open process handle
+fn mem_close_process(proc: ProcessMem) {
+    if proc.handle != 0 and proc.handle != -1 {
+        api := get_win32_proc_api()
+        if api.p_close != 0 {
+            args := mem_alloc_aligned(64)
+            ptr_write_i64(args, 0, proc.handle)
+            c_call_v(api.p_close, 1, args)
+            mem_free_aligned(args)
+        }
+    }
+}
+
+// --- 4. Process Memory Reading (ByteBuf & Typed Primitives) ---
+
+// Reads raw bytes from target process memory into a newly allocated ByteBuf
+fn mem_read_bytes(proc: ProcessMem, address: i64, count: i64) -> ByteBuf ! i64 {
+    if count < 0 or count > 67108864 { return err(400) }
+    if count == 0 { return ok(buf_new(0)) }
+
+    api := get_win32_proc_api()
+    if api.p_read_mem == 0 { return err(501) }
+
+    raw_buf := mem_alloc_aligned(mem_align_up(count + 8, 16))
+    if raw_buf == 0 { return err(500) }
+    args := mem_alloc_aligned(64)
+    if args == 0 {
+        mem_free_aligned(raw_buf)
+        return err(500)
+    }
+    bytes_read_ptr := args + 48
+    ptr_write_i64(bytes_read_ptr, 0, 0)
+
+    ptr_write_i64(args, 0, proc.handle)
+    ptr_write_i64(args, 1, address)
+    ptr_write_i64(args, 2, raw_buf)
+    ptr_write_i64(args, 3, count)
+    ptr_write_i64(args, 4, bytes_read_ptr)
+    ok_read := c_call_v(api.p_read_mem, 5, args)
+    n_read := ptr_read_i64(bytes_read_ptr, 0)
+
+    mem_free_aligned(args)
+    if ok_read == 0 or n_read != count {
+        mem_free_aligned(raw_buf)
+        return err(500)
+    }
+
+    out := buf_new(count)
+    mut i := 0
+    while i < count {
+        buf_push(out, ptr_read_u8(raw_buf, i))
+        i += 1
+    }
+    mem_free_aligned(raw_buf)
+    return ok(out)
+}
+
+// Reads 8-bit unsigned integer
+fn mem_read_u8(proc: ProcessMem, address: i64) -> i64 ! i64 {
+    bytes := mem_read_bytes(proc, address, 1) or return err(500)
+    v := buf_get(bytes, 0)
+    buf_free(move bytes)
+    return ok(v)
+}
+
+// Reads 8-bit signed integer
+fn mem_read_i8(proc: ProcessMem, address: i64) -> i64 ! i64 {
+    u := mem_read_u8(proc, address) or return err(500)
+    if u >= 128 { return ok(u - 256) }
+    return ok(u)
+}
+
+// Reads 16-bit unsigned integer (little-endian)
+fn mem_read_u16(proc: ProcessMem, address: i64) -> i64 ! i64 {
+    bytes := mem_read_bytes(proc, address, 2) or return err(500)
+    b0 := buf_get(bytes, 0)
+    b1 := buf_get(bytes, 1)
+    buf_free(move bytes)
+    return ok(b0 | (b1 << 8))
+}
+
+// Reads 16-bit signed integer
+fn mem_read_i16(proc: ProcessMem, address: i64) -> i64 ! i64 {
+    u := mem_read_u16(proc, address) or return err(500)
+    if u >= 32768 { return ok(u - 65536) }
+    return ok(u)
+}
+
+// Reads 32-bit unsigned integer (little-endian)
+fn mem_read_u32(proc: ProcessMem, address: i64) -> i64 ! i64 {
+    bytes := mem_read_bytes(proc, address, 4) or return err(500)
+    b0 := buf_get(bytes, 0)
+    b1 := buf_get(bytes, 1)
+    b2 := buf_get(bytes, 2)
+    b3 := buf_get(bytes, 3)
+    buf_free(move bytes)
+    return ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+}
+
+// Reads 32-bit signed integer
+fn mem_read_i32(proc: ProcessMem, address: i64) -> i64 ! i64 {
+    u := mem_read_u32(proc, address) or return err(500)
+    if u >= 2147483648 { return ok(u - 4294967296) }
+    return ok(u)
+}
+
+// Reads 64-bit integer (little-endian)
+fn mem_read_u64(proc: ProcessMem, address: i64) -> i64 ! i64 {
+    bytes := mem_read_bytes(proc, address, 8) or return err(500)
+    mut res := 0
+    mut i := 7
+    while i >= 0 {
+        res = (res << 8) | buf_get(bytes, i)
+        i -= 1
+    }
+    buf_free(move bytes)
+    return ok(res)
+}
+
+fn mem_read_i64(proc: ProcessMem, address: i64) -> i64 ! i64 {
+    return mem_read_u64(proc, address)
+}
+
+// Reads 32-bit single-precision float
+fn mem_read_f32(proc: ProcessMem, address: i64) -> f32 ! i64 {
+    raw := mem_read_u32(proc, address) or return err(500)
+    tmp := mem_alloc_aligned(16)
+    ptr_write_u8(tmp, 0, raw & 0xFF)
+    ptr_write_u8(tmp, 1, (raw >> 8) & 0xFF)
+    ptr_write_u8(tmp, 2, (raw >> 16) & 0xFF)
+    ptr_write_u8(tmp, 3, (raw >> 24) & 0xFF)
+    val := ptr_read_f32(tmp, 0)
+    mem_free_aligned(tmp)
+    return ok(val)
+}
+
+// Reads null-terminated ASCII/UTF-8 string from process memory
+fn mem_read_str(proc: ProcessMem, address: i64, max_len: i64 = 256) -> str ! i64 {
+    if max_len < 0 or max_len > 67108864 { return err(400) }
+    if max_len == 0 { return ok("") }
+    raw := mem_read_bytes(proc, address, max_len) or return err(500)
+    out := buf_new(max_len)
+    mut i := 0
+    while i < buf_len(raw) {
+        b := buf_get(raw, i)
+        if b == 0 { break }
+        buf_push(out, b)
+        i += 1
+    }
+    buf_free(move raw)
+    return ok(mem_buf_to_str(move out))
+}
+
+// Multi-level pointer chasing:
+//   Given base address and offsets [0x10, 0x20, 0x08]:
+//   1. addr1 = read_u64(base + 0x10)
+//   2. addr2 = read_u64(addr1 + 0x20)
+//   3. final_addr = addr2 + 0x08
+fn mem_read_ptr_chain(proc: ProcessMem, base_address: i64, offsets: IntBuf) -> i64 ! i64 {
+    if base_address == 0 { return err(404) }
+    n := ibuf_len(offsets)
+    if n == 0 { return ok(base_address) }
+
+    mut curr := base_address
+    mut i := 0
+    while i < n - 1 {
+        off := ibuf_get(offsets, i)
+        ptr_val := mem_read_u64(proc, curr + off) or return err(500)
+        if ptr_val == 0 { return err(404) } // Null pointer dereference in chain
+        curr = ptr_val
+        i += 1
+    }
+    // Add the final offset to reach the target variable address
+    last_off := ibuf_get(offsets, n - 1)
+    return ok(curr + last_off)
+}
+
+// --- 5. Process Memory Writing (ByteBuf & Typed Primitives) ---
+
+// Writes raw bytes from ByteBuf to target process memory
+fn mem_write_bytes(proc: ProcessMem, address: i64, data: ByteBuf) -> bool {
+    n := buf_len(data)
+    if n < 0 or n > 67108864 { return false }
+    if n == 0 { return true }
+
+    api := get_win32_proc_api()
+    if api.p_write_mem == 0 { return false }
+
+    raw_buf := mem_alloc_aligned(mem_align_up(n + 8, 16))
+    if raw_buf == 0 { return false }
+    mut i := 0
+    while i < n {
+        ptr_write_u8(raw_buf, i, buf_get(data, i))
+        i += 1
+    }
+
+    args := mem_alloc_aligned(64)
+    if args == 0 {
+        mem_free_aligned(raw_buf)
+        return false
+    }
+    bytes_written_ptr := args + 48
+    ptr_write_i64(bytes_written_ptr, 0, 0)
+    ptr_write_i64(args, 0, proc.handle)
+    ptr_write_i64(args, 1, address)
+    ptr_write_i64(args, 2, raw_buf)
+    ptr_write_i64(args, 3, n)
+    ptr_write_i64(args, 4, bytes_written_ptr)
+    ok_write := c_call_v(api.p_write_mem, 5, args)
+    n_written := ptr_read_i64(bytes_written_ptr, 0)
+
+    mem_free_aligned(args)
+    mem_free_aligned(raw_buf)
+    return ok_write != 0 and n_written == n
+}
+
+// Writes 8-bit integer
+fn mem_write_u8(proc: ProcessMem, address: i64, val: i64) -> bool {
+    b := buf_new(1)
+    buf_push(b, val & 0xFF)
+    res := mem_write_bytes(proc, address, b)
+    buf_free(move b)
+    return res
+}
+
+fn mem_write_i8(proc: ProcessMem, address: i64, val: i64) -> bool {
+    return mem_write_u8(proc, address, val)
+}
+
+// Writes 16-bit integer (little-endian)
+fn mem_write_u16(proc: ProcessMem, address: i64, val: i64) -> bool {
+    b := buf_new(2)
+    buf_push(b, val & 0xFF)
+    buf_push(b, (val >> 8) & 0xFF)
+    res := mem_write_bytes(proc, address, b)
+    buf_free(move b)
+    return res
+}
+
+fn mem_write_i16(proc: ProcessMem, address: i64, val: i64) -> bool {
+    return mem_write_u16(proc, address, val)
+}
+
+// Writes 32-bit integer (little-endian)
+fn mem_write_u32(proc: ProcessMem, address: i64, val: i64) -> bool {
+    b := buf_new(4)
+    buf_push(b, val & 0xFF)
+    buf_push(b, (val >> 8) & 0xFF)
+    buf_push(b, (val >> 16) & 0xFF)
+    buf_push(b, (val >> 24) & 0xFF)
+    res := mem_write_bytes(proc, address, b)
+    buf_free(move b)
+    return res
+}
+
+fn mem_write_i32(proc: ProcessMem, address: i64, val: i64) -> bool {
+    return mem_write_u32(proc, address, val)
+}
+
+// Writes 64-bit integer (little-endian)
+fn mem_write_u64(proc: ProcessMem, address: i64, val: i64) -> bool {
+    b := buf_new(8)
+    mut v := val
+    mut i := 0
+    while i < 8 {
+        buf_push(b, v & 0xFF)
+        v = ushr64(v, 8)
+        i += 1
+    }
+    res := mem_write_bytes(proc, address, b)
+    buf_free(move b)
+    return res
+}
+
+fn mem_write_i64(proc: ProcessMem, address: i64, val: i64) -> bool {
+    return mem_write_u64(proc, address, val)
+}
+
+// Writes 32-bit float
+fn mem_write_f32(proc: ProcessMem, address: i64, val: f32) -> bool {
+    tmp := mem_alloc_aligned(16)
+    ptr_write_f32(tmp, 0, val)
+    b0 := ptr_read_u8(tmp, 0)
+    b1 := ptr_read_u8(tmp, 1)
+    b2 := ptr_read_u8(tmp, 2)
+    b3 := ptr_read_u8(tmp, 3)
+    mem_free_aligned(tmp)
+
+    b := buf_new(4)
+    buf_push(b, b0); buf_push(b, b1); buf_push(b, b2); buf_push(b, b3)
+    res := mem_write_bytes(proc, address, b)
+    buf_free(move b)
+    return res
+}
+
+// Writes string (with optional null-terminator)
+fn mem_write_str(proc: ProcessMem, address: i64, s: str, null_terminate: bool = true) -> bool {
+    n := str_len(s)
+    b := buf_new(n + 1)
+    mut i := 0
+    while i < n {
+        buf_push(b, str_byte(s, i))
+        i += 1
+    }
+    if null_terminate {
+        buf_push(b, 0)
+    }
+    res := mem_write_bytes(proc, address, b)
+    buf_free(move b)
+    return res
+}
+
+// --- 6. Virtual Memory Allocation & Protection ---
+
+// Allocates memory in target process (MEM_COMMIT | MEM_RESERVE = 0x3000)
+// Defaults to W^X-safe PAGE_READWRITE (0x04); callers requiring executable pages must opt in explicitly.
+fn mem_virtual_alloc(proc: ProcessMem, size: i64, protect: i64 = 0x04, target_addr: i64 = 0) -> i64 ! i64 {
+    if size <= 0 { return err(400) }
+    api := get_win32_proc_api()
+    if api.p_alloc_ex == 0 { return err(501) }
+
+    args := mem_alloc_aligned(64)
+    if args == 0 { return err(500) }
+    ptr_write_i64(args, 0, proc.handle)
+    ptr_write_i64(args, 1, target_addr)
+    ptr_write_i64(args, 2, size)
+    ptr_write_i64(args, 3, mem_commit() | mem_reserve()) // 0x3000
+    ptr_write_i64(args, 4, protect)
+    alloc_ptr := c_call_v(api.p_alloc_ex, 5, args)
+
+    mem_free_aligned(args)
+    if alloc_ptr == 0 { return err(500) }
+    return ok(alloc_ptr)
+}
+
+// Frees memory in target process (MEM_RELEASE = 0x8000)
+fn mem_virtual_free(proc: ProcessMem, address: i64) -> bool {
+    if address == 0 { return false }
+    api := get_win32_proc_api()
+    if api.p_free_ex == 0 { return false }
+
+    args := mem_alloc_aligned(64)
+    if args == 0 { return false }
+    ptr_write_i64(args, 0, proc.handle)
+    ptr_write_i64(args, 1, address)
+    ptr_write_i64(args, 2, 0) // dwSize must be 0 for MEM_RELEASE
+    ptr_write_i64(args, 3, mem_release())
+    res := c_call_v(api.p_free_ex, 4, args)
+
+    mem_free_aligned(args)
+    return res != 0
+}
+
+// Changes protection flags of memory region in target process; returns old protection
+fn mem_virtual_protect(proc: ProcessMem, address: i64, size: i64, new_protect: i64) -> i64 ! i64 {
+    if address == 0 or size <= 0 { return err(400) }
+    api := get_win32_proc_api()
+    if api.p_protect_ex == 0 { return err(501) }
+
+    old_prot_buf := mem_alloc_aligned(16)
+    if old_prot_buf == 0 { return err(500) }
+    args := mem_alloc_aligned(64)
+    if args == 0 {
+        mem_free_aligned(old_prot_buf)
+        return err(500)
+    }
+
+    ptr_write_i64(args, 0, proc.handle)
+    ptr_write_i64(args, 1, address)
+    ptr_write_i64(args, 2, size)
+    ptr_write_i64(args, 3, new_protect)
+    ptr_write_i64(args, 4, old_prot_buf)
+    ok_protect := c_call_v(api.p_protect_ex, 5, args)
+
+    old_prot := ptr_read_u8(old_prot_buf, 0) | (ptr_read_u8(old_prot_buf, 1) << 8) | (ptr_read_u8(old_prot_buf, 2) << 16) | (ptr_read_u8(old_prot_buf, 3) << 24)
+
+    mem_free_aligned(args)
+    mem_free_aligned(old_prot_buf)
+    if ok_protect == 0 { return err(500) }
+    return ok(old_prot)
+}
+
+// --- 7. Pattern / Signature Scanning (AOB Scan with Wildcards) ---
+
+// Scans for byte pattern with mask in memory region:
+//   pattern: ByteBuf of target bytes
+//   mask: string of 'x' (match byte) and '?' (wildcard byte), e.g. "xx??xx"
+fn mem_scan_pattern(proc: ProcessMem, start_addr: i64, scan_len: i64, pattern: ByteBuf, mask: str) -> i64 {
+    pat_len := buf_len(pattern)
+    if pat_len <= 0 or scan_len < pat_len or str_len(mask) < pat_len { return -1 }
+
+    // Read target memory block in chunks (at least pat_len * 2 when pattern is large)
+    mut chunk_size := 65536
+    if pat_len > 32768 { chunk_size = pat_len * 2 }
+    if chunk_size > 67108864 { return -1 }
+    mut cur_off := 0
+
+    while cur_off < scan_len {
+        mut read_size := chunk_size
+        if scan_len - cur_off < read_size {
+            read_size = scan_len - cur_off
+        }
+        if read_size < pat_len { break }
+
+        chunk := mem_read_bytes(proc, start_addr + cur_off, read_size) or buf_new(0)
+        c_len := buf_len(chunk)
+        if c_len < pat_len {
+            buf_free(move chunk)
+            break
+        }
+
+        mut i := 0
+        limit := c_len - pat_len
+        while i <= limit {
+            mut matched := true
+            mut pi := 0
+            while pi < pat_len {
+                m_ch := str_byte(mask, pi)
+                if m_ch == 120 { // 'x'
+                    if buf_get(chunk, i + pi) != buf_get(pattern, pi) {
+                        matched = false
+                        break
+                    }
+                }
+                pi += 1
+            }
+            if matched {
+                found_addr := start_addr + cur_off + i
+                buf_free(move chunk)
+                return found_addr
+            }
+            i += 1
+        }
+        buf_free(move chunk)
+        step := read_size - pat_len + 1
+        if step <= 0 { break }
+        cur_off += step
+    }
+    return -1
+}
+
+// Converts hex character ('0'..'9', 'a'..'f', 'A'..'F') to integer
+fn hex_char_to_val(ch: i64) -> i64 {
+    if ch >= 48 and ch <= 57 { return ch - 48 }
+    if ch >= 97 and ch <= 102 { return 10 + (ch - 97) }
+    if ch >= 65 and ch <= 70 { return 10 + (ch - 65) }
+    return -1
+}
+
+fn mem_is_ws(ch: i64) -> bool {
+    return ch == 32 or ch == 9 or ch == 10 or ch == 13
+}
+
+// Scans using IDA-style signature string, e.g. "48 89 5C 24 ? 57 48 83 EC"
+fn mem_scan_ida_sig(proc: ProcessMem, start_addr: i64, scan_len: i64, ida_sig: str) -> i64 {
+    n := str_len(ida_sig)
+    if n <= 0 or n > 65536 { return -1 }
+    pat := buf_new(n + 4)
+    mask_buf := buf_new(n + 4)
+
+    mut i := 0
+    while i < n {
+        // Skip whitespace
+        while i < n and mem_is_ws(str_byte(ida_sig, i)) { i += 1 }
+        if i >= n { break }
+
+        b0 := str_byte(ida_sig, i)
+        if b0 == 63 { // '?' wildcard
+            buf_push(pat, 0)
+            buf_push(mask_buf, 63) // '?'
+            i += 1
+            if i < n and str_byte(ida_sig, i) == 63 { i += 1 } // handle "??"
+            if i < n and not mem_is_ws(str_byte(ida_sig, i)) {
+                buf_free(move pat); buf_free(move mask_buf)
+                return -1
+            }
+        } else {
+            // One or two valid hex digits
+            mut v := hex_char_to_val(b0)
+            if v < 0 {
+                buf_free(move pat); buf_free(move mask_buf)
+                return -1
+            }
+            i += 1
+            if i < n and not mem_is_ws(str_byte(ida_sig, i)) {
+                v2 := hex_char_to_val(str_byte(ida_sig, i))
+                if v2 < 0 {
+                    buf_free(move pat); buf_free(move mask_buf)
+                    return -1
+                }
+                v = (v << 4) | v2
+                i += 1
+                if i < n and not mem_is_ws(str_byte(ida_sig, i)) {
+                    buf_free(move pat); buf_free(move mask_buf)
+                    return -1
+                }
+            }
+            buf_push(pat, v & 0xFF)
+            buf_push(mask_buf, 120) // 'x'
+        }
+    }
+
+    mask_str := mem_buf_to_str(move mask_buf)
+    res := mem_scan_pattern(proc, start_addr, scan_len, pat, mask_str)
+    buf_free(move pat)
+    return res
+}
+
+// --- 8. Shared Memory / Memory-Mapped Files (IPC) ---
+
+// Creates or opens a named shared memory block
+fn shm_open_or_create(name: str, size: i64) -> SharedMem ! i64 {
+    if size <= 0 or str_len(name) == 0 or mem_has_nul(name) { return err(400) }
+    api := get_win32_shm_api()
+    if api.p_create_map == 0 or api.p_map_view == 0 { return err(501) }
+
+    args := mem_alloc_aligned(64)
+    if args == 0 { return err(500) }
+    name_z := name + "\0"
+
+    // CreateFileMappingA(INVALID_HANDLE_VALUE = -1, NULL, PAGE_READWRITE = 4, hi, lo, name)
+    ptr_write_i64(args, 0, -1)
+    ptr_write_i64(args, 1, 0)
+    ptr_write_i64(args, 2, page_readwrite())
+    ptr_write_i64(args, 3, ushr64(size, 32) & 0xFFFFFFFF)
+    ptr_write_i64(args, 4, size & 0xFFFFFFFF)
+    ptr_write_i64(args, 5, c_str_ptr(name_z))
+    h_map := c_call_v(api.p_create_map, 6, args)
+
+    if h_map == 0 {
+        mem_free_aligned(args)
+        return err(500)
+    }
+
+    // MapViewOfFile(h_map, FILE_MAP_ALL_ACCESS = 0xF001F, 0, 0, size)
+    ptr_write_i64(args, 0, h_map)
+    ptr_write_i64(args, 1, file_map_all_access())
+    ptr_write_i64(args, 2, 0)
+    ptr_write_i64(args, 3, 0)
+    ptr_write_i64(args, 4, size)
+    p_view := c_call_v(api.p_map_view, 5, args)
+
+    mem_free_aligned(args)
+    if p_view == 0 {
+        args2 := mem_alloc_aligned(64)
+        if args2 != 0 {
+            ptr_write_i64(args2, 0, h_map)
+            c_call_v(api.p_close, 1, args2)
+            mem_free_aligned(args2)
+        }
+        return err(500)
+    }
+
+    return ok(SharedMem(handle = h_map, ptr = p_view, size = size, name = name, read_only = false))
+}
+
+// Opens an existing shared memory mapping
+fn shm_open_existing(name: str, size: i64, read_only: bool = false) -> SharedMem ! i64 {
+    if size <= 0 or str_len(name) == 0 or mem_has_nul(name) { return err(400) }
+    api := get_win32_shm_api()
+    if api.p_open_map == 0 or api.p_map_view == 0 { return err(501) }
+
+    args := mem_alloc_aligned(64)
+    if args == 0 { return err(500) }
+    name_z := name + "\0"
+
+    mut access := file_map_all_access()
+    if read_only { access = file_map_read() }
+
+    // OpenFileMappingA(access, FALSE, name)
+    ptr_write_i64(args, 0, access)
+    ptr_write_i64(args, 1, 0)
+    ptr_write_i64(args, 2, c_str_ptr(name_z))
+    h_map := c_call_v(api.p_open_map, 3, args)
+
+    if h_map == 0 {
+        mem_free_aligned(args)
+        return err(404)
+    }
+
+    ptr_write_i64(args, 0, h_map)
+    ptr_write_i64(args, 1, access)
+    ptr_write_i64(args, 2, 0)
+    ptr_write_i64(args, 3, 0)
+    ptr_write_i64(args, 4, size)
+    p_view := c_call_v(api.p_map_view, 5, args)
+
+    mem_free_aligned(args)
+    if p_view == 0 {
+        args2 := mem_alloc_aligned(64)
+        if args2 != 0 {
+            ptr_write_i64(args2, 0, h_map)
+            c_call_v(api.p_close, 1, args2)
+            mem_free_aligned(args2)
+        }
+        return err(500)
+    }
+
+    return ok(SharedMem(handle = h_map, ptr = p_view, size = size, name = name, read_only = read_only))
+}
+
+// Reads bytes from shared memory (overflow-safe bounds check)
+fn shm_read_bytes(shm: SharedMem, offset: i64, count: i64) -> ByteBuf ! i64 {
+    if shm.ptr == 0 or offset < 0 or count <= 0 or count > 67108864 or offset > shm.size or count > shm.size - offset {
+        return err(400) // Out of bounds
+    }
+    out := buf_new(count)
+    mut i := 0
+    while i < count {
+        buf_push(out, ptr_read_u8(shm.ptr, offset + i))
+        i += 1
+    }
+    return ok(out)
+}
+
+// Writes bytes to shared memory (rejects read-only views and integer overflow)
+fn shm_write_bytes(shm: SharedMem, offset: i64, data: ByteBuf) -> bool {
+    if shm.ptr == 0 or shm.read_only { return false }
+    n := buf_len(data)
+    if offset < 0 or n < 0 or offset > shm.size or n > shm.size - offset {
+        return false // Out of bounds
+    }
+    mut i := 0
+    while i < n {
+        ptr_write_u8(shm.ptr, offset + i, buf_get(data, i))
+        i += 1
+    }
+    return true
+}
+
+// Reads 64-bit integer from shared memory
+fn shm_read_u64(shm: SharedMem, offset: i64) -> i64 ! i64 {
+    if shm.ptr == 0 or offset < 0 or offset > shm.size or 8 > shm.size - offset { return err(400) }
+    mut res := 0
+    mut i := 7
+    while i >= 0 {
+        res = (res << 8) | ptr_read_u8(shm.ptr, offset + i)
+        i -= 1
+    }
+    return ok(res)
+}
+
+// Writes 64-bit integer to shared memory
+fn shm_write_u64(shm: SharedMem, offset: i64, val: i64) -> bool {
+    if shm.ptr == 0 or shm.read_only or offset < 0 or offset > shm.size or 8 > shm.size - offset { return false }
+    mut v := val
+    mut i := 0
+    while i < 8 {
+        ptr_write_u8(shm.ptr, offset + i, v & 0xFF)
+        v = ushr64(v, 8)
+        i += 1
+    }
+    return true
+}
+
+// Reads null-terminated string from shared memory
+fn shm_read_str(shm: SharedMem, offset: i64, max_len: i64 = 256) -> str ! i64 {
+    if shm.ptr == 0 or offset < 0 or offset >= shm.size or max_len < 0 or max_len > 67108864 { return err(400) }
+    if max_len == 0 { return ok("") }
+    avail := shm.size - offset
+    mut lim := max_len
+    if lim > avail { lim = avail }
+
+    out := buf_new(lim)
+    mut i := 0
+    while i < lim {
+        b := ptr_read_u8(shm.ptr, offset + i)
+        if b == 0 { break }
+        buf_push(out, b)
+        i += 1
+    }
+    return ok(mem_buf_to_str(move out))
+}
+
+// Writes string to shared memory
+fn shm_write_str(shm: SharedMem, offset: i64, s: str, null_terminate: bool = true) -> bool {
+    if shm.ptr == 0 or shm.read_only { return false }
+    n := str_len(s)
+    mut total := n
+    if null_terminate { total += 1 }
+    if offset < 0 or offset > shm.size or total > shm.size - offset { return false }
+
+    mut i := 0
+    while i < n {
+        ptr_write_u8(shm.ptr, offset + i, str_byte(s, i))
+        i += 1
+    }
+    if null_terminate {
+        ptr_write_u8(shm.ptr, offset + n, 0)
+    }
+    return true
+}
+
+// Closes and unmaps shared memory region
+fn shm_close(shm: SharedMem) {
+    api := get_win32_shm_api()
+    args := mem_alloc_aligned(64)
+    if args == 0 { return }
+
+    if shm.ptr != 0 and api.p_unmap_view != 0 {
+        ptr_write_i64(args, 0, shm.ptr)
+        c_call_v(api.p_unmap_view, 1, args)
+    }
+    if shm.handle != 0 and api.p_close != 0 {
+        ptr_write_i64(args, 0, shm.handle)
+        c_call_v(api.p_close, 1, args)
+    }
+    mem_free_aligned(args)
+}
+
+// --- 9. Direct Local Memory Operations (Zero-Overhead Raw Pointer Manipulation) ---
+
+@no_alloc
+fn raw_mem_read_u8(addr: i64, offset: i64 = 0) -> i64 {
+    return ptr_read_u8(addr, offset)
+}
+
+@no_alloc
+fn raw_mem_write_u8(addr: i64, offset: i64, val: i64) {
+    ptr_write_u8(addr, offset, val & 0xFF)
+}
+
+@no_alloc
+fn raw_mem_read_u16(addr: i64, offset: i64 = 0) -> i64 {
+    b0 := ptr_read_u8(addr, offset)
+    b1 := ptr_read_u8(addr, offset + 1)
+    return b0 | (b1 << 8)
+}
+
+@no_alloc
+fn raw_mem_write_u16(addr: i64, offset: i64, val: i64) {
+    ptr_write_u8(addr, offset, val & 0xFF)
+    ptr_write_u8(addr, offset + 1, (val >> 8) & 0xFF)
+}
+
+@no_alloc
+fn raw_mem_read_u32(addr: i64, offset: i64 = 0) -> i64 {
+    b0 := ptr_read_u8(addr, offset)
+    b1 := ptr_read_u8(addr, offset + 1)
+    b2 := ptr_read_u8(addr, offset + 2)
+    b3 := ptr_read_u8(addr, offset + 3)
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+@no_alloc
+fn raw_mem_write_u32(addr: i64, offset: i64, val: i64) {
+    ptr_write_u8(addr, offset, val & 0xFF)
+    ptr_write_u8(addr, offset + 1, (val >> 8) & 0xFF)
+    ptr_write_u8(addr, offset + 2, (val >> 16) & 0xFF)
+    ptr_write_u8(addr, offset + 3, (val >> 24) & 0xFF)
+}
+
+@no_alloc
+fn raw_mem_read_u64(addr: i64, offset: i64 = 0) -> i64 {
+    mut res := 0
+    mut i := 7
+    while i >= 0 {
+        res = (res << 8) | ptr_read_u8(addr, offset + i)
+        i -= 1
+    }
+    return res
+}
+
+@no_alloc
+fn raw_mem_write_u64(addr: i64, offset: i64, val: i64) {
+    mut v := val
+    mut i := 0
+    while i < 8 {
+        ptr_write_u8(addr, offset + i, v & 0xFF)
+        v = ushr64(v, 8)
+        i += 1
+    }
+}

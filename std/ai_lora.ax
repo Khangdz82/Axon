@@ -25,26 +25,37 @@ struct LoraAdapter {
 fn lora_new(in_dim: i64, out_dim: i64, rank: i64, alpha: f64, rng: AiRng, opt_kind: i64 = 2, use_dora: bool = false) -> LoraAdapter {
     mut r := rank
     if r < 1 { r = 1 }
+    if r > 4096 { r = 4096 }
     mut ind := in_dim
     if ind < 1 { ind = 1 }
+    if ind > 65536 { ind = 65536 }
     mut outd := out_dim
     if outd < 1 { outd = 1 }
+    if outd > 65536 { outd = 65536 }
 
     a := param_new(r * ind, opt_kind)
     b := param_new(outd * r, opt_kind)
     // Kaiming init for `A`, exact 0 init for `B` so initial delta = 0
-    init_kaiming_normal_f32(a.data_ptr, r * ind, ind, rng)
-    vec_zero_f32(b.data_ptr, outd * r)
+    if a.data_ptr != 0 {
+        init_kaiming_normal_f32(a.data_ptr, r * ind, ind, rng)
+    }
+    if b.data_ptr != 0 {
+        vec_zero_f32(b.data_ptr, outd * r)
+    }
     mut mag_sz := 1
     if use_dora { mag_sz = outd }
     mag := param_new(mag_sz, opt_kind)
-    mut i := 0
-    while i < mag_sz {
-        ptr_write_f32(mag.data_ptr, i, 1.0)
-        i += 1
+    if mag.data_ptr != 0 {
+        mut i := 0
+        while i < mag_sz {
+            ptr_write_f32(mag.data_ptr, i, 1.0)
+            i += 1
+        }
     }
     mp := mem_alloc_aligned(64)
-    ptr_write_i64(mp, 0, 0)
+    if mp != 0 {
+        ptr_write_i64(mp, 0, 0)
+    }
     return LoraAdapter(
         in_dim = ind,
         out_dim = outd,
@@ -116,6 +127,8 @@ fn lora_fwd_f32(base_w_ptr: i64, l: LoraAdapter, x_ptr: i64, out_ptr: i64, hidde
 @no_alloc
 @nan_guard
 fn qlora_fwd_f32(base_q: QuantTensor, l: LoraAdapter, x_ptr: i64, out_ptr: i64, hidden_buf: i64, batch: i64) {
+    if batch <= 0 or x_ptr == 0 or out_ptr == 0 or hidden_buf == 0 { return }
+    if base_q.rows != l.out_dim or base_q.cols != l.in_dim { return }
     quant_matmul_f32(base_q, x_ptr, out_ptr, batch)
     gemm_f32(x_ptr, l.a.data_ptr, hidden_buf, batch, l.in_dim, l.rank, false, true, 1.0, 0.0)
     gemm_f32(hidden_buf, l.b.data_ptr, out_ptr, batch, l.rank, l.out_dim, false, true, l.scale, 1.0)
@@ -139,6 +152,20 @@ fn qlora_fwd_f32(base_q: QuantTensor, l: LoraAdapter, x_ptr: i64, out_ptr: i64, 
 @no_alloc
 @nan_guard
 fn lora_bwd_f32(base_w_ptr: i64, l: LoraAdapter, x_ptr: i64, hidden_buf: i64, dout_ptr: i64, dx_ptr: i64, tmp_dh_buf: i64, batch: i64, propagate_dx: bool) {
+    if batch <= 0 or x_ptr == 0 or hidden_buf == 0 or dout_ptr == 0 or tmp_dh_buf == 0 { return }
+    if l.use_dora and l.mag.data_ptr != 0 {
+        mut b := 0
+        while b < batch {
+            row := b * l.out_dim
+            mut j := 0
+            while j < l.out_dim {
+                m := ptr_read_f32(l.mag.data_ptr, j)
+                ptr_write_f32(dout_ptr, row + j, ptr_read_f32(dout_ptr, row + j) * m)
+                j += 1
+            }
+            b += 1
+        }
+    }
     // dB[out_dim, rank] += scale * dY^T @ H
     gemm_f32(dout_ptr, hidden_buf, l.b.grad_ptr, l.out_dim, batch, l.rank, true, false, l.scale, 1.0)
     // dH[batch, rank] = scale * dY @ B
@@ -149,7 +176,9 @@ fn lora_bwd_f32(base_w_ptr: i64, l: LoraAdapter, x_ptr: i64, hidden_buf: i64, do
         if base_w_ptr != 0 {
             gemm_f32(dout_ptr, base_w_ptr, dx_ptr, batch, l.out_dim, l.in_dim, false, false, 1.0, 1.0)
         }
-        gemm_f32(tmp_dh_buf, l.a.data_ptr, dx_ptr, batch, l.rank, l.in_dim, false, false, 1.0, 1.0)
+        if l.merged_ptr == 0 or ptr_read_i64(l.merged_ptr, 0) == 0 {
+            gemm_f32(tmp_dh_buf, l.a.data_ptr, dx_ptr, batch, l.rank, l.in_dim, false, false, 1.0, 1.0)
+        }
     }
 }
 
@@ -165,7 +194,10 @@ struct Adamw8bitState {
 }
 
 fn adamw_8bit_init(numel: i64) -> Adamw8bitState {
-    mut n := numel
+    mut safe_numel := numel
+    if safe_numel < 0 { safe_numel = 0 }
+    if safe_numel > 268435456 { safe_numel = 268435456 }
+    mut n := safe_numel
     if n < 32 { n = 32 }
     blocks := (n + 31) / 32
 
@@ -175,6 +207,19 @@ fn adamw_8bit_init(numel: i64) -> Adamw8bitState {
     sv := mem_alloc_aligned(blocks * 4 + 64)
     sm_scratch := mem_alloc_aligned(128)
     sv_scratch := mem_alloc_aligned(128)
+
+    if qm == 0 or qv == 0 or sm == 0 or sv == 0 or sm_scratch == 0 or sv_scratch == 0 {
+        if qm != 0 { mem_free_aligned(qm) }
+        if qv != 0 { mem_free_aligned(qv) }
+        if sm != 0 { mem_free_aligned(sm) }
+        if sv != 0 { mem_free_aligned(sv) }
+        if sm_scratch != 0 { mem_free_aligned(sm_scratch) }
+        if sv_scratch != 0 { mem_free_aligned(sv_scratch) }
+        return Adamw8bitState(
+            q_m_ptr = 0, q_v_ptr = 0, scale_m_ptr = 0, scale_v_ptr = 0,
+            scratch_m_ptr = 0, scratch_v_ptr = 0, numel = 0, num_blocks = 0
+        )
+    }
 
     mut i := 0
     while i < blocks * 32 {
@@ -197,7 +242,7 @@ fn adamw_8bit_init(numel: i64) -> Adamw8bitState {
         scale_v_ptr = sv,
         scratch_m_ptr = sm_scratch,
         scratch_v_ptr = sv_scratch,
-        numel = numel,
+        numel = safe_numel,
         num_blocks = blocks
     )
 }
@@ -224,8 +269,12 @@ fn adamw_8bit_step(
     eps: f64 = 0.00000001,
     weight_decay: f64 = 0.01
 ) {
+    if opt.numel <= 0 or opt.num_blocks <= 0 or w_ptr == 0 or g_ptr == 0 or opt.q_m_ptr == 0 or opt.q_v_ptr == 0 {
+        return
+    }
     mut st := step_num
     if st < 1 { st = 1 }
+    safe_eps := max_f64(eps, 0.000000000001)
     bc1 := 1.0 - pow_f64(beta1, st as f64)
     bc2 := 1.0 - pow_f64(beta2, st as f64)
     inv_bc1 := 1.0 / max_f64(bc1, 0.000000000001)
@@ -257,9 +306,10 @@ fn adamw_8bit_step(
                 raw_v := ptr_read_u8(opt.q_v_ptr, idx) as f64
                 v_old := raw_v * scale_v
 
-                g := ptr_read_f32(g_ptr, idx)
-                m_new := beta1 * m_old + one_m_b1 * g
-                v_new := beta2 * v_old + one_m_b2 * g * g
+                mut g := ptr_read_f32(g_ptr, idx)
+                g = clamp_f64(g, -1000000000000.0, 1000000000000.0)
+                m_new := clamp_f64(beta1 * m_old + one_m_b1 * g, -1000000000000000000.0, 1000000000000000000.0)
+                v_new := clamp_f64(beta2 * v_old + one_m_b2 * g * g, 0.0, 1000000000000000000000000000000.0)
 
                 ptr_write_f32(scratch_m, j, m_new)
                 ptr_write_f32(scratch_v, j, v_new)
@@ -270,7 +320,7 @@ fn adamw_8bit_step(
 
                 m_hat := m_new * inv_bc1
                 v_hat := v_new * inv_bc2
-                upd := m_hat / (sqrt_f64(max_f64(v_hat, 0.0)) + eps)
+                upd := m_hat / (sqrt_f64(max_f64(v_hat, 0.0)) + safe_eps)
 
                 w := ptr_read_f32(w_ptr, idx) * decay_factor
                 ptr_write_f32(w_ptr, idx, w - lr * upd)
@@ -326,6 +376,7 @@ fn lora_step_adamw_8bit(
     lr: f64,
     weight_decay: f64 = 0.01
 ) {
+    if opt_a.numel != l.a.numel or opt_b.numel != l.b.numel { return }
     adamw_8bit_step(opt_a, l.a.data_ptr, l.a.grad_ptr, step_num, lr, 0.9, 0.999, 0.00000001, weight_decay)
     adamw_8bit_step(opt_b, l.b.data_ptr, l.b.grad_ptr, step_num, lr, 0.9, 0.999, 0.00000001, weight_decay)
 }
@@ -367,6 +418,7 @@ fn lora_clip_grad(l: LoraAdapter, max_norm: f64) -> f64 {
 @no_alloc
 @nan_guard
 fn lora_merge_into_f32(base_w_ptr: i64, l: LoraAdapter) {
+    if base_w_ptr == 0 or l.merged_ptr == 0 { return }
     if ptr_read_i64(l.merged_ptr, 0) != 0 { return }
     gemm_f32(l.b.data_ptr, l.a.data_ptr, base_w_ptr, l.out_dim, l.rank, l.in_dim, false, false, l.scale, 1.0)
     ptr_write_i64(l.merged_ptr, 0, 1)
@@ -376,26 +428,32 @@ fn lora_merge_into_f32(base_w_ptr: i64, l: LoraAdapter) {
 @no_alloc
 @nan_guard
 fn lora_unmerge_from_f32(base_w_ptr: i64, l: LoraAdapter) {
+    if base_w_ptr == 0 or l.merged_ptr == 0 { return }
     if ptr_read_i64(l.merged_ptr, 0) == 0 { return }
     gemm_f32(l.b.data_ptr, l.a.data_ptr, base_w_ptr, l.out_dim, l.rank, l.in_dim, false, false, 0.0 - l.scale, 1.0)
     ptr_write_i64(l.merged_ptr, 0, 0)
 }
 
-// --- Compact Binary `.axlora` Checkpoint Save / Load (with FNV-64 Checksum) ---
+// --- Compact Binary `.axlora` Checkpoint Save / Load (with Full Header+Payload FNV-64 Checksum) ---
 
-fn fnv1a_raw_bytes(ptr: i64, num_bytes: i64) -> i64 {
-    mut h := -3750763034362895579
-    mut i := 0
-    while i < num_bytes {
-        h = (h ^ ptr_read_u8(ptr, i)) *% 1099511628211
+fn fnv1a_buf_range(b: ByteBuf, start: i64, end: i64, seed: i64) -> i64 {
+    mut h := seed
+    mut i := start
+    while i < end {
+        h = (h ^ buf_get(b, i)) *% 1099511628211
         i += 1
     }
     return h
 }
 
+fn lora_is_finite_f32_bits(bits: i64) -> bool {
+    return ((bits >> 23) & 0xFF) != 0xFF
+}
+
 fn lora_save_file(path: str, l: LoraAdapter) -> i64 ! i64 {
     mut total_floats := l.a.numel + l.b.numel
     if l.use_dora { total_floats = total_floats + l.mag.numel }
+    if total_floats <= 0 or total_floats > 268435456 { return err(400) }
     out := buf_new(64 + total_floats * 4)
     // Magic "AXLR" = 0x524C5841, version = 1
     buf_push_u32(out, 0x524C5841)
@@ -407,11 +465,8 @@ fn lora_save_file(path: str, l: LoraAdapter) -> i64 ! i64 {
     mut dora_flag := 0
     if l.use_dora { dora_flag = 1 }
     buf_push_u64(out, dora_flag)
-    mut hash := fnv1a_raw_bytes(l.a.data_ptr, l.a.numel * 4) ^ fnv1a_raw_bytes(l.b.data_ptr, l.b.numel * 4)
-    if l.use_dora {
-        hash = hash ^ fnv1a_raw_bytes(l.mag.data_ptr, l.mag.numel * 4)
-    }
-    buf_push_u64(out, hash)
+    // Placeholder for full header[0..48] + payload[56..] integrity hash
+    buf_push_u64(out, 0)
     mut i := 0
     while i < l.a.numel {
         bits := f64_to_f32_bits(l.a.scratch_ptr, ptr_read_f32(l.a.data_ptr, i))
@@ -432,7 +487,14 @@ fn lora_save_file(path: str, l: LoraAdapter) -> i64 ! i64 {
             i += 1
         }
     }
-    return fs_write_file(path, out)
+    // Non-commutative sequential FNV-64 hash over entire header [0..48) and payload [56..len)
+    mut hash := fnv1a_buf_range(out, 0, 48, -3750763034362895579)
+    hash = fnv1a_buf_range(out, 56, buf_len(out), hash)
+    buf_put_u64(out, 48, hash)
+    wr := fs_write_file(path, out) or -1
+    buf_free(move out)
+    if wr < 0 { return err(500) }
+    return ok(wr)
 }
 
 fn buf_read_u32_le(b: ByteBuf, off: i64) -> i64 {
@@ -447,12 +509,14 @@ fn buf_read_u64_le(b: ByteBuf, off: i64) -> i64 {
 
 fn lora_load_file(path: str, opt_kind: i64 = 2) -> LoraAdapter ! i64 {
     raw := fs_read_file(path) or return err(404)
-    if buf_len(raw) < 56 {
+    raw_len := buf_len(raw)
+    if raw_len < 56 {
         buf_free(move raw)
         return err(422)
     }
     magic := buf_read_u32_le(raw, 0)
-    if magic != 0x524C5841 {
+    ver := buf_read_u32_le(raw, 4)
+    if magic != 0x524C5841 or ver != 1 {
         buf_free(move raw)
         return err(422)
     }
@@ -466,18 +530,52 @@ fn lora_load_file(path: str, opt_kind: i64 = 2) -> LoraAdapter ! i64 {
         buf_free(move raw)
         return err(422)
     }
-    mut expected_floats := rank * in_dim + out_dim * rank
-    if dora_flag != 0 { expected_floats = expected_floats + out_dim }
-    expected_len := 56 + expected_floats * 4
-    if expected_len < 56 or buf_len(raw) < expected_len {
+    if not lora_is_finite_f32_bits(alpha_bits) {
         buf_free(move raw)
         return err(422)
     }
-    rng := ai_rng_new(1)
-    scr := rng.state_ptr
+    mut expected_floats := rank * in_dim + out_dim * rank
+    if dora_flag != 0 { expected_floats = expected_floats + out_dim }
+    if expected_floats <= 0 or expected_floats > 268435456 {
+        buf_free(move raw)
+        return err(422)
+    }
+    expected_len := 56 + expected_floats * 4
+    if raw_len != expected_len {
+        buf_free(move raw)
+        return err(422)
+    }
+    // Verify integrity hash & NaN/Inf freedom BEFORE allocating large adapter tensors!
+    mut actual_hash := fnv1a_buf_range(raw, 0, 48, -3750763034362895579)
+    actual_hash = fnv1a_buf_range(raw, 56, expected_len, actual_hash)
+    if actual_hash != expected_hash {
+        buf_free(move raw)
+        return err(422)
+    }
+    mut chk_off := 56
+    while chk_off < expected_len {
+        if not lora_is_finite_f32_bits(buf_read_u32_le(raw, chk_off)) {
+            buf_free(move raw)
+            return err(422)
+        }
+        chk_off += 4
+    }
+
+    scr := mem_alloc_aligned(16)
+    if scr == 0 {
+        buf_free(move raw)
+        return err(500)
+    }
     alpha := f32_bits_to_f64(scr, alpha_bits)
+    mem_free_aligned(scr)
+    rng := ai_rng_new(1)
     adapter := lora_new(in_dim, out_dim, rank, alpha, rng, opt_kind, dora_flag != 0)
     ai_rng_free(move rng)
+    if adapter.a.data_ptr == 0 or adapter.b.data_ptr == 0 or adapter.mag.data_ptr == 0 or adapter.merged_ptr == 0 {
+        lora_free(move adapter)
+        buf_free(move raw)
+        return err(500)
+    }
 
     mut off := 56
     mut i := 0
@@ -504,13 +602,5 @@ fn lora_load_file(path: str, opt_kind: i64 = 2) -> LoraAdapter ! i64 {
         }
     }
     buf_free(move raw)
-    mut actual_hash := fnv1a_raw_bytes(adapter.a.data_ptr, adapter.a.numel * 4) ^ fnv1a_raw_bytes(adapter.b.data_ptr, adapter.b.numel * 4)
-    if adapter.use_dora {
-        actual_hash = actual_hash ^ fnv1a_raw_bytes(adapter.mag.data_ptr, adapter.mag.numel * 4)
-    }
-    if actual_hash != expected_hash {
-        lora_free(move adapter)
-        return err(422)
-    }
     return ok(adapter)
 }

@@ -15,22 +15,39 @@ New-Item -ItemType Directory -Path $InstallStd -Force | Out-Null
 $CurrentAxc = Join-Path $PSScriptRoot "bin\axc.exe"
 $ZipPkg = Join-Path $PSScriptRoot "dist\axon-v1.0.0-win-x64.zip"
 
-if (Test-Path -Path $CurrentAxc) {
-    Copy-Item -Path $CurrentAxc -Destination $AxcExe -Force
-    Copy-Item -Path (Join-Path $PSScriptRoot "std\*.ax") -Destination $InstallStd -Force
-    if (Test-Path (Join-Path $PSScriptRoot "AXON_LLM_SPEC.md")) {
-        Copy-Item -Path (Join-Path $PSScriptRoot "AXON_LLM_SPEC.md") -Destination $AxonRoot -Force
+if (Test-Path -LiteralPath $CurrentAxc) {
+    Copy-Item -LiteralPath $CurrentAxc -Destination $AxcExe -Force
+    Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot "std") -Filter "*.ax" -File | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $InstallStd -Force
     }
-} elseif (Test-Path -Path $ZipPkg) {
+    $SpecFile = Join-Path $PSScriptRoot "AXON_LLM_SPEC.md"
+    if (Test-Path -LiteralPath $SpecFile) {
+        Copy-Item -LiteralPath $SpecFile -Destination $AxonRoot -Force
+    }
+    $McpJson = Join-Path $PSScriptRoot "axon_mcp.json"
+    if (Test-Path -LiteralPath $McpJson) {
+        Copy-Item -LiteralPath $McpJson -Destination $AxonRoot -Force
+    }
+} elseif (Test-Path -LiteralPath $ZipPkg) {
     Write-Host "[*] Extracting ultra-lightweight toolchain package ($ZipPkg)..." -ForegroundColor Cyan
-    Expand-Archive -Path $ZipPkg -DestinationPath $AxonRoot -Force
+    Expand-Archive -LiteralPath $ZipPkg -DestinationPath $AxonRoot -Force
 } else {
     throw "Neither bin\axc.exe nor distribution package found."
 }
 
 $UserPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::User)
-if ($UserPath -notlike "*$InstallBin*") {
-    $NewPath = "$InstallBin;$UserPath"
+if ($null -eq $UserPath) { $UserPath = "" }
+$NormalizedBin = $InstallBin.TrimEnd('\').ToLowerInvariant()
+$PathEntries = @($UserPath -split ';' | Where-Object { $_.Trim().Length -gt 0 })
+$AlreadyInPath = $false
+foreach ($entry in $PathEntries) {
+    if ($entry.Trim().TrimEnd('\').ToLowerInvariant() -eq $NormalizedBin) {
+        $AlreadyInPath = $true
+        break
+    }
+}
+if (-not $AlreadyInPath) {
+    $NewPath = if ($PathEntries.Count -gt 0) { "$InstallBin;$UserPath" } else { $InstallBin }
     [Environment]::SetEnvironmentVariable("Path", $NewPath, [EnvironmentVariableTarget]::User)
     $env:Path = "$InstallBin;$env:Path"
     Write-Host "[+] Added $InstallBin to User PATH." -ForegroundColor Green
