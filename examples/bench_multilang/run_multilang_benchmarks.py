@@ -96,10 +96,14 @@ def main():
     workloads = [
         ("gemm", "Matrix GEMM (256x256 FP32)"),
         ("bnn", "BNN POPCOUNT GEMV (4096)"),
-        ("sort", "Quicksort (100k Int64)"),
+        ("sort", "Quicksort / Radix (100k Int64)"),
         ("sieve", "Sieve Primes (2,000,000)"),
         ("physics", "3D Kinematics (50k x 10)"),
-        ("json", "JSON Scan (100k runs)")
+        ("json", "JSON Scan (100k runs)"),
+        ("fib", "Recursive fib(35)"),
+        ("crc32", "CRC32 (16 MB)"),
+        ("mandel", "Mandelbrot (512x512)"),
+        ("gc_churn", "Alloc/GC Churn (1M)")
     ]
 
     header = f"{'Language / Runtime':<30} | " + " | ".join([f"{w[0].upper():<9}" for w in workloads])

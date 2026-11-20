@@ -212,6 +212,78 @@ func benchJSON() float64 {
 	return elapsed
 }
 
+func fibGo(n int64) int64 {
+	if n <= 1 { return n }
+	return fibGo(n-1) + fibGo(n-2)
+}
+
+func benchFib() float64 {
+	t0 := time.Now()
+	r := fibGo(35)
+	el := float64(time.Since(t0).Nanoseconds()) / 1000000.0
+	if r != 9227465 { fmt.Printf("checksum: %d\n", r) }
+	return el
+}
+
+func benchCRC32() float64 {
+	n := 16777216
+	buf := make([]byte, n)
+	var tbl [256]uint32
+	for i := 0; i < 256; i++ {
+		c := uint32(i)
+		for k := 0; k < 8; k++ {
+			if (c & 1) != 0 { c = (c >> 1) ^ 0xEDB88320 } else { c >>= 1 }
+		}
+		tbl[i] = c
+	}
+	for i := 0; i < n; i++ { buf[i] = byte((i*7 + 13) & 255) }
+	t0 := time.Now()
+	var crc uint32 = 0xFFFFFFFF
+	for _, b := range buf { crc = (crc >> 8) ^ tbl[byte(crc)^b] }
+	crc ^= 0xFFFFFFFF
+	el := float64(time.Since(t0).Nanoseconds()) / 1000000.0
+	if crc == 0 { fmt.Printf("checksum: %d\n", crc) }
+	return el
+}
+
+func benchMandel() float64 {
+	size := 512
+	t0 := time.Now()
+	var total int64
+	for py := 0; py < size; py++ {
+		ci := (float64(py)/512.0)*2.4 - 1.2
+		for px := 0; px < size; px++ {
+			cr := (float64(px)/512.0)*3.0 - 2.0
+			zr, zi := 0.0, 0.0
+			it := 0
+			for it < 64 {
+				zr2, zi2 := zr*zr, zi*zi
+				if zr2+zi2 > 4.0 { break }
+				zi = 2.0*zr*zi + ci
+				zr = zr2 - zi2 + cr
+				it++
+			}
+			total += int64(it)
+		}
+	}
+	el := float64(time.Since(t0).Nanoseconds()) / 1000000.0
+	if total == 0 { fmt.Printf("checksum: %d\n", total) }
+	return el
+}
+
+func benchGCChurn() float64 {
+	t0 := time.Now()
+	var acc int64
+	for i := int64(0); i < 1000000; i++ {
+		b := make([]int64, 0, 8)
+		b = append(b, i&255)
+		acc += b[0]
+	}
+	el := float64(time.Since(t0).Nanoseconds()) / 1000000.0
+	if acc == 0 { fmt.Printf("checksum: %d\n", acc) }
+	return el
+}
+
 func main() {
 	tGemm := benchGEMM()
 	tBnn := benchBNN()
@@ -219,7 +291,11 @@ func main() {
 	tSieve := benchSieve()
 	tPhys := benchPhysics()
 	tJson := benchJSON()
+	tFib := benchFib()
+	tCrc := benchCRC32()
+	tMandel := benchMandel()
+	tGc := benchGCChurn()
 
-	fmt.Printf("{\"lang\": \"Go (go 1.26)\", \"gemm\": %.2f, \"bnn\": %.3f, \"sort\": %.2f, \"sieve\": %.2f, \"physics\": %.2f, \"json\": %.2f}\n",
-		tGemm, tBnn, tSort, tSieve, tPhys, tJson)
+	fmt.Printf("{\"lang\": \"Go (go 1.26)\", \"gemm\": %.2f, \"bnn\": %.3f, \"sort\": %.2f, \"sieve\": %.2f, \"physics\": %.2f, \"json\": %.2f, \"fib\": %.2f, \"crc32\": %.2f, \"mandel\": %.2f, \"gc_churn\": %.2f}\n",
+		tGemm, tBnn, tSort, tSieve, tPhys, tJson, tFib, tCrc, tMandel, tGc)
 }

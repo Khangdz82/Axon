@@ -232,6 +232,86 @@ static double bench_json(void) {
     return elapsed;
 }
 
+static long long fib_c(int n) {
+    if (n <= 1) return n;
+    return fib_c(n - 1) + fib_c(n - 2);
+}
+
+static double bench_fib(void) {
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    volatile long long r = fib_c(35);
+    QueryPerformanceCounter(&t1);
+    if (r != 9227465) printf("checksum: %lld\n", r);
+    return get_time_ms(t0, t1, freq);
+}
+
+static double bench_crc32(void) {
+    int n = 16777216;
+    unsigned char* buf = (unsigned char*)malloc(n);
+    unsigned int tbl[256];
+    for (int i = 0; i < 256; i++) {
+        unsigned int c = (unsigned int)i;
+        for (int k = 0; k < 8; k++) c = (c & 1) ? ((c >> 1) ^ 0xEDB88320u) : (c >> 1);
+        tbl[i] = c;
+    }
+    for (int i = 0; i < n; i++) buf[i] = (unsigned char)((i * 7 + 13) & 255);
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    unsigned int crc = 0xFFFFFFFFu;
+    for (int i = 0; i < n; i++) crc = (crc >> 8) ^ tbl[(crc ^ buf[i]) & 255];
+    crc ^= 0xFFFFFFFFu;
+    QueryPerformanceCounter(&t1);
+    if (crc == 0) printf("checksum: %u\n", crc);
+    free(buf);
+    return get_time_ms(t0, t1, freq);
+}
+
+static double bench_mandel(void) {
+    int size = 512;
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    long long total = 0;
+    for (int py = 0; py < size; py++) {
+        double ci = ((double)py / 512.0) * 2.4 - 1.2;
+        for (int px = 0; px < size; px++) {
+            double cr = ((double)px / 512.0) * 3.0 - 2.0;
+            double zr = 0.0, zi = 0.0;
+            int it = 0;
+            while (it < 64) {
+                double zr2 = zr * zr, zi2 = zi * zi;
+                if (zr2 + zi2 > 4.0) break;
+                zi = 2.0 * zr * zi + ci;
+                zr = zr2 - zi2 + cr;
+                it++;
+            }
+            total += it;
+        }
+    }
+    QueryPerformanceCounter(&t1);
+    if (total == 0) printf("checksum: %lld\n", total);
+    return get_time_ms(t0, t1, freq);
+}
+
+static double bench_gc_churn(void) {
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    volatile long long acc = 0;
+    for (int i = 0; i < 1000000; i++) {
+        long long* volatile b = (long long*)malloc(64);
+        b[0] = i & 255;
+        acc += b[0];
+        free(b);
+    }
+    QueryPerformanceCounter(&t1);
+    if (acc == 0) printf("checksum: %lld\n", acc);
+    return get_time_ms(t0, t1, freq);
+}
+
 int main(void) {
     double t_gemm = bench_gemm();
     double t_bnn = bench_bnn();
@@ -239,8 +319,12 @@ int main(void) {
     double t_sieve = bench_sieve();
     double t_phys = bench_physics();
     double t_json = bench_json();
+    double t_fib = bench_fib();
+    double t_crc = bench_crc32();
+    double t_mandel = bench_mandel();
+    double t_gc = bench_gc_churn();
 
-    printf("{\"lang\": \"C (MSVC /O2)\", \"gemm\": %.2f, \"bnn\": %.2f, \"sort\": %.2f, \"sieve\": %.2f, \"physics\": %.2f, \"json\": %.2f}\n",
-           t_gemm, t_bnn, t_sort, t_sieve, t_phys, t_json);
+    printf("{\"lang\": \"C (MSVC /O2)\", \"gemm\": %.2f, \"bnn\": %.2f, \"sort\": %.2f, \"sieve\": %.2f, \"physics\": %.2f, \"json\": %.2f, \"fib\": %.2f, \"crc32\": %.2f, \"mandel\": %.2f, \"gc_churn\": %.2f}\n",
+           t_gemm, t_bnn, t_sort, t_sieve, t_phys, t_json, t_fib, t_crc, t_mandel, t_gc);
     return 0;
 }

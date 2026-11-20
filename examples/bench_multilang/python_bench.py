@@ -147,6 +147,64 @@ def bench_json():
         print("checksum:", sum_price)
     return elapsed
 
+def fib_py(n):
+    return n if n <= 1 else fib_py(n - 1) + fib_py(n - 2)
+
+def bench_fib():
+    t0 = time.perf_counter()
+    r = fib_py(35)
+    el = (time.perf_counter() - t0) * 1000.0
+    if r != 9227465: print("checksum:", r)
+    return el
+
+def bench_crc32():
+    n = 16777216
+    buf = bytes([(i * 7 + 13) & 255 for i in range(n)])
+    tbl = []
+    for i in range(256):
+        c = i
+        for _ in range(8): c = ((c >> 1) ^ 0xEDB88320) if (c & 1) else (c >> 1)
+        tbl.append(c)
+    t0 = time.perf_counter()
+    crc = 0xFFFFFFFF
+    for b in buf:
+        crc = (crc >> 8) ^ tbl[(crc ^ b) & 255]
+    crc ^= 0xFFFFFFFF
+    el = (time.perf_counter() - t0) * 1000.0
+    if crc == 0: print("checksum:", crc)
+    return el
+
+def bench_mandel():
+    size = 512
+    t0 = time.perf_counter()
+    total = 0
+    for py in range(size):
+        ci = (py / 512.0) * 2.4 - 1.2
+        for px in range(size):
+            cr = (px / 512.0) * 3.0 - 2.0
+            zr = 0.0; zi = 0.0; it = 0
+            while it < 64:
+                zr2 = zr * zr; zi2 = zi * zi
+                if zr2 + zi2 > 4.0: break
+                zi = 2.0 * zr * zi + ci
+                zr = zr2 - zi2 + cr
+                it += 1
+            total += it
+    el = (time.perf_counter() - t0) * 1000.0
+    if total == 0: print("checksum:", total)
+    return el
+
+def bench_gc_churn():
+    t0 = time.perf_counter()
+    acc = 0
+    for i in range(1000000):
+        b = [0, 0, 0, 0, 0, 0, 0, 0]
+        b[0] = i & 255
+        acc += b[0]
+    el = (time.perf_counter() - t0) * 1000.0
+    if acc == 0: print("checksum:", acc)
+    return el
+
 if __name__ == "__main__":
     t_gemm = bench_gemm()
     t_bnn = bench_bnn()
@@ -154,6 +212,10 @@ if __name__ == "__main__":
     t_sieve = bench_sieve()
     t_phys = bench_physics()
     t_json = bench_json()
+    t_fib = bench_fib()
+    t_crc = bench_crc32()
+    t_mandel = bench_mandel()
+    t_gc = bench_gc_churn()
 
     res = {
         "lang": "Python 3.11",
@@ -162,6 +224,10 @@ if __name__ == "__main__":
         "sort": round(t_sort, 2),
         "sieve": round(t_sieve, 2),
         "physics": round(t_phys, 2),
-        "json": round(t_json, 2)
+        "json": round(t_json, 2),
+        "fib": round(t_fib, 2),
+        "crc32": round(t_crc, 2),
+        "mandel": round(t_mandel, 2),
+        "gc_churn": round(t_gc, 2)
     }
     print(json.dumps(res))

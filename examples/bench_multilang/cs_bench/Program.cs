@@ -222,6 +222,82 @@ class Program
         return sw.Elapsed.TotalMilliseconds;
     }
 
+    static long FibCs(int n) => n <= 1 ? n : FibCs(n - 1) + FibCs(n - 2);
+
+    static double BenchFib()
+    {
+        var sw = Stopwatch.StartNew();
+        long r = FibCs(35);
+        sw.Stop();
+        if (r != 9227465) Console.WriteLine("checksum: " + r);
+        return sw.Elapsed.TotalMilliseconds;
+    }
+
+    static double BenchCRC32()
+    {
+        int n = 16777216;
+        byte[] buf = new byte[n];
+        uint[] tbl = new uint[256];
+        for (int i = 0; i < 256; i++)
+        {
+            uint c = (uint)i;
+            for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? ((c >> 1) ^ 0xEDB88320u) : (c >> 1);
+            tbl[i] = c;
+        }
+        for (int i = 0; i < n; i++) buf[i] = (byte)((i * 7 + 13) & 255);
+        var sw = Stopwatch.StartNew();
+        uint crc = 0xFFFFFFFFu;
+        for (int i = 0; i < n; i++) crc = (crc >> 8) ^ tbl[(crc ^ buf[i]) & 255];
+        crc ^= 0xFFFFFFFFu;
+        sw.Stop();
+        if (crc == 0) Console.WriteLine("checksum: " + crc);
+        return sw.Elapsed.TotalMilliseconds;
+    }
+
+    static double BenchMandel()
+    {
+        int size = 512;
+        var sw = Stopwatch.StartNew();
+        long total = 0;
+        for (int py = 0; py < size; py++)
+        {
+            double ci = (py / 512.0) * 2.4 - 1.2;
+            for (int px = 0; px < size; px++)
+            {
+                double cr = (px / 512.0) * 3.0 - 2.0;
+                double zr = 0.0, zi = 0.0;
+                int it = 0;
+                while (it < 64)
+                {
+                    double zr2 = zr * zr, zi2 = zi * zi;
+                    if (zr2 + zi2 > 4.0) break;
+                    zi = 2.0 * zr * zi + ci;
+                    zr = zr2 - zi2 + cr;
+                    it++;
+                }
+                total += it;
+            }
+        }
+        sw.Stop();
+        if (total == 0) Console.WriteLine("checksum: " + total);
+        return sw.Elapsed.TotalMilliseconds;
+    }
+
+    static double BenchGCChurn()
+    {
+        var sw = Stopwatch.StartNew();
+        long acc = 0;
+        for (int i = 0; i < 1000000; i++)
+        {
+            long[] b = new long[8];
+            b[0] = i & 255;
+            acc += b[0];
+        }
+        sw.Stop();
+        if (acc == 0) Console.WriteLine("checksum: " + acc);
+        return sw.Elapsed.TotalMilliseconds;
+    }
+
     static void Main()
     {
         double tGemm = BenchGEMM();
@@ -230,7 +306,11 @@ class Program
         double tSieve = BenchSieve();
         double tPhys = BenchPhysics();
         double tJson = BenchJSON();
+        double tFib = BenchFib();
+        double tCrc = BenchCRC32();
+        double tMandel = BenchMandel();
+        double tGc = BenchGCChurn();
 
-        Console.WriteLine($"{{\"lang\": \"C# (.NET 10)\", \"gemm\": {tGemm:F2}, \"bnn\": {tBnn:F2}, \"sort\": {tSort:F2}, \"sieve\": {tSieve:F2}, \"physics\": {tPhys:F2}, \"json\": {tJson:F2}}}");
+        Console.WriteLine($"{{\"lang\": \"C# (.NET 10)\", \"gemm\": {tGemm:F2}, \"bnn\": {tBnn:F2}, \"sort\": {tSort:F2}, \"sieve\": {tSieve:F2}, \"physics\": {tPhys:F2}, \"json\": {tJson:F2}, \"fib\": {tFib:F2}, \"crc32\": {tCrc:F2}, \"mandel\": {tMandel:F2}, \"gc_churn\": {tGc:F2}}}");
     }
 }

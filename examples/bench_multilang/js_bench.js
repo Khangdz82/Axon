@@ -182,6 +182,72 @@ function benchJSON() {
     return elapsed;
 }
 
+function fibJs(n) { return n <= 1 ? n : fibJs(n - 1) + fibJs(n - 2); }
+
+function benchFib() {
+    const t0 = performance.now();
+    const r = fibJs(35);
+    const el = performance.now() - t0;
+    if (r !== 9227465) console.log("checksum:", r);
+    return el;
+}
+
+function benchCRC32() {
+    const n = 16777216;
+    const buf = new Uint8Array(n);
+    const tbl = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+        let c = i;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? ((c >>> 1) ^ 0xEDB88320) : (c >>> 1);
+        tbl[i] = c;
+    }
+    for (let i = 0; i < n; i++) buf[i] = (i * 7 + 13) & 255;
+    const t0 = performance.now();
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < n; i++) crc = (crc >>> 8) ^ tbl[(crc ^ buf[i]) & 255];
+    crc = (crc ^ 0xFFFFFFFF) >>> 0;
+    const el = performance.now() - t0;
+    if (crc === 0) console.log("checksum:", crc);
+    return el;
+}
+
+function benchMandel() {
+    const size = 512;
+    const t0 = performance.now();
+    let total = 0;
+    for (let py = 0; py < size; py++) {
+        const ci = (py / 512.0) * 2.4 - 1.2;
+        for (let px = 0; px < size; px++) {
+            const cr = (px / 512.0) * 3.0 - 2.0;
+            let zr = 0.0, zi = 0.0, it = 0;
+            while (it < 64) {
+                const zr2 = zr * zr, zi2 = zi * zi;
+                if (zr2 + zi2 > 4.0) break;
+                zi = 2.0 * zr * zi + ci;
+                zr = zr2 - zi2 + cr;
+                it++;
+            }
+            total += it;
+        }
+    }
+    const el = performance.now() - t0;
+    if (total === 0) console.log("checksum:", total);
+    return el;
+}
+
+function benchGCChurn() {
+    const t0 = performance.now();
+    let acc = 0;
+    for (let i = 0; i < 1000000; i++) {
+        const b = [0, 0, 0, 0, 0, 0, 0, 0];
+        b[0] = i & 255;
+        acc += b[0];
+    }
+    const el = performance.now() - t0;
+    if (acc === 0) console.log("checksum:", acc);
+    return el;
+}
+
 const runtime = typeof Bun !== 'undefined' ? "Bun (1.4)" : "Node.js (v24 V8)";
 const tGemm = benchGEMM();
 const tBnn = benchBNN();
@@ -189,6 +255,10 @@ const tSort = benchSort();
 const tSieve = benchSieve();
 const tPhys = benchPhysics();
 const tJson = benchJSON();
+const tFib = benchFib();
+const tCrc = benchCRC32();
+const tMandel = benchMandel();
+const tGc = benchGCChurn();
 
 console.log(JSON.stringify({
     lang: runtime,
@@ -197,5 +267,9 @@ console.log(JSON.stringify({
     sort: parseFloat(tSort.toFixed(2)),
     sieve: parseFloat(tSieve.toFixed(2)),
     physics: parseFloat(tPhys.toFixed(2)),
-    json: parseFloat(tJson.toFixed(2))
+    json: parseFloat(tJson.toFixed(2)),
+    fib: parseFloat(tFib.toFixed(2)),
+    crc32: parseFloat(tCrc.toFixed(2)),
+    mandel: parseFloat(tMandel.toFixed(2)),
+    gc_churn: parseFloat(tGc.toFixed(2))
 }));

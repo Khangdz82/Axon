@@ -189,6 +189,75 @@ public class Main {
         return elapsed;
     }
 
+    static long fibJava(int n) {
+        return n <= 1 ? n : fibJava(n - 1) + fibJava(n - 2);
+    }
+
+    static double benchFib() {
+        long t0 = System.nanoTime();
+        long r = fibJava(35);
+        double el = (System.nanoTime() - t0) / 1_000_000.0;
+        if (r != 9227465) System.out.println("checksum: " + r);
+        return el;
+    }
+
+    static double benchCRC32() {
+        int n = 16777216;
+        byte[] buf = new byte[n];
+        int[] tbl = new int[256];
+        for (int i = 0; i < 256; i++) {
+            int c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? ((c >>> 1) ^ 0xEDB88320) : (c >>> 1);
+            tbl[i] = c;
+        }
+        for (int i = 0; i < n; i++) buf[i] = (byte)((i * 7 + 13) & 255);
+        long t0 = System.nanoTime();
+        int crc = 0xFFFFFFFF;
+        for (int i = 0; i < n; i++) crc = (crc >>> 8) ^ tbl[(crc ^ buf[i]) & 255];
+        crc ^= 0xFFFFFFFF;
+        double el = (System.nanoTime() - t0) / 1_000_000.0;
+        if (crc == 0) System.out.println("checksum: " + crc);
+        return el;
+    }
+
+    static double benchMandel() {
+        int size = 512;
+        long t0 = System.nanoTime();
+        long total = 0;
+        for (int py = 0; py < size; py++) {
+            double ci = (py / 512.0) * 2.4 - 1.2;
+            for (int px = 0; px < size; px++) {
+                double cr = (px / 512.0) * 3.0 - 2.0;
+                double zr = 0.0, zi = 0.0;
+                int it = 0;
+                while (it < 64) {
+                    double zr2 = zr * zr, zi2 = zi * zi;
+                    if (zr2 + zi2 > 4.0) break;
+                    zi = 2.0 * zr * zi + ci;
+                    zr = zr2 - zi2 + cr;
+                    it++;
+                }
+                total += it;
+            }
+        }
+        double el = (System.nanoTime() - t0) / 1_000_000.0;
+        if (total == 0) System.out.println("checksum: " + total);
+        return el;
+    }
+
+    static double benchGCChurn() {
+        long t0 = System.nanoTime();
+        long acc = 0;
+        for (int i = 0; i < 1000000; i++) {
+            long[] b = new long[8];
+            b[0] = i & 255;
+            acc += b[0];
+        }
+        double el = (System.nanoTime() - t0) / 1_000_000.0;
+        if (acc == 0) System.out.println("checksum: " + acc);
+        return el;
+    }
+
     public static void main(String[] args) {
         double tGemm = benchGEMM();
         double tBnn = benchBNN();
@@ -196,8 +265,12 @@ public class Main {
         double tSieve = benchSieve();
         double tPhys = benchPhysics();
         double tJson = benchJSON();
+        double tFib = benchFib();
+        double tCrc = benchCRC32();
+        double tMandel = benchMandel();
+        double tGc = benchGCChurn();
 
-        System.out.printf("{\"lang\": \"Java (JDK 21)\", \"gemm\": %.2f, \"bnn\": %.2f, \"sort\": %.2f, \"sieve\": %.2f, \"physics\": %.2f, \"json\": %.2f}\n",
-                tGemm, tBnn, tSort, tSieve, tPhys, tJson);
+        System.out.printf("{\"lang\": \"Java (JDK 21)\", \"gemm\": %.2f, \"bnn\": %.2f, \"sort\": %.2f, \"sieve\": %.2f, \"physics\": %.2f, \"json\": %.2f, \"fib\": %.2f, \"crc32\": %.2f, \"mandel\": %.2f, \"gc_churn\": %.2f}\n",
+                tGemm, tBnn, tSort, tSieve, tPhys, tJson, tFib, tCrc, tMandel, tGc);
     }
 }
