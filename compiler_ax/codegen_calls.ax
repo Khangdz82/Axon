@@ -11,6 +11,60 @@ fn er_pack(slot: i64, ty: i64) -> i64 {
     return (slot << 36) | (ty & 0xFFFFFFFFF)
 }
 
+fn mc_vex256(c: ByteBuf, map: i64, reg: i64, vvvv: i64, rm: i64, op: i64) {
+    mut r_bit := 1
+    if (reg & 8) != 0 { r_bit = 0 }
+    mut b_bit := 1
+    if (rm & 8) != 0 { b_bit = 0 }
+    b1 := (r_bit << 7) | 0x40 | (b_bit << 5) | (map & 31)
+    b2 := (((vvvv & 15) ^ 15) << 3) | 0x05
+    modrm := 0xC0 | ((reg & 7) << 3) | (rm & 7)
+    mc_b4(c, 0xC4, b1, b2, op)
+    mc_b1(c, modrm)
+}
+
+// `VMOVDQU YMMd, [RBX + disp]; VPXOR YMMd, YMMd, [RDX + disp]` (base+disp only: 100% Skylake micro-fused!)
+fn mc_avx_load_xor(c: ByteBuf, dst: i64, disp: i64) {
+    mut r_bit := 1
+    if (dst & 8) != 0 { r_bit = 0 }
+    b1 := (r_bit << 7) | 0x61
+    b2_ld := 0x7E
+    b2_xr := (((dst & 15) ^ 15) << 3) | 0x05
+    mut mod_bits := 0
+    if disp != 0 {
+        if disp >= -128 and disp <= 127 { mod_bits = 0x40 }
+        else { mod_bits = 0x80 }
+    }
+    modrm_rbx := mod_bits | ((dst & 7) << 3) | 0x03
+    modrm_rdx := mod_bits | ((dst & 7) << 3) | 0x02
+    mc_b4(c, 0xC4, b1, b2_ld, 0x6F); mc_b1(c, modrm_rbx) // VMOVDQU YMMd, [RBX + disp]
+    if mod_bits == 0x40 { mc_b1(c, disp & 255) }
+    else if mod_bits == 0x80 { mc_u32(c, disp & 0xFFFFFFFF) }
+    mc_b4(c, 0xC4, b1, b2_xr, 0xEF); mc_b1(c, modrm_rdx) // VPXOR YMMd, YMMd, [RDX + disp]
+    if mod_bits == 0x40 { mc_b1(c, disp & 255) }
+    else if mod_bits == 0x80 { mc_u32(c, disp & 0xFFFFFFFF) }
+}
+
+// Carry-Save Adder: `(h, l) = CSA(a, b, cin)` using scratch `YMM14`, `YMM15`
+fn mc_avx_csa(c: ByteBuf, h: i64, l: i64, a: i64, b: i64, cin: i64) {
+    mc_vex256(c, 1, 14, a, b, 0xEF)     // VPXOR YMM14, a, b
+    mc_vex256(c, 1, 15, a, b, 0xDB)     // VPAND YMM15, a, b
+    mc_vex256(c, 1, h, 14, cin, 0xDB)   // VPAND h, YMM14, cin
+    mc_vex256(c, 1, h, 15, h, 0xEB)     // VPOR  h, YMM15, h
+    mc_vex256(c, 1, l, 14, cin, 0xEF)   // VPXOR l, YMM14, cin
+}
+
+// `dst = popcnt256_4x64(src)` using `YMM0=lut, YMM1=0x0F, YMM2=0`, scratch `YMM14, YMM15`
+fn mc_avx_popcnt256(c: ByteBuf, dst: i64, src: i64) {
+    mc_vex256(c, 1, 14, src, 1, 0xDB)          // VPAND YMM14, src, YMM1
+    mc_vex256(c, 1, 2, 15, src, 0x71); mc_b1(c, 4) // VPSRLW YMM15, src, 4
+    mc_vex256(c, 1, 15, 15, 1, 0xDB)           // VPAND YMM15, YMM15, YMM1
+    mc_vex256(c, 2, 14, 0, 14, 0x00)           // VPSHUFB YMM14, YMM0, YMM14
+    mc_vex256(c, 2, 15, 0, 15, 0x00)           // VPSHUFB YMM15, YMM0, YMM15
+    mc_vex256(c, 1, 14, 14, 15, 0xFC)          // VPADDB YMM14, YMM14, YMM15
+    mc_vex256(c, 1, dst, 14, 2, 0xF6)          // VPSADBW dst, YMM14, YMM2
+}
+
 fn er_slot(r: i64) -> i64 {
     return ushr64(r, 36)
 }
@@ -661,7 +715,9 @@ fn try_emit_v7_domain_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, bre
         out_r := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
         rr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 3), 4))
         dr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 4), 4))
-        mc_b3(c, 0x53, 0x56, 0x57)      // PUSH RBX; PUSH RSI; PUSH RDI
+        mc_b3(c, 0x53, 0x56, 0x57)              // PUSH RBX; PUSH RSI; PUSH RDI
+        mc_b4(c, 0x41, 0x54, 0x41, 0x55)        // PUSH R12; PUSH R13
+        mc_b4(c, 0x41, 0x56, 0x41, 0x57)        // PUSH R14; PUSH R15
         mc_load_rcx(c, er_slot(wr), 0); mc_b3(c, 0x49, 0x89, 0xCB) // R11 = weights
         mc_load_rdx(c, er_slot(ar), 0); mc_b3(c, 0x49, 0x89, 0xD0) // R8 = act
         mc_load_rcx(c, er_slot(out_r), 0)                          // RCX = out
@@ -673,85 +729,200 @@ fn try_emit_v7_domain_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, bre
         mc_b3(c, 0x48, 0x85, 0xC9); jz_bo := mc_jcc32(c, 0x84)
         mc_b3(c, 0x4D, 0x85, 0xC9); jle_br := mc_jcc32(c, 0x8E)
         mc_b3(c, 0x4D, 0x85, 0xD2); jle_bd := mc_jcc32(c, 0x8E)
-        mc_b2(c, 0x31, 0xFF)             // XOR EDI, EDI (r = 0)
-        lp_b_out := buf_len(c)
-        mc_b2(c, 0x31, 0xDB)             // XOR EBX, EBX (sum0 = 0)
-        mc_b2(c, 0x31, 0xD2)             // XOR EDX, EDX (sum1 = 0)
-        mc_b2(c, 0x31, 0xF6)             // XOR ESI, ESI (w = 0)
-        lp_b_in := buf_len(c)
-        mc_b4(c, 0x48, 0x8D, 0x46, 0x08) // LEA RAX, [RSI + 8]
-        mc_b3(c, 0x4C, 0x39, 0xD0)       // CMP RAX, R10
-        jg_b_tail := mc_jcc32(c, 0x8F)   // JG scalar_tail (prevents OOB read when words % 8 != 0)
-        // 0:
-        mc_b4(c, 0x49, 0x8B, 0x04, 0xF3) // MOV RAX, [R11 + RSI*8]
-        mc_b4(c, 0x49, 0x33, 0x04, 0xF0) // XOR RAX, [R8 + RSI*8]
-        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0) // POPCNT RAX, RAX
-        mc_b2(c, 0x01, 0xC3)             // ADD EBX, EAX
-        // 1:
-        mc_b4(c, 0x49, 0x8B, 0x44, 0xF3); mc_b1(c, 8) // MOV RAX, [R11 + RSI*8 + 8]
-        mc_b4(c, 0x49, 0x33, 0x44, 0xF0); mc_b1(c, 8) // XOR RAX, [R8 + RSI*8 + 8]
-        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0) // POPCNT RAX, RAX
-        mc_b2(c, 0x01, 0xC2)             // ADD EDX, EAX
-        // 2:
-        mc_b4(c, 0x49, 0x8B, 0x44, 0xF3); mc_b1(c, 16) // MOV RAX, [R11 + RSI*8 + 16]
-        mc_b4(c, 0x49, 0x33, 0x44, 0xF0); mc_b1(c, 16) // XOR RAX, [R8 + RSI*8 + 16]
-        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0) // POPCNT RAX, RAX
-        mc_b2(c, 0x01, 0xC3)             // ADD EBX, EAX
-        // 3:
-        mc_b4(c, 0x49, 0x8B, 0x44, 0xF3); mc_b1(c, 24) // MOV RAX, [R11 + RSI*8 + 24]
-        mc_b4(c, 0x49, 0x33, 0x44, 0xF0); mc_b1(c, 24) // XOR RAX, [R8 + RSI*8 + 24]
-        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0) // POPCNT RAX, RAX
-        mc_b2(c, 0x01, 0xC2)             // ADD EDX, EAX
-        // 4:
-        mc_b4(c, 0x49, 0x8B, 0x44, 0xF3); mc_b1(c, 32) // MOV RAX, [R11 + RSI*8 + 32]
-        mc_b4(c, 0x49, 0x33, 0x44, 0xF0); mc_b1(c, 32) // XOR RAX, [R8 + RSI*8 + 32]
-        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0) // POPCNT RAX, RAX
-        mc_b2(c, 0x01, 0xC3)             // ADD EBX, EAX
-        // 5:
-        mc_b4(c, 0x49, 0x8B, 0x44, 0xF3); mc_b1(c, 40) // MOV RAX, [R11 + RSI*8 + 40]
-        mc_b4(c, 0x49, 0x33, 0x44, 0xF0); mc_b1(c, 40) // XOR RAX, [R8 + RSI*8 + 40]
-        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0) // POPCNT RAX, RAX
-        mc_b2(c, 0x01, 0xC2)             // ADD EDX, EAX
-        // 6:
-        mc_b4(c, 0x49, 0x8B, 0x44, 0xF3); mc_b1(c, 48) // MOV RAX, [R11 + RSI*8 + 48]
-        mc_b4(c, 0x49, 0x33, 0x44, 0xF0); mc_b1(c, 48) // XOR RAX, [R8 + RSI*8 + 48]
-        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0) // POPCNT RAX, RAX
-        mc_b2(c, 0x01, 0xC3)             // ADD EBX, EAX
-        // 7:
-        mc_b4(c, 0x49, 0x8B, 0x44, 0xF3); mc_b1(c, 56) // MOV RAX, [R11 + RSI*8 + 56]
-        mc_b4(c, 0x49, 0x33, 0x44, 0xF0); mc_b1(c, 56) // XOR RAX, [R8 + RSI*8 + 56]
-        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0) // POPCNT RAX, RAX
-        mc_b2(c, 0x01, 0xC2)             // ADD EDX, EAX
+        // Dispatch AVX2 Harley-Seal (8x256-bit CSA = 32 u64 words/iter!) when `g_simd_tier >= 2` and `words >= 32`
+        cg_mov_rax_data(cg, data_off_simd_tier())
+        mc_b4(c, 0x48, 0x83, 0xF8, 0x02); jl_hs_sc1 := mc_jcc32(c, 0x8C)
+        mc_b4(c, 0x49, 0x83, 0xFA, 0x20); jl_hs_sc2 := mc_jcc32(c, 0x8C)
+        // Save Win64 non-volatile XMM6..XMM15 (`160 bytes`) + 32 bytes LUT/mask = `192 bytes`
+        mc_b3(c, 0x48, 0x81, 0xEC); mc_u32(c, 192)
+        mut xi := 0
+        while xi < 10 {
+            xreg := 6 + xi
+            mut xr_bit := 1
+            if (xreg & 8) != 0 { xr_bit = 0 }
+            // VMOVDQU [RSP + 32 + xi*16], XMM(xreg) -> `C4 [R 1 1 00001] [0 1111 0 10 = 7A] 7F modrm 24 disp`
+            off_x := 32 + xi * 16
+            if off_x < 128 {
+                mc_b4(c, 0xC4, (xr_bit << 7) | 0x61, 0x7A, 0x7F)
+                mc_b3(c, 0x44 | ((xreg & 7) << 3), 0x24, off_x)
+            } else {
+                mc_b4(c, 0xC4, (xr_bit << 7) | 0x61, 0x7A, 0x7F)
+                mc_b2(c, 0x84 | ((xreg & 7) << 3), 0x24); mc_u32(c, off_x)
+            }
+            xi += 1
+        }
+        mc_mov_rax_imm(c, 0x0302020102010100); mc_b4(c, 0x48, 0x89, 0x04, 0x24)
+        mc_mov_rax_imm(c, 0x0403030203020201); mc_b4(c, 0x48, 0x89, 0x44, 0x24); mc_b1(c, 8)
+        mc_mov_rax_imm(c, 0x0F0F0F0F0F0F0F0F)
+        mc_b4(c, 0x48, 0x89, 0x44, 0x24); mc_b1(c, 16)
+        mc_b4(c, 0x48, 0x89, 0x44, 0x24); mc_b1(c, 24)
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0x5A); mc_b2(c, 0x04, 0x24)       // VBROADCASTI128 YMM0, [RSP]
+        mc_b4(c, 0xC4, 0xE2, 0x7D, 0x5A); mc_b3(c, 0x4C, 0x24, 0x10) // VBROADCASTI128 YMM1, [RSP+16]
+        mc_vex256(c, 1, 2, 2, 2, 0xEF)                               // VPXOR YMM2, YMM2, YMM2
+        // R8 = act_base (preserved!), R11 = row_base (bumped by R12 per row), RBX/RDX = bumped inner ptrs
+        mc_b3(c, 0x4D, 0x89, 0xD4); mc_b4(c, 0x49, 0xC1, 0xE4, 0x03) // R12 = words * 8 (row_bytes)
+        mc_b3(c, 0x4D, 0x89, 0xD5); mc_b4(c, 0x49, 0x83, 0xE5, 0xE0); mc_b4(c, 0x49, 0xC1, 0xE5, 0x03) // R13 = (words & ~31) * 8
+        mc_b2(c, 0x31, 0xFF)                                         // XOR EDI, EDI (r = 0)
+        lp_hs_row := buf_len(c)
+        mc_b3(c, 0x4C, 0x89, 0xDB)     // RBX = R11 (row_ptr)
+        mc_b3(c, 0x4C, 0x89, 0xC2)     // RDX = R8  (act_ptr)
+        mc_vex256(c, 1, 3, 3, 3, 0xEF) // YMM3 = total
+        mc_vex256(c, 1, 4, 4, 4, 0xEF) // YMM4 = ones
+        mc_vex256(c, 1, 5, 5, 5, 0xEF) // YMM5 = twos
+        mc_vex256(c, 1, 6, 6, 6, 0xEF) // YMM6 = fours
+        mc_b2(c, 0x31, 0xF6)           // XOR ESI, ESI (byte_off = 0)
+        lp_hs_blk := buf_len(c)
+        mc_b3(c, 0x4C, 0x39, 0xEE); jge_hs_rem := mc_jcc32(c, 0x8D) // CMP RSI, R13
+        mc_avx_load_xor(c, 12, 0);   mc_avx_load_xor(c, 13, 32);  mc_avx_csa(c, 8, 4, 4, 12, 13)
+        mc_avx_load_xor(c, 12, 64);  mc_avx_load_xor(c, 13, 96);  mc_avx_csa(c, 9, 4, 4, 12, 13)
+        mc_avx_csa(c, 10, 5, 5, 8, 9)
+        mc_avx_load_xor(c, 12, 128); mc_avx_load_xor(c, 13, 160); mc_avx_csa(c, 8, 4, 4, 12, 13)
+        mc_avx_load_xor(c, 12, 192); mc_avx_load_xor(c, 13, 224); mc_avx_csa(c, 9, 4, 4, 12, 13)
+        mc_avx_csa(c, 11, 5, 5, 8, 9)
+        mc_avx_csa(c, 7, 6, 6, 10, 11)
+        mc_avx_popcnt256(c, 12, 7)
+        mc_vex256(c, 1, 3, 3, 12, 0xD4) // VPADDQ YMM3, YMM3, YMM12
+        mc_b3(c, 0x48, 0x81, 0xC3); mc_u32(c, 256) // ADD RBX, 256
+        mc_b3(c, 0x48, 0x81, 0xC2); mc_u32(c, 256) // ADD RDX, 256
+        mc_b3(c, 0x48, 0x81, 0xC6); mc_u32(c, 256) // ADD RSI, 256
+        jmp_hs_blk := mc_jmp32(c)
+        mc_patch_rel32(c, jmp_hs_blk, lp_hs_blk)
+        mc_patch_rel32(c, jge_hs_rem, buf_len(c))
+        // Combine `total = (YMM3 << 3) + (pop(fours) << 2) + (pop(twos) << 1) + pop(ones)`
+        mc_vex256(c, 1, 6, 3, 3, 0x73); mc_b1(c, 3)   // VPSLLQ YMM3, YMM3, 3
+        mc_avx_popcnt256(c, 12, 6)
+        mc_vex256(c, 1, 6, 12, 12, 0x73); mc_b1(c, 2) // VPSLLQ YMM12, YMM12, 2
+        mc_vex256(c, 1, 3, 3, 12, 0xD4)
+        mc_avx_popcnt256(c, 12, 5)
+        mc_vex256(c, 1, 6, 12, 12, 0x73); mc_b1(c, 1) // VPSLLQ YMM12, YMM12, 1
+        mc_vex256(c, 1, 3, 3, 12, 0xD4)
+        mc_avx_popcnt256(c, 12, 4)
+        mc_vex256(c, 1, 3, 3, 12, 0xD4)
+        // Horizontal sum 4x64 lanes of YMM3 -> R14
+        mc_b4(c, 0xC4, 0xE3, 0x7D, 0x39); mc_b2(c, 0xDE, 0x01) // VEXTRACTI128 XMM6, YMM3, 1
+        mc_b4(c, 0xC5, 0xE1, 0xD4, 0xDE)                       // VPADDQ XMM3, XMM3, XMM6
+        mc_b4(c, 0xC5, 0xC9, 0x73, 0xDB); mc_b1(c, 0x08)       // VPSRLDQ XMM6, XMM3, 8
+        mc_b4(c, 0xC5, 0xE1, 0xD4, 0xDE)                       // VPADDQ XMM3, XMM3, XMM6
+        mc_b4(c, 0xC4, 0xC1, 0xF9, 0x7E); mc_b1(c, 0xDE)       // VMOVQ R14, XMM3
+        // Scalar tail for `words % 32` (`RBX`/`RDX` already point to `row + R13` / `act + R13`!)
+        lp_hs_t := buf_len(c)
+        mc_b3(c, 0x4C, 0x39, 0xE6); jge_hs_td := mc_jcc8(c, 0x7D) // CMP RSI, R12
+        mc_b3(c, 0x48, 0x8B, 0x03)       // MOV RAX, [RBX]
+        mc_b3(c, 0x48, 0x33, 0x02)       // XOR RAX, [RDX]
+        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0)
+        mc_b3(c, 0x49, 0x01, 0xC6)       // ADD R14, RAX
+        mc_b4(c, 0x48, 0x83, 0xC3, 0x08) // ADD RBX, 8
+        mc_b4(c, 0x48, 0x83, 0xC2, 0x08) // ADD RDX, 8
         mc_b4(c, 0x48, 0x83, 0xC6, 0x08) // ADD RSI, 8
+        jmp_hs_t := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_hs_t, lp_hs_t)
+        mc_patch_jcc8(c, jge_hs_td, buf_len(c))
+        mc_b4(c, 0x4C, 0x89, 0x34, 0xF9) // MOV [RCX + RDI*8], R14
+        mc_b3(c, 0x4D, 0x01, 0xE3)       // ADD R11, R12
+        mc_b3(c, 0x48, 0xFF, 0xC7)       // INC RDI
+        mc_b3(c, 0x4C, 0x39, 0xCF)       // CMP RDI, R9
+        jl_hs_row := mc_jcc32(c, 0x8C)
+        mc_patch_rel32(c, jl_hs_row, lp_hs_row)
+        // Restore XMM6..XMM15 + VZEROUPPER
+        xi = 0
+        while xi < 10 {
+            xreg := 6 + xi
+            mut xr_bit := 1
+            if (xreg & 8) != 0 { xr_bit = 0 }
+            off_x := 32 + xi * 16
+            if off_x < 128 {
+                mc_b4(c, 0xC4, (xr_bit << 7) | 0x61, 0x7A, 0x6F)
+                mc_b3(c, 0x44 | ((xreg & 7) << 3), 0x24, off_x)
+            } else {
+                mc_b4(c, 0xC4, (xr_bit << 7) | 0x61, 0x7A, 0x6F)
+                mc_b2(c, 0x84 | ((xreg & 7) << 3), 0x24); mc_u32(c, off_x)
+            }
+            xi += 1
+        }
+        mc_b3(c, 0xC5, 0xF8, 0x77)       // VZEROUPPER
+        mc_b3(c, 0x48, 0x81, 0xC4); mc_u32(c, 192)
+        jmp_hs_done := mc_jmp32(c)
+        // Scalar 8-word (64B cache-line) 4-register-independent POPCNT fallback
+        hs_sc_start := buf_len(c)
+        mc_patch_rel32(c, jl_hs_sc1, hs_sc_start)
+        mc_patch_rel32(c, jl_hs_sc2, hs_sc_start)
+        mc_b2(c, 0x31, 0xFF)                    // XOR EDI, EDI (r = 0)
+        lp_b_out := buf_len(c)
+        mc_b2(c, 0x31, 0xDB)                    // XOR EBX, EBX (sum0 = 0)
+        mc_b2(c, 0x31, 0xD2)                    // XOR EDX, EDX (sum1 = 0)
+        mc_b3(c, 0x45, 0x31, 0xFF)              // XOR R15D, R15D (sum2 = 0)
+        mc_b2(c, 0x31, 0xF6)                    // XOR ESI, ESI (w = 0)
+        lp_b_in := buf_len(c)
+        mc_b4(c, 0x48, 0x8D, 0x46, 0x08)        // LEA RAX, [RSI + 8]
+        mc_b3(c, 0x4C, 0x39, 0xD0)              // CMP RAX, R10
+        jg_b_tail := mc_jcc32(c, 0x8F)          // JG scalar_tail
+        // Words 0..3 into 4 independent regs (RAX, R12, R13, R14)
+        mc_b4(c, 0x49, 0x8B, 0x04, 0xF3)                         // MOV RAX, [R11 + RSI*8]
+        mc_b4(c, 0x4D, 0x8B, 0x64, 0xF3); mc_b1(c, 8)            // MOV R12, [R11 + RSI*8 + 8]
+        mc_b4(c, 0x4D, 0x8B, 0x6C, 0xF3); mc_b1(c, 16)           // MOV R13, [R11 + RSI*8 + 16]
+        mc_b4(c, 0x4D, 0x8B, 0x74, 0xF3); mc_b1(c, 24)           // MOV R14, [R11 + RSI*8 + 24]
+        mc_b4(c, 0x49, 0x33, 0x04, 0xF0)                         // XOR RAX, [R8 + RSI*8]
+        mc_b4(c, 0x4D, 0x33, 0x64, 0xF0); mc_b1(c, 8)            // XOR R12, [R8 + RSI*8 + 8]
+        mc_b4(c, 0x4D, 0x33, 0x6C, 0xF0); mc_b1(c, 16)           // XOR R13, [R8 + RSI*8 + 16]
+        mc_b4(c, 0x4D, 0x33, 0x74, 0xF0); mc_b1(c, 24)           // XOR R14, [R8 + RSI*8 + 24]
+        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0)         // POPCNT RAX, RAX
+        mc_b4(c, 0xF3, 0x4D, 0x0F, 0xB8); mc_b1(c, 0xE4)         // POPCNT R12, R12
+        mc_b4(c, 0xF3, 0x4D, 0x0F, 0xB8); mc_b1(c, 0xED)         // POPCNT R13, R13
+        mc_b4(c, 0xF3, 0x4D, 0x0F, 0xB8); mc_b1(c, 0xF6)         // POPCNT R14, R14
+        mc_b2(c, 0x01, 0xC3)                                     // ADD EBX, EAX
+        mc_b3(c, 0x44, 0x01, 0xE2)                               // ADD EDX, R12D
+        mc_b3(c, 0x45, 0x01, 0xEF)                               // ADD R15D, R13D
+        mc_b3(c, 0x44, 0x01, 0xF3)                               // ADD EBX, R14D
+        // Words 4..7 into 4 independent regs (RAX, R12, R13, R14)
+        mc_b4(c, 0x49, 0x8B, 0x44, 0xF3); mc_b1(c, 32)           // MOV RAX, [R11 + RSI*8 + 32]
+        mc_b4(c, 0x4D, 0x8B, 0x64, 0xF3); mc_b1(c, 40)           // MOV R12, [R11 + RSI*8 + 40]
+        mc_b4(c, 0x4D, 0x8B, 0x6C, 0xF3); mc_b1(c, 48)           // MOV R13, [R11 + RSI*8 + 48]
+        mc_b4(c, 0x4D, 0x8B, 0x74, 0xF3); mc_b1(c, 56)           // MOV R14, [R11 + RSI*8 + 56]
+        mc_b4(c, 0x49, 0x33, 0x44, 0xF0); mc_b1(c, 32)           // XOR RAX, [R8 + RSI*8 + 32]
+        mc_b4(c, 0x4D, 0x33, 0x64, 0xF0); mc_b1(c, 40)           // XOR R12, [R8 + RSI*8 + 40]
+        mc_b4(c, 0x4D, 0x33, 0x6C, 0xF0); mc_b1(c, 48)           // XOR R13, [R8 + RSI*8 + 48]
+        mc_b4(c, 0x4D, 0x33, 0x74, 0xF0); mc_b1(c, 56)           // XOR R14, [R8 + RSI*8 + 56]
+        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0)         // POPCNT RAX, RAX
+        mc_b4(c, 0xF3, 0x4D, 0x0F, 0xB8); mc_b1(c, 0xE4)         // POPCNT R12, R12
+        mc_b4(c, 0xF3, 0x4D, 0x0F, 0xB8); mc_b1(c, 0xED)         // POPCNT R13, R13
+        mc_b4(c, 0xF3, 0x4D, 0x0F, 0xB8); mc_b1(c, 0xF6)         // POPCNT R14, R14
+        mc_b2(c, 0x01, 0xC2)                                     // ADD EDX, EAX
+        mc_b3(c, 0x45, 0x01, 0xE7)                               // ADD R15D, R12D
+        mc_b3(c, 0x44, 0x01, 0xEB)                               // ADD EBX, R13D
+        mc_b3(c, 0x44, 0x01, 0xF2)                               // ADD EDX, R14D
+        mc_b4(c, 0x48, 0x83, 0xC6, 0x08)        // ADD RSI, 8
         jmp_b_in := mc_jmp32(c)
         mc_patch_rel32(c, jmp_b_in, lp_b_in)
-        // Scalar tail loop for remaining `words % 8`
         mc_patch_rel32(c, jg_b_tail, buf_len(c))
         lp_b_tail := buf_len(c)
-        mc_b3(c, 0x4C, 0x39, 0xD6)       // CMP RSI, R10
+        mc_b3(c, 0x4C, 0x39, 0xD6)              // CMP RSI, R10
         jge_b_td := mc_jcc8(c, 0x7D)
-        mc_b4(c, 0x49, 0x8B, 0x04, 0xF3) // MOV RAX, [R11 + RSI*8]
-        mc_b4(c, 0x49, 0x33, 0x04, 0xF0) // XOR RAX, [R8 + RSI*8]
-        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0) // POPCNT RAX, RAX
-        mc_b2(c, 0x01, 0xC3)             // ADD EBX, EAX
-        mc_b3(c, 0x48, 0xFF, 0xC6)       // INC RSI
+        mc_b4(c, 0x49, 0x8B, 0x04, 0xF3)        // MOV RAX, [R11 + RSI*8]
+        mc_b4(c, 0x49, 0x33, 0x04, 0xF0)        // XOR RAX, [R8 + RSI*8]
+        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0)
+        mc_b2(c, 0x01, 0xC3)                    // ADD EBX, EAX
+        mc_b3(c, 0x48, 0xFF, 0xC6)              // INC RSI
         jmp_b_tl := mc_jcc8(c, 0xEB)
         mc_patch_jcc8(c, jmp_b_tl, lp_b_tail)
         mc_patch_jcc8(c, jge_b_td, buf_len(c))
-        mc_b2(c, 0x01, 0xD3)             // ADD EBX, EDX
-        mc_b4(c, 0x48, 0x89, 0x1C, 0xF9) // MOV [RCX + RDI*8], RBX
-        mc_b4(c, 0x4F, 0x8D, 0x1C, 0xD3) // LEA R11, [R11 + R10*8]
-        mc_b3(c, 0x48, 0xFF, 0xC7)       // INC RDI
-        mc_b3(c, 0x4C, 0x39, 0xCF)       // CMP RDI, R9
+        mc_b2(c, 0x01, 0xD3)                    // ADD EBX, EDX
+        mc_b3(c, 0x44, 0x01, 0xFB)              // ADD EBX, R15D
+        mc_b4(c, 0x48, 0x89, 0x1C, 0xF9)        // MOV [RCX + RDI*8], RBX
+        mc_b4(c, 0x4F, 0x8D, 0x1C, 0xD3)        // LEA R11, [R11 + R10*8]
+        mc_b3(c, 0x48, 0xFF, 0xC7)              // INC RDI
+        mc_b3(c, 0x4C, 0x39, 0xCF)              // CMP RDI, R9
         jl_b_out := mc_jcc32(c, 0x8C)
         mc_patch_rel32(c, jl_b_out, lp_b_out)
         b_done := buf_len(c)
+        mc_patch_rel32(c, jmp_hs_done, b_done)
         mc_patch_rel32(c, jz_bw, b_done)
         mc_patch_rel32(c, jz_ba, b_done)
         mc_patch_rel32(c, jz_bo, b_done)
         mc_patch_rel32(c, jle_br, b_done)
         mc_patch_rel32(c, jle_bd, b_done)
-        mc_b3(c, 0x5F, 0x5E, 0x5B)       // POP RDI; POP RSI; POP RBX
+        mc_b4(c, 0x41, 0x5F, 0x41, 0x5E)        // POP R15; POP R14
+        mc_b4(c, 0x41, 0x5D, 0x41, 0x5C)        // POP R13; POP R12
+        mc_b3(c, 0x5F, 0x5E, 0x5B)              // POP RDI; POP RSI; POP RBX
         zs := cg_alloc_slots(cg, 1)
         return er_pack(zs, ty_unit())
     }
@@ -1108,46 +1279,110 @@ fn try_emit_v7_domain_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, bre
         return er_pack(dst, ty_float())
     }
     if pool_str_eq_lit(p, csoff, cslen, "ptr_read_i64") and acnt == 2 {
-        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
-        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        e0 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4)
+        e1 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4)
+        pr := emit_expr_ax(cg, vars, drops, breaks, e0)
+        s1 := emit_fast_val_arg(cg, vars, drops, breaks, e1)
         mc_load_rcx(c, er_slot(pr), 0)
-        mc_load_rdx(c, er_slot(ir), 0)
-        mc_b4(c, 0x48, 0x8B, 0x04, 0xD1) // MOV RAX, [RCX + RDX*8]
+        if s1 < 0 {
+            idx := eval_const_int_val(p, cg.nodes, cg.sym, e1)
+            if idx == 0 {
+                mc_b3(c, 0x48, 0x8B, 0x01) // MOV RAX, [RCX]
+            } else if idx >= -15 and idx <= 15 {
+                mc_b4(c, 0x48, 0x8B, 0x41, (idx * 8) & 255) // MOV RAX, [RCX + disp8]
+            } else {
+                mc_mov_reg_imm(c, 1, idx)
+                mc_b4(c, 0x48, 0x8B, 0x04, 0xD1)
+            }
+        } else {
+            mc_load_rdx(c, s1, 0)
+            mc_b4(c, 0x48, 0x8B, 0x04, 0xD1) // MOV RAX, [RCX + RDX*8]
+        }
         dst := cg_alloc_slots(cg, 1)
         mc_store_rax(c, dst, 0)
         return er_pack(dst, ty_int())
     }
     if pool_str_eq_lit(p, csoff, cslen, "ptr_write_i64") and acnt == 3 {
-        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
-        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
-        vr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        e0 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4)
+        e1 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4)
+        e2 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4)
+        pr := emit_expr_ax(cg, vars, drops, breaks, e0)
+        s1 := emit_fast_val_arg(cg, vars, drops, breaks, e1)
+        s2 := emit_fast_val_arg(cg, vars, drops, breaks, e2)
         mc_load_rcx(c, er_slot(pr), 0)
-        mc_load_rdx(c, er_slot(ir), 0)
-        mc_load_rax(c, er_slot(vr), 0)
-        mc_b4(c, 0x48, 0x89, 0x04, 0xD1)
-        zs := cg_alloc_slots(cg, 1)
-        return er_pack(zs, ty_unit())
+        if s2 < 0 {
+            mc_mov_rax_imm(c, eval_const_int_val(p, cg.nodes, cg.sym, e2))
+        } else {
+            mc_load_rax(c, s2, 0)
+        }
+        if s1 < 0 {
+            idx := eval_const_int_val(p, cg.nodes, cg.sym, e1)
+            if idx == 0 {
+                mc_b3(c, 0x48, 0x89, 0x01)
+            } else if idx >= -15 and idx <= 15 {
+                mc_b4(c, 0x48, 0x89, 0x41, (idx * 8) & 255)
+            } else {
+                mc_mov_reg_imm(c, 1, idx)
+                mc_b4(c, 0x48, 0x89, 0x04, 0xD1)
+            }
+        } else {
+            mc_load_rdx(c, s1, 0)
+            mc_b4(c, 0x48, 0x89, 0x04, 0xD1)
+        }
+        return er_pack(cg_unit_slot(cg), ty_unit())
     }
     if pool_str_eq_lit(p, csoff, cslen, "ptr_read_u8") and acnt == 2 {
-        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
-        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
+        e0 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4)
+        e1 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4)
+        pr := emit_expr_ax(cg, vars, drops, breaks, e0)
+        s1 := emit_fast_val_arg(cg, vars, drops, breaks, e1)
         mc_load_rcx(c, er_slot(pr), 0)
-        mc_load_rdx(c, er_slot(ir), 0)
-        mc_b4(c, 0x0F, 0xB6, 0x04, 0x11)
+        if s1 < 0 {
+            idx := eval_const_int_val(p, cg.nodes, cg.sym, e1)
+            if idx == 0 {
+                mc_b3(c, 0x0F, 0xB6, 0x01)
+            } else if idx >= -128 and idx <= 127 {
+                mc_b4(c, 0x0F, 0xB6, 0x41, idx & 255)
+            } else {
+                mc_mov_reg_imm(c, 1, idx)
+                mc_b4(c, 0x0F, 0xB6, 0x04, 0x11)
+            }
+        } else {
+            mc_load_rdx(c, s1, 0)
+            mc_b4(c, 0x0F, 0xB6, 0x04, 0x11)
+        }
         dst := cg_alloc_slots(cg, 1)
         mc_store_rax(c, dst, 0)
         return er_pack(dst, ty_int())
     }
     if pool_str_eq_lit(p, csoff, cslen, "ptr_write_u8") and acnt == 3 {
-        pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
-        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
-        vr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4))
+        e0 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4)
+        e1 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4)
+        e2 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4)
+        pr := emit_expr_ax(cg, vars, drops, breaks, e0)
+        s1 := emit_fast_val_arg(cg, vars, drops, breaks, e1)
+        s2 := emit_fast_val_arg(cg, vars, drops, breaks, e2)
         mc_load_rcx(c, er_slot(pr), 0)
-        mc_load_rdx(c, er_slot(ir), 0)
-        mc_load_rax(c, er_slot(vr), 0)
-        mc_b3(c, 0x88, 0x04, 0x11)
-        zs := cg_alloc_slots(cg, 1)
-        return er_pack(zs, ty_unit())
+        if s2 < 0 {
+            mc_mov_rax_imm(c, eval_const_int_val(p, cg.nodes, cg.sym, e2))
+        } else {
+            mc_load_rax(c, s2, 0)
+        }
+        if s1 < 0 {
+            idx := eval_const_int_val(p, cg.nodes, cg.sym, e1)
+            if idx == 0 {
+                mc_b2(c, 0x88, 0x01)
+            } else if idx >= -128 and idx <= 127 {
+                mc_b3(c, 0x88, 0x41, idx & 255)
+            } else {
+                mc_mov_reg_imm(c, 1, idx)
+                mc_b3(c, 0x88, 0x04, 0x11)
+            }
+        } else {
+            mc_load_rdx(c, s1, 0)
+            mc_b3(c, 0x88, 0x04, 0x11)
+        }
+        return er_pack(cg_unit_slot(cg), ty_unit())
     }
     if pool_str_eq_lit(p, csoff, cslen, "ptr_read_f32") and acnt == 2 {
         pr := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))

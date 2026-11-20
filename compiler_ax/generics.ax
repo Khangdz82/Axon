@@ -1,0 +1,980 @@
+// Axon v1.0.0 Self-Hosted Compiler - Zero-Cost Monomorphized Generics (`compiler_ax/generics.ax`)
+// Instantiates generic structs (`struct Box[T]`, `struct Pair[A, B]`, `struct Option[T]`)
+// and generic functions (`fn max_val[T](a: T, b: T) -> T`) into concrete AST declarations
+// before semantic analysis, Perceus 0-GC FBIP, SIMD, and native codegen.
+
+use compiler_ax::tokens_ast
+
+// Helper: check if `nk_fn` has at least one type generic param (`gkind == 0`)
+fn mono_fn_type_param_cnt(nodes: IntBuf, extra: IntBuf, fnid: i64) -> i64 {
+    moff := ushr64(ast_get(nodes, fnid, 4), 16)
+    if moff <= 0 { return 0 }
+    goff := ibuf_get(extra, moff + 7)
+    gcnt := ibuf_get(extra, moff + 8)
+    mut tcnt := 0
+    mut i := 0
+    while i < gcnt {
+        if ibuf_get(extra, goff + i * 4) == 0 {
+            tcnt += 1
+        }
+        i += 1
+    }
+    return tcnt
+}
+
+// Append canonical type name string into `pool` for name mangling (`int`->`i64`, `float`->`f64`, `string`->`str`)
+fn mono_append_type_mangle(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, tnid: i64) {
+    if tnid <= 0 {
+        buf_push_str(pool, "unit")
+        return
+    }
+    k := ast_kind(nodes, tnid)
+    if k == nk_ty_unit() {
+        buf_push_str(pool, "unit")
+        return
+    }
+    if k == nk_ty_named() {
+        soff := ast_get(nodes, tnid, 1)
+        slen := ast_get(nodes, tnid, 2)
+        ta_off := ast_get(nodes, tnid, 3)
+        ta_cnt := ast_get(nodes, tnid, 4)
+        if ta_cnt == 0 {
+            if pool_str_eq_lit(pool, soff, slen, "int") or pool_str_eq_lit(pool, soff, slen, "i32") or pool_str_eq_lit(pool, soff, slen, "usize") or pool_str_eq_lit(pool, soff, slen, "u64") {
+                buf_push_str(pool, "i64")
+                return
+            }
+            if pool_str_eq_lit(pool, soff, slen, "float") or pool_str_eq_lit(pool, soff, slen, "f32") {
+                buf_push_str(pool, "f64")
+                return
+            }
+            if pool_str_eq_lit(pool, soff, slen, "string") {
+                buf_push_str(pool, "str")
+                return
+            }
+        }
+        mut i := 0
+        while i < slen {
+            buf_push(pool, buf_get(pool, soff + i))
+            i += 1
+        }
+        mut ti := 0
+        while ti < ta_cnt {
+            buf_push(pool, 95)
+            buf_push(pool, 95)
+            mono_append_type_mangle(pool, nodes, extra, ibuf_get(extra, ta_off + ti))
+            ti += 1
+        }
+        return
+    }
+    if k == nk_ty_table() {
+        buf_push_str(pool, "Table__")
+        mono_append_type_mangle(pool, nodes, extra, ast_get(nodes, tnid, 1))
+        return
+    }
+    if k == nk_ty_tuple() {
+        buf_push_str(pool, "Tup")
+        off := ast_get(nodes, tnid, 1)
+        cnt := ast_get(nodes, tnid, 2)
+        mut i := 0
+        while i < cnt {
+            buf_push(pool, 95)
+            buf_push(pool, 95)
+            mono_append_type_mangle(pool, nodes, extra, ibuf_get(extra, off + i))
+            i += 1
+        }
+        return
+    }
+    if k == nk_ty_result() {
+        buf_push_str(pool, "Res__")
+        mono_append_type_mangle(pool, nodes, extra, ast_get(nodes, tnid, 1))
+        return
+    }
+    buf_push_str(pool, "T")
+}
+
+// Build mangled name `Base__T1__T2` in `pool`; returns `(len << 32) | off`
+fn mono_mangle_name(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, base_soff: i64, base_slen: i64, ta_off: i64, ta_cnt: i64) -> i64 {
+    start := buf_len(pool)
+    mut i := 0
+    while i < base_slen {
+        buf_push(pool, buf_get(pool, base_soff + i))
+        i += 1
+    }
+    mut ti := 0
+    while ti < ta_cnt {
+        buf_push(pool, 95)
+        buf_push(pool, 95)
+        mono_append_type_mangle(pool, nodes, extra, ibuf_get(extra, ta_off + ti))
+        ti += 1
+    }
+    mlen := buf_len(pool) - start
+    return (mlen << 32) | (start & 0xFFFFFFFF)
+}
+
+// Lookup type parameter in `sub` (triples `[param_soff, param_slen, targ_nid]`)
+fn mono_sub_find(pool: ByteBuf, sub: IntBuf, soff: i64, slen: i64) -> i64 {
+    cnt := ibuf_len(sub) / 3
+    mut i := 0
+    while i < cnt {
+        b := i * 3
+        if ibuf_get(sub, b + 1) == slen and pool_str_eq2(pool, ibuf_get(sub, b), slen, soff) {
+            return ibuf_get(sub, b + 2)
+        }
+        i += 1
+    }
+    return 0
+}
+
+fn mono_commit_list(extra: IntBuf, items: IntBuf) -> i64 {
+    off := ibuf_len(extra)
+    cnt := ibuf_len(items)
+    mut i := 0
+    while i < cnt {
+        ibuf_push(extra, ibuf_get(items, i))
+        i += 1
+    }
+    return off
+}
+
+// Deep-clone any AST node (TypeSpec, Stmt, Expr, Param, FieldDecl) substituting type params in `sub`
+fn mono_clone_node(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sub: IntBuf, nid: i64) -> i64 {
+    if nid <= 0 { return 0 }
+    k := ast_kind(nodes, nid)
+    sp := ast_span(nodes, nid)
+
+    // 1. TypeSpecs
+    if k == nk_ty_named() {
+        soff := ast_get(nodes, nid, 1)
+        slen := ast_get(nodes, nid, 2)
+        ta_off := ast_get(nodes, nid, 3)
+        ta_cnt := ast_get(nodes, nid, 4)
+        if ta_cnt == 0 and ibuf_len(sub) > 0 {
+            rep := mono_sub_find(pool, sub, soff, slen)
+            if rep > 0 {
+                empty := ibuf_new(4)
+                out := mono_clone_node(pool, nodes, extra, empty, rep)
+                buf_free(move empty)
+                return out
+            }
+        }
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, soff)
+        ast_set(nodes, nn, 2, slen)
+        if ta_cnt > 0 {
+            tmp := ibuf_new(ta_cnt + 2)
+            mut i := 0
+            while i < ta_cnt {
+                ibuf_push(tmp, mono_clone_node(pool, nodes, extra, sub, ibuf_get(extra, ta_off + i)))
+                i += 1
+            }
+            ast_set(nodes, nn, 3, mono_commit_list(extra, tmp))
+            ast_set(nodes, nn, 4, ta_cnt)
+            buf_free(move tmp)
+        }
+        return nn
+    }
+    if k == nk_ty_unit() or k == nk_ty_tensor() {
+        nn := ast_alloc(nodes, k, sp)
+        mut s := 1
+        while s <= 6 { ast_set(nodes, nn, s, ast_get(nodes, nid, s)); s += 1 }
+        return nn
+    }
+    if k == nk_ty_ref() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, nid, 1))
+        ast_set(nodes, nn, 2, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 2)))
+        return nn
+    }
+    if k == nk_ty_table() or k == nk_ty_tainted() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 1)))
+        return nn
+    }
+    if k == nk_ty_result() or k == nk_ty_refined() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 1)))
+        ast_set(nodes, nn, 2, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 2)))
+        return nn
+    }
+    if k == nk_ty_tuple() or k == nk_block() or k == nk_tuple() or k == nk_fstr() {
+        off := ast_get(nodes, nid, 1)
+        cnt := ast_get(nodes, nid, 2)
+        tmp := ibuf_new(cnt + 2)
+        mut i := 0
+        while i < cnt {
+            ibuf_push(tmp, mono_clone_node(pool, nodes, extra, sub, ibuf_get(extra, off + i)))
+            i += 1
+        }
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, mono_commit_list(extra, tmp))
+        ast_set(nodes, nn, 2, cnt)
+        if k == nk_block() {
+            ast_set(nodes, nn, 3, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 3)))
+        }
+        buf_free(move tmp)
+        return nn
+    }
+
+    // 2. Declarations & Statements
+    if k == nk_field_decl() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, nid, 1))
+        ast_set(nodes, nn, 2, ast_get(nodes, nid, 2))
+        ast_set(nodes, nn, 3, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 3)))
+        return nn
+    }
+    if k == nk_param() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, nid, 1))
+        ast_set(nodes, nn, 2, ast_get(nodes, nid, 2))
+        ast_set(nodes, nn, 3, ast_get(nodes, nid, 3))
+        ast_set(nodes, nn, 4, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 4)))
+        ast_set(nodes, nn, 5, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 5)))
+        return nn
+    }
+    if k == nk_var_decl() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, nid, 1))
+        ast_set(nodes, nn, 2, ast_get(nodes, nid, 2))
+        ast_set(nodes, nn, 3, ast_get(nodes, nid, 3))
+        ast_set(nodes, nn, 4, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 4)))
+        ast_set(nodes, nn, 5, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 5)))
+        return nn
+    }
+    if k == nk_tuple_destruct() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, nid, 1))
+        ast_set(nodes, nn, 2, ast_get(nodes, nid, 2))
+        ast_set(nodes, nn, 3, ast_get(nodes, nid, 3))
+        ast_set(nodes, nn, 4, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 4)))
+        return nn
+    }
+    if k == nk_assign() or k == nk_binary() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, nid, 1))
+        ast_set(nodes, nn, 2, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 2)))
+        ast_set(nodes, nn, 3, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 3)))
+        return nn
+    }
+    if k == nk_if() or k == nk_if_expr() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 1)))
+        ast_set(nodes, nn, 2, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 2)))
+        ast_set(nodes, nn, 3, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 3)))
+        return nn
+    }
+    if k == nk_while() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 1)))
+        ast_set(nodes, nn, 2, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 2)))
+        return nn
+    }
+    if k == nk_for_range() or k == nk_par_for_range() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, nid, 1))
+        ast_set(nodes, nn, 2, ast_get(nodes, nid, 2))
+        ast_set(nodes, nn, 3, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 3)))
+        ast_set(nodes, nn, 4, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 4)))
+        ast_set(nodes, nn, 5, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 5)))
+        return nn
+    }
+    if k == nk_for_each() or k == nk_par_for_each() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, nid, 1))
+        ast_set(nodes, nn, 2, ast_get(nodes, nid, 2))
+        ast_set(nodes, nn, 3, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 3)))
+        ast_set(nodes, nn, 4, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 4)))
+        return nn
+    }
+    if k == nk_return() or k == nk_expr_stmt() or k == nk_spawn() or k == nk_await() or k == nk_comptime_expr() or k == nk_comptime_block() or k == nk_unsafe_block() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 1)))
+        return nn
+    }
+    if k == nk_unary() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, nid, 1))
+        ast_set(nodes, nn, 2, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 2)))
+        return nn
+    }
+    if k == nk_or_return() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 1)))
+        ast_set(nodes, nn, 2, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 2)))
+        ast_set(nodes, nn, 3, ast_get(nodes, nid, 3))
+        return nn
+    }
+    if k == nk_cast() or k == nk_index() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 1)))
+        ast_set(nodes, nn, 2, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 2)))
+        return nn
+    }
+    if k == nk_field() or k == nk_tuple_idx() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 1)))
+        ast_set(nodes, nn, 2, ast_get(nodes, nid, 2))
+        ast_set(nodes, nn, 3, ast_get(nodes, nid, 3))
+        return nn
+    }
+    if k == nk_table_alloc() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, nid, 1))
+        ast_set(nodes, nn, 2, ast_get(nodes, nid, 2))
+        ast_set(nodes, nn, 3, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 3)))
+        return nn
+    }
+    if k == nk_call_arg() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, nid, 1))
+        ast_set(nodes, nn, 2, ast_get(nodes, nid, 2))
+        ast_set(nodes, nn, 3, ast_get(nodes, nid, 3))
+        ast_set(nodes, nn, 4, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 4)))
+        ast_set(nodes, nn, 5, ast_get(nodes, nid, 5))
+        return nn
+    }
+    if k == nk_call() {
+        aoff := ast_get(nodes, nid, 3)
+        acnt := ast_get(nodes, nid, 4)
+        ta_off := ast_get(nodes, nid, 5)
+        ta_cnt := ast_get(nodes, nid, 6)
+        atmp := ibuf_new(acnt + 2)
+        mut i := 0
+        while i < acnt {
+            ibuf_push(atmp, mono_clone_node(pool, nodes, extra, sub, ibuf_get(extra, aoff + i)))
+            i += 1
+        }
+        new_aoff := mono_commit_list(extra, atmp)
+        buf_free(move atmp)
+        mut new_ta_off := 0
+        if ta_cnt > 0 {
+            ttmp := ibuf_new(ta_cnt + 2)
+            i = 0
+            while i < ta_cnt {
+                ibuf_push(ttmp, mono_clone_node(pool, nodes, extra, sub, ibuf_get(extra, ta_off + i)))
+                i += 1
+            }
+            new_ta_off = mono_commit_list(extra, ttmp)
+            buf_free(move ttmp)
+        }
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, nid, 1))
+        ast_set(nodes, nn, 2, ast_get(nodes, nid, 2))
+        ast_set(nodes, nn, 3, new_aoff)
+        ast_set(nodes, nn, 4, acnt)
+        ast_set(nodes, nn, 5, new_ta_off)
+        ast_set(nodes, nn, 6, ta_cnt)
+        return nn
+    }
+    if k == nk_method_call() {
+        aoff := ast_get(nodes, nid, 4)
+        acnt := ast_get(nodes, nid, 5)
+        base_c := mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 1))
+        atmp := ibuf_new(acnt + 2)
+        mut i := 0
+        while i < acnt {
+            ibuf_push(atmp, mono_clone_node(pool, nodes, extra, sub, ibuf_get(extra, aoff + i)))
+            i += 1
+        }
+        new_aoff := mono_commit_list(extra, atmp)
+        buf_free(move atmp)
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, base_c)
+        ast_set(nodes, nn, 2, ast_get(nodes, nid, 2))
+        ast_set(nodes, nn, 3, ast_get(nodes, nid, 3))
+        ast_set(nodes, nn, 4, new_aoff)
+        ast_set(nodes, nn, 5, acnt)
+        return nn
+    }
+    if k == nk_in_range() {
+        nn := ast_alloc(nodes, k, sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, nid, 1))
+        ast_set(nodes, nn, 2, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 2)))
+        ast_set(nodes, nn, 3, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 3)))
+        ast_set(nodes, nn, 4, mono_clone_node(pool, nodes, extra, sub, ast_get(nodes, nid, 4)))
+        return nn
+    }
+    // Leaf nodes (`nk_int`, `nk_float`, `nk_dec`, `nk_bool`, `nk_str`, `nk_ident`, `nk_break`, `nk_continue`, etc.)
+    nn := ast_alloc(nodes, k, sp)
+    mut s := 1
+    while s <= 6 { ast_set(nodes, nn, s, ast_get(nodes, nid, s)); s += 1 }
+    return nn
+}
+
+struct MonoCtx {
+    pool: ByteBuf
+    nodes: IntBuf
+    extra: IntBuf
+    gen_structs: IntBuf
+    gen_fns: IntBuf
+    out_structs: IntBuf
+    out_fns: IntBuf
+    inst_structs: IntBuf
+    inst_fns: IntBuf
+}
+
+fn mono_find_tpl(pool: ByteBuf, nodes: IntBuf, list: IntBuf, soff: i64, slen: i64) -> i64 {
+    cnt := ibuf_len(list)
+    mut i := 0
+    while i < cnt {
+        nid := ibuf_get(list, i)
+        if ast_get(nodes, nid, 2) == slen and pool_str_eq2(pool, ast_get(nodes, nid, 1), slen, soff) {
+            return nid
+        }
+        i += 1
+    }
+    return 0
+}
+
+fn mono_is_inst(pool: ByteBuf, inst: IntBuf, soff: i64, slen: i64) -> bool {
+    cnt := ibuf_len(inst) / 2
+    mut i := 0
+    while i < cnt {
+        b := i * 2
+        if ibuf_get(inst, b + 1) == slen and pool_str_eq2(pool, ibuf_get(inst, b), slen, soff) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+fn mono_inst_struct(mc: MonoCtx, tpl_nid: i64, ta_off: i64, ta_cnt: i64) -> i64 {
+    bsoff := ast_get(mc.nodes, tpl_nid, 1)
+    bslen := ast_get(mc.nodes, tpl_nid, 2)
+    packed := mono_mangle_name(mc.pool, mc.nodes, mc.extra, bsoff, bslen, ta_off, ta_cnt)
+    msoff := packed & 0xFFFFFFFF
+    mslen := ushr64(packed, 32)
+    if mono_is_inst(mc.pool, mc.inst_structs, msoff, mslen) {
+        return packed
+    }
+    ibuf_push(mc.inst_structs, msoff)
+    ibuf_push(mc.inst_structs, mslen)
+
+    sg_off := ast_get(mc.nodes, tpl_nid, 5)
+    sg_cnt := ast_get(mc.nodes, tpl_nid, 6)
+    sub := ibuf_new(sg_cnt * 3 + 4)
+    mut i := 0
+    while i < sg_cnt and i < ta_cnt {
+        ibuf_push(sub, ibuf_get(mc.extra, sg_off + i * 2))
+        ibuf_push(sub, ibuf_get(mc.extra, sg_off + i * 2 + 1))
+        ibuf_push(sub, ibuf_get(mc.extra, ta_off + i))
+        i += 1
+    }
+    foff := ast_get(mc.nodes, tpl_nid, 3)
+    fcnt := ast_get(mc.nodes, tpl_nid, 4)
+    ftmp := ibuf_new(fcnt + 2)
+    i = 0
+    while i < fcnt {
+        ibuf_push(ftmp, mono_clone_node(mc.pool, mc.nodes, mc.extra, sub, ibuf_get(mc.extra, foff + i)))
+        i += 1
+    }
+    new_foff := mono_commit_list(mc.extra, ftmp)
+    buf_free(move ftmp)
+    buf_free(move sub)
+
+    sn := ast_alloc(mc.nodes, nk_struct(), ast_span(mc.nodes, tpl_nid))
+    ast_set(mc.nodes, sn, 1, msoff)
+    ast_set(mc.nodes, sn, 2, mslen)
+    ast_set(mc.nodes, sn, 3, new_foff)
+    ast_set(mc.nodes, sn, 4, fcnt)
+    ast_set(mc.nodes, sn, 5, 0)
+    ast_set(mc.nodes, sn, 6, 0)
+    ibuf_push(mc.out_structs, sn)
+    return packed
+}
+
+fn mono_inst_fn(mc: MonoCtx, tpl_nid: i64, ta_off: i64, ta_cnt: i64) -> i64 {
+    bsoff := ast_get(mc.nodes, tpl_nid, 1)
+    bslen := ast_get(mc.nodes, tpl_nid, 2)
+    packed := mono_mangle_name(mc.pool, mc.nodes, mc.extra, bsoff, bslen, ta_off, ta_cnt)
+    msoff := packed & 0xFFFFFFFF
+    mslen := ushr64(packed, 32)
+    if mono_is_inst(mc.pool, mc.inst_fns, msoff, mslen) {
+        return packed
+    }
+    ibuf_push(mc.inst_fns, msoff)
+    ibuf_push(mc.inst_fns, mslen)
+
+    moff := ushr64(ast_get(mc.nodes, tpl_nid, 4), 16)
+    goff := ibuf_get(mc.extra, moff + 7)
+    gcnt := ibuf_get(mc.extra, moff + 8)
+    sub := ibuf_new(gcnt * 3 + 4)
+    mut ti := 0
+    mut gi := 0
+    while gi < gcnt and ti < ta_cnt {
+        if ibuf_get(mc.extra, goff + gi * 4) == 0 {
+            ibuf_push(sub, ibuf_get(mc.extra, goff + gi * 4 + 1))
+            ibuf_push(sub, ibuf_get(mc.extra, goff + gi * 4 + 2))
+            ibuf_push(sub, ibuf_get(mc.extra, ta_off + ti))
+            ti += 1
+        }
+        gi += 1
+    }
+
+    poff := ast_get(mc.nodes, tpl_nid, 3)
+    pcnt := ast_get(mc.nodes, tpl_nid, 4) & 0xFFFF
+    ptmp := ibuf_new(pcnt + 2)
+    mut pi := 0
+    while pi < pcnt {
+        ibuf_push(ptmp, mono_clone_node(mc.pool, mc.nodes, mc.extra, sub, ibuf_get(mc.extra, poff + pi)))
+        pi += 1
+    }
+    new_poff := mono_commit_list(mc.extra, ptmp)
+    buf_free(move ptmp)
+
+    new_ret := mono_clone_node(mc.pool, mc.nodes, mc.extra, sub, ast_get(mc.nodes, tpl_nid, 5))
+    old_s6 := ast_get(mc.nodes, tpl_nid, 6)
+    flags := ushr64(old_s6, 32)
+    old_body := old_s6 & 0xFFFFFFFF
+    new_body := mono_clone_node(mc.pool, mc.nodes, mc.extra, sub, old_body)
+    buf_free(move sub)
+
+    fn_n := ast_alloc(mc.nodes, nk_fn(), ast_span(mc.nodes, tpl_nid))
+    ast_set(mc.nodes, fn_n, 1, msoff)
+    ast_set(mc.nodes, fn_n, 2, mslen)
+    ast_set(mc.nodes, fn_n, 3, new_poff)
+    ast_set(mc.nodes, fn_n, 4, pcnt)
+    ast_set(mc.nodes, fn_n, 5, new_ret)
+    ast_set(mc.nodes, fn_n, 6, (flags << 32) | (new_body & 0xFFFFFFFF))
+    ibuf_push(mc.out_fns, fn_n)
+    return packed
+}
+
+// Helper: construct a synthetic `nk_ty_named` node for primitive type name (for inference)
+fn mono_make_prim_ty(mc: MonoCtx, name: str, sp: i64) -> i64 {
+    soff := pool_intern_str(mc.pool, name)
+    tn := ast_alloc(mc.nodes, nk_ty_named(), sp)
+    ast_set(mc.nodes, tn, 1, soff)
+    ast_set(mc.nodes, tn, 2, str_len(name))
+    return tn
+}
+
+// Lookup local variable's AST type node in `ltypes` (`[vsoff, vslen, tnid]`)
+fn mono_ltype_find(pool: ByteBuf, ltypes: IntBuf, soff: i64, slen: i64) -> i64 {
+    cnt := ibuf_len(ltypes) / 3
+    mut i := cnt - 1
+    while i >= 0 {
+        b := i * 3
+        if ibuf_get(ltypes, b + 1) == slen and pool_str_eq2(pool, ibuf_get(ltypes, b), slen, soff) {
+            return ibuf_get(ltypes, b + 2)
+        }
+        i -= 1
+    }
+    return 0
+}
+
+// Best-effort lightweight type-AST inference for unannotated generic fn calls like `max_val(10, 20)`
+fn mono_infer_expr_ty(mc: MonoCtx, ltypes: IntBuf, enid: i64) -> i64 {
+    if enid <= 0 { return 0 }
+    k := ast_kind(mc.nodes, enid)
+    sp := ast_span(mc.nodes, enid)
+    if k == nk_int() { return mono_make_prim_ty(mc, "i64", sp) }
+    if k == nk_float() { return mono_make_prim_ty(mc, "f64", sp) }
+    if k == nk_bool() { return mono_make_prim_ty(mc, "bool", sp) }
+    if k == nk_str() or k == nk_fstr() { return mono_make_prim_ty(mc, "str", sp) }
+    if k == nk_ident() or k == nk_move_ident() {
+        return mono_ltype_find(mc.pool, ltypes, ast_get(mc.nodes, enid, 1), ast_get(mc.nodes, enid, 2))
+    }
+    if k == nk_cast() { return ast_get(mc.nodes, enid, 2) }
+    if k == nk_unary() { return mono_infer_expr_ty(mc, ltypes, ast_get(mc.nodes, enid, 2)) }
+    if k == nk_binary() { return mono_infer_expr_ty(mc, ltypes, ast_get(mc.nodes, enid, 2)) }
+    if k == nk_call() {
+        csoff := ast_get(mc.nodes, enid, 1)
+        cslen := ast_get(mc.nodes, enid, 2)
+        // If calling a concrete struct constructor (e.g., `Box__i64(...)`), return `nk_ty_named(Box__i64)`
+        if mono_find_tpl(mc.pool, mc.nodes, mc.out_structs, csoff, cslen) > 0 {
+            tn := ast_alloc(mc.nodes, nk_ty_named(), sp)
+            ast_set(mc.nodes, tn, 1, csoff)
+            ast_set(mc.nodes, tn, 2, cslen)
+            return tn
+        }
+    }
+    return 0
+}
+
+// Match pattern type `pat_tn` (e.g. `T` or `Option[T]`) against concrete type `arg_tn` (e.g. `i64` or `Option__i64`)
+fn mono_unify_type_arg(mc: MonoCtx, gnames: IntBuf, resolved: IntBuf, pat_tn: i64, arg_tn: i64) {
+    if pat_tn <= 0 or arg_tn <= 0 { return }
+    if ast_kind(mc.nodes, pat_tn) != nk_ty_named() { return }
+    psoff := ast_get(mc.nodes, pat_tn, 1)
+    pslen := ast_get(mc.nodes, pat_tn, 2)
+    pta_cnt := ast_get(mc.nodes, pat_tn, 4)
+    gcnt := ibuf_len(gnames) / 2
+    if pta_cnt == 0 {
+        mut gi := 0
+        while gi < gcnt {
+            if ibuf_get(gnames, gi * 2 + 1) == pslen and pool_str_eq2(mc.pool, ibuf_get(gnames, gi * 2), pslen, psoff) {
+                if ibuf_get(resolved, gi) == 0 {
+                    ibuf_set(resolved, gi, arg_tn)
+                }
+                return
+            }
+            gi += 1
+        }
+        return
+    }
+    // Single-param generic container match: `Option[T]` vs mangled `Option__i64`
+    if pta_cnt == 1 and ast_kind(mc.nodes, arg_tn) == nk_ty_named() {
+        asoff := ast_get(mc.nodes, arg_tn, 1)
+        aslen := ast_get(mc.nodes, arg_tn, 2)
+        if aslen > pslen + 2 and pool_str_eq2(mc.pool, asoff, pslen, psoff) {
+            if buf_get(mc.pool, asoff + pslen) == 95 and buf_get(mc.pool, asoff + pslen + 1) == 95 {
+                inner_tn := ast_alloc(mc.nodes, nk_ty_named(), ast_span(mc.nodes, arg_tn))
+                ast_set(mc.nodes, inner_tn, 1, asoff + pslen + 2)
+                ast_set(mc.nodes, inner_tn, 2, aslen - pslen - 2)
+                mono_unify_type_arg(mc, gnames, resolved, ibuf_get(mc.extra, ast_get(mc.nodes, pat_tn, 3)), inner_tn)
+            }
+        }
+    }
+}
+
+// Walk & rewrite all generic type references and generic calls inside an AST subtree
+fn mono_rewrite_node(mc: MonoCtx, ltypes: IntBuf, nid: i64) {
+    if nid <= 0 { return }
+    k := ast_kind(mc.nodes, nid)
+
+    if k == nk_ty_named() {
+        ta_off := ast_get(mc.nodes, nid, 3)
+        ta_cnt := ast_get(mc.nodes, nid, 4)
+        if ta_cnt > 0 {
+            mut i := 0
+            while i < ta_cnt {
+                mono_rewrite_node(mc, ltypes, ibuf_get(mc.extra, ta_off + i))
+                i += 1
+            }
+            soff := ast_get(mc.nodes, nid, 1)
+            slen := ast_get(mc.nodes, nid, 2)
+            tpl := mono_find_tpl(mc.pool, mc.nodes, mc.gen_structs, soff, slen)
+            if tpl > 0 and ast_get(mc.nodes, tpl, 6) == ta_cnt {
+                pk := mono_inst_struct(mc, tpl, ta_off, ta_cnt)
+                ast_set(mc.nodes, nid, 1, pk & 0xFFFFFFFF)
+                ast_set(mc.nodes, nid, 2, ushr64(pk, 32))
+                ast_set(mc.nodes, nid, 3, 0)
+                ast_set(mc.nodes, nid, 4, 0)
+            }
+        }
+        return
+    }
+    if k == nk_ty_ref() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 2))
+        return
+    }
+    if k == nk_ty_table() or k == nk_ty_tainted() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 1))
+        return
+    }
+    if k == nk_ty_result() or k == nk_ty_refined() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 1))
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 2))
+        return
+    }
+    if k == nk_ty_tuple() or k == nk_tuple() or k == nk_fstr() {
+        off := ast_get(mc.nodes, nid, 1)
+        cnt := ast_get(mc.nodes, nid, 2)
+        mut i := 0
+        while i < cnt { mono_rewrite_node(mc, ltypes, ibuf_get(mc.extra, off + i)); i += 1 }
+        return
+    }
+    if k == nk_block() {
+        saved := ibuf_len(ltypes)
+        off := ast_get(mc.nodes, nid, 1)
+        cnt := ast_get(mc.nodes, nid, 2)
+        mut i := 0
+        while i < cnt { mono_rewrite_node(mc, ltypes, ibuf_get(mc.extra, off + i)); i += 1 }
+        tail_e := ast_get(mc.nodes, nid, 3)
+        if tail_e > 0 { mono_rewrite_node(mc, ltypes, tail_e) }
+        ibuf_truncate(ltypes, saved)
+        return
+    }
+    if k == nk_field_decl() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 3))
+        return
+    }
+    if k == nk_var_decl() {
+        ty_nid := ast_get(mc.nodes, nid, 4)
+        init_e := ast_get(mc.nodes, nid, 5)
+        mono_rewrite_node(mc, ltypes, ty_nid)
+        mono_rewrite_node(mc, ltypes, init_e)
+        mut vty := ty_nid
+        if vty <= 0 { vty = mono_infer_expr_ty(mc, ltypes, init_e) }
+        if vty > 0 {
+            ibuf_push(ltypes, ast_get(mc.nodes, nid, 1))
+            ibuf_push(ltypes, ast_get(mc.nodes, nid, 2))
+            ibuf_push(ltypes, vty)
+        }
+        return
+    }
+    if k == nk_tuple_destruct() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 4))
+        return
+    }
+    if k == nk_assign() or k == nk_binary() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 2))
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 3))
+        return
+    }
+    if k == nk_if() or k == nk_if_expr() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 1))
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 2))
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 3))
+        return
+    }
+    if k == nk_while() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 1))
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 2))
+        return
+    }
+    if k == nk_for_range() or k == nk_par_for_range() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 3))
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 4))
+        saved := ibuf_len(ltypes)
+        ibuf_push(ltypes, ast_get(mc.nodes, nid, 1))
+        ibuf_push(ltypes, ast_get(mc.nodes, nid, 2))
+        ibuf_push(ltypes, mono_make_prim_ty(mc, "i64", ast_span(mc.nodes, nid)))
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 5))
+        ibuf_truncate(ltypes, saved)
+        return
+    }
+    if k == nk_for_each() or k == nk_par_for_each() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 3))
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 4))
+        return
+    }
+    if k == nk_return() or k == nk_expr_stmt() or k == nk_spawn() or k == nk_await() or k == nk_comptime_expr() or k == nk_comptime_block() or k == nk_unsafe_block() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 1))
+        return
+    }
+    if k == nk_unary() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 2))
+        return
+    }
+    if k == nk_or_return() or k == nk_cast() or k == nk_index() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 1))
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 2))
+        return
+    }
+    if k == nk_field() or k == nk_tuple_idx() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 1))
+        return
+    }
+    if k == nk_table_alloc() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 3))
+        return
+    }
+    if k == nk_in_range() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 2))
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 3))
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 4))
+        return
+    }
+    if k == nk_method_call() {
+        mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, nid, 1))
+        aoff := ast_get(mc.nodes, nid, 4)
+        acnt := ast_get(mc.nodes, nid, 5)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(mc.extra, aoff + i)
+            mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, ca, 4))
+            i += 1
+        }
+        return
+    }
+    if k == nk_call() {
+        aoff := ast_get(mc.nodes, nid, 3)
+        acnt := ast_get(mc.nodes, nid, 4)
+        ta_off := ast_get(mc.nodes, nid, 5)
+        ta_cnt := ast_get(mc.nodes, nid, 6)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(mc.extra, aoff + i)
+            mono_rewrite_node(mc, ltypes, ast_get(mc.nodes, ca, 4))
+            i += 1
+        }
+        if ta_cnt > 0 {
+            i = 0
+            while i < ta_cnt {
+                mono_rewrite_node(mc, ltypes, ibuf_get(mc.extra, ta_off + i))
+                i += 1
+            }
+            soff := ast_get(mc.nodes, nid, 1)
+            slen := ast_get(mc.nodes, nid, 2)
+            stpl := mono_find_tpl(mc.pool, mc.nodes, mc.gen_structs, soff, slen)
+            if stpl > 0 and ast_get(mc.nodes, stpl, 6) == ta_cnt {
+                pk := mono_inst_struct(mc, stpl, ta_off, ta_cnt)
+                ast_set(mc.nodes, nid, 1, pk & 0xFFFFFFFF)
+                ast_set(mc.nodes, nid, 2, ushr64(pk, 32))
+                ast_set(mc.nodes, nid, 5, 0)
+                ast_set(mc.nodes, nid, 6, 0)
+                return
+            }
+            ftpl := mono_find_tpl(mc.pool, mc.nodes, mc.gen_fns, soff, slen)
+            if ftpl > 0 and mono_fn_type_param_cnt(mc.nodes, mc.extra, ftpl) == ta_cnt {
+                pk := mono_inst_fn(mc, ftpl, ta_off, ta_cnt)
+                ast_set(mc.nodes, nid, 1, pk & 0xFFFFFFFF)
+                ast_set(mc.nodes, nid, 2, ushr64(pk, 32))
+                ast_set(mc.nodes, nid, 5, 0)
+                ast_set(mc.nodes, nid, 6, 0)
+                return
+            }
+        } else {
+            // Unannotated call to generic fn -> infer type arguments from call arguments!
+            soff := ast_get(mc.nodes, nid, 1)
+            slen := ast_get(mc.nodes, nid, 2)
+            ftpl := mono_find_tpl(mc.pool, mc.nodes, mc.gen_fns, soff, slen)
+            if ftpl > 0 {
+                moff := ushr64(ast_get(mc.nodes, ftpl, 4), 16)
+                goff := ibuf_get(mc.extra, moff + 7)
+                gcnt := ibuf_get(mc.extra, moff + 8)
+                gnames := ibuf_new(gcnt * 2 + 2)
+                resolved := ibuf_new(gcnt + 2)
+                mut gi := 0
+                while gi < gcnt {
+                    if ibuf_get(mc.extra, goff + gi * 4) == 0 {
+                        ibuf_push(gnames, ibuf_get(mc.extra, goff + gi * 4 + 1))
+                        ibuf_push(gnames, ibuf_get(mc.extra, goff + gi * 4 + 2))
+                        ibuf_push(resolved, 0)
+                    }
+                    gi += 1
+                }
+                tcnt := ibuf_len(resolved)
+                fpoff := ast_get(mc.nodes, ftpl, 3)
+                fpcnt := ast_get(mc.nodes, ftpl, 4) & 0xFFFF
+                mut ai := 0
+                while ai < acnt and ai < fpcnt {
+                    ca := ibuf_get(mc.extra, aoff + ai)
+                    arg_ty := mono_infer_expr_ty(mc, ltypes, ast_get(mc.nodes, ca, 4))
+                    pn := ibuf_get(mc.extra, fpoff + ai)
+                    mono_unify_type_arg(mc, gnames, resolved, ast_get(mc.nodes, pn, 4), arg_ty)
+                    ai += 1
+                }
+                mut all_ok := tcnt > 0
+                mut ri := 0
+                while ri < tcnt {
+                    if ibuf_get(resolved, ri) == 0 { all_ok = false }
+                    ri += 1
+                }
+                if all_ok {
+                    inf_off := mono_commit_list(mc.extra, resolved)
+                    pk := mono_inst_fn(mc, ftpl, inf_off, tcnt)
+                    ast_set(mc.nodes, nid, 1, pk & 0xFFFFFFFF)
+                    ast_set(mc.nodes, nid, 2, ushr64(pk, 32))
+                }
+                buf_free(move gnames)
+                buf_free(move resolved)
+            }
+        }
+    }
+}
+
+// Entry Point: called at the top of `analyze_semantics_and_perceus` before symbol registration
+fn monomorphize_program_generics(pool: ByteBuf, nodes: IntBuf, extra: IntBuf) {
+    prog := ibuf_get(nodes, 7)
+    s_list_off := ast_get(nodes, prog, 3)
+    s_cnt := ast_get(nodes, prog, 4)
+    f_list_off := ibuf_get(nodes, 8)
+    f_cnt := ibuf_get(nodes, 9)
+
+    gen_structs := ibuf_new(32)
+    gen_fns := ibuf_new(32)
+    out_structs := ibuf_new(s_cnt + 32)
+    out_fns := ibuf_new(f_cnt + 64)
+
+    mut si := 0
+    while si < s_cnt {
+        snid := ibuf_get(extra, s_list_off + si)
+        if ast_get(nodes, snid, 6) > 0 {
+            ibuf_push(gen_structs, snid)
+        } else {
+            ibuf_push(out_structs, snid)
+        }
+        si += 1
+    }
+    mut fi := 0
+    while fi < f_cnt {
+        fnid := ibuf_get(extra, f_list_off + fi)
+        if mono_fn_type_param_cnt(nodes, extra, fnid) > 0 {
+            ibuf_push(gen_fns, fnid)
+        } else {
+            ibuf_push(out_fns, fnid)
+        }
+        fi += 1
+    }
+
+    if ibuf_len(gen_structs) == 0 and ibuf_len(gen_fns) == 0 {
+        buf_free(move gen_structs)
+        buf_free(move gen_fns)
+        buf_free(move out_structs)
+        buf_free(move out_fns)
+        return
+    }
+
+    inst_structs := ibuf_new(64)
+    inst_fns := ibuf_new(64)
+    mc := MonoCtx(pool, nodes, extra, gen_structs, gen_fns, out_structs, out_fns, inst_structs, inst_fns)
+
+    // Fixed-point monomorphization loop (handles chained generic structs & generic fns calling generic fns)
+    mut s_done := 0
+    mut f_done := 0
+    mut round := 0
+    while round < 16 {
+        s_cur := ibuf_len(mc.out_structs)
+        f_cur := ibuf_len(mc.out_fns)
+        if s_done >= s_cur and f_done >= f_cur {
+            break
+        }
+        ltypes := ibuf_new(128)
+        while s_done < s_cur {
+            snid := ibuf_get(mc.out_structs, s_done)
+            fl_off := ast_get(nodes, snid, 3)
+            fl_cnt := ast_get(nodes, snid, 4)
+            mut j := 0
+            while j < fl_cnt {
+                mono_rewrite_node(mc, ltypes, ibuf_get(extra, fl_off + j))
+                j += 1
+            }
+            s_done += 1
+        }
+        while f_done < f_cur {
+            fnid := ibuf_get(mc.out_fns, f_done)
+            ibuf_truncate(ltypes, 0)
+            poff := ast_get(nodes, fnid, 3)
+            pcnt := ast_get(nodes, fnid, 4) & 0xFFFF
+            mut pi := 0
+            while pi < pcnt {
+                pn := ibuf_get(extra, poff + pi)
+                pty := ast_get(nodes, pn, 4)
+                mono_rewrite_node(mc, ltypes, pty)
+                mono_rewrite_node(mc, ltypes, ast_get(nodes, pn, 5))
+                if pty > 0 {
+                    ibuf_push(ltypes, ast_get(nodes, pn, 1))
+                    ibuf_push(ltypes, ast_get(nodes, pn, 2))
+                    ibuf_push(ltypes, pty)
+                }
+                pi += 1
+            }
+            mono_rewrite_node(mc, ltypes, ast_get(nodes, fnid, 5))
+            body := ast_get(nodes, fnid, 6) & 0xFFFFFFFF
+            if body > 0 {
+                mono_rewrite_node(mc, ltypes, body)
+            }
+            f_done += 1
+        }
+        buf_free(move ltypes)
+        round += 1
+    }
+
+    new_s_off := mono_commit_list(extra, mc.out_structs)
+    new_f_off := mono_commit_list(extra, mc.out_fns)
+    ast_set(nodes, prog, 3, new_s_off)
+    ast_set(nodes, prog, 4, ibuf_len(mc.out_structs))
+    ibuf_set(nodes, 8, new_f_off)
+    ibuf_set(nodes, 9, ibuf_len(mc.out_fns))
+
+    buf_free(move gen_structs)
+    buf_free(move gen_fns)
+    buf_free(move out_structs)
+    buf_free(move out_fns)
+    buf_free(move inst_structs)
+    buf_free(move inst_fns)
+}

@@ -1663,9 +1663,6 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
     if cg_is_helper_used(cg, h_pow_i64()) and ibuf_get(cg.state, 0) == 1 {
         cg_mark_helper_used(cg, h_sec_trap())
     }
-    if cg_is_helper_used(cg, h_sec_trap()) {
-        cg_mark_helper_used(cg, h_print_bytes())
-    }
     if cg_is_helper_used(cg, h_shield_trap()) {
         cg_mark_helper_used(cg, h_print_bytes())
     }
@@ -1683,6 +1680,10 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
         cg_mark_helper_used(cg, h_alloc_mem())
         cg_mark_helper_used(cg, h_ai_pool_worker())
         cg_mark_helper_used(cg, h_sec_trap())
+        cg_mark_helper_used(cg, h_print_bytes())
+    }
+    if cg_is_helper_used(cg, h_sec_trap()) {
+        cg_mark_helper_used(cg, h_print_i64())
         cg_mark_helper_used(cg, h_print_bytes())
     }
 
@@ -1923,9 +1924,21 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
     if cg_is_helper_used(cg, h_sec_trap()) {
         sec_msg := "[AXON SECURITY] Memory/Arithmetic safety violation blocked\n"
         sec_off := cg_intern_lit(cg, sec_msg)
+        bt_hdr := "Stack backtrace:\n"
+        bt_hdr_off := cg_intern_lit(cg, bt_hdr)
+        bt_pfx := "  #"
+        bt_pfx_off := cg_intern_lit(cg, bt_pfx)
+        bt_sp := "  "
+        bt_sp_off := cg_intern_lit(cg, bt_sp)
+        bt_nl := "\n"
+        bt_nl_off := cg_intern_lit(cg, bt_nl)
+        symtab_roff := ibuf_get(cg.state, 22)
         mc_align16(c)
         s_t1 := buf_len(c)
         mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+        // Capture faulting RIP (`[RSP]`) and frame pointer (`RBP`) BEFORE setting up trap frame!
+        mc_b4(c, 0x4C, 0x8B, 0x2C, 0x24) // MOV R13, [RSP]
+        mc_b3(c, 0x49, 0x89, 0xEE)       // MOV R14, RBP
         mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
         mc_b4(c, 0x48, 0x83, 0xE4, 0xF0)
         mc_b4(c, 0x48, 0x83, 0xEC, 0x20)
@@ -1934,6 +1947,76 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
         mc_b1(c, 0xBA)
         mc_u32(c, str_len(sec_msg))
         cg_call_fn(cg, h_print_bytes())
+        if symtab_roff > 0 {
+            cg_lea_rax_rdata(cg, bt_hdr_off)
+            mc_b3(c, 0x48, 0x89, 0xC1)
+            mc_b1(c, 0xBA); mc_u32(c, str_len(bt_hdr))
+            cg_call_fn(cg, h_print_bytes())
+            // R12 = PIE runtime `.text + 0` base
+            mc_b3(c, 0x4C, 0x8D, 0x25)
+            mc_u32(c, 0 - (buf_len(c) + 4))
+            // R15 = PIE runtime `.rdata` user base, RBX = symtab base
+            cg_lea_rax_rdata(cg, 0); mc_b3(c, 0x49, 0x89, 0xC7)
+            cg_lea_rax_rdata(cg, symtab_roff); mc_b3(c, 0x48, 0x89, 0xC3)
+            mc_b2(c, 0x31, 0xF6) // XOR ESI, ESI (frame index = 0)
+            lp_bt := buf_len(c)
+            mc_b3(c, 0x4C, 0x89, 0xE8) // MOV RAX, R13
+            mc_b3(c, 0x4C, 0x29, 0xE0) // SUB RAX, R12 (rel_rip)
+            mc_b3(c, 0x48, 0xFF, 0xC8) // DEC RAX (point inside CALL instruction so fn_end stub matches `#0`!)
+            mc_b3(c, 0x48, 0x89, 0xDF) // MOV RDI, RBX
+            lp_sym := buf_len(c)
+            mc_b2(c, 0x8B, 0x0F)             // MOV ECX, [RDI] (start)
+            mc_b3(c, 0x8B, 0x57, 0x04)       // MOV EDX, [RDI + 4] (end)
+            mc_b2(c, 0x85, 0xD2); jz_smiss := mc_jcc32(c, 0x84)
+            mc_b3(c, 0x48, 0x39, 0xC8); jb_snext := mc_jcc8(c, 0x72)
+            mc_b3(c, 0x48, 0x39, 0xD0); jae_snext := mc_jcc8(c, 0x73)
+            // Matched function entry `[RDI]`! Print `  #<idx>  <name>\n`
+            cg_lea_rax_rdata(cg, bt_pfx_off); mc_b3(c, 0x48, 0x89, 0xC1)
+            mc_b1(c, 0xBA); mc_u32(c, str_len(bt_pfx))
+            cg_call_fn(cg, h_print_bytes())
+            mc_b3(c, 0x48, 0x89, 0xF1) // MOV RCX, RSI
+            cg_call_fn(cg, h_print_i64())
+            cg_lea_rax_rdata(cg, bt_sp_off); mc_b3(c, 0x48, 0x89, 0xC1)
+            mc_b1(c, 0xBA); mc_u32(c, str_len(bt_sp))
+            cg_call_fn(cg, h_print_bytes())
+            mc_b3(c, 0x8B, 0x4F, 0x08) // MOV ECX, [RDI + 8] (name_roff)
+            mc_b3(c, 0x4C, 0x01, 0xF9) // ADD RCX, R15
+            mc_b3(c, 0x8B, 0x57, 0x0C) // MOV EDX, [RDI + 12] (name_len)
+            cg_call_fn(cg, h_print_bytes())
+            cg_lea_rax_rdata(cg, bt_nl_off); mc_b3(c, 0x48, 0x89, 0xC1)
+            mc_b1(c, 0xBA); mc_u32(c, 1)
+            cg_call_fn(cg, h_print_bytes())
+            jmp_bt_next := mc_jmp32(c)
+            sym_next_p := buf_len(c)
+            mc_patch_jcc8(c, jb_snext, sym_next_p)
+            mc_patch_jcc8(c, jae_snext, sym_next_p)
+            mc_b4(c, 0x48, 0x83, 0xC7, 0x10) // ADD RDI, 16
+            jmp_lp_sym := mc_jmp32(c)
+            mc_patch_rel32(c, jmp_lp_sym, lp_sym)
+            mc_patch_rel32(c, jz_smiss, buf_len(c))
+            mc_b3(c, 0x48, 0x85, 0xF6); jnz_bt_done0 := mc_jcc32(c, 0x85)
+            // Advance frame pointer safely
+            bt_next_p := buf_len(c)
+            mc_patch_rel32(c, jmp_bt_next, bt_next_p)
+            mc_b3(c, 0x4D, 0x85, 0xF6); jz_bt_d1 := mc_jcc32(c, 0x84) // TEST R14, R14
+            mc_b3(c, 0x49, 0xF7, 0xC6); mc_u32(c, 7); jnz_bt_d2 := mc_jcc32(c, 0x85) // TEST R14, 7
+            mc_b3(c, 0x49, 0x8B, 0x06)       // MOV RAX, [R14] (next_rbp)
+            mc_b3(c, 0x4C, 0x39, 0xF0); jbe_bt_d3 := mc_jcc32(c, 0x86) // CMP RAX, R14
+            mc_b3(c, 0x48, 0x89, 0xC2); mc_b3(c, 0x4C, 0x29, 0xF2) // RDX = RAX - R14
+            mc_b3(c, 0x48, 0x81, 0xFA); mc_u32(c, 0x100000); ja_bt_d4 := mc_jcc32(c, 0x87)
+            mc_b4(c, 0x4D, 0x8B, 0x6E, 0x08) // MOV R13, [R14 + 8] (caller RIP)
+            mc_b3(c, 0x49, 0x89, 0xC6)       // MOV R14, RAX
+            mc_b3(c, 0x48, 0xFF, 0xC6)       // INC RSI
+            mc_b4(c, 0x48, 0x83, 0xFE, 0x10) // CMP RSI, 16
+            jl_bt := mc_jcc32(c, 0x8C)
+            mc_patch_rel32(c, jl_bt, lp_bt)
+            bt_done_p := buf_len(c)
+            mc_patch_rel32(c, jnz_bt_done0, bt_done_p)
+            mc_patch_rel32(c, jz_bt_d1, bt_done_p)
+            mc_patch_rel32(c, jnz_bt_d2, bt_done_p)
+            mc_patch_rel32(c, jbe_bt_d3, bt_done_p)
+            mc_patch_rel32(c, ja_bt_d4, bt_done_p)
+        }
         cg_emit_exit_imm(cg, 101)
         cg_reg_helper(cg, h_sec_trap(), s_t1, buf_len(c))
     }

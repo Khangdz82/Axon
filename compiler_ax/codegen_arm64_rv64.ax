@@ -229,8 +229,90 @@ fn arm_emit_expr(ac: ArmCg, vars: IntBuf, enid: i64) -> i64 {
         arm_str_slot(c, 0, s, 0)
         return arm_pack(s, ty_int())
     }
+    if k == nk_if_expr() {
+        cr := arm_emit_expr(ac, vars, ast_get(ac.nodes, enid, 1))
+        arm_ldr_slot(c, 0, arm_slot(cr), 0)
+        cbz_p := buf_len(c)
+        arm_emit(c, 0xB4000000)
+        tr := arm_emit_expr(ac, vars, ast_get(ac.nodes, enid, 2))
+        dst := arm_alloc_slots(ac, 2)
+        arm_ldr_slot(c, 0, arm_slot(tr), 0)
+        arm_str_slot(c, 0, dst, 0)
+        if ty_tag(arm_ty(tr)) == 5 {
+            arm_ldr_slot(c, 1, arm_slot(tr), 1)
+            arm_str_slot(c, 1, dst, 1)
+        }
+        b_end := buf_len(c)
+        arm_emit(c, 0x14000000)
+        d1 := (buf_len(c) - cbz_p) >> 2
+        buf_put_u32(c, cbz_p, 0xB4000000 | ((d1 & 0x7FFFF) << 5))
+        er := arm_emit_expr(ac, vars, ast_get(ac.nodes, enid, 3))
+        arm_ldr_slot(c, 0, arm_slot(er), 0)
+        arm_str_slot(c, 0, dst, 0)
+        if ty_tag(arm_ty(er)) == 5 {
+            arm_ldr_slot(c, 1, arm_slot(er), 1)
+            arm_str_slot(c, 1, dst, 1)
+        }
+        d2 := (buf_len(c) - b_end) >> 2
+        buf_put_u32(c, b_end, 0x14000000 | (d2 & 0x3FFFFFF))
+        return arm_pack(dst, arm_ty(tr))
+    }
+    if k == nk_field() {
+        br := arm_emit_expr(ac, vars, ast_get(ac.nodes, enid, 1))
+        fsoff := ast_get(ac.nodes, enid, 2)
+        fslen := ast_get(ac.nodes, enid, 3)
+        bty := arm_ty(br)
+        bslot := arm_slot(br)
+        if pool_str_eq_lit(ac.pool, fsoff, fslen, "len") {
+            s := arm_alloc_slots(ac, 1)
+            if bty == ty_str() or ty_tag(bty) == 12 {
+                arm_ldr_slot(c, 0, bslot, 1)
+            } else {
+                arm_ldr_slot(c, 1, bslot, 0)
+                arm_emit(c, 0xF9400020) // LDR X0, [X1]
+            }
+            arm_str_slot(c, 0, s, 0)
+            return arm_pack(s, ty_int())
+        }
+        if ty_tag(bty) == 9 {
+            sidx := ty_pay(bty)
+            foff := find_struct_field(ac.pool, ac.sym, sidx, (fslen << 32) | (fsoff & 0xFFFFFFFF))
+            if foff >= 0 {
+                fty := ibuf_get(ac.sym, foff + 2)
+                fslot := ibuf_get(ac.sym, foff + 3)
+                return arm_pack(bslot + fslot, fty)
+            }
+        }
+    }
+    if k == nk_index() {
+        br := arm_emit_expr(ac, vars, ast_get(ac.nodes, enid, 1))
+        ir := arm_emit_expr(ac, vars, ast_get(ac.nodes, enid, 2))
+        bty := arm_ty(br)
+        s := arm_alloc_slots(ac, 1)
+        arm_ldr_slot(c, 1, arm_slot(br), 0)
+        arm_ldr_slot(c, 2, arm_slot(ir), 0)
+        if bty == ty_intbuf() {
+            arm_emit(c, 0x91004021) // ADD X1, X1, #16 (skip len/cap header)
+            arm_emit(c, 0xF8627820) // LDR X0, [X1, X2, LSL #3]
+        } else if bty == ty_bytebuf() {
+            arm_emit(c, 0x91004021) // ADD X1, X1, #16
+            arm_emit(c, 0x38626820) // LDRB W0, [X1, X2]
+        } else {
+            arm_emit(c, 0xF8627820) // LDR X0, [X1, X2, LSL #3]
+        }
+        arm_str_slot(c, 0, s, 0)
+        return arm_pack(s, ty_int())
+    }
     if k == nk_await() {
         return arm_emit_expr(ac, vars, ast_get(ac.nodes, enid, 1))
+    }
+    if k == nk_unsafe_block() {
+        ub := ast_get(ac.nodes, enid, 1)
+        arm_emit_block(ac, vars, ub)
+        te := ast_get(ac.nodes, ub, 3)
+        if te > 0 { return arm_emit_expr(ac, vars, te) }
+        zs := arm_alloc_slots(ac, 1)
+        return arm_pack(zs, ty_unit())
     }
     if k == nk_unary() {
         uop := ast_get(ac.nodes, enid, 1)
@@ -265,6 +347,19 @@ fn arm_emit_expr(ac: ArmCg, vars: IntBuf, enid: i64) -> i64 {
             else if op == op_sub() or op == op_wrap_sub() { arm_emit(c, 0x1E613800) }
             else if op == op_mul() or op == op_wrap_mul() { arm_emit(c, 0x1E610800) }
             else if op == op_div() { arm_emit(c, 0x1E611800) }
+            else {
+                // FCMP D0, D1 (`0x1E612000`) + CSET X0, cond
+                arm_emit(c, 0x1E612000)
+                mut ic := 1 // EQ -> inv NE (1)
+                if op == op_neq() { ic = 0 }
+                else if op == op_lt() { ic = 5 }  // MI (4) -> inv PL (5)
+                else if op == op_lte() { ic = 8 } // LS (9) -> inv HI (8)
+                else if op == op_gt() { ic = 13 } // GT (12) -> inv LE (13)
+                else if op == op_gte() { ic = 11 } // GE (10) -> inv LT (11)
+                arm_emit(c, 0x9A9F07E0 | (ic << 12))
+                arm_str_slot(c, 0, s, 0)
+                return arm_pack(s, ty_bool())
+            }
             // FMOV X0, D0 (`0x9E660000`)
             arm_emit(c, 0x9E660000)
             arm_str_slot(c, 0, s, 0)
@@ -368,6 +463,19 @@ fn arm_emit_expr(ac: ArmCg, vars: IntBuf, enid: i64) -> i64 {
             }
             zs := arm_alloc_slots(ac, 1)
             return arm_pack(zs, ty_unit())
+        }
+        if pool_str_eq_lit(ac.pool, csoff, cslen, "len") and acnt == 1 {
+            ar := arm_emit_expr(ac, vars, ast_get(ac.nodes, ibuf_get(ac.extra, aoff), 4))
+            aty := arm_ty(ar)
+            s := arm_alloc_slots(ac, 1)
+            if aty == ty_str() or ty_tag(aty) == 12 {
+                arm_ldr_slot(c, 0, arm_slot(ar), 1)
+            } else {
+                arm_ldr_slot(c, 1, arm_slot(ar), 0)
+                arm_emit(c, 0xF9400020) // LDR X0, [X1]
+            }
+            arm_str_slot(c, 0, s, 0)
+            return arm_pack(s, ty_int())
         }
         if (pool_str_eq_lit(ac.pool, csoff, cslen, "buf_new") or pool_str_eq_lit(ac.pool, csoff, cslen, "ibuf_new")) and acnt == 1 {
             cr := arm_emit_expr(ac, vars, ast_get(ac.nodes, ibuf_get(ac.extra, aoff), 4))
@@ -604,6 +712,9 @@ fn arm_emit_stmt(ac: ArmCg, vars: IntBuf, snid: i64) {
     }
     if k == nk_expr_stmt() {
         arm_emit_expr(ac, vars, ast_get(ac.nodes, snid, 1))
+    }
+    if k == nk_unsafe_block() {
+        arm_emit_block(ac, vars, ast_get(ac.nodes, snid, 1))
     }
 }
 

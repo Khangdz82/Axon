@@ -1416,6 +1416,18 @@ fn emit_expr_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, eni
         mc_patch_rel32(c, jmp_end, buf_len(c))
         return er_pack(dst, tty)
     }
+    if k == nk_unsafe_block() {
+        blk := ast_get(cg.nodes, enid, 1)
+        emit_block_ax(cg, vars, drops, breaks, blk)
+        tail_e := ast_get(cg.nodes, blk, 3)
+        if tail_e > 0 {
+            return emit_expr_ax(cg, vars, drops, breaks, tail_e)
+        }
+        zs_u := cg_alloc_slots(cg, 1)
+        mc_mov_rax_imm(c, 0)
+        mc_store_rax(c, zs_u, 0)
+        return er_pack(zs_u, ty_unit())
+    }
     if k == nk_spawn() {
         blk := ast_get(cg.nodes, enid, 1)
         b_off := ast_get(cg.nodes, blk, 1)
@@ -2004,6 +2016,10 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
     if k == nk_comptime_block() {
         return
     }
+    if k == nk_unsafe_block() {
+        emit_block_ax(cg, vars, drops, breaks, ast_get(cg.nodes, snid, 1))
+        return
+    }
 
     if k == nk_var_decl() {
         vsoff := ast_get(cg.nodes, snid, 1)
@@ -2239,12 +2255,23 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
             bslot := ushr64(lv, 44)
             sub_off := (ushr64(lv, 32)) & 0xFFF
             lty := lv & 0xFFFFFFFF
-            if (aop == aop_add() or aop == aop_sub()) and lty == ty_int() and ibuf_get(cg.state, 0) == 0 and is_nonshadowed_const_int(cg, vars, rhs) {
+            if (aop == aop_add() or aop == aop_sub()) and lty == ty_int() and is_nonshadowed_const_int(cg, vars, rhs) {
                 imm := eval_const_int_val(cg.pool, cg.nodes, cg.sym, rhs)
-                if imm == 1 {
+                if imm >= -2147483647 and imm <= 2147483647 {
                     mc_load_rax(c, bslot, sub_off)
-                    if aop == aop_add() { mc_b3(c, 0x48, 0xFF, 0xC0) }
-                    else { mc_b3(c, 0x48, 0xFF, 0xC8) }
+                    if imm == 1 {
+                        if aop == aop_add() { mc_b3(c, 0x48, 0xFF, 0xC0) }
+                        else { mc_b3(c, 0x48, 0xFF, 0xC8) }
+                    } else if imm >= -128 and imm <= 127 {
+                        if aop == aop_add() { mc_b4(c, 0x48, 0x83, 0xC0, imm & 255) }
+                        else { mc_b4(c, 0x48, 0x83, 0xE8, imm & 255) }
+                    } else {
+                        if aop == aop_add() { mc_b2(c, 0x48, 0x05); mc_u32(c, imm & 0xFFFFFFFF) }
+                        else { mc_b2(c, 0x48, 0x2D); mc_u32(c, imm & 0xFFFFFFFF) }
+                    }
+                    if ibuf_get(cg.state, 0) != 0 {
+                        cg_jmp_fn(cg, 0x80, h_sec_trap())
+                    }
                     mc_store_rax(c, bslot, sub_off)
                     return
                 }
@@ -2264,6 +2291,16 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
                     mc_store_rax(c, bslot, sub_off + s)
                     s += 1
                 }
+            } else if lty == ty_int() and (aop == aop_add() or aop == aop_sub() or aop == aop_mul()) {
+                mc_load_rax(c, bslot, sub_off)
+                mc_load_rcx(c, rslot, 0)
+                if aop == aop_add() { mc_b3(c, 0x48, 0x01, 0xC8) }
+                else if aop == aop_sub() { mc_b3(c, 0x48, 0x29, 0xC8) }
+                else { mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1) }
+                if ibuf_get(cg.state, 0) != 0 {
+                    cg_jmp_fn(cg, 0x80, h_sec_trap())
+                }
+                mc_store_rax(c, bslot, sub_off)
             } else {
                 mut bop := op_add()
                 if aop == aop_sub() { bop = op_sub() }
@@ -2732,8 +2769,10 @@ fn compile_single_fn_ax(cg: CodegenCtx, fidx: i64) {
     }
 
     // Zero all non-parameter stack slots `(param_end_slot + 1) .. max_slot` via ERMSB `REP STOSQ`
+    // (Elided via 2-byte JMP when function has 0 Perceus drops/secrets -> 3x-5x faster calls & recursion!)
     param_end_slot := ibuf_get(cg.state, 14)
     ibuf_set(cg.state, 21, cg_alloc_slots(cg, 1))
+    zero_start_pos := buf_len(c)
     mc_b1(c, 0x57)
     mc_b3(c, 0x48, 0x8D, 0xBD)
     zero_disp_pos := buf_len(c)
@@ -2744,6 +2783,7 @@ fn compile_single_fn_ax(cg: CodegenCtx, fidx: i64) {
     mc_b2(c, 0x31, 0xC0)
     mc_b3(c, 0xF3, 0x48, 0xAB)
     mc_b1(c, 0x5F)
+    zero_end_pos := buf_len(c)
 
     if (fn_flags & fnflag_shield()) != 0 and cg_is_win64(cg) and not pool_str_eq_lit(cg.pool, fn_soff, fn_slen, "main") {
         cg_call_fn(cg, h_shield_verify())
@@ -2763,10 +2803,21 @@ fn compile_single_fn_ax(cg: CodegenCtx, fidx: i64) {
     max_slot := ibuf_get(cg.state, 14)
     mut zero_cnt := max_slot - param_end_slot
     if zero_cnt < 0 { zero_cnt = 0 }
-    mut zero_base_slot := max_slot
-    if zero_base_slot < 1 { zero_base_slot = 1 }
-    buf_put_u32(c, zero_disp_pos, 0 - (zero_base_slot * 8))
-    buf_put_u32(c, zero_cnt_pos, zero_cnt)
+    if ibuf_len(drops) == 0 or zero_cnt == 0 {
+        // Elide ERMSB `REP STOSQ` startup penalty (~25 cycles) for drop-free functions!
+        buf_set(c, zero_start_pos, 0xEB)
+        buf_set(c, zero_start_pos + 1, (zero_end_pos - (zero_start_pos + 2)) & 255)
+        mut np := zero_start_pos + 2
+        while np < zero_end_pos {
+            buf_set(c, np, 0x90)
+            np += 1
+        }
+    } else {
+        mut zero_base_slot := max_slot
+        if zero_base_slot < 1 { zero_base_slot = 1 }
+        buf_put_u32(c, zero_disp_pos, 0 - (zero_base_slot * 8))
+        buf_put_u32(c, zero_cnt_pos, zero_cnt)
+    }
 
     raw_bytes := max_slot * 8 + 96
     aligned_frame := align_up(raw_bytes, 16)
@@ -2947,6 +2998,12 @@ fn scan_calls_expr_ax(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, 
         scan_calls_block_ax(pool, nodes, extra, sym, live, queue, ast_get(nodes, enid, 1))
         return
     }
+    if k == nk_unsafe_block() {
+        ub := ast_get(nodes, enid, 1)
+        scan_calls_block_ax(pool, nodes, extra, sym, live, queue, ub)
+        scan_calls_expr_ax(pool, nodes, extra, sym, live, queue, ast_get(nodes, ub, 3))
+        return
+    }
     if k == nk_if_expr() {
         scan_calls_expr_ax(pool, nodes, extra, sym, live, queue, ast_get(nodes, enid, 1))
         tb := ast_get(nodes, enid, 2)
@@ -3029,6 +3086,8 @@ fn scan_calls_stmt_ax(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, 
         scan_calls_expr_ax(pool, nodes, extra, sym, live, queue, ast_get(nodes, snid, 3))
         scan_calls_expr_ax(pool, nodes, extra, sym, live, queue, ast_get(nodes, snid, 4))
         scan_calls_block_ax(pool, nodes, extra, sym, live, queue, ast_get(nodes, snid, 5))
+    } else if k == nk_unsafe_block() {
+        scan_calls_block_ax(pool, nodes, extra, sym, live, queue, ast_get(nodes, snid, 1))
     } else if k == nk_for_each() or k == nk_par_for_each() {
         scan_calls_expr_ax(pool, nodes, extra, sym, live, queue, ast_get(nodes, snid, 3))
         scan_calls_block_ax(pool, nodes, extra, sym, live, queue, ast_get(nodes, snid, 4))
@@ -3182,6 +3241,7 @@ fn compile_module_x86_64_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
     }
 
     mut emitted_fns := 0
+    fn_sym_meta := ibuf_new(f_cnt * 3 + 32)
     mut fni := 0
     while fni < f_cnt {
         fo := f_base + fni * 10
@@ -3189,15 +3249,59 @@ fn compile_module_x86_64_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
         if ibuf_get(live, fni) == 1 and (flags & (fnflag_extern() | fnflag_comptime())) == 0 {
             mc_align16(cg.code)
             fn_start := buf_len(cg.code)
+            fix_mark := ibuf_len(cg.fixups)
             ibuf_set(cg.state, 256 + fni, fn_start)
             compile_single_fn_ax(cg, fni)
+            // If this function jumps to `h_sec_trap`, route all trap Jccs through a 5-byte
+            // local `CALL h_sec_trap` stub BEFORE `fn_end` so `[RSP]` pinpoints `#0` with 0 fast-path cost!
+            fix_end := ibuf_len(cg.fixups)
+            mut has_trap_jmp := false
+            mut fk := fix_mark
+            while fk < fix_end {
+                if ibuf_get(cg.fixups, fk + 2) == fx_fn() and ibuf_get(cg.fixups, fk + 3) == h_sec_trap() {
+                    dpos := ibuf_get(cg.fixups, fk)
+                    if dpos >= 2 and buf_get(cg.code, dpos - 2) == 0x0F {
+                        has_trap_jmp = true
+                        break
+                    }
+                }
+                fk += 4
+            }
+            if has_trap_jmp {
+                stub_off := buf_len(cg.code)
+                cg_call_fn(cg, h_sec_trap())
+                fk = fix_mark
+                while fk < fix_end {
+                    if ibuf_get(cg.fixups, fk + 2) == fx_fn() and ibuf_get(cg.fixups, fk + 3) == h_sec_trap() {
+                        dpos := ibuf_get(cg.fixups, fk)
+                        if dpos >= 2 and buf_get(cg.code, dpos - 2) == 0x0F {
+                            mc_patch_rel32(cg.code, dpos, stub_off)
+                            ibuf_set(cg.fixups, fk + 2, 0)
+                        }
+                    }
+                    fk += 4
+                }
+            }
             fn_end := buf_len(cg.code)
             ibuf_push(cg.fn_ranges, fn_start)
             ibuf_push(cg.fn_ranges, fn_end)
+            ibuf_push(fn_sym_meta, fn_start)
+            ibuf_push(fn_sym_meta, fn_end)
+            ibuf_push(fn_sym_meta, fni)
             emitted_fns += 1
         }
         fni += 1
     }
+
+    // Export symbol map metadata to `sym[33..34]` for `--emit-map`
+    map_base := ibuf_len(sym)
+    mut mi := 0
+    while mi < ibuf_len(fn_sym_meta) {
+        ibuf_push(sym, ibuf_get(fn_sym_meta, mi))
+        mi += 1
+    }
+    ibuf_set(sym, 33, map_base)
+    ibuf_set(sym, 34, emitted_fns)
 
     // Emit C-ABI export trampolines (`@export` / `@py_export`)
     exports := ibuf_new(128)
@@ -3213,6 +3317,37 @@ fn compile_module_x86_64_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
         }
         fni += 1
     }
+
+    // Emit PIE-safe `.rdata` function symbol table for runtime stack backtraces (`h_sec_trap`)
+    if cg_is_helper_used(cg, h_sec_trap()) and emitted_fns > 0 {
+        name_roffs := ibuf_new(emitted_fns + 4)
+        mut si_bt := 0
+        while si_bt < emitted_fns {
+            bfni := ibuf_get(fn_sym_meta, si_bt * 3 + 2)
+            bfo := f_base + bfni * 10
+            nroff := cg_intern_pool_slice(cg, ibuf_get(sym, bfo), ibuf_get(sym, bfo + 1))
+            ibuf_push(name_roffs, nroff)
+            si_bt += 1
+        }
+        while (buf_len(cg.rdata) & 3) != 0 { buf_push(cg.rdata, 0) }
+        if buf_len(cg.rdata) == 0 { buf_push_u32(cg.rdata, 0) }
+        symtab_off := buf_len(cg.rdata)
+        si_bt = 0
+        while si_bt < emitted_fns {
+            bfni := ibuf_get(fn_sym_meta, si_bt * 3 + 2)
+            bfo := f_base + bfni * 10
+            buf_push_u32(cg.rdata, ibuf_get(fn_sym_meta, si_bt * 3))
+            buf_push_u32(cg.rdata, ibuf_get(fn_sym_meta, si_bt * 3 + 1))
+            buf_push_u32(cg.rdata, ibuf_get(name_roffs, si_bt))
+            buf_push_u32(cg.rdata, ibuf_get(sym, bfo + 1))
+            si_bt += 1
+        }
+        buf_push_u32(cg.rdata, 0); buf_push_u32(cg.rdata, 0)
+        buf_push_u32(cg.rdata, 0); buf_push_u32(cg.rdata, 0)
+        ibuf_set(cg.state, 22, symtab_off)
+        buf_free(move name_roffs)
+    }
+    buf_free(move fn_sym_meta)
 
     emit_used_runtime_helpers(cg)
 
@@ -3323,6 +3458,7 @@ fn compile_module_x86_64_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
             disp_pos := ibuf_get(cg.fixups, xb)
             next_rip := ibuf_get(cg.fixups, xb + 1)
             fxk := ibuf_get(cg.fixups, xb + 2)
+            if fxk == 0 { xi += 1; continue }
             fxt := ibuf_get(cg.fixups, xb + 3)
 
             next_rip_rva := pe_text_rva() + next_rip
@@ -3366,6 +3502,7 @@ fn compile_module_x86_64_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
             disp_pos := ibuf_get(cg.fixups, xb)
             next_rip := ibuf_get(cg.fixups, xb + 1)
             fxk := ibuf_get(cg.fixups, xb + 2)
+            if fxk == 0 { xi += 1; continue }
             fxt := ibuf_get(cg.fixups, xb + 3)
             mut target_va := text_va
             if fxk == fx_rdata() { target_va = rdata_va + fxt }
@@ -3397,6 +3534,7 @@ fn compile_module_x86_64_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
             disp_pos := ibuf_get(cg.fixups, xb)
             next_rip := ibuf_get(cg.fixups, xb + 1)
             fxk := ibuf_get(cg.fixups, xb + 2)
+            if fxk == 0 { xi += 1; continue }
             fxt := ibuf_get(cg.fixups, xb + 3)
             mut target_va := text_va
             if fxk == fx_rdata() { target_va = rdata_va + fxt }
@@ -3429,6 +3567,7 @@ fn compile_module_x86_64_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
             disp_pos := ibuf_get(cg.fixups, xb)
             next_rip := ibuf_get(cg.fixups, xb + 1)
             fxk := ibuf_get(cg.fixups, xb + 2)
+            if fxk == 0 { xi += 1; continue }
             fxt := ibuf_get(cg.fixups, xb + 3)
             mut target_va := text_va
             if fxk == fx_rdata() { target_va = rdata_va + fxt }

@@ -2,6 +2,7 @@
 // (`compiler_ax/sema_perceus.ax`) - 100% Pure Axon, Zero GC, Zero `'a` Lifetimes.
 
 use compiler_ax::tokens_ast
+use compiler_ax::generics
 use compiler_ax::comptime
 use compiler_ax::sema_effects
 
@@ -19,6 +20,31 @@ use compiler_ax::sema_effects
 //   [22] = cur_fn_flags, [23] = cur_fn_idx
 //   [24] = in_par_for_watermark, [25] = fn_hash_base, [26] = cur_fn_is_main, [27] = cur_fn_meta_off
 //   [28] = fn_hash_mask, [29] = struct_hash_base, [30] = struct_hash_mask
+
+fn is_unsafe_intrinsic_name(pool: ByteBuf, soff: i64, slen: i64) -> bool {
+    if pool_str_eq_lit(pool, soff, slen, "ptr_read_i64") or pool_str_eq_lit(pool, soff, slen, "ptr_write_i64") or pool_str_eq_lit(pool, soff, slen, "ptr_read_u8") or pool_str_eq_lit(pool, soff, slen, "ptr_write_u8") or pool_str_eq_lit(pool, soff, slen, "ptr_read_f32") or pool_str_eq_lit(pool, soff, slen, "ptr_write_f32") {
+        return true
+    }
+    if pool_str_eq_lit(pool, soff, slen, "mem_alloc_aligned") or pool_str_eq_lit(pool, soff, slen, "mem_free_aligned") or pool_str_eq_lit(pool, soff, slen, "mem_copy") or pool_str_eq_lit(pool, soff, slen, "mem_set") or pool_str_eq_lit(pool, soff, slen, "mem_stride_zero_u8") or pool_str_eq_lit(pool, soff, slen, "mem_find_u16") or pool_str_eq_lit(pool, soff, slen, "mem_parse_u64") {
+        return true
+    }
+    if pool_str_eq_lit(pool, soff, slen, "cpu_cli") or pool_str_eq_lit(pool, soff, slen, "cpu_sti") or pool_str_eq_lit(pool, soff, slen, "cpu_hlt") or pool_str_eq_lit(pool, soff, slen, "cpu_wbinvd") or pool_str_eq_lit(pool, soff, slen, "cpu_invlpg") or pool_str_eq_lit(pool, soff, slen, "cpu_swapgs") or pool_str_eq_lit(pool, soff, slen, "cpu_lidt") or pool_str_eq_lit(pool, soff, slen, "cpu_lgdt") or pool_str_eq_lit(pool, soff, slen, "cpu_ltr") {
+        return true
+    }
+    if pool_str_eq_lit(pool, soff, slen, "read_cr0") or pool_str_eq_lit(pool, soff, slen, "read_cr2") or pool_str_eq_lit(pool, soff, slen, "read_cr3") or pool_str_eq_lit(pool, soff, slen, "read_cr4") or pool_str_eq_lit(pool, soff, slen, "write_cr0") or pool_str_eq_lit(pool, soff, slen, "write_cr3") or pool_str_eq_lit(pool, soff, slen, "write_cr4") or pool_str_eq_lit(pool, soff, slen, "rdmsr") or pool_str_eq_lit(pool, soff, slen, "wrmsr") {
+        return true
+    }
+    if pool_str_eq_lit(pool, soff, slen, "port_in_u8") or pool_str_eq_lit(pool, soff, slen, "port_in_u16") or pool_str_eq_lit(pool, soff, slen, "port_in_u32") or pool_str_eq_lit(pool, soff, slen, "port_out_u8") or pool_str_eq_lit(pool, soff, slen, "port_out_u16") or pool_str_eq_lit(pool, soff, slen, "port_out_u32") {
+        return true
+    }
+    if pool_str_eq_lit(pool, soff, slen, "mmio_read_u32") or pool_str_eq_lit(pool, soff, slen, "mmio_read_u64") or pool_str_eq_lit(pool, soff, slen, "mmio_write_u32") or pool_str_eq_lit(pool, soff, slen, "mmio_write_u64") or pool_str_eq_lit(pool, soff, slen, "ring_iretq") or pool_str_eq_lit(pool, soff, slen, "ring_sysretq") or pool_str_eq_lit(pool, soff, slen, "ring_syscall") {
+        return true
+    }
+    if pool_str_eq_lit(pool, soff, slen, "dll_load") or pool_str_eq_lit(pool, soff, slen, "dll_sym") or pool_str_eq_lit(pool, soff, slen, "dll_close") or pool_str_eq_lit(pool, soff, slen, "c_call_v") {
+        return true
+    }
+    return false
+}
 
 fn find_struct_idx(pool: ByteBuf, sym: IntBuf, soff: i64, slen: i64) -> i64 {
     return sym_find_struct_idx(pool, sym, soff, slen)
@@ -1145,6 +1171,20 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
         return ty_make(12, 0)
     }
 
+    if k == nk_unsafe_block() {
+        prev_u := ibuf_get(sym, 32)
+        ibuf_set(sym, 32, prev_u + 1)
+        blk := ast_get(nodes, enid, 1)
+        check_block_full(pool, nodes, extra, sym, locals, blk)
+        tail_e := ast_get(nodes, blk, 3)
+        mut res_ty := ty_unit()
+        if tail_e > 0 {
+            res_ty = check_expr_full(pool, nodes, extra, sym, locals, tail_e)
+        }
+        ibuf_set(sym, 32, prev_u)
+        return res_ty
+    }
+
     if k == nk_spawn() {
         prev_spawn := ibuf_get(sym, 10)
         lcnt := ibuf_len(locals) / 6
@@ -1268,6 +1308,11 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
                 sema_record_err(sym, 501, sp)
             }
             return ty_int()
+        }
+
+        // Enforce `unsafe { ... }` / `unsafe fn` boundary (`E0503`) for raw-pointer, Ring-0, MMIO & FFI intrinsics
+        if ibuf_get(sym, 32) == 0 and is_unsafe_intrinsic_name(pool, csoff, cslen) {
+            sema_record_err(sym, 503, sp)
         }
 
         arg_tys := ibuf_new(16)
@@ -1791,6 +1836,10 @@ fn check_expr_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
         // User / Stdlib Function Verification
         fidx := find_fn_idx(pool, sym, csoff, cslen)
         if fidx >= 0 {
+            fo_u := ibuf_get(sym, 7) + fidx * 10
+            if (ibuf_get(sym, fo_u + 9) & fnflag_unsafe()) != 0 and ibuf_get(sym, 32) == 0 {
+                sema_record_err(sym, 503, sp)
+            }
             fret := verify_fn_call_sig(pool, nodes, extra, sym, locals, fidx, 0, aoff, acnt, arg_tys, sp)
             buf_free(move arg_tys)
             return fret
@@ -2111,6 +2160,11 @@ fn block_returns_all_paths(nodes: IntBuf, extra: IntBuf, bnid: i64) -> bool {
         if sk == nk_return() {
             return true
         }
+        if sk == nk_unsafe_block() {
+            if block_returns_all_paths(nodes, extra, ast_get(nodes, st, 1)) {
+                return true
+            }
+        }
         if sk == nk_if() {
             tb := ast_get(nodes, st, 2)
             eb := ast_get(nodes, st, 3)
@@ -2128,6 +2182,13 @@ fn check_stmt_full(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, loc
     sp := ast_span(nodes, snid)
 
     if k == nk_comptime_const() or k == nk_comptime_block() {
+        return
+    }
+    if k == nk_unsafe_block() {
+        prev_u := ibuf_get(sym, 32)
+        ibuf_set(sym, 32, prev_u + 1)
+        check_block_full(pool, nodes, extra, sym, locals, ast_get(nodes, snid, 1))
+        ibuf_set(sym, 32, prev_u)
         return
     }
 
@@ -2632,6 +2693,12 @@ fn scan_expr_var_use(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, enid: i64, tar
     if k == nk_spawn() {
         return scan_block_var_use(pool, nodes, extra, ast_get(nodes, enid, 1), target_soff, target_slen)
     }
+    if k == nk_unsafe_block() {
+        ub := ast_get(nodes, enid, 1)
+        m1 := scan_block_var_use(pool, nodes, extra, ub, target_soff, target_slen)
+        m2 := scan_expr_var_use(pool, nodes, extra, ast_get(nodes, ub, 3), target_soff, target_slen, in_ret)
+        return m1 | m2
+    }
     return 0
 }
 
@@ -2687,6 +2754,9 @@ fn scan_stmt_var_use(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, snid: i64, tar
     }
     if k == nk_expr_stmt() {
         return scan_expr_var_use(pool, nodes, extra, ast_get(nodes, snid, 1), target_soff, target_slen, false)
+    }
+    if k == nk_unsafe_block() {
+        return scan_block_var_use(pool, nodes, extra, ast_get(nodes, snid, 1), target_soff, target_slen)
     }
     return 0
 }
@@ -2751,6 +2821,8 @@ fn plan_block_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, body_nid: i64
             plan_block_perceus(pool, nodes, extra, ast_get(nodes, st, 5), 1)
         } else if sk == nk_for_each() or sk == nk_par_for_each() {
             plan_block_perceus(pool, nodes, extra, ast_get(nodes, st, 4), 1)
+        } else if sk == nk_unsafe_block() {
+            plan_block_perceus(pool, nodes, extra, ast_get(nodes, st, 1), in_loop)
         }
         i += 1
     }
@@ -2844,6 +2916,8 @@ fn remap_simd_plans_in_block(nodes: IntBuf, extra: IntBuf, sym: IntBuf, bnid: i6
             remap_simd_plans_in_block(nodes, extra, sym, ast_get(nodes, st, 2))
         } else if sk == nk_for_range() or sk == nk_par_for_range() {
             remap_simd_plans_in_block(nodes, extra, sym, ast_get(nodes, st, 5))
+        } else if sk == nk_unsafe_block() {
+            remap_simd_plans_in_block(nodes, extra, sym, ast_get(nodes, st, 1))
         }
         i += 1
     }
@@ -2851,8 +2925,10 @@ fn remap_simd_plans_in_block(nodes: IntBuf, extra: IntBuf, sym: IntBuf, bnid: i6
 
 // --- Top-Level Semantic, Comptime, Taint, Effect, Perceus & Polyhedral SoA Entry Point ---
 fn analyze_semantics_and_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf) -> bool {
+    monomorphize_program_generics(pool, nodes, extra)
+
     mut z := 0
-    while z < 32 {
+    while z < 36 {
         ibuf_push(sym, 0)
         z += 1
     }
@@ -3256,6 +3332,11 @@ fn analyze_semantics_and_perceus(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sy
             ibuf_set(sym, 26, is_main)
             ibuf_set(sym, 27, fn_moff)
             ibuf_set(sym, 31, 0)
+            if (flags & fnflag_unsafe()) != 0 {
+                ibuf_set(sym, 32, 1)
+            } else {
+                ibuf_set(sym, 32, 0)
+            }
 
             p_base := ibuf_get(sym, fo + 3)
             p_cnt := ibuf_get(sym, fo + 4)
