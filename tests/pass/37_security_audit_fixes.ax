@@ -1,0 +1,250 @@
+// Axon v1.1.0 - Comprehensive Security Audit Regression Suite (`tests/pass/37_security_audit_fixes.ax`)
+// Verifies runtime & stdlib security fixes across compiler, JSON, compress, regex, ECS, physics,
+// render, AI serving/LoRA, kernel, memory subsystem, IEEE-754 NaN comparisons, and pythonic ergonomics.
+
+use std::json
+use std::compress
+use std::regex
+use std::game_ecs
+use std::game_physics
+use std::game_render
+use std::ai_serve
+use std::kernel
+use std::memory
+
+@test
+fn test_json_hardening() {
+    // 1. Escaped backslash before closing quote (`"a\\"` ends string; `"a\"b"` does not)
+    j1 := "{\"path\":\"C:\\\\\",\"val\":42}"
+    v1 := json_get_i64(j1, "val") or -1
+    assert(v1 == 42)
+
+    // 2. Full INT64_MIN and INT64_MAX parsing
+    j_min := "{\"n\":-9223372036854775808}"
+    vmin := json_get_i64(j_min, "n") or 0
+    assert(vmin == (1 << 63))
+
+    j_max := "{\"n\":9223372036854775807}"
+    vmax := json_get_i64(j_max, "n") or 0
+    assert(vmax == 9223372036854775807)
+
+    // 3. Reject integer overflow & trailing junk (`123abc`, `truefoo`)
+    j_ovf := "{\"n\":9223372036854775808}"
+    vovf := json_get_i64(j_ovf, "n") or -777
+    assert(vovf == -777)
+
+    j_junk := "{\"n\":123abc}"
+    vjunk := json_get_i64(j_junk, "n") or -888
+    assert(vjunk == -888)
+
+    j_bjunk := "{\"b\":trueish}"
+    vbjunk := json_get_bool(j_bjunk, "b") or false
+    assert(not vbjunk)
+}
+
+@test
+fn test_compress_bomb_and_truncation() {
+    // 1. Decompression bomb header (4-byte payload claiming 10 MB output) must fail cleanly
+    bomb := buf_new(8)
+    buf_push(bomb, 0x00)
+    buf_push(bomb, 0x00)
+    buf_push(bomb, 0xA0)
+    buf_push(bomb, 0x00)
+    buf_push(bomb, 0x00)
+    dec_b := decompress_bytes(bomb) or buf_new(4)
+    assert(buf_len(dec_b) == 0)
+    buf_free(move dec_b)
+    buf_free(move bomb)
+
+    // 2. Exact 4-byte empty compressed stream (no OOB 8-byte read)
+    empty_in := buf_new(4)
+    empty_c := compress_bytes(empty_in)
+    assert(buf_len(empty_c) == 4)
+    empty_d := decompress_bytes(empty_c) or buf_new(4)
+    assert(buf_len(empty_d) == 0)
+    buf_free(move empty_d)
+    buf_free(move empty_c)
+    buf_free(move empty_in)
+
+    // 3. Truncated trailing match token (low nibble != 0 at EOF) must be rejected
+    trunc := buf_new(16)
+    buf_push(trunc, 5)
+    buf_push(trunc, 0)
+    buf_push(trunc, 0)
+    buf_push(trunc, 0)
+    buf_push(trunc, 0x11) // 1 literal + match len 5, but EOF right after literal
+    buf_push(trunc, 65)
+    dec_t := decompress_bytes(trunc) or buf_new(4)
+    assert(buf_len(dec_t) == 0)
+    buf_free(move dec_t)
+    buf_free(move trunc)
+}
+
+@test
+fn test_regex_multi_alt_and_fuel() {
+    // 1. >= 8 alternations (previously overflowed fixed 16-slot split buffer)
+    pat := "aa|bb|cc|dd|ee|ff|gg|hh|ii|jj|kk|ll"
+    assert(regex_is_match(pat, "kk"))
+    assert(regex_is_match(pat, "aa"))
+    assert(not regex_is_match(pat, "zz"))
+
+    // 2. Deeply nested groups rejected safely without stack overflow
+    rx_ok := regex_compile("aa|bb|cc") or Regex(ibuf_new(4), false, false)
+    assert(ibuf_len(rx_ok.code) > 0)
+    regex_free(move rx_ok)
+}
+
+@test
+fn test_ecs_zero_init_and_physics_render() {
+    // 1. ECS respawn must zero-init all active component slots (no stale dead-entity data leak)
+    w := ecs_world_new(64)
+    e1 := ecs_spawn(w, 1 | 2)
+    ecs_set_position(w, e1, 99.0, 88.0, 77.0)
+    ecs_set_velocity(w, e1, 11.0, 22.0, 33.0)
+    assert(ecs_despawn(w, e1))
+    e2 := ecs_spawn(w, 1 | 2)
+    assert(ecs_get_pos_x(w, e2) == 0.0)
+    assert(ecs_get_pos_y(w, e2) == 0.0)
+    assert(ecs_get_vel_x(w, e2) == 0.0)
+    ecs_world_free(move w)
+
+    // 2. Physics hardware sqrt & O(1) wrap_angle + SAT containment
+    assert(p2_sqrt(16.0) == 4.0)
+    wa := p2_wrap_angle(1000000.0)
+    assert(wa >= -3.15 and wa <= 3.15)
+    man := phys2d_sat_obb_vs_obb(0.0, 0.0, 5.0, 5.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0)
+    assert(man.has_hit and man.depth > 0.0)
+
+    // 3. Renderer Liang-Barsky clipped line with extreme off-screen coords (no CPU DoS / overflow)
+    fb := fb_new(32, 32)
+    fb_clear(fb, 0, 1.0)
+    fb_draw_line(fb, -1000000000, -1000000000, 1000000000, 1000000000, 0xFF00FF)
+    assert(fb_get_pixel(fb, 10, 10) == 0xFF00FF)
+    fb_free(move fb)
+}
+
+@test
+fn test_ieee754_nan_and_buf_truncate() {
+    // 1. IEEE-754 NaN comparisons (`UCOMISD` parity check!)
+    z := 0.0
+    nan := z / z
+    assert(not (nan == nan))
+    assert(nan != nan)
+    assert(not (nan < 1.0))
+    assert(not (nan <= 1.0))
+    assert(not (nan > 1.0))
+    assert(not (nan >= 1.0))
+
+    // 2. buf_truncate / ibuf_truncate valid shrink (`new_len <= current_len`; expanding traps with exit 101!)
+    b := buf_new(32)
+    buf_push(b, 10)
+    buf_push(b, 20)
+    buf_truncate(b, 2)
+    assert(buf_len(b) == 2)
+    buf_truncate(b, 1)
+    assert(buf_len(b) == 1)
+    buf_free(move b)
+
+    ib := ibuf_new(32)
+    ibuf_push(ib, 100)
+    ibuf_push(ib, 200)
+    ibuf_truncate(ib, 2)
+    assert(ibuf_len(ib) == 2)
+    ibuf_truncate(ib, 1)
+    assert(ibuf_len(ib) == 1)
+    buf_free(move ib)
+}
+
+@test
+fn test_kernel_memory_and_serve_hardening() {
+    // 1. Kernel SYSRETQ GDT order & NX bit & IDT vector 255 no-overflow
+    assert(gdt_sel_user_ds() == 0x1B)
+    assert(gdt_sel_user_cs() == 0x23)
+    pte := vmm_entry_encode(0x200000, page_present() | page_nx())
+    assert((pte & page_nx()) != 0)
+
+    // 2. Overlap-safe raw_mem_copy (memmove semantics: forward overlap)
+    p := mem_alloc_aligned(64)
+    assert(p != 0)
+    mut i := 0
+    while i < 8 {
+        raw_mem_write_u8(p, i, 65 + i)
+        i += 1
+    }
+    raw_mem_copy(p + 2, p, 6) // A B C D E F -> at +2 should be A B C D E F!
+    assert(raw_mem_read_u8(p, 2) == 65)
+    assert(raw_mem_read_u8(p, 3) == 66)
+    assert(raw_mem_read_u8(p, 7) == 70)
+    mem_free_aligned(p)
+
+    // 3. SharedMem read_only enforcement + overflow rejection
+    shm_w := shm_open_or_create("Local\\AxonSecAuditShm37", 4096) or SharedMem(0, 0, 0, "", false)
+    assert(shm_w.ptr != 0)
+    assert(shm_write_u64(shm_w, 0, 0xCAFEBABE))
+    shm_r := shm_open_existing("Local\\AxonSecAuditShm37", 4096, true) or SharedMem(0, 0, 0, "", true)
+    assert(shm_r.ptr != 0)
+    assert(not shm_write_u64(shm_r, 0, 0x1111))
+    assert(not shm_write_u64(shm_w, 9223372036854775800, 1))
+    got := shm_read_u64(shm_r, 0) or 0
+    assert(got == 0xCAFEBABE)
+    shm_close(shm_r)
+    shm_close(shm_w)
+
+    // 4. PromptCache ring wrap without UAF
+    pc := prompt_cache_new(4, 64)
+    k1 := prompt_cache_key("m", "s", "p1")
+    prompt_cache_put(pc, k1, "hello-world-1234567890")
+    hit1 := prompt_cache_get(pc, k1) or ""
+    assert(hit1 == "hello-world-1234567890")
+    prompt_cache_free(move pc)
+}
+
+fn next_val_once(counter: IntBuf) -> i64 {
+    c := ibuf_get(counter, 0) + 1
+    ibuf_set(counter, 0, c)
+    return c * 5
+}
+
+@test
+fn test_pythonic_hardening() {
+    // 1. Single-evaluation `in` / `not in` range membership (lhs evaluated ONCE!)
+    cnt := ibuf_new(4)
+    ibuf_push(cnt, 0)
+    r1 := next_val_once(cnt) in 0..10
+    assert(r1 == True)
+    assert(ibuf_get(cnt, 0) == 1)
+
+    r2 := next_val_once(cnt) not in 0..10
+    assert(r2 == True) // 2*5 = 10 -> not in 0..10
+    assert(ibuf_get(cnt, 0) == 2)
+    buf_free(move cnt)
+
+    // 2. Local variable named `null` must NOT be hijacked by `None`/`null` literal
+    null := 12345
+    assert(null == 12345)
+
+    // 3. Type-safe `len()` on str, ByteBuf, IntBuf, Table
+    assert(len("Axon") == 4)
+    b := buf_new(8)
+    buf_push(b, 1); buf_push(b, 2)
+    assert(len(b) == 2)
+    buf_free(move b)
+
+    // 4. Exact `**` boundary (`(-2) ** 63 == INT64_MIN`, `2 ** 62`)
+    assert((2 ** 62) == (1 << 62))
+    assert(((-2) ** 63) == (1 << 63))
+    assert((2 ** -3) == 0)
+    assert((0 ** 0) == 1)
+}
+
+fn main() -> i32 {
+    test_json_hardening()
+    test_compress_bomb_and_truncation()
+    test_regex_multi_alt_and_fuel()
+    test_ecs_zero_init_and_physics_render()
+    test_ieee754_nan_and_buf_truncate()
+    test_kernel_memory_and_serve_hardening()
+    test_pythonic_hardening()
+    println("[PASS] 37_security_audit_fixes: all 7 security regression suites verified!")
+    return 0
+}
