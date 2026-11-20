@@ -1,0 +1,378 @@
+// Axon Production Cross-Platform Native GUI & Desktop Backend (`std/gui.ax`)
+// Connects Axon's zero-dependency `std::ui` (HTML5/CSS/Tailwind/Flexbox/Signals/Canvas)
+// directly to real OS native windows, high-FPS pixel blitting, mouse/keyboard input,
+// clipboard, message boxes, and native file dialogs:
+//   - Windows: Win32 `user32.dll` + `gdi32.dll` (`CreateWindowExA`, `StretchDIBits`, `PeekMessageA`, Clipboard, `comdlg32.dll`)
+//   - Linux:   `libSDL2-2.0.so.0` / `libX11.so.6` dynamic FFI
+//   - macOS:   `libSDL2.dylib` dynamic FFI
+
+use std::ffi
+use std::ui
+use std::ui_render
+
+struct GuiWindow {
+    backend: i64 // 1 = Win32, 2 = SDL2 (Linux/macOS), 3 = X11
+    hwnd: i64
+    aux1: i64    // SDL_Renderer / X11 Display
+    aux2: i64    // SDL_Texture / X11 GC
+    width: i64
+    height: i64
+    mouse_x: i64
+    mouse_y: i64
+    mouse_down: bool
+    key_escape: bool
+    is_open: bool
+    user32: i64
+    gdi32: i64
+    sdl2: i64
+}
+
+fn _gui_win32_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64 {
+    u32 := ffi_open_one("user32.dll")
+    g32 := ffi_open_one("gdi32.dll")
+    k32 := ffi_open_one("kernel32.dll")
+    if u32 == 0 or g32 == 0 { return err(-600) }
+
+    f_mod   := ffi_sym(k32, "GetModuleHandleA")
+    f_reg   := ffi_sym(u32, "RegisterClassExA")
+    f_def   := ffi_sym(u32, "DefWindowProcA")
+    f_cw    := ffi_sym(u32, "CreateWindowExA")
+    f_show  := ffi_sym(u32, "ShowWindow")
+    f_upd   := ffi_sym(u32, "UpdateWindow")
+    if f_cw == 0 or f_def == 0 { return err(-601) }
+
+    hinst := ffi_call1(f_mod, 0)
+    cname := ffi_cstr("AxonNativeGuiClass")
+    ctitle := ffi_cstr(title)
+
+    // Register WNDCLASSEXA (80 bytes on Win64) using native DefWindowProcA
+    wc := ffi_alloc(96)
+    ffi_write_u32_le(wc, 0, 80)        // cbSize = 80
+    ffi_write_u32_le(wc, 4, 0x0023)    // CS_HREDRAW | CS_VREDRAW | CS_OWNDC
+    ffi_write_i64(wc, 1, f_def)        // lpfnWndProc at offset 8
+    ffi_write_i64(wc, 3, hinst)        // hInstance at offset 24
+    ffi_write_i64(wc, 8, cname)        // lpszClassName at offset 64
+    _ := ffi_call1(f_reg, wc)
+    ffi_free(wc)
+
+    // CreateWindowExA(0, cls, title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, w, h, 0, 0, hinst, 0)
+    mut style := 0x00CF0000 // WS_OVERLAPPEDWINDOW
+    if visible { style = style | 0x10000000 } // WS_VISIBLE
+    args := ibuf_new(16)
+    ibuf_push(args, 0)
+    ibuf_push(args, cname)
+    ibuf_push(args, ctitle)
+    ibuf_push(args, style)
+    ibuf_push(args, 0x80000000) // CW_USEDEFAULT
+    ibuf_push(args, 0x80000000)
+    ibuf_push(args, w)
+    ibuf_push(args, h)
+    ibuf_push(args, 0)
+    ibuf_push(args, 0)
+    ibuf_push(args, hinst)
+    ibuf_push(args, 0)
+    hwnd := ffi_call_arr(f_cw, 12, args)
+    buf_free(move args)
+    ffi_free(cname)
+    ffi_free(ctitle)
+    if hwnd == 0 { return err(-602) }
+
+    if visible {
+        _ := ffi_call2(f_show, hwnd, 5) // SW_SHOW
+        _ := ffi_call1(f_upd, hwnd)
+    }
+    return ok(GuiWindow(
+        backend = 1, hwnd = hwnd, aux1 = 0, aux2 = 0,
+        width = w, height = h, mouse_x = 0, mouse_y = 0,
+        mouse_down = false, key_escape = false, is_open = true,
+        user32 = u32, gdi32 = g32, sdl2 = 0
+    ))
+}
+
+fn _gui_sdl2_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64 {
+    sdl := ffi_open("SDL2.dll", "libSDL2-2.0.so.0", "libSDL2.dylib")
+    if sdl == 0 { return err(-610) }
+    f_init := ffi_sym(sdl, "SDL_Init")
+    f_cw   := ffi_sym(sdl, "SDL_CreateWindow")
+    f_cr   := ffi_sym(sdl, "SDL_CreateRenderer")
+    f_ct   := ffi_sym(sdl, "SDL_CreateTexture")
+    if f_cw == 0 { return err(-611) }
+    _ := ffi_call1(f_init, 0x20) // SDL_INIT_VIDEO
+    ct := ffi_cstr(title)
+    mut fl := 4 // SDL_WINDOW_SHOWN
+    if not visible { fl = 8 } // SDL_WINDOW_HIDDEN
+    win := ffi_call6(f_cw, ct, 0x1FFF0000, 0x1FFF0000, w, h, fl)
+    ffi_free(ct)
+    if win == 0 { return err(-612) }
+    ren := ffi_call3(f_cr, win, -1, 2) // SDL_RENDERER_ACCELERATED
+    // SDL_PIXELFORMAT_ARGB8888 = 0x16362004, SDL_TEXTUREACCESS_STREAMING = 1
+    tex := ffi_call5(f_ct, ren, 0x16362004, 1, w, h)
+    return ok(GuiWindow(
+        backend = 2, hwnd = win, aux1 = ren, aux2 = tex,
+        width = w, height = h, mouse_x = 0, mouse_y = 0,
+        mouse_down = false, key_escape = false, is_open = true,
+        user32 = 0, gdi32 = 0, sdl2 = sdl
+    ))
+}
+
+// Open a native OS window (auto-selects Win32 on Windows, SDL2 on Linux/macOS)
+fn gui_open(title: str, w: i64, h: i64, visible: bool = true) -> GuiWindow ! i64 {
+    if ffi_open_one("user32.dll") != 0 {
+        return _gui_win32_open(title, w, h, visible)
+    }
+    return _gui_sdl2_open(title, w, h, visible)
+}
+
+fn gui_set_title(win: GuiWindow, title: str) {
+    if not win.is_open { return }
+    ct := ffi_cstr(title)
+    if win.backend == 1 {
+        f := ffi_sym(win.user32, "SetWindowTextA")
+        _ := ffi_call2(f, win.hwnd, ct)
+    } else if win.backend == 2 {
+        f := ffi_sym(win.sdl2, "SDL_SetWindowTitle")
+        _ := ffi_call2(f, win.hwnd, ct)
+    }
+    ffi_free(ct)
+}
+
+fn gui_poll_events(mut win: GuiWindow) -> bool {
+    if not win.is_open { return false }
+    if win.backend == 1 {
+        f_isw  := ffi_sym(win.user32, "IsWindow")
+        if (ffi_call1(f_isw, win.hwnd) & 0xFFFFFFFF) == 0 {
+            win.is_open = false
+            return false
+        }
+        f_peek := ffi_sym(win.user32, "PeekMessageA")
+        f_tr   := ffi_sym(win.user32, "TranslateMessage")
+        f_disp := ffi_sym(win.user32, "DispatchMessageA")
+        msg := ffi_alloc(64)
+        mut guard := 0
+        while guard < 64 {
+            guard += 1
+            got := ffi_call5(f_peek, msg, win.hwnd, 0, 0, 1) & 0xFFFFFFFF // PM_REMOVE
+            if got == 0 { break }
+            mcode := ffi_read_u32_le(msg, 8)
+            if mcode == 0x0012 or mcode == 0x0010 or mcode == 0x0002 { // WM_QUIT/WM_CLOSE/WM_DESTROY
+                win.is_open = false
+                break
+            }
+            _ := ffi_call1(f_tr, msg)
+            _ := ffi_call1(f_disp, msg)
+        }
+        ffi_free(msg)
+
+        // Poll mouse coordinates & button/escape state
+        f_cp := ffi_sym(win.user32, "GetCursorPos")
+        f_sc := ffi_sym(win.user32, "ScreenToClient")
+        f_ks := ffi_sym(win.user32, "GetAsyncKeyState")
+        pt := ffi_alloc(16)
+        _ := ffi_call1(f_cp, pt)
+        _ := ffi_call2(f_sc, win.hwnd, pt)
+        win.mouse_x = ffi_sext32(ffi_read_u32_le(pt, 0))
+        win.mouse_y = ffi_sext32(ffi_read_u32_le(pt, 4))
+        ffi_free(pt)
+        win.mouse_down = (ffi_call1(f_ks, 0x01) & 0x8000) != 0
+        win.key_escape = (ffi_call1(f_ks, 0x1B) & 0x8000) != 0
+        return win.is_open
+    }
+    if win.backend == 2 {
+        f_pe := ffi_sym(win.sdl2, "SDL_PollEvent")
+        ev := ffi_alloc(64)
+        while (ffi_call1(f_pe, ev) & 0xFFFFFFFF) != 0 {
+            et := ffi_read_u32_le(ev, 0)
+            if et == 0x100 { win.is_open = false } // SDL_QUIT
+        }
+        ffi_free(ev)
+        return win.is_open
+    }
+    return false
+}
+
+// Blit an Axon `Canvas` (`std::ui_render`) directly into the native OS window surface at 60+ FPS!
+fn gui_present_canvas(win: GuiWindow, canvas: Canvas) -> bool {
+    if not win.is_open { return false }
+    w := canvas.width
+    h := canvas.height
+    if w <= 0 or h <= 0 { return false }
+    npix := w * h
+    if buf_len(canvas.pixels) < npix * 4 { return false }
+
+    if win.backend == 1 {
+        f_gdc := ffi_sym(win.user32, "GetDC")
+        f_rdc := ffi_sym(win.user32, "ReleaseDC")
+        f_sdib := ffi_sym(win.gdi32, "StretchDIBits")
+        hdc := ffi_call1(f_gdc, win.hwnd)
+        if hdc == 0 { return false }
+
+        // Pack RGBA Canvas -> 32-bit BGRA DIB pixels (top-down via biHeight = -h)
+        bgra := ffi_alloc(npix * 4 + 16)
+        mut i := 0
+        while i < npix {
+            p := i * 4
+            r := buf_get(canvas.pixels, p)
+            g := buf_get(canvas.pixels, p + 1)
+            b := buf_get(canvas.pixels, p + 2)
+            a := buf_get(canvas.pixels, p + 3)
+            ffi_write_u8(bgra, p, b)
+            ffi_write_u8(bgra, p + 1, g)
+            ffi_write_u8(bgra, p + 2, r)
+            ffi_write_u8(bgra, p + 3, a)
+            i += 1
+        }
+        bmi := ffi_alloc(64)
+        ffi_write_u32_le(bmi, 0, 40)       // biSize = 40
+        ffi_write_u32_le(bmi, 4, w)        // biWidth
+        ffi_write_u32_le(bmi, 8, (0 - h) & 0xFFFFFFFF) // negative = top-down DIB
+        ffi_write_u16_le(bmi, 12, 1)       // biPlanes = 1
+        ffi_write_u16_le(bmi, 14, 32)      // biBitCount = 32
+        ffi_write_u32_le(bmi, 16, 0)       // BI_RGB
+
+        args := ibuf_new(16)
+        ibuf_push(args, hdc)
+        ibuf_push(args, 0); ibuf_push(args, 0); ibuf_push(args, win.width); ibuf_push(args, win.height)
+        ibuf_push(args, 0); ibuf_push(args, 0); ibuf_push(args, w); ibuf_push(args, h)
+        ibuf_push(args, bgra)
+        ibuf_push(args, bmi)
+        ibuf_push(args, 0)          // DIB_RGB_COLORS
+        ibuf_push(args, 0x00CC0020) // SRCCOPY
+        drawn := ffi_sext32(ffi_call_arr(f_sdib, 13, args))
+        buf_free(move args)
+        ffi_free(bmi)
+        ffi_free(bgra)
+        _ := ffi_call2(f_rdc, win.hwnd, hdc)
+        return drawn >= 0
+    }
+    if win.backend == 2 {
+        f_ut := ffi_sym(win.sdl2, "SDL_UpdateTexture")
+        f_rc := ffi_sym(win.sdl2, "SDL_RenderCopy")
+        f_rp := ffi_sym(win.sdl2, "SDL_RenderPresent")
+        px := ffi_bytes_to_ptr(canvas.pixels)
+        _ := ffi_call4(f_ut, win.aux2, 0, px, w * 4)
+        _ := ffi_call4(f_rc, win.aux1, win.aux2, 0, 0)
+        _ := ffi_call1(f_rp, win.aux1)
+        ffi_free(px)
+        return true
+    }
+    return false
+}
+
+fn gui_close(mut win: GuiWindow) {
+    if not win.is_open { return }
+    if win.backend == 1 and win.hwnd != 0 {
+        f := ffi_sym(win.user32, "DestroyWindow")
+        _ := ffi_call1(f, win.hwnd)
+    } else if win.backend == 2 and win.hwnd != 0 {
+        f_dw := ffi_sym(win.sdl2, "SDL_DestroyWindow")
+        _ := ffi_call1(f_dw, win.hwnd)
+    }
+    win.is_open = false
+}
+
+// 1-line production desktop app runner for `std::ui` (`UiApp`)
+// Set `max_frames > 0` for automated/CI smoke runs, or `0` for interactive loop until window closed.
+fn gui_run_ui_app(mut app: UiApp, max_frames: i64 = 0, visible: bool = true) -> i64 {
+    mut win := gui_open(app.title, app.width, app.height, visible) or return -1
+    mut frames := 0
+    mut prev_down := false
+    while gui_poll_events(mut win) {
+        if win.mouse_down and not prev_down {
+            _ := ui_click(mut app, win.mouse_x, win.mouse_y)
+        }
+        prev_down = win.mouse_down
+        canv := ui_render(mut app)
+        _ := gui_present_canvas(win, canv)
+        frames += 1
+        if max_frames > 0 and frames >= max_frames { break }
+        if win.key_escape { break }
+        sleep_ms(16)
+    }
+    gui_close(mut win)
+    return frames
+}
+
+// Native OS MessageBox (`flags`: 0 = OK, 1 = OK/Cancel, 4 = Yes/No)
+fn gui_msgbox(title: str, text: str, flags: i64 = 0) -> i64 {
+    u32 := ffi_open_one("user32.dll")
+    if u32 == 0 { return 0 }
+    f := ffi_sym(u32, "MessageBoxA")
+    ct := ffi_cstr(title); cm := ffi_cstr(text)
+    r := ffi_sext32(ffi_call4(f, 0, cm, ct, flags))
+    ffi_free(ct); ffi_free(cm)
+    return r
+}
+
+// Native OS Clipboard (Win32 `OpenClipboard` / `SetClipboardData` / `GetClipboardData`)
+fn gui_clipboard_set(text: str) -> bool {
+    u32 := ffi_open_one("user32.dll")
+    k32 := ffi_open_one("kernel32.dll")
+    if u32 == 0 or k32 == 0 { return false }
+    f_open := ffi_sym(u32, "OpenClipboard")
+    f_emp  := ffi_sym(u32, "EmptyClipboard")
+    f_set  := ffi_sym(u32, "SetClipboardData")
+    f_cls  := ffi_sym(u32, "CloseClipboard")
+    f_ga   := ffi_sym(k32, "GlobalAlloc")
+    f_gl   := ffi_sym(k32, "GlobalLock")
+    f_gu   := ffi_sym(k32, "GlobalUnlock")
+    if (ffi_call1(f_open, 0) & 0xFFFFFFFF) == 0 { return false }
+    _ := ffi_call0(f_emp)
+    n := str_len(text)
+    hmem := ffi_call2(f_ga, 0x0002, n + 1) // GMEM_MOVEABLE
+    if hmem != 0 {
+        p := ffi_call1(f_gl, hmem)
+        if p != 0 {
+            mut i := 0
+            while i < n { ffi_write_u8(p, i, str_byte(text, i)); i += 1 }
+            ffi_write_u8(p, n, 0)
+            _ := ffi_call1(f_gu, hmem)
+            _ := ffi_call2(f_set, 1, hmem) // CF_TEXT = 1
+        }
+    }
+    _ := ffi_call0(f_cls)
+    return hmem != 0
+}
+
+fn gui_clipboard_get() -> str {
+    u32 := ffi_open_one("user32.dll")
+    k32 := ffi_open_one("kernel32.dll")
+    if u32 == 0 or k32 == 0 { return "" }
+    f_open := ffi_sym(u32, "OpenClipboard")
+    f_get  := ffi_sym(u32, "GetClipboardData")
+    f_cls  := ffi_sym(u32, "CloseClipboard")
+    f_gl   := ffi_sym(k32, "GlobalLock")
+    f_gu   := ffi_sym(k32, "GlobalUnlock")
+    if (ffi_call1(f_open, 0) & 0xFFFFFFFF) == 0 { return "" }
+    hmem := ffi_call1(f_get, 1) // CF_TEXT = 1
+    mut out := ""
+    if hmem != 0 {
+        p := ffi_call1(f_gl, hmem)
+        if p != 0 {
+            out = ffi_read_cstr(p, 65536)
+            _ := ffi_call1(f_gu, hmem)
+        }
+    }
+    _ := ffi_call0(f_cls)
+    return out
+}
+
+// Native OS Open File Dialog (`comdlg32.dll` `GetOpenFileNameA`)
+fn gui_file_open_dialog(title: str = "Open File") -> str {
+    cd := ffi_open_one("comdlg32.dll")
+    if cd == 0 { return "" }
+    f_ofn := ffi_sym(cd, "GetOpenFileNameA")
+    if f_ofn == 0 { return "" }
+    ofn := ffi_alloc(160)   // sizeof(OPENFILENAMEA) = 152 on x64
+    fbuf := ffi_alloc(1024)
+    ct := ffi_cstr(title)
+    ffi_write_u32_le(ofn, 0, 152)  // lStructSize
+    ffi_write_i64(ofn, 6, fbuf)    // lpstrFile = offset 48 on Win64
+    ffi_write_u32_le(ofn, 56, 1023) // nMaxFile = offset 56
+    ffi_write_i64(ofn, 11, ct)     // lpstrTitle = offset 88
+    ffi_write_u32_le(ofn, 96, 0x00081800) // Flags = offset 96 (OFN_EXPLORER | FILEMUSTEXIST | PATHMUSTEXIST)
+    ok_d := (ffi_call1(f_ofn, ofn) & 0xFFFFFFFF) != 0
+    mut path := ""
+    if ok_d { path = ffi_read_cstr(fbuf, 1024) }
+    ffi_free(ct); ffi_free(fbuf); ffi_free(ofn)
+    return path
+}

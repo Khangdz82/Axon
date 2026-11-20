@@ -1,0 +1,477 @@
+// Axon Production gRPC + HTTP/2 + Protobuf v3 Wire Stack (`std/grpc.ax`)
+// 100% Pure-Axon high-performance RPC stack (Zero libgrpc/protoc runtime required):
+//   - Protobuf v3 Wire Codec (Varint, ZigZag sint64, Length-delimited string/bytes/submsg, Fixed64)
+//   - HTTP/2 Binary Framing (PRI preface, SETTINGS, HEADERS, DATA, PING, WINDOW_UPDATE, GOAWAY)
+//   - HPACK Header Encoder/Decoder for `:method`, `:scheme`, `:path`, `:authority`, `content-type: application/grpc`, `grpc-status`
+//   - gRPC Length-Prefixed Message Framing (`[compressed:1][len:4 BE][protobuf]`)
+//   - Live Unary gRPC Client & Server over `std::net` TCP (and composable with `std::tls` ALPN `h2`).
+
+use std::net
+
+// ==================== 1. PROTOBUF V3 WIRE CODEC ====================
+
+fn pb_write_varint(b: ByteBuf, val: i64) {
+    mut v := val
+    while true {
+        lo := v & 0x7F
+        v = ushr64(v, 7)
+        if v == 0 {
+            buf_push(b, lo)
+            break
+        }
+        buf_push(b, lo | 0x80)
+    }
+}
+
+fn pb_read_varint(b: ByteBuf, pos_box: IntBuf) -> i64 {
+    n := buf_len(b)
+    mut pos := ibuf_get(pos_box, 0)
+    mut res := 0
+    mut shift := 0
+    while pos < n and shift < 64 {
+        by := buf_get(b, pos)
+        pos += 1
+        res = res | ((by & 0x7F) << shift)
+        if (by & 0x80) == 0 { break }
+        shift += 7
+    }
+    ibuf_set(pos_box, 0, pos)
+    return res
+}
+
+fn pb_zigzag_encode(v: i64) -> i64 {
+    return (v << 1) ^ (v >> 63)
+}
+
+fn pb_zigzag_decode(u: i64) -> i64 {
+    return ushr64(u, 1) ^ (0 - (u & 1))
+}
+
+fn pb_write_i64(b: ByteBuf, field_num: i64, val: i64) {
+    pb_write_varint(b, (field_num << 3) | 0) // wire type 0 = varint
+    pb_write_varint(b, val)
+}
+
+fn pb_write_sint64(b: ByteBuf, field_num: i64, val: i64) {
+    pb_write_varint(b, (field_num << 3) | 0)
+    pb_write_varint(b, pb_zigzag_encode(val))
+}
+
+fn pb_write_bool(b: ByteBuf, field_num: i64, val: bool) {
+    pb_write_varint(b, (field_num << 3) | 0)
+    if val { buf_push(b, 1) } else { buf_push(b, 0) }
+}
+
+fn pb_write_str(b: ByteBuf, field_num: i64, s: str) {
+    pb_write_varint(b, (field_num << 3) | 2) // wire type 2 = length-delimited
+    pb_write_varint(b, str_len(s))
+    buf_push_str(b, s)
+}
+
+fn pb_write_bytes(b: ByteBuf, field_num: i64, data: ByteBuf) {
+    pb_write_varint(b, (field_num << 3) | 2)
+    n := buf_len(data)
+    pb_write_varint(b, n)
+    mut i := 0
+    while i < n { buf_push(b, buf_get(data, i)); i += 1 }
+}
+
+fn pb_write_fixed64(b: ByteBuf, field_num: i64, val: i64) {
+    pb_write_varint(b, (field_num << 3) | 1) // wire type 1 = 64-bit LE
+    mut sh := 0
+    while sh < 64 { buf_push(b, ushr64(val, sh) & 255); sh += 8 }
+}
+
+struct PbParsed {
+    fnums: IntBuf
+    wtypes: IntBuf
+    ivals: IntBuf
+    soffs: IntBuf
+    slens: IntBuf
+    raw: ByteBuf
+}
+
+fn pb_decode(src: ByteBuf) -> PbParsed {
+    fnums := ibuf_new(32)
+    wtypes := ibuf_new(32)
+    ivals := ibuf_new(32)
+    soffs := ibuf_new(32)
+    slens := ibuf_new(32)
+    raw := buf_new(buf_len(src) + 4)
+    mut ci := 0
+    while ci < buf_len(src) { buf_push(raw, buf_get(src, ci)); ci += 1 }
+
+    pbox := ibuf_new(2); ibuf_push(pbox, 0)
+    n := buf_len(raw)
+    while ibuf_get(pbox, 0) < n {
+        tag := pb_read_varint(raw, pbox)
+        fn_id := ushr64(tag, 3)
+        wt := tag & 7
+        ibuf_push(fnums, fn_id)
+        ibuf_push(wtypes, wt)
+        if wt == 0 {
+            v := pb_read_varint(raw, pbox)
+            ibuf_push(ivals, v); ibuf_push(soffs, 0); ibuf_push(slens, 0)
+        } else if wt == 1 {
+            p := ibuf_get(pbox, 0)
+            mut v := 0
+            mut k := 0
+            while k < 8 and p + k < n { v = v | (buf_get(raw, p + k) << (k * 8)); k += 1 }
+            ibuf_set(pbox, 0, p + 8)
+            ibuf_push(ivals, v); ibuf_push(soffs, 0); ibuf_push(slens, 0)
+        } else if wt == 2 {
+            ln := pb_read_varint(raw, pbox)
+            p := ibuf_get(pbox, 0)
+            ibuf_push(ivals, 0); ibuf_push(soffs, p); ibuf_push(slens, ln)
+            ibuf_set(pbox, 0, p + ln)
+        } else if wt == 5 {
+            p := ibuf_get(pbox, 0)
+            mut v := 0
+            mut k := 0
+            while k < 4 and p + k < n { v = v | (buf_get(raw, p + k) << (k * 8)); k += 1 }
+            ibuf_set(pbox, 0, p + 4)
+            ibuf_push(ivals, v); ibuf_push(soffs, 0); ibuf_push(slens, 0)
+        } else {
+            break
+        }
+    }
+    buf_free(move pbox)
+    return PbParsed(fnums = fnums, wtypes = wtypes, ivals = ivals, soffs = soffs, slens = slens, raw = raw)
+}
+
+fn pb_get_i64(m: PbParsed, field_num: i64, default_val: i64 = 0) -> i64 {
+    mut i := ibuf_len(m.fnums) - 1
+    while i >= 0 {
+        if ibuf_get(m.fnums, i) == field_num { return ibuf_get(m.ivals, i) }
+        i -= 1
+    }
+    return default_val
+}
+
+fn pb_get_str(m: PbParsed, field_num: i64, default_val: str = "") -> str {
+    mut i := ibuf_len(m.fnums) - 1
+    while i >= 0 {
+        if ibuf_get(m.fnums, i) == field_num and ibuf_get(m.wtypes, i) == 2 {
+            o := ibuf_get(m.soffs, i)
+            l := ibuf_get(m.slens, i)
+            if o + l <= buf_len(m.raw) { return buf_slice_str(m.raw, o, o + l) }
+        }
+        i -= 1
+    }
+    return default_val
+}
+
+// ==================== 2. HTTP/2 FRAMING & HPACK ====================
+
+fn h2_client_preface() -> str {
+    return "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+}
+
+fn h2_frame_data() -> i64          { return 0 }
+fn h2_frame_headers() -> i64       { return 1 }
+fn h2_frame_rst_stream() -> i64    { return 3 }
+fn h2_frame_settings() -> i64      { return 4 }
+fn h2_frame_ping() -> i64          { return 6 }
+fn h2_frame_goaway() -> i64        { return 7 }
+fn h2_frame_window_update() -> i64 { return 8 }
+
+fn h2_flag_end_stream() -> i64  { return 1 }
+fn h2_flag_ack() -> i64         { return 1 }
+fn h2_flag_end_headers() -> i64 { return 4 }
+
+fn h2_encode_frame(ftype: i64, flags: i64, stream_id: i64, payload: ByteBuf) -> ByteBuf {
+    n := buf_len(payload)
+    f := buf_new(n + 16)
+    buf_push(f, (n >> 16) & 255)
+    buf_push(f, (n >> 8) & 255)
+    buf_push(f, n & 255)
+    buf_push(f, ftype & 255)
+    buf_push(f, flags & 255)
+    sid := stream_id & 0x7FFFFFFF
+    buf_push(f, (sid >> 24) & 255)
+    buf_push(f, (sid >> 16) & 255)
+    buf_push(f, (sid >> 8) & 255)
+    buf_push(f, sid & 255)
+    mut i := 0
+    while i < n { buf_push(f, buf_get(payload, i)); i += 1 }
+    return f
+}
+
+struct H2Frame {
+    ftype: i64
+    flags: i64
+    stream_id: i64
+    payload: ByteBuf
+}
+
+fn h2_recv_frame(sock: TcpStream) -> H2Frame ! i64 {
+    hdr := tcp_recv_exact(sock, 9) or return
+    plen := (buf_get(hdr, 0) << 16) | (buf_get(hdr, 1) << 8) | buf_get(hdr, 2)
+    ft := buf_get(hdr, 3)
+    fl := buf_get(hdr, 4)
+    sid := ((buf_get(hdr, 5) & 0x7F) << 24) | (buf_get(hdr, 6) << 16) | (buf_get(hdr, 7) << 8) | buf_get(hdr, 8)
+    buf_free(move hdr)
+    if plen == 0 {
+        return ok(H2Frame(ftype = ft, flags = fl, stream_id = sid, payload = buf_new(0)))
+    }
+    pl := tcp_recv_exact(sock, plen) or return
+    return ok(H2Frame(ftype = ft, flags = fl, stream_id = sid, payload = pl))
+}
+
+fn _hpack_push_str(b: ByteBuf, s: str) {
+    // Uncompressed HPACK string literal (`H=0`, 7-bit len or continuation)
+    n := str_len(s)
+    if n < 127 {
+        buf_push(b, n)
+    } else {
+        buf_push(b, 127)
+        pb_write_varint(b, n - 127)
+    }
+    buf_push_str(b, s)
+}
+
+fn _hpack_push_hdr(b: ByteBuf, name: str, val: str) {
+    buf_push(b, 0x00) // Literal Header Field without Indexing - New Name
+    _hpack_push_str(b, name)
+    _hpack_push_str(b, val)
+}
+
+fn hpack_encode_grpc_request(authority: str, service_method: str) -> ByteBuf {
+    b := buf_new(256)
+    buf_push(b, 0x83) // Static index 3: `:method: POST`
+    buf_push(b, 0x86) // Static index 6: `:scheme: http`
+    _hpack_push_hdr(b, ":path", service_method)
+    _hpack_push_hdr(b, ":authority", authority)
+    _hpack_push_hdr(b, "content-type", "application/grpc")
+    _hpack_push_hdr(b, "te", "trailers")
+    return b
+}
+
+fn hpack_encode_grpc_response(grpc_status: i64, grpc_msg: str) -> ByteBuf {
+    b := buf_new(128)
+    buf_push(b, 0x88) // Static index 8: `:status: 200`
+    _hpack_push_hdr(b, "content-type", "application/grpc")
+    _hpack_push_hdr(b, "grpc-status", f"{grpc_status}")
+    if str_len(grpc_msg) > 0 { _hpack_push_hdr(b, "grpc-message", grpc_msg) }
+    return b
+}
+
+fn hpack_find_header(block: ByteBuf, target_name: str) -> str {
+    n := buf_len(block)
+    mut p := 0
+    while p < n {
+        b0 := buf_get(block, p)
+        if (b0 & 0x80) != 0 {
+            p += 1 // indexed static header
+        } else if b0 == 0x00 or b0 == 0x10 or b0 == 0x40 {
+            p += 1
+            if p >= n { break }
+            nlen := buf_get(block, p) & 0x7F; p += 1
+            if p + nlen > n { break }
+            nm := buf_slice_str(block, p, p + nlen); p += nlen
+            if p >= n { break }
+            vlen := buf_get(block, p) & 0x7F; p += 1
+            if p + vlen > n { break }
+            vl := buf_slice_str(block, p, p + vlen); p += vlen
+            if str_eq(nm, target_name) { return vl }
+        } else {
+            p += 1
+        }
+    }
+    return ""
+}
+
+// ==================== 3. gRPC LENGTH-PREFIXED MESSAGE & LIVE RPC ====================
+
+fn grpc_frame_encode(pb_payload: ByteBuf, compressed: bool = false) -> ByteBuf {
+    n := buf_len(pb_payload)
+    out := buf_new(n + 8)
+    if compressed { buf_push(out, 1) } else { buf_push(out, 0) }
+    buf_push(out, (n >> 24) & 255)
+    buf_push(out, (n >> 16) & 255)
+    buf_push(out, (n >> 8) & 255)
+    buf_push(out, n & 255)
+    mut i := 0
+    while i < n { buf_push(out, buf_get(pb_payload, i)); i += 1 }
+    return out
+}
+
+fn grpc_frame_decode(frame_data: ByteBuf) -> ByteBuf ! i64 {
+    n := buf_len(frame_data)
+    if n < 5 { return err(-500) }
+    mlen := (buf_get(frame_data, 1) << 24) | (buf_get(frame_data, 2) << 16) | (buf_get(frame_data, 3) << 8) | buf_get(frame_data, 4)
+    if 5 + mlen > n { return err(-501) }
+    out := buf_new(mlen + 4)
+    mut i := 0
+    while i < mlen { buf_push(out, buf_get(frame_data, 5 + i)); i += 1 }
+    return ok(out)
+}
+
+struct GrpcChannel {
+    sock: TcpStream
+    authority: str
+    next_stream_id: i64
+}
+
+struct GrpcResponse {
+    status: i64
+    message: str
+    payload: ByteBuf
+}
+
+struct GrpcServer {
+    listener: TcpListener
+}
+
+struct GrpcIncoming {
+    sock: TcpStream
+    stream_id: i64
+    method_path: str
+    payload: ByteBuf
+}
+
+fn grpc_connect(host: str, port: i64) -> GrpcChannel ! i64 {
+    sock := tcp_connect(host, port) or return
+    _ := tcp_set_nodelay(sock, true)
+    // Send HTTP/2 client connection preface + empty SETTINGS frame
+    r0 := tcp_send_str(sock, h2_client_preface()) or -1
+    if r0 < 0 { tcp_close(sock); return err(-510) }
+    empty := buf_new(0)
+    sf := h2_encode_frame(h2_frame_settings(), 0, 0, empty)
+    buf_free(move empty)
+    r1 := tcp_send_bytes(sock, sf) or -1
+    buf_free(move sf)
+    if r1 < 0 { tcp_close(sock); return err(-511) }
+    return ok(GrpcChannel(sock = sock, authority = f"{host}:{port}", next_stream_id = 1))
+}
+
+fn grpc_unary_call(mut ch: GrpcChannel, service_method: str, req_pb: ByteBuf) -> GrpcResponse ! i64 {
+    sid := ch.next_stream_id
+    ch.next_stream_id += 2
+
+    hblk := hpack_encode_grpc_request(ch.authority, service_method)
+    hf := h2_encode_frame(h2_frame_headers(), h2_flag_end_headers(), sid, hblk)
+    buf_free(move hblk)
+    rh := tcp_send_bytes(ch.sock, hf) or -1
+    buf_free(move hf)
+    if rh < 0 { return err(-512) }
+
+    gmsg := grpc_frame_encode(req_pb, false)
+    df := h2_encode_frame(h2_frame_data(), h2_flag_end_stream(), sid, gmsg)
+    buf_free(move gmsg)
+    rd := tcp_send_bytes(ch.sock, df) or -1
+    buf_free(move df)
+    if rd < 0 { return err(-513) }
+
+    resp_raw := buf_new(1024)
+    mut st_code := 0
+    mut st_msg := ""
+    mut guard := 0
+    while guard < 128 {
+        guard += 1
+        fr := h2_recv_frame(ch.sock) or H2Frame(ftype = -1, flags = 0, stream_id = 0, payload = buf_new(0))
+        if fr.ftype < 0 { buf_free(move fr.payload); break }
+        if fr.ftype == h2_frame_settings() and (fr.flags & h2_flag_ack()) == 0 {
+            em := buf_new(0)
+            ack := h2_encode_frame(h2_frame_settings(), h2_flag_ack(), 0, em)
+            buf_free(move em)
+            _ := tcp_send_bytes(ch.sock, ack) or 0
+            buf_free(move ack)
+        } else if fr.ftype == h2_frame_headers() and fr.stream_id == sid {
+            gst := hpack_find_header(fr.payload, "grpc-status")
+            if str_len(gst) > 0 { st_code = parse_i64(gst) or 0 }
+            gmsg_h := hpack_find_header(fr.payload, "grpc-message")
+            if str_len(gmsg_h) > 0 { st_msg = gmsg_h }
+            if (fr.flags & h2_flag_end_stream()) != 0 {
+                buf_free(move fr.payload)
+                break
+            }
+        } else if fr.ftype == h2_frame_data() and fr.stream_id == sid {
+            mut i := 0
+            while i < buf_len(fr.payload) { buf_push(resp_raw, buf_get(fr.payload, i)); i += 1 }
+            if (fr.flags & h2_flag_end_stream()) != 0 {
+                buf_free(move fr.payload)
+                break
+            }
+        }
+        buf_free(move fr.payload)
+    }
+    pb_out := grpc_frame_decode(resp_raw) or buf_new(0)
+    buf_free(move resp_raw)
+    return ok(GrpcResponse(status = st_code, message = st_msg, payload = pb_out))
+}
+
+fn grpc_close(ch: GrpcChannel) {
+    tcp_close(ch.sock)
+}
+
+fn grpc_listen(bind_ip: str, port: i64) -> GrpcServer ! i64 {
+    ln := tcp_listen(bind_ip, port, 128) or return
+    return ok(GrpcServer(listener = ln))
+}
+
+fn grpc_server_accept_unary(srv: GrpcServer) -> GrpcIncoming ! i64 {
+    sock := tcp_accept(srv.listener) or return
+    _ := tcp_set_nodelay(sock, true)
+    // Read 24-byte HTTP/2 client preface
+    pref := tcp_recv_exact(sock, 24) or buf_new(0)
+    plen := buf_len(pref)
+    buf_free(move pref)
+    if plen != 24 { tcp_close(sock); return err(-520) }
+    // Send server SETTINGS
+    em := buf_new(0)
+    sf := h2_encode_frame(h2_frame_settings(), 0, 0, em)
+    buf_free(move em)
+    _ := tcp_send_bytes(sock, sf) or 0
+    buf_free(move sf)
+
+    mut req_sid := 1
+    mut mpath := ""
+    req_raw := buf_new(1024)
+    mut guard := 0
+    while guard < 128 {
+        guard += 1
+        fr := h2_recv_frame(sock) or H2Frame(ftype = -1, flags = 0, stream_id = 0, payload = buf_new(0))
+        if fr.ftype < 0 { buf_free(move fr.payload); break }
+        if fr.ftype == h2_frame_settings() and (fr.flags & h2_flag_ack()) == 0 {
+            em2 := buf_new(0)
+            ack := h2_encode_frame(h2_frame_settings(), h2_flag_ack(), 0, em2)
+            buf_free(move em2)
+            _ := tcp_send_bytes(sock, ack) or 0
+            buf_free(move ack)
+        } else if fr.ftype == h2_frame_headers() {
+            req_sid = fr.stream_id
+            mp := hpack_find_header(fr.payload, ":path")
+            if str_len(mp) > 0 { mpath = mp }
+            if (fr.flags & h2_flag_end_stream()) != 0 { buf_free(move fr.payload); break }
+        } else if fr.ftype == h2_frame_data() {
+            mut i := 0
+            while i < buf_len(fr.payload) { buf_push(req_raw, buf_get(fr.payload, i)); i += 1 }
+            if (fr.flags & h2_flag_end_stream()) != 0 { buf_free(move fr.payload); break }
+        }
+        buf_free(move fr.payload)
+    }
+    pb_in := grpc_frame_decode(req_raw) or buf_new(0)
+    buf_free(move req_raw)
+    return ok(GrpcIncoming(sock = sock, stream_id = req_sid, method_path = mpath, payload = pb_in))
+}
+
+fn grpc_server_reply(inc: GrpcIncoming, resp_pb: ByteBuf, grpc_status: i64 = 0, grpc_msg: str = "") -> bool {
+    hblk := hpack_encode_grpc_response(grpc_status, grpc_msg)
+    hf := h2_encode_frame(h2_frame_headers(), h2_flag_end_headers(), inc.stream_id, hblk)
+    buf_free(move hblk)
+    ok1 := (tcp_send_bytes(inc.sock, hf) or -1) >= 0
+    buf_free(move hf)
+
+    gmsg := grpc_frame_encode(resp_pb, false)
+    df := h2_encode_frame(h2_frame_data(), h2_flag_end_stream(), inc.stream_id, gmsg)
+    buf_free(move gmsg)
+    ok2 := (tcp_send_bytes(inc.sock, df) or -1) >= 0
+    buf_free(move df)
+    tcp_close(inc.sock)
+    return ok1 and ok2
+}
+
+fn grpc_server_close(srv: GrpcServer) {
+    tcp_listener_close(srv.listener)
+}

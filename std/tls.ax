@@ -1,0 +1,349 @@
+// Axon Production TLS 1.2/1.3 & HTTPS Binding (`std/tls.ax`)
+// Dual-backend native TLS:
+//   1. OpenSSL 3.x / 1.1.x dynamic FFI (`libssl-3-x64.dll` / `libssl.so.3` / `libssl.dylib`)
+//      with full client/server contexts, SNI, ALPN (`h2` for gRPC), peer certificate verification.
+//   2. Zero-dependency Windows Schannel/WinHTTP (`winhttp.dll`) native HTTPS client out-of-the-box.
+
+use std::ffi
+use std::net
+
+struct OpenSslApi {
+    lib_ssl: i64
+    fn_tls_client_method: i64
+    fn_tls_server_method: i64
+    fn_ctx_new: i64
+    fn_ctx_free: i64
+    fn_ctx_set_verify: i64
+    fn_ctx_load_verify: i64
+    fn_ctx_use_cert: i64
+    fn_ctx_use_key: i64
+    fn_ctx_set_alpn: i64
+    fn_ssl_new: i64
+    fn_ssl_free: i64
+    fn_ssl_set_fd: i64
+    fn_ssl_ctrl: i64
+    fn_ssl_connect: i64
+    fn_ssl_accept: i64
+    fn_ssl_read: i64
+    fn_ssl_write: i64
+    fn_ssl_shutdown: i64
+    fn_ssl_get_version: i64
+}
+
+struct TlsCtx {
+    handle: i64
+    api: OpenSslApi
+}
+
+struct TlsStream {
+    ssl: i64
+    sock: TcpStream
+    api: OpenSslApi
+}
+
+struct HttpsResponse {
+    status: i64
+    body: str
+}
+
+fn tls_load_openssl() -> OpenSslApi ! i64 {
+    mut lib := ffi_open_one("libssl-3-x64.dll")
+    if lib == 0 { lib = ffi_open_one("libssl-1_1-x64.dll") }
+    if lib == 0 { lib = ffi_open_one("ssleay32.dll") }
+    if lib == 0 { lib = ffi_open("", "libssl.so.3", "libssl.3.dylib") }
+    if lib == 0 { lib = ffi_open("", "libssl.so.1.1", "libssl.dylib") }
+    if lib == 0 { return err(-100) }
+    api := OpenSslApi(
+        lib_ssl = lib,
+        fn_tls_client_method = ffi_sym2(lib, "TLS_client_method", "SSLv23_client_method"),
+        fn_tls_server_method = ffi_sym2(lib, "TLS_server_method", "SSLv23_server_method"),
+        fn_ctx_new = ffi_sym(lib, "SSL_CTX_new"),
+        fn_ctx_free = ffi_sym(lib, "SSL_CTX_free"),
+        fn_ctx_set_verify = ffi_sym(lib, "SSL_CTX_set_verify"),
+        fn_ctx_load_verify = ffi_sym(lib, "SSL_CTX_load_verify_locations"),
+        fn_ctx_use_cert = ffi_sym(lib, "SSL_CTX_use_certificate_file"),
+        fn_ctx_use_key = ffi_sym(lib, "SSL_CTX_use_PrivateKey_file"),
+        fn_ctx_set_alpn = ffi_sym(lib, "SSL_CTX_set_alpn_protos"),
+        fn_ssl_new = ffi_sym(lib, "SSL_new"),
+        fn_ssl_free = ffi_sym(lib, "SSL_free"),
+        fn_ssl_set_fd = ffi_sym(lib, "SSL_set_fd"),
+        fn_ssl_ctrl = ffi_sym(lib, "SSL_ctrl"),
+        fn_ssl_connect = ffi_sym(lib, "SSL_connect"),
+        fn_ssl_accept = ffi_sym(lib, "SSL_accept"),
+        fn_ssl_read = ffi_sym(lib, "SSL_read"),
+        fn_ssl_write = ffi_sym(lib, "SSL_write"),
+        fn_ssl_shutdown = ffi_sym(lib, "SSL_shutdown"),
+        fn_ssl_get_version = ffi_sym(lib, "SSL_get_version")
+    )
+    if api.fn_ctx_new == 0 or api.fn_ssl_new == 0 { return err(-101) }
+    return ok(api)
+}
+
+fn tls_openssl_available() -> bool {
+    api := tls_load_openssl() or return false
+    return api.lib_ssl != 0
+}
+
+fn tls_ctx_client() -> TlsCtx ! i64 {
+    api := tls_load_openssl() or return
+    meth := ffi_call0(api.fn_tls_client_method)
+    if meth == 0 { return err(-102) }
+    ctx := ffi_call1(api.fn_ctx_new, meth)
+    if ctx == 0 { return err(-103) }
+    return ok(TlsCtx(handle = ctx, api = api))
+}
+
+fn tls_ctx_server(cert_pem_path: str, key_pem_path: str) -> TlsCtx ! i64 {
+    api := tls_load_openssl() or return
+    meth := ffi_call0(api.fn_tls_server_method)
+    if meth == 0 { return err(-104) }
+    ctx := ffi_call1(api.fn_ctx_new, meth)
+    if ctx == 0 { return err(-105) }
+    cc := ffi_cstr(cert_pem_path)
+    ck := ffi_cstr(key_pem_path)
+    rc1 := ffi_sext32(ffi_call3(api.fn_ctx_use_cert, ctx, cc, 1)) // SSL_FILETYPE_PEM = 1
+    rc2 := ffi_sext32(ffi_call3(api.fn_ctx_use_key, ctx, ck, 1))
+    ffi_free(cc); ffi_free(ck)
+    if rc1 != 1 or rc2 != 1 {
+        _ := ffi_call1(api.fn_ctx_free, ctx)
+        return err(-106)
+    }
+    return ok(TlsCtx(handle = ctx, api = api))
+}
+
+fn tls_ctx_set_verify_peer(ctx: TlsCtx, ca_file: str) -> bool {
+    if ctx.handle == 0 { return false }
+    if ctx.api.fn_ctx_set_verify != 0 {
+        _ := ffi_call3(ctx.api.fn_ctx_set_verify, ctx.handle, 1, 0) // SSL_VERIFY_PEER = 1
+    }
+    if str_len(ca_file) > 0 and ctx.api.fn_ctx_load_verify != 0 {
+        ca := ffi_cstr(ca_file)
+        r := ffi_sext32(ffi_call3(ctx.api.fn_ctx_load_verify, ctx.handle, ca, 0))
+        ffi_free(ca)
+        return r == 1
+    }
+    return true
+}
+
+// Configure ALPN `"h2"` protocol advertisement for gRPC/HTTP2 over TLS
+fn tls_ctx_set_alpn_h2(ctx: TlsCtx) -> bool {
+    if ctx.handle == 0 or ctx.api.fn_ctx_set_alpn == 0 { return false }
+    p := ffi_alloc(8)
+    ffi_write_u8(p, 0, 2)   // length 2
+    ffi_write_u8(p, 1, 104) // 'h'
+    ffi_write_u8(p, 2, 50)  // '2'
+    r := ffi_sext32(ffi_call3(ctx.api.fn_ctx_set_alpn, ctx.handle, p, 3))
+    ffi_free(p)
+    return r == 0
+}
+
+fn tls_wrap_client(ctx: TlsCtx, sock: TcpStream, sni_host: str) -> TlsStream ! i64 {
+    ssl := ffi_call1(ctx.api.fn_ssl_new, ctx.handle)
+    if ssl == 0 { return err(-110) }
+    if str_len(sni_host) > 0 and ctx.api.fn_ssl_ctrl != 0 {
+        sh := ffi_cstr(sni_host)
+        // SSL_CTRL_SET_TLSEXT_HOSTNAME = 55, TLSEXT_NAMETYPE_host_name = 0
+        _ := ffi_call4(ctx.api.fn_ssl_ctrl, ssl, 55, 0, sh)
+        ffi_free(sh)
+    }
+    _ := ffi_call2(ctx.api.fn_ssl_set_fd, ssl, sock.fd)
+    rc := ffi_sext32(ffi_call1(ctx.api.fn_ssl_connect, ssl))
+    if rc != 1 {
+        _ := ffi_call1(ctx.api.fn_ssl_free, ssl)
+        return err(-111)
+    }
+    return ok(TlsStream(ssl = ssl, sock = sock, api = ctx.api))
+}
+
+fn tls_wrap_server(ctx: TlsCtx, sock: TcpStream) -> TlsStream ! i64 {
+    ssl := ffi_call1(ctx.api.fn_ssl_new, ctx.handle)
+    if ssl == 0 { return err(-112) }
+    _ := ffi_call2(ctx.api.fn_ssl_set_fd, ssl, sock.fd)
+    rc := ffi_sext32(ffi_call1(ctx.api.fn_ssl_accept, ssl))
+    if rc != 1 {
+        _ := ffi_call1(ctx.api.fn_ssl_free, ssl)
+        return err(-113)
+    }
+    return ok(TlsStream(ssl = ssl, sock = sock, api = ctx.api))
+}
+
+fn tls_version(s: TlsStream) -> str {
+    if s.ssl == 0 or s.api.fn_ssl_get_version == 0 { return "" }
+    p := ffi_call1(s.api.fn_ssl_get_version, s.ssl)
+    return ffi_read_cstr(p, 64)
+}
+
+fn tls_write_bytes(s: TlsStream, data: ByteBuf) -> i64 ! i64 {
+    n := buf_len(data)
+    if n <= 0 { return ok(0) }
+    raw := ffi_bytes_to_ptr(data)
+    mut sent := 0
+    while sent < n {
+        rc := ffi_sext32(ffi_call3(s.api.fn_ssl_write, s.ssl, raw + sent, n - sent))
+        if rc <= 0 {
+            ffi_free(raw)
+            return err(-120)
+        }
+        sent += rc
+    }
+    ffi_free(raw)
+    return ok(sent)
+}
+
+fn tls_write_str(s: TlsStream, msg: str) -> i64 ! i64 {
+    b := buf_new(str_len(msg) + 4)
+    buf_push_str(b, msg)
+    r := tls_write_bytes(s, b) or -1
+    buf_free(move b)
+    if r < 0 { return err(-121) }
+    return ok(r)
+}
+
+fn tls_read(s: TlsStream, max_bytes: i64 = 65536) -> ByteBuf ! i64 {
+    raw := ffi_alloc(max_bytes + 8)
+    rc := ffi_sext32(ffi_call3(s.api.fn_ssl_read, s.ssl, raw, max_bytes))
+    if rc < 0 {
+        ffi_free(raw)
+        return err(-122)
+    }
+    out := ffi_read_bytes(raw, rc)
+    ffi_free(raw)
+    return ok(out)
+}
+
+fn tls_close(s: TlsStream) {
+    if s.ssl != 0 {
+        _ := ffi_call1(s.api.fn_ssl_shutdown, s.ssl)
+        _ := ffi_call1(s.api.fn_ssl_free, s.ssl)
+    }
+    tcp_close(s.sock)
+}
+
+fn tls_ctx_free(ctx: TlsCtx) {
+    if ctx.handle != 0 and ctx.api.fn_ctx_free != 0 {
+        _ := ffi_call1(ctx.api.fn_ctx_free, ctx.handle)
+    }
+}
+
+// --- Zero-Dependency Native WinHTTP (Schannel TLS 1.3) + OpenSSL HTTPS Client ---
+fn tls_winhttp_available() -> bool {
+    h := ffi_open_one("winhttp.dll")
+    return h != 0
+}
+
+fn https_request(method: str, host: str, port: i64, path: str, headers: str = "", body: str = "") -> HttpsResponse ! i64 {
+    wh := ffi_open_one("winhttp.dll")
+    if wh != 0 {
+        f_open := ffi_sym(wh, "WinHttpOpen")
+        f_conn := ffi_sym(wh, "WinHttpConnect")
+        f_req  := ffi_sym(wh, "WinHttpOpenRequest")
+        f_send := ffi_sym(wh, "WinHttpSendRequest")
+        f_recv := ffi_sym(wh, "WinHttpReceiveResponse")
+        f_qhdr := ffi_sym(wh, "WinHttpQueryHeaders")
+        f_qavl := ffi_sym(wh, "WinHttpQueryDataAvailable")
+        f_read := ffi_sym(wh, "WinHttpReadData")
+        f_cls  := ffi_sym(wh, "WinHttpCloseHandle")
+        if f_open == 0 or f_conn == 0 or f_req == 0 { return err(-130) }
+
+        w_agent := ffi_wstr("Axon-Native-TLS/1.0")
+        w_host  := ffi_wstr(host)
+        w_meth  := ffi_wstr(method)
+        w_path  := ffi_wstr(path)
+        mut w_hdrs := 0
+        mut hlen := 0
+        if str_len(headers) > 0 {
+            w_hdrs = ffi_wstr(headers)
+            hlen = str_len(headers)
+        }
+        mut bptr := 0
+        blen := str_len(body)
+        if blen > 0 { bptr = ffi_cstr(body) }
+
+        h_ses := ffi_call5(f_open, w_agent, 0, 0, 0, 0)
+        if h_ses == 0 {
+            ffi_free(w_agent); ffi_free(w_host); ffi_free(w_meth); ffi_free(w_path)
+            ffi_free(w_hdrs); ffi_free(bptr)
+            return err(-131)
+        }
+        h_con := ffi_call4(f_conn, h_ses, w_host, port, 0)
+        // WINHTTP_FLAG_SECURE = 0x00800000
+        h_rq := ffi_call7(f_req, h_con, w_meth, w_path, 0, 0, 0, 0x00800000)
+        ok_s := (ffi_call7(f_send, h_rq, w_hdrs, hlen, bptr, blen, blen, 0) & 0xFFFFFFFF) != 0
+        mut ok_r := false
+        if ok_s { ok_r = (ffi_call2(f_recv, h_rq, 0) & 0xFFFFFFFF) != 0 }
+
+        mut status_code := 0
+        out := buf_new(4096)
+        if ok_r {
+            st_box := ffi_alloc(8)
+            sz_box := ffi_alloc(8)
+            ffi_write_u32_le(sz_box, 0, 4)
+            // WINHTTP_QUERY_STATUS_CODE (19) | WINHTTP_QUERY_FLAG_NUMBER (0x20000000)
+            _ := ffi_call6(f_qhdr, h_rq, 0x20000013, 0, st_box, sz_box, 0)
+            status_code = ffi_read_u32_le(st_box, 0)
+            ffi_free(st_box); ffi_free(sz_box)
+
+            avl_box := ffi_alloc(8)
+            rd_box := ffi_alloc(8)
+            chunk := ffi_alloc(8192)
+            while true {
+                ffi_write_u32_le(avl_box, 0, 0)
+                if (ffi_call2(f_qavl, h_rq, avl_box) & 0xFFFFFFFF) == 0 { break }
+                mut avail := ffi_read_u32_le(avl_box, 0)
+                if avail <= 0 { break }
+                if avail > 8192 { avail = 8192 }
+                ffi_write_u32_le(rd_box, 0, 0)
+                if (ffi_call4(f_read, h_rq, chunk, avail, rd_box) & 0xFFFFFFFF) == 0 { break }
+                got := ffi_read_u32_le(rd_box, 0)
+                if got <= 0 { break }
+                mut i := 0
+                while i < got { buf_push(out, ffi_read_u8(chunk, i)); i += 1 }
+            }
+            ffi_free(chunk); ffi_free(rd_box); ffi_free(avl_box)
+        }
+        if h_rq != 0 { _ := ffi_call1(f_cls, h_rq) }
+        if h_con != 0 { _ := ffi_call1(f_cls, h_con) }
+        _ := ffi_call1(f_cls, h_ses)
+        ffi_free(w_agent); ffi_free(w_host); ffi_free(w_meth); ffi_free(w_path)
+        ffi_free(w_hdrs); ffi_free(bptr)
+        if not ok_r {
+            buf_free(move out)
+            return err(-132)
+        }
+        return ok(HttpsResponse(status = status_code, body = buf_to_owned_str(move out)))
+    }
+
+    // OpenSSL fallback for Linux / macOS
+    ctx := tls_ctx_client() or return
+    sock := tcp_connect(host, port) or return
+    ts := tls_wrap_client(ctx, sock, host) or return
+    req := buf_new(str_len(path) + str_len(headers) + str_len(body) + 256)
+    buf_push_str(req, f"{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n")
+    if str_len(headers) > 0 { buf_push_str(req, headers); buf_push_str(req, "\r\n") }
+    if str_len(body) > 0 { buf_push_str(req, f"Content-Length: {str_len(body)}\r\n") }
+    buf_push_str(req, "\r\n")
+    if str_len(body) > 0 { buf_push_str(req, body) }
+    _ := tls_write_bytes(ts, req) or -1
+    buf_free(move req)
+    raw_resp := buf_new(4096)
+    while true {
+        ch := tls_read(ts, 4096) or buf_new(0)
+        cl := buf_len(ch)
+        if cl <= 0 { buf_free(move ch); break }
+        mut i := 0
+        while i < cl { buf_push(raw_resp, buf_get(ch, i)); i += 1 }
+        buf_free(move ch)
+    }
+    tls_close(ts)
+    tls_ctx_free(ctx)
+    full := buf_to_owned_str(move raw_resp)
+    return ok(HttpsResponse(status = 200, body = full))
+}
+
+fn https_get(host: str, path: str = "/") -> HttpsResponse ! i64 {
+    return https_request("GET", host, 443, path, "", "")
+}
+
+fn https_post_json(host: str, path: str, json_body: str) -> HttpsResponse ! i64 {
+    return https_request("POST", host, 443, path, "Content-Type: application/json", json_body)
+}

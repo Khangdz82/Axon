@@ -1,0 +1,343 @@
+// Axon Production Cross-Platform TCP/UDP Networking & DNS (`std/net.ax`)
+// Directly binds WinSock2 (`ws2_32.dll`) on Windows and POSIX `libc` sockets on Linux/macOS
+// via `std::ffi`. Supports real TCP listeners, clients, non-blocking/nodelay, UDP, DNS, and HTTP/1.1.
+
+use std::ffi
+use std::os
+use std::str
+
+struct NetApi {
+    lib: i64
+    is_win: bool
+    fn_socket: i64
+    fn_bind: i64
+    fn_listen: i64
+    fn_accept: i64
+    fn_connect: i64
+    fn_send: i64
+    fn_recv: i64
+    fn_sendto: i64
+    fn_recvfrom: i64
+    fn_setsockopt: i64
+    fn_close: i64
+    fn_gethostbyname: i64
+}
+
+struct TcpListener {
+    fd: i64
+    port: i64
+    api: NetApi
+}
+
+struct TcpStream {
+    fd: i64
+    api: NetApi
+}
+
+struct UdpSocket {
+    fd: i64
+    port: i64
+    api: NetApi
+}
+
+fn net_init() -> NetApi ! i64 {
+    mut lib := ffi_open_one("ws2_32.dll")
+    mut is_win := lib != 0
+    if not is_win {
+        lib = ffi_open("", "libc.so.6", "libSystem.B.dylib")
+    }
+    if lib == 0 { return err(-1) }
+    if is_win {
+        fn_wsa := ffi_sym(lib, "WSAStartup")
+        if fn_wsa != 0 {
+            wsa := ffi_alloc(512)
+            _ := ffi_call2(fn_wsa, 0x0202, wsa)
+            ffi_free(wsa)
+        }
+    }
+    api := NetApi(
+        lib = lib,
+        is_win = is_win,
+        fn_socket = ffi_sym(lib, "socket"),
+        fn_bind = ffi_sym(lib, "bind"),
+        fn_listen = ffi_sym(lib, "listen"),
+        fn_accept = ffi_sym(lib, "accept"),
+        fn_connect = ffi_sym(lib, "connect"),
+        fn_send = ffi_sym(lib, "send"),
+        fn_recv = ffi_sym(lib, "recv"),
+        fn_sendto = ffi_sym(lib, "sendto"),
+        fn_recvfrom = ffi_sym(lib, "recvfrom"),
+        fn_setsockopt = ffi_sym(lib, "setsockopt"),
+        fn_close = ffi_sym2(lib, "closesocket", "close"),
+        fn_gethostbyname = ffi_sym(lib, "gethostbyname")
+    )
+    if api.fn_socket == 0 { return err(-2) }
+    return ok(api)
+}
+
+// Parse IPv4 dotted quad (`"127.0.0.1"`) into network-byte-order u32 (`0x0100007F` LE memory = `[127,0,0,1]`)
+fn net_parse_ipv4(ip: str) -> i64 ! i64 {
+    if str_eq(ip, "localhost") { return ok(127 | (1 << 24)) }
+    n := str_len(ip)
+    mut oct := 0
+    mut cur := 0
+    mut digits := 0
+    mut shift := 0
+    mut i := 0
+    while i <= n {
+        mut ch := 46
+        if i < n { ch = str_byte(ip, i) }
+        if ch == 46 {
+            if digits == 0 or cur > 255 or shift > 24 { return err(-1) }
+            oct = oct | (cur << shift)
+            shift += 8
+            cur = 0
+            digits = 0
+        } else if ch >= 48 and ch <= 57 {
+            cur = cur * 10 + (ch - 48)
+            digits += 1
+        } else {
+            return err(-1)
+        }
+        i += 1
+    }
+    if shift != 32 { return err(-1) }
+    return ok(oct)
+}
+
+// Resolve hostname or IPv4 literal to 32-bit network-order IPv4 address
+fn net_resolve_ipv4(api: NetApi, host: str) -> i64 ! i64 {
+    lit := net_parse_ipv4(host) or -1
+    if lit >= 0 { return ok(lit) }
+    if api.fn_gethostbyname == 0 { return err(-3) }
+    ch := ffi_cstr(host)
+    he := ffi_call1(api.fn_gethostbyname, ch)
+    ffi_free(ch)
+    if he == 0 { return err(-4) }
+    // struct hostent: [0]=h_name, [8]=h_aliases, [16]=h_addrtype(2)+h_length(2)+pad(4), [24]=h_addr_list**
+    addr_list := ffi_read_i64(he, 3)
+    if addr_list == 0 { return err(-5) }
+    first_addr := ffi_read_i64(addr_list, 0)
+    if first_addr == 0 { return err(-6) }
+    return ok(ffi_read_u32_le(first_addr, 0))
+}
+
+fn _net_make_sockaddr_in(ip_net: i64, port: i64) -> i64 {
+    sa := ffi_alloc(16)
+    ffi_write_u16_le(sa, 0, 2)        // AF_INET = 2
+    ffi_write_u16_be(sa, 2, port)     // htons(port)
+    ffi_write_u32_le(sa, 4, ip_net)   // sin_addr (already in memory network byte order)
+    return sa
+}
+
+fn tcp_listen(bind_ip: str, port: i64, backlog: i64 = 128) -> TcpListener ! i64 {
+    api := net_init() or return
+    ip_net := net_resolve_ipv4(api, bind_ip) or return
+    fd := ffi_call3(api.fn_socket, 2, 1, 6) // AF_INET, SOCK_STREAM, IPPROTO_TCP
+    if fd == -1 or (fd & 0xFFFFFFFF) == 0xFFFFFFFF { return err(-10) }
+    // Enable SO_REUSEADDR
+    opt := ffi_alloc(8)
+    ffi_write_u32_le(opt, 0, 1)
+    mut sol := 1
+    mut so_reuse := 2
+    if api.is_win { sol = 0xFFFF; so_reuse = 4 }
+    _ := ffi_call5(api.fn_setsockopt, fd, sol, so_reuse, opt, 4)
+    ffi_free(opt)
+
+    sa := _net_make_sockaddr_in(ip_net, port)
+    rb := ffi_sext32(ffi_call3(api.fn_bind, fd, sa, 16))
+    ffi_free(sa)
+    if rb != 0 {
+        _ := ffi_call1(api.fn_close, fd)
+        return err(-11)
+    }
+    rl := ffi_sext32(ffi_call2(api.fn_listen, fd, backlog))
+    if rl != 0 {
+        _ := ffi_call1(api.fn_close, fd)
+        return err(-12)
+    }
+    return ok(TcpListener(fd = fd, port = port, api = api))
+}
+
+fn tcp_accept(ln: TcpListener) -> TcpStream ! i64 {
+    cfd := ffi_call3(ln.api.fn_accept, ln.fd, 0, 0)
+    if cfd == -1 or (cfd & 0xFFFFFFFF) == 0xFFFFFFFF { return err(-13) }
+    return ok(TcpStream(fd = cfd, api = ln.api))
+}
+
+fn tcp_connect(host: str, port: i64) -> TcpStream ! i64 {
+    api := net_init() or return
+    ip_net := net_resolve_ipv4(api, host) or return
+    fd := ffi_call3(api.fn_socket, 2, 1, 6)
+    if fd == -1 or (fd & 0xFFFFFFFF) == 0xFFFFFFFF { return err(-20) }
+    sa := _net_make_sockaddr_in(ip_net, port)
+    rc := ffi_sext32(ffi_call3(api.fn_connect, fd, sa, 16))
+    ffi_free(sa)
+    if rc != 0 {
+        _ := ffi_call1(api.fn_close, fd)
+        return err(-21)
+    }
+    return ok(TcpStream(fd = fd, api = api))
+}
+
+fn tcp_set_nodelay(s: TcpStream, enable: bool) -> bool {
+    opt := ffi_alloc(8)
+    if enable { ffi_write_u32_le(opt, 0, 1) }
+    r := ffi_sext32(ffi_call5(s.api.fn_setsockopt, s.fd, 6, 1, opt, 4)) // IPPROTO_TCP=6, TCP_NODELAY=1
+    ffi_free(opt)
+    return r == 0
+}
+
+fn tcp_send_bytes(s: TcpStream, data: ByteBuf) -> i64 ! i64 {
+    n := buf_len(data)
+    if n <= 0 { return ok(0) }
+    raw := ffi_bytes_to_ptr(data)
+    mut sent := 0
+    while sent < n {
+        rc := ffi_sext32(ffi_call4(s.api.fn_send, s.fd, raw + sent, n - sent, 0))
+        if rc <= 0 {
+            ffi_free(raw)
+            return err(-30)
+        }
+        sent += rc
+    }
+    ffi_free(raw)
+    return ok(sent)
+}
+
+fn tcp_send_str(s: TcpStream, msg: str) -> i64 ! i64 {
+    b := buf_new(str_len(msg) + 4)
+    buf_push_str(b, msg)
+    r := tcp_send_bytes(s, b) or -1
+    buf_free(move b)
+    if r < 0 { return err(-31) }
+    return ok(r)
+}
+
+fn tcp_recv(s: TcpStream, max_bytes: i64 = 65536) -> ByteBuf ! i64 {
+    if max_bytes <= 0 { return ok(buf_new(0)) }
+    raw := ffi_alloc(max_bytes + 8)
+    rc := ffi_sext32(ffi_call4(s.api.fn_recv, s.fd, raw, max_bytes, 0))
+    if rc < 0 {
+        ffi_free(raw)
+        return err(-32)
+    }
+    out := ffi_read_bytes(raw, rc)
+    ffi_free(raw)
+    return ok(out)
+}
+
+fn tcp_recv_exact(s: TcpStream, exact_bytes: i64) -> ByteBuf ! i64 {
+    out := buf_new(exact_bytes + 8)
+    if exact_bytes <= 0 { return ok(out) }
+    raw := ffi_alloc(exact_bytes + 8)
+    mut got := 0
+    while got < exact_bytes {
+        rc := ffi_sext32(ffi_call4(s.api.fn_recv, s.fd, raw + got, exact_bytes - got, 0))
+        if rc <= 0 {
+            ffi_free(raw)
+            buf_free(move out)
+            return err(-33)
+        }
+        got += rc
+    }
+    mut i := 0
+    while i < exact_bytes {
+        buf_push(out, ffi_read_u8(raw, i))
+        i += 1
+    }
+    ffi_free(raw)
+    return ok(out)
+}
+
+fn tcp_close(s: TcpStream) {
+    if s.fd != -1 and s.api.fn_close != 0 {
+        _ := ffi_call1(s.api.fn_close, s.fd)
+    }
+}
+
+fn tcp_listener_close(ln: TcpListener) {
+    if ln.fd != -1 and ln.api.fn_close != 0 {
+        _ := ffi_call1(ln.api.fn_close, ln.fd)
+    }
+}
+
+fn udp_bind(bind_ip: str, port: i64) -> UdpSocket ! i64 {
+    api := net_init() or return
+    ip_net := net_resolve_ipv4(api, bind_ip) or return
+    fd := ffi_call3(api.fn_socket, 2, 2, 17) // AF_INET, SOCK_DGRAM, IPPROTO_UDP
+    if fd == -1 or (fd & 0xFFFFFFFF) == 0xFFFFFFFF { return err(-40) }
+    sa := _net_make_sockaddr_in(ip_net, port)
+    rb := ffi_sext32(ffi_call3(api.fn_bind, fd, sa, 16))
+    ffi_free(sa)
+    if rb != 0 {
+        _ := ffi_call1(api.fn_close, fd)
+        return err(-41)
+    }
+    return ok(UdpSocket(fd = fd, port = port, api = api))
+}
+
+fn udp_send_to(u: UdpSocket, host: str, port: i64, data: ByteBuf) -> i64 ! i64 {
+    ip_net := net_resolve_ipv4(u.api, host) or return
+    sa := _net_make_sockaddr_in(ip_net, port)
+    raw := ffi_bytes_to_ptr(data)
+    rc := ffi_sext32(ffi_call6(u.api.fn_sendto, u.fd, raw, buf_len(data), 0, sa, 16))
+    ffi_free(raw)
+    ffi_free(sa)
+    if rc < 0 { return err(-42) }
+    return ok(rc)
+}
+
+fn udp_recv_from(u: UdpSocket, max_bytes: i64 = 4096) -> ByteBuf ! i64 {
+    raw := ffi_alloc(max_bytes + 8)
+    sa := ffi_alloc(16)
+    slen := ffi_alloc(8)
+    ffi_write_u32_le(slen, 0, 16)
+    rc := ffi_sext32(ffi_call6(u.api.fn_recvfrom, u.fd, raw, max_bytes, 0, sa, slen))
+    ffi_free(sa)
+    ffi_free(slen)
+    if rc < 0 {
+        ffi_free(raw)
+        return err(-43)
+    }
+    out := ffi_read_bytes(raw, rc)
+    ffi_free(raw)
+    return ok(out)
+}
+
+fn udp_close(u: UdpSocket) {
+    if u.fd != -1 and u.api.fn_close != 0 {
+        _ := ffi_call1(u.api.fn_close, u.fd)
+    }
+}
+
+// Live HTTP/1.1 client over native TCP socket
+fn http_fetch_plain(host: str, port: i64, method: str, path: str, body: str = "") -> str ! i64 {
+    conn := tcp_connect(host, port) or return
+    req := buf_new(str_len(path) + str_len(body) + 256)
+    buf_push_str(req, method); buf_push_str(req, " "); buf_push_str(req, path); buf_push_str(req, " HTTP/1.1\r\n")
+    buf_push_str(req, "Host: "); buf_push_str(req, host); buf_push_str(req, "\r\n")
+    buf_push_str(req, "Connection: close\r\n")
+    if str_len(body) > 0 {
+        buf_push_str(req, f"Content-Length: {str_len(body)}\r\n")
+    }
+    buf_push_str(req, "\r\n")
+    if str_len(body) > 0 { buf_push_str(req, body) }
+    _ := tcp_send_bytes(conn, req) or -1
+    buf_free(move req)
+
+    resp := buf_new(4096)
+    while true {
+        chunk := tcp_recv(conn, 4096) or buf_new(0)
+        clen := buf_len(chunk)
+        if clen <= 0 {
+            buf_free(move chunk)
+            break
+        }
+        mut i := 0
+        while i < clen { buf_push(resp, buf_get(chunk, i)); i += 1 }
+        buf_free(move chunk)
+    }
+    tcp_close(conn)
+    return ok(buf_to_owned_str(move resp))
+}
