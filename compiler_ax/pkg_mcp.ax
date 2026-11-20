@@ -3,6 +3,7 @@
 
 use compiler_ax::tokens_ast
 use compiler_ax::diagnostics
+use compiler_ax::c_import
 
 // Native Zero-CRT Stdin & Subprocess Execution Bridges
 fn ax_stdin_line(line_buf: ByteBuf) -> i64 {
@@ -566,6 +567,206 @@ fn mcp_exec_capture_file(cmd_line: str, out_file: str) -> str {
     return res
 }
 
+fn str_starts_with_tok(s: str, prefix: str) -> bool {
+    pl := str_len(prefix)
+    if str_len(s) < pl { return false }
+    return str_slice(s, 0, pl) == prefix
+}
+
+fn mcp_read_std_module(mod_name: str) -> ByteBuf {
+    p1 := buf_new(str_len(mod_name) + 16)
+    buf_push_str(p1, "std/")
+    buf_push_str(p1, mod_name)
+    buf_push_str(p1, ".ax")
+    s1 := buf_slice_str(p1, 0, buf_len(p1))
+    b1 := fs_read_file(s1) or buf_new(0)
+    buf_free(move p1)
+    if buf_len(b1) > 0 { return b1 }
+    buf_free(move b1)
+
+    p2 := buf_new(str_len(mod_name) + 32)
+    buf_push_str(p2, "../std/")
+    buf_push_str(p2, mod_name)
+    buf_push_str(p2, ".ax")
+    s2 := buf_slice_str(p2, 0, buf_len(p2))
+    b2 := fs_read_file(s2) or buf_new(0)
+    buf_free(move p2)
+    return b2
+}
+
+fn mcp_search_stdlib(query: str, mod_filter: str, out: ByteBuf) {
+    buf_push_str(out, "=== Axon Standard Library API Documentation ===\n")
+    if str_len(mod_filter) > 0 {
+        buf_push_str(out, f"Filter Module: std::{mod_filter}\n\n")
+    } else if str_len(query) > 0 {
+        buf_push_str(out, f"Search Query: \"{query}\"\n\n")
+    }
+
+    modules := "ai ai_autograd ai_engine ai_gguf ai_local ai_lora ai_math ai_nn ai_quant ai_serve async_io audio cap cli collections compress crdt crypto css cuda data decimal encoding faiss game game2d game3d game_ecs game_physics game_render html http iot json llama log math math3d npu numpy onnx os path quant rand regex ringbuf safetensors semiconductor sklearn str taint terminal test_kit tiktoken time tokenizers torch transformers ui ui_js ui_layout ui_render ui_signal ui_tailwind uuid vllm"
+    
+    mut m_pos := 0
+    mod_len := str_len(modules)
+    mut matches_found := 0
+
+    while m_pos < mod_len {
+        while m_pos < mod_len and str_byte(modules, m_pos) == 32 { m_pos += 1 }
+        if m_pos >= mod_len { break }
+        s_m := m_pos
+        while m_pos < mod_len and str_byte(modules, m_pos) != 32 { m_pos += 1 }
+        e_m := m_pos
+        cur_mod := str_slice(modules, s_m, e_m)
+
+        mut scan_this_mod := false
+        if str_len(mod_filter) > 0 {
+            if cur_mod == mod_filter { scan_this_mod = true }
+        } else if str_len(query) > 0 {
+            if repl_str_contains(cur_mod, query) { scan_this_mod = true }
+            else { scan_this_mod = true }
+        } else {
+            scan_this_mod = true
+        }
+
+        if scan_this_mod {
+            m_src := mcp_read_std_module(cur_mod)
+            if buf_len(m_src) > 0 {
+                mut line_start := 0
+                sz := buf_len(m_src)
+                mut header_printed := false
+                mut mod_matches := 0
+
+                while line_start < sz {
+                    mut line_end := line_start
+                    while line_end < sz and buf_get(m_src, line_end) != 10 and buf_get(m_src, line_end) != 13 {
+                        line_end += 1
+                    }
+                    if line_end > line_start {
+                        line := buf_slice_str(m_src, line_start, line_end)
+                        mut ls := 0
+                        while ls < str_len(line) and (str_byte(line, ls) == 32 or str_byte(line, ls) == 9) { ls += 1 }
+                        trimmed := str_slice(line, ls, str_len(line))
+                        
+                        mut is_decl := str_starts_with_tok(trimmed, "fn ") or str_starts_with_tok(trimmed, "pub fn ") or str_starts_with_tok(trimmed, "struct ") or str_starts_with_tok(trimmed, "@no_alloc") or str_starts_with_tok(trimmed, "@shield")
+                        mut hit := false
+                        if is_decl {
+                            if str_len(query) == 0 or repl_str_contains(trimmed, query) or (str_len(mod_filter) > 0 and cur_mod == mod_filter) {
+                                hit = true
+                            }
+                        }
+
+                        if hit {
+                            if not header_printed {
+                                buf_push_str(out, f"--- Module `std::{cur_mod}` (import with `use std::{cur_mod}`) ---\n")
+                                header_printed = true
+                            }
+                            buf_push_str(out, "  ")
+                            buf_push_str(out, trimmed)
+                            buf_push_str(out, "\n")
+                            matches_found += 1
+                            mod_matches += 1
+                            if mod_matches >= 30 and str_len(mod_filter) == 0 {
+                                buf_push_str(out, "  ... (more declarations in module)\n")
+                                break
+                            }
+                        }
+                    }
+                    line_start = line_end + 1
+                    while line_start < sz and (buf_get(m_src, line_start) == 10 or buf_get(m_src, line_start) == 13) {
+                        line_start += 1
+                    }
+                }
+                if header_printed {
+                    buf_push_str(out, "\n")
+                }
+            }
+            buf_free(move m_src)
+        }
+        if matches_found >= 60 and str_len(mod_filter) == 0 {
+            buf_push_str(out, f"(Results limited to first {matches_found} matches. Use `module: \"<name>\"` to see all declarations of a specific module)\n")
+            break
+        }
+    }
+    if matches_found == 0 {
+        buf_push_str(out, "No matching stdlib declarations found for query. Run with `module: \"<name>\"` or check `axon_spec`.\n")
+    }
+}
+
+fn mcp_inspect_c_header(src: ByteBuf, hdr_name: str, out: ByteBuf) {
+    buf_push_str(out, "=== Axon C Header & FFI Inspector (@cImport) ===\n")
+    if str_len(hdr_name) > 0 {
+        buf_push_str(out, f"Header: `{hdr_name}` ({buf_len(src)} bytes)\n\n")
+    }
+    pool := buf_new(524288)
+    nodes := ibuf_new(262144)
+    extra := ibuf_new(262144)
+    out_structs := ibuf_new(256)
+    out_funcs := ibuf_new(256)
+    out_consts := ibuf_new(256)
+
+    parse_c_header_into_program(src, pool, nodes, extra, 0, 0, 1, out_structs, out_funcs, out_consts)
+
+    c_cnt := ibuf_len(out_consts)
+    buf_push_str(out, f"Constants (#define) ({c_cnt}):\n")
+    mut ci := 0
+    while ci < c_cnt and ci < 20 {
+        cid := ibuf_get(out_consts, ci)
+        c_soff := ast_get(nodes, cid, 1)
+        c_slen := ast_get(nodes, cid, 2)
+        if c_soff >= 0 and c_slen > 0 and c_soff + c_slen <= buf_len(pool) {
+            cname := buf_slice_str(pool, c_soff, c_soff + c_slen)
+            buf_push_str(out, f"  const {cname}\n")
+        }
+        ci += 1
+    }
+    if c_cnt > 20 { buf_push_str(out, f"  ... and {c_cnt - 20} more constants\n") }
+
+    s_cnt := ibuf_len(out_structs)
+    buf_push_str(out, f"\nC Structs & Typedefs ({s_cnt}):\n")
+    mut si := 0
+    while si < s_cnt and si < 20 {
+        sid := ibuf_get(out_structs, si)
+        s_soff := ast_get(nodes, sid, 1)
+        s_slen := ast_get(nodes, sid, 2)
+        fc := ast_get(nodes, sid, 4)
+        if s_soff >= 0 and s_slen > 0 and s_soff + s_slen <= buf_len(pool) {
+            sname := buf_slice_str(pool, s_soff, s_soff + s_slen)
+            buf_push_str(out, f"  struct {sname} ({fc} fields)\n")
+        }
+        si += 1
+    }
+    if s_cnt > 20 { buf_push_str(out, f"  ... and {s_cnt - 20} more structs\n") }
+
+    f_cnt := ibuf_len(out_funcs)
+    buf_push_str(out, f"\nC Functions (@extern) ({f_cnt}):\n")
+    mut fi := 0
+    while fi < f_cnt and fi < 30 {
+        fid := ibuf_get(out_funcs, fi)
+        f_soff := ast_get(nodes, fid, 1)
+        f_slen := ast_get(nodes, fid, 2)
+        if f_soff >= 0 and f_slen > 0 and f_soff + f_slen <= buf_len(pool) {
+            fname := buf_slice_str(pool, f_soff, f_soff + f_slen)
+            buf_push_str(out, f"  @extern fn {fname}(...)\n")
+        }
+        fi += 1
+    }
+    if f_cnt > 30 { buf_push_str(out, f"  ... and {f_cnt - 30} more functions\n") }
+
+    buf_push_str(out, "\nAxon Usage Example:\n")
+    buf_push_str(out, "```axon\n")
+    if str_len(hdr_name) > 0 {
+        buf_push_str(out, f"@cImport(\"{hdr_name}\")\n")
+    } else {
+        buf_push_str(out, "@cImport(\"my_header.h\")\n")
+    }
+    buf_push_str(out, "fn main() -> i32 {\n    // Directly call imported C functions with zero overhead\n    return 0\n}\n```\n")
+
+    buf_free(move out_consts)
+    buf_free(move out_funcs)
+    buf_free(move out_structs)
+    buf_free(move extra)
+    buf_free(move nodes)
+    buf_free(move pool)
+}
+
 fn mcp_emit_initialize_resp(raw_id: str) {
     out := buf_new(1024)
     buf_push_str(out, "{\"jsonrpc\":\"2.0\",\"id\":")
@@ -576,7 +777,7 @@ fn mcp_emit_initialize_resp(raw_id: str) {
 }
 
 fn mcp_emit_tools_list_resp(raw_id: str) {
-    out := buf_new(16384)
+    out := buf_new(24576)
     buf_push_str(out, "{\"jsonrpc\":\"2.0\",\"id\":")
     buf_push_str(out, raw_id)
     buf_push_str(out, ",\"result\":{\"tools\":[")
@@ -584,6 +785,10 @@ fn mcp_emit_tools_list_resp(raw_id: str) {
     buf_push_str(out, "{\"name\":\"axon_test\",\"description\":\"Compile and run all unit tests (@test functions or test files) with zero-config test runner, reporting test pass/fail results and assertions.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"File path to test file\"},\"code\":{\"type\":\"string\",\"description\":\"Inline Axon code with @test functions\"}}}},")
     buf_push_str(out, "{\"name\":\"axon_run\",\"description\":\"Compile and execute Axon code immediately with native execution, capturing stdout/stderr, runtime duration in ms, and exit code.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"File path to execute\"},\"code\":{\"type\":\"string\",\"description\":\"Inline Axon code snippet to run\"},\"args\":{\"type\":\"string\",\"description\":\"Optional arguments string\"}}}},")
     buf_push_str(out, "{\"name\":\"axon_eval\",\"description\":\"Quickly evaluate an Axon expression or code block directly (REPL/comptime style) and return the computed value and output.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"expr\":{\"type\":\"string\",\"description\":\"Axon expression or code block (e.g. '2 + 2' or 'vec3_dot(a, b)')\"}},\"required\":[\"expr\"]}},")
+    buf_push_str(out, "{\"name\":\"axon_docs\",\"description\":\"Search Axon Standard Library (67 std/*.ax modules) by keyword or inspect a specific module. Returns matching module paths, function signatures, structs, and doc comments to prevent AI hallucination.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Keyword to search across all stdlib functions and structs (e.g. 'json', 'vec3', 'hash', 'matrix', 'sort', 'tcp')\"},\"module\":{\"type\":\"string\",\"description\":\"Specific module name to inspect (e.g. 'math3d', 'json', 'collections', 'crypto', 'game_ecs', 'ai_gguf', 'decimal', 'cap')\"}}}},")
+    buf_push_str(out, "{\"name\":\"axon_leak_check\",\"description\":\"Verify Perceus 0-GC reference counting, FBIP in-place reuse, @no_alloc zero-allocation guarantees, and runtime memory leaks on an Axon file or code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"File path to .ax source\"},\"code\":{\"type\":\"string\",\"description\":\"Inline Axon code snippet to analyze\"}}}},")
+    buf_push_str(out, "{\"name\":\"axon_security_audit\",\"description\":\"Perform static cybersecurity audit on Axon code: verifies tainted data flow barriers (tainted[str]), capability security token scope (RootCap, FsCap, NetCap), and polymorphic anti-tamper @shield decorators.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"File path to .ax source\"},\"code\":{\"type\":\"string\",\"description\":\"Inline Axon code snippet to audit\"}}}},")
+    buf_push_str(out, "{\"name\":\"axon_cimport_inspect\",\"description\":\"Inspect C header file (.h) or C declaration code using Axon's built-in @cImport Clang-free parser. Extracts C structs, typedefs, #define constants, and function prototypes with mapped Axon types.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path to .h C header file\"},\"header_code\":{\"type\":\"string\",\"description\":\"Inline C header code string\"}}}},")
     buf_push_str(out, "{\"name\":\"axon_ast\",\"description\":\"Debug AST inspector. Dumps the parsed Abstract Syntax Tree for Axon source code to inspect node hierarchy, token spans, and syntax tree.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"File path\"},\"code\":{\"type\":\"string\",\"description\":\"Inline code string\"}}}},")
     buf_push_str(out, "{\"name\":\"axon_sym\",\"description\":\"Debug symbol table inspector. Lists all declared functions (with params, return types, @shield/@no_alloc flags), structs (fields, types), and interfaces.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"File path\"},\"code\":{\"type\":\"string\",\"description\":\"Inline code string\"}}}},")
     buf_push_str(out, "{\"name\":\"axon_asm\",\"description\":\"Debug native machine code inspector. Compiles and inspects the emitted native x86_64 / WASM binary size, code sections, and entry info.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"File path\"},\"target\":{\"type\":\"string\",\"description\":\"Target ID (default: win-x64)\"}}}},")
