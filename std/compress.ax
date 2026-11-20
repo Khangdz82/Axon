@@ -1,6 +1,7 @@
 // Axon Standard Library: High-Speed Lossless Byte Compression (`std/compress.ax`)
 // Pure native LZ4-style streaming block compression & decompression.
 // Zero third-party dependencies, AV-clean, sub-millisecond roundtrip for RAM buffers & network payloads.
+// Optimized with 64-bit (8-byte) word copying and fast 32-bit hash scanning.
 
 use std::os
 use std::str
@@ -11,18 +12,27 @@ struct CompressResult {
     comp_len: i64
 }
 
+fn lz_read_u32_le(p: i64) -> i64 {
+    b0 := ptr_read_u8(p, 0)
+    b1 := ptr_read_u8(p + 1, 0)
+    b2 := ptr_read_u8(p + 2, 0)
+    b3 := ptr_read_u8(p + 3, 0)
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
 fn lz_hash4(b: ByteBuf, pos: i64) -> i64 {
-    v := (buf_get(b, pos) & 255) |
-         ((buf_get(b, pos + 1) & 255) << 8) |
-         ((buf_get(b, pos + 2) & 255) << 16) |
-         ((buf_get(b, pos + 3) & 255) << 24)
+    if pos < 0 or pos + 4 > buf_len(b) {
+        return 0
+    }
+    bp := (b as i64) + 16 + pos
+    v := lz_read_u32_le(bp)
     h := (v *% 2654435761) & 0xFFFFFFFF
     return ushr64(h, 18) & 4095 // 4096 hash slots
 }
 
 fn compress_bytes(src: ByteBuf) -> ByteBuf {
     n := buf_len(src)
-    if n <= 0 {
+    if n <= 0 or n > 67108864 {
         empty_out := buf_new(4)
         buf_push(empty_out, 0)
         buf_push(empty_out, 0)
@@ -30,6 +40,8 @@ fn compress_bytes(src: ByteBuf) -> ByteBuf {
         buf_push(empty_out, 0)
         return empty_out
     }
+
+    src_p := (src as i64) + 16
 
     // Hash table with 4096 entries, initialized to -1
     ht := ibuf_new(4096)
@@ -39,13 +51,15 @@ fn compress_bytes(src: ByteBuf) -> ByteBuf {
         h_idx += 1
     }
 
-    out := buf_new(n + n / 4 + 16)
+    out := buf_new(n + n / 4 + 64)
+    out_p := (out as i64) + 16
     
-    // Store original 32-bit length in little endian
-    buf_push(out, n & 255)
-    buf_push(out, (n >> 8) & 255)
-    buf_push(out, (n >> 16) & 255)
-    buf_push(out, (n >> 24) & 255)
+    // Store original 32-bit length in little endian (exact 4 bytes, no OOB)
+    ptr_write_u8(out_p, 0, n & 255)
+    ptr_write_u8(out_p + 1, 0, (n >> 8) & 255)
+    ptr_write_u8(out_p + 2, 0, (n >> 16) & 255)
+    ptr_write_u8(out_p + 3, 0, (n >> 24) & 255)
+    mut out_pos := 4
 
     mut ip := 0
     mut anchor := 0
@@ -56,16 +70,23 @@ fn compress_bytes(src: ByteBuf) -> ByteBuf {
         ibuf_set(ht, slot, ip)
 
         if ref_pos >= 0 and ip - ref_pos < 65535 and ip - ref_pos > 0 {
-            // Check 4-byte match
-            m0 := buf_get(src, ref_pos) == buf_get(src, ip)
-            m1 := buf_get(src, ref_pos + 1) == buf_get(src, ip + 1)
-            m2 := buf_get(src, ref_pos + 2) == buf_get(src, ip + 2)
-            m3 := buf_get(src, ref_pos + 3) == buf_get(src, ip + 3)
+            // Exact 4-byte match comparison without 8-byte over-read
+            v_ref := lz_read_u32_le(src_p + ref_pos)
+            v_ip  := lz_read_u32_le(src_p + ip)
 
-            if m0 and m1 and m2 and m3 {
-                // Find full match length
+            if v_ref == v_ip {
+                // Find full match length using 8-byte word comparisons
                 mut match_len := 4
-                while ip + match_len < n and buf_get(src, ref_pos + match_len) == buf_get(src, ip + match_len) {
+                while ip + match_len + 8 <= n {
+                    w_ref := ptr_read_i64(src_p + ref_pos + match_len, 0)
+                    w_ip  := ptr_read_i64(src_p + ip + match_len, 0)
+                    if w_ref != w_ip {
+                        break
+                    }
+                    match_len += 8
+                    if match_len >= 255 + 15 { break }
+                }
+                while ip + match_len < n and ptr_read_u8(src_p + ref_pos + match_len, 0) == ptr_read_u8(src_p + ip + match_len, 0) {
                     if match_len >= 255 + 15 { break }
                     match_len += 1
                 }
@@ -79,36 +100,50 @@ fn compress_bytes(src: ByteBuf) -> ByteBuf {
                 mut token_mat := match_len - 4
                 if token_mat > 15 { token_mat = 15 }
 
-                buf_push(out, (token_lit << 4) | token_mat)
+                ptr_write_u8(out_p + out_pos, 0, (token_lit << 4) | token_mat)
+                out_pos += 1
 
                 if lit_len >= 15 {
                     mut rem_lit := lit_len - 15
                     while rem_lit >= 255 {
-                        buf_push(out, 255)
+                        ptr_write_u8(out_p + out_pos, 0, 255)
+                        out_pos += 1
                         rem_lit -= 255
                     }
-                    buf_push(out, rem_lit)
+                    ptr_write_u8(out_p + out_pos, 0, rem_lit)
+                    out_pos += 1
                 }
 
-                // Copy literals
-                mut l := 0
-                while l < lit_len {
-                    buf_push(out, buf_get(src, anchor + l))
-                    l += 1
+                // Fast 8-byte word copy for literals
+                if lit_len > 0 {
+                    mut l := 0
+                    while l + 8 <= lit_len {
+                        w := ptr_read_i64(src_p + anchor + l, 0)
+                        ptr_write_i64(out_p + out_pos + l, 0, w)
+                        l += 8
+                    }
+                    while l < lit_len {
+                        ptr_write_u8(out_p + out_pos + l, 0, ptr_read_u8(src_p + anchor + l, 0))
+                        l += 1
+                    }
+                    out_pos += lit_len
                 }
 
                 // Emit offset (16-bit LE)
-                buf_push(out, offset & 255)
-                buf_push(out, (offset >> 8) & 255)
+                ptr_write_u8(out_p + out_pos, 0, offset & 255)
+                ptr_write_u8(out_p + out_pos + 1, 0, (offset >> 8) & 255)
+                out_pos += 2
 
                 // Emit extra match length if >= 15
                 if match_len - 4 >= 15 {
                     mut rem_mat := (match_len - 4) - 15
                     while rem_mat >= 255 {
-                        buf_push(out, 255)
+                        ptr_write_u8(out_p + out_pos, 0, 255)
+                        out_pos += 1
                         rem_mat -= 255
                     }
-                    buf_push(out, rem_mat)
+                    ptr_write_u8(out_p + out_pos, 0, rem_mat)
+                    out_pos += 1
                 }
 
                 ip += match_len
@@ -124,23 +159,33 @@ fn compress_bytes(src: ByteBuf) -> ByteBuf {
     if last_lit > 0 {
         mut tok_lit := last_lit
         if tok_lit > 15 { tok_lit = 15 }
-        buf_push(out, tok_lit << 4)
+        ptr_write_u8(out_p + out_pos, 0, tok_lit << 4)
+        out_pos += 1
         if last_lit >= 15 {
             mut rem := last_lit - 15
             while rem >= 255 {
-                buf_push(out, 255)
+                ptr_write_u8(out_p + out_pos, 0, 255)
+                out_pos += 1
                 rem -= 255
             }
-            buf_push(out, rem)
+            ptr_write_u8(out_p + out_pos, 0, rem)
+            out_pos += 1
         }
         mut k := 0
+        while k + 8 <= last_lit {
+            w := ptr_read_i64(src_p + anchor + k, 0)
+            ptr_write_i64(out_p + out_pos + k, 0, w)
+            k += 8
+        }
         while k < last_lit {
-            buf_push(out, buf_get(src, anchor + k))
+            ptr_write_u8(out_p + out_pos + k, 0, ptr_read_u8(src_p + anchor + k, 0))
             k += 1
         }
+        out_pos += last_lit
     }
 
     buf_free(move ht)
+    ptr_write_i64(out as i64, 0, out_pos)
     return out
 }
 
@@ -150,28 +195,40 @@ fn decompress_bytes(comp: ByteBuf) -> ByteBuf ! i64 {
         return err(400)
     }
 
-    // Read original size
-    orig_len := (buf_get(comp, 0) & 255) |
-                ((buf_get(comp, 1) & 255) << 8) |
-                ((buf_get(comp, 2) & 255) << 16) |
-                ((buf_get(comp, 3) & 255) << 24)
+    comp_p := (comp as i64) + 16
+    orig_len := lz_read_u32_le(comp_p)
 
     if orig_len < 0 or orig_len > 67108864 {
         return err(400)
     }
+    if orig_len == 0 {
+        if cn != 4 { return err(400) }
+        return ok(buf_new(1))
+    }
+    if cn <= 4 {
+        return err(400)
+    }
+    // Reject decompression bombs before allocating output memory:
+    // every valid LZ4 block byte emits strictly <= 255 bytes (+ constant initial match).
+    max_possible := (cn - 4) * 256 + 64
+    if orig_len > max_possible {
+        return err(400)
+    }
 
-    out := buf_new(orig_len + 8)
+    out := buf_new(orig_len + 16)
+    out_p := (out as i64) + 16
+    mut out_pos := 0
     mut ip := 4
 
     while ip < cn {
-        token := buf_get(comp, ip) & 255
+        token := ptr_read_u8(comp_p + ip, 0)
         ip += 1
 
         mut lit_len := (token >> 4) & 15
         if lit_len == 15 {
             mut lit_done := false
             while ip < cn {
-                extra := buf_get(comp, ip) & 255
+                extra := ptr_read_u8(comp_p + ip, 0)
                 ip += 1
                 lit_len += extra
                 if lit_len > orig_len {
@@ -189,32 +246,44 @@ fn decompress_bytes(comp: ByteBuf) -> ByteBuf ! i64 {
             }
         }
 
-        if lit_len < 0 or buf_len(out) + lit_len > orig_len or ip + lit_len > cn {
+        if lit_len < 0 or out_pos + lit_len > orig_len or ip + lit_len > cn {
             buf_free(move out)
             return err(400)
         }
 
-        // Copy literals
-        mut l := 0
-        while l < lit_len {
-            buf_push(out, buf_get(comp, ip))
-            ip += 1
-            l += 1
+        // Fast 8-byte word copy for literals
+        if lit_len > 0 {
+            mut l := 0
+            while l + 8 <= lit_len {
+                w := ptr_read_i64(comp_p + ip + l, 0)
+                ptr_write_i64(out_p + out_pos + l, 0, w)
+                l += 8
+            }
+            while l < lit_len {
+                b := ptr_read_u8(comp_p + ip + l, 0)
+                ptr_write_u8(out_p + out_pos + l, 0, b)
+                l += 1
+            }
+            out_pos += lit_len
+            ip += lit_len
         }
 
         if ip >= cn {
+            if (token & 15) != 0 {
+                buf_free(move out)
+                return err(400)
+            }
             break
         }
 
-        // Read offset
         if ip + 1 >= cn {
             buf_free(move out)
             return err(400)
         }
-        offset := (buf_get(comp, ip) & 255) | ((buf_get(comp, ip + 1) & 255) << 8)
+        offset := ptr_read_u8(comp_p + ip, 0) | (ptr_read_u8(comp_p + ip + 1, 0) << 8)
         ip += 2
 
-        if offset <= 0 {
+        if offset <= 0 or offset > out_pos {
             buf_free(move out)
             return err(400)
         }
@@ -223,7 +292,7 @@ fn decompress_bytes(comp: ByteBuf) -> ByteBuf ! i64 {
         if (token & 15) == 15 {
             mut mat_done := false
             while ip < cn {
-                extra := buf_get(comp, ip) & 255
+                extra := ptr_read_u8(comp_p + ip, 0)
                 ip += 1
                 mat_len += extra
                 if mat_len > orig_len {
@@ -241,30 +310,43 @@ fn decompress_bytes(comp: ByteBuf) -> ByteBuf ! i64 {
             }
         }
 
-        if mat_len < 0 or buf_len(out) + mat_len > orig_len {
+        if mat_len < 0 or out_pos + mat_len > orig_len {
             buf_free(move out)
             return err(400)
         }
 
-        // Copy matched slice
-        out_pos := buf_len(out)
-        mut m := 0
-        while m < mat_len {
-            ref_idx := out_pos - offset + m
-            if ref_idx < 0 or ref_idx >= buf_len(out) {
-                buf_free(move out)
-                return err(400)
+        ref_pos := out_pos - offset
+        // Fast 8-byte word copy for non-overlapping matches
+        if offset >= 8 {
+            mut m := 0
+            while m + 8 <= mat_len {
+                w := ptr_read_i64(out_p + ref_pos + m, 0)
+                ptr_write_i64(out_p + out_pos + m, 0, w)
+                m += 8
             }
-            buf_push(out, buf_get(out, ref_idx))
-            m += 1
+            while m < mat_len {
+                b := ptr_read_u8(out_p + ref_pos + m, 0)
+                ptr_write_u8(out_p + out_pos + m, 0, b)
+                m += 1
+            }
+        } else {
+            // Small offset overlap (run-length byte copy)
+            mut m := 0
+            while m < mat_len {
+                b := ptr_read_u8(out_p + ref_pos + m, 0)
+                ptr_write_u8(out_p + out_pos + m, 0, b)
+                m += 1
+            }
         }
+        out_pos += mat_len
     }
 
-    if buf_len(out) != orig_len {
+    if out_pos != orig_len {
         buf_free(move out)
         return err(400)
     }
 
+    ptr_write_i64(out as i64, 0, out_pos)
     return ok(out)
 }
 

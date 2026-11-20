@@ -1,0 +1,200 @@
+// Test 36: Axon Standard Memory Subsystem (`std/memory.ax`) Test Suite
+// Verifies:
+//   1. Process Memory: Open current process, read/write primitives (u8, u16, u32, u64, string)
+//   2. Multi-level pointer chasing: Pointer chains (`[[[base + off1] + off2] + off3]`)
+//   3. Virtual Memory: Dynamic allocation, page protection query/modification, deallocation
+//   4. AOB Pattern & IDA Signature Scanning with wildcards
+//   5. Shared Memory (IPC): Inter-process communication via memory-mapped files
+//   6. Raw Local Memory: Zero-overhead direct pointer manipulation, raw zeroing and copying
+
+use std::memory
+use std::os
+
+@test
+fn test_process_memory_open_current_and_rw() {
+    proc := mem_open_current_process()
+    assert(proc.pid > 0, "Current process PID must be > 0")
+    assert(proc.is_local == true, "Current process must be flagged as local")
+
+    buf := mem_alloc_aligned(128)
+    raw_mem_zero(buf, 128)
+
+    // 1. Read / Write 8-bit unsigned integer
+    w8_ok := mem_write_u8(proc, buf, 0x42)
+    assert(w8_ok == true, "mem_write_u8 must succeed")
+    val_u8 := mem_read_u8(proc, buf) or 0
+    assert(val_u8 == 0x42, "mem_read_u8 mismatch")
+
+    // 2. Read / Write 16-bit unsigned integer
+    w16_ok := mem_write_u16(proc, buf + 2, 0x1234)
+    assert(w16_ok == true, "mem_write_u16 must succeed")
+    val_u16 := mem_read_u16(proc, buf + 2) or 0
+    assert(val_u16 == 0x1234, "mem_read_u16 mismatch")
+
+    // 3. Read / Write 32-bit unsigned integer
+    w32_ok := mem_write_u32(proc, buf + 4, 0x11223344)
+    assert(w32_ok == true, "mem_write_u32 must succeed")
+    val_u32 := mem_read_u32(proc, buf + 4) or 0
+    assert(val_u32 == 0x11223344, "mem_read_u32 mismatch")
+
+    // 4. Read / Write 64-bit unsigned integer
+    w64_ok := mem_write_u64(proc, buf + 8, 0x0123456789ABCDEF)
+    assert(w64_ok == true, "mem_write_u64 must succeed")
+    val_u64 := mem_read_u64(proc, buf + 8) or 0
+    assert(val_u64 == 0x0123456789ABCDEF, "mem_read_u64 mismatch")
+
+    // 5. Read / Write String
+    test_str := "Axon Memory Engine"
+    wstr_ok := mem_write_str(proc, buf + 16, test_str)
+    assert(wstr_ok == true, "mem_write_str must succeed")
+    val_str := mem_read_str(proc, buf + 16, 18) or ""
+    assert(str_eq(val_str, test_str), "mem_read_str mismatch")
+
+    mem_free_aligned(buf)
+}
+
+@test
+fn test_pointer_chain_dereferencing() {
+    proc := mem_open_current_process()
+
+    b1 := mem_alloc_aligned(64)
+    b2 := mem_alloc_aligned(64)
+    b3 := mem_alloc_aligned(64)
+    raw_mem_zero(b1, 64)
+    raw_mem_zero(b2, 64)
+    raw_mem_zero(b3, 64)
+
+    // Setup 3-level chain:
+    // b1 + 16 -> points to b2
+    // b2 + 32 -> points to b3
+    // b3 + 8  -> contains target value 0xCAFEBABE11223344
+    ptr_write_i64(b1, 2, b2) // offset 16 is QWORD index 2
+    ptr_write_i64(b2, 4, b3) // offset 32 is QWORD index 4
+    ptr_write_i64(b3, 1, 0xCAFEBABE11223344) // offset 8 is QWORD index 1
+
+    offsets := ibuf_new(3)
+    ibuf_push(offsets, 16)
+    ibuf_push(offsets, 32)
+    ibuf_push(offsets, 8)
+
+    target_addr := mem_read_ptr_chain(proc, b1, offsets) or 0
+    buf_free(move offsets)
+    assert(target_addr == b3 + 8, "Pointer chain resolved address mismatch")
+
+    val := mem_read_u64(proc, target_addr) or 0
+    assert(val == 0xCAFEBABE11223344, "Pointer chain dereferenced value mismatch")
+
+    mem_free_aligned(b1)
+    mem_free_aligned(b2)
+    mem_free_aligned(b3)
+}
+
+@test
+fn test_virtual_memory_alloc_protect_free() {
+    proc := mem_open_current_process()
+
+    // 1. VirtualAllocEx: Allocate page with PAGE_READWRITE (0x04)
+    v_addr := mem_virtual_alloc(proc, 4096, page_readwrite()) or 0
+    assert(v_addr != 0, "VirtualAllocEx must return non-zero pointer")
+
+    // 2. Write and Read back
+    magic := 0xDEADBEEFCAFE1234
+    w_ok := mem_write_u64(proc, v_addr, magic)
+    assert(w_ok == true, "Writing to newly allocated virtual memory must succeed")
+    r_val := mem_read_u64(proc, v_addr) or 0
+    assert(r_val == magic, "Reading from virtual memory must match written value")
+
+    // 3. VirtualProtectEx: Change protection to PAGE_READONLY (0x02)
+    old_prot := mem_virtual_protect(proc, v_addr, 4096, page_readonly()) or 0
+    assert(old_prot == page_readwrite(), "Old protection must be PAGE_READWRITE (0x04)")
+
+    // 4. VirtualFreeEx: Decommit and release page
+    freed := mem_virtual_free(proc, v_addr)
+    assert(freed == true, "VirtualFreeEx must succeed")
+}
+
+@test
+fn test_pattern_and_ida_signature_scanning() {
+    proc := mem_open_current_process()
+
+    scan_size := 256
+    scan_buf := mem_alloc_aligned(scan_size)
+    raw_mem_zero(scan_buf, scan_size)
+
+    // Embed signature bytes at offset 64:
+    // 48 89 5C 24 18 57 48 83 EC 20
+    target_offset := 64
+    ptr_write_u8(scan_buf, target_offset + 0, 0x48)
+    ptr_write_u8(scan_buf, target_offset + 1, 0x89)
+    ptr_write_u8(scan_buf, target_offset + 2, 0x5C)
+    ptr_write_u8(scan_buf, target_offset + 3, 0x24)
+    ptr_write_u8(scan_buf, target_offset + 4, 0x18)
+    ptr_write_u8(scan_buf, target_offset + 5, 0x57)
+    ptr_write_u8(scan_buf, target_offset + 6, 0x48)
+    ptr_write_u8(scan_buf, target_offset + 7, 0x83)
+    ptr_write_u8(scan_buf, target_offset + 8, 0xEC)
+    ptr_write_u8(scan_buf, target_offset + 9, 0x20)
+
+    // Search with wildcard signature (? matches byte 0x18 at offset 4)
+    sig := "48 89 5C 24 ? 57 48 83 EC 20"
+    found_addr := mem_scan_ida_sig(proc, scan_buf, scan_size, sig)
+    assert(found_addr == scan_buf + target_offset, "IDA pattern scanner must find correct target offset")
+
+    mem_free_aligned(scan_buf)
+}
+
+@test
+fn test_shared_memory_ipc() {
+    shm_name := "Axon_IPC_Test_Shm_Region"
+    shm_size := 4096
+
+    // Open or create shared memory block
+    shm := shm_open_or_create(shm_name, shm_size) or return
+    assert(shm.ptr != 0, "Shared memory view pointer must not be null")
+    assert(shm.size == shm_size, "Shared memory size must match requested size")
+
+    // Write 64-bit value to shared memory
+    shm_w64_ok := shm_write_u64(shm, 0, 0x9988776655443322)
+    assert(shm_w64_ok == true, "shm_write_u64 must succeed")
+    shm_r64 := shm_read_u64(shm, 0) or 0
+    assert(shm_r64 == 0x9988776655443322, "shm_read_u64 mismatch")
+
+    // Write string to shared memory
+    ipc_msg := "IPC Shared Buffer Active"
+    shm_wstr_ok := shm_write_str(shm, 64, ipc_msg)
+    assert(shm_wstr_ok == true, "shm_write_str must succeed")
+    shm_rstr := shm_read_str(shm, 64, 24) or ""
+    assert(str_eq(shm_rstr, ipc_msg), "shm_read_str mismatch")
+
+    shm_close(shm)
+}
+
+@test
+fn test_raw_local_memory_primitives() {
+    mem := mem_alloc_aligned(64)
+    raw_mem_zero(mem, 64)
+
+    raw_mem_write_u8(mem, 0, 0xAA)
+    assert(raw_mem_read_u8(mem, 0) == 0xAA, "raw_mem u8 mismatch")
+
+    raw_mem_write_u16(mem, 2, 0xBEEF)
+    assert(raw_mem_read_u16(mem, 2) == 0xBEEF, "raw_mem u16 mismatch")
+
+    raw_mem_write_u32(mem, 4, 0x12345678)
+    assert(raw_mem_read_u32(mem, 4) == 0x12345678, "raw_mem u32 mismatch")
+
+    raw_mem_write_u64(mem, 8, 0xFEDCBA9876543210)
+    assert(raw_mem_read_u64(mem, 8) == 0xFEDCBA9876543210, "raw_mem u64 mismatch")
+
+    // Test raw_mem_copy and raw_mem_zero
+    dst := mem_alloc_aligned(64)
+    raw_mem_zero(dst, 64)
+    raw_mem_copy(dst, mem, 16)
+    assert(raw_mem_read_u64(dst, 8) == 0xFEDCBA9876543210, "raw_mem_copy mismatch")
+
+    raw_mem_zero(dst, 16)
+    assert(raw_mem_read_u64(dst, 8) == 0, "raw_mem_zero mismatch")
+
+    mem_free_aligned(mem)
+    mem_free_aligned(dst)
+}

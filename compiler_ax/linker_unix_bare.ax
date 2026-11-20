@@ -77,6 +77,130 @@ fn emit_elf64_shdr(out: ByteBuf, sh_name: i64, sh_type: i64, sh_flags: i64, sh_a
     buf_push_u64(out, 0)
 }
 
+fn is_elf64_safety_trap_range(text_code: ByteBuf, s_off: i64, e_off: i64) -> bool {
+    if s_off < 0 or e_off > buf_len(text_code) or e_off <= s_off { return false }
+    rlen := e_off - s_off
+    if rlen >= 5 {
+        mut p := s_off
+        if rlen >= 9 and buf_get(text_code, p) == 0xF3 and buf_get(text_code, p + 1) == 0x0F {
+            p += 4
+        }
+        if p + 5 <= e_off {
+            op := buf_get(text_code, p)
+            if op == 0xB9 or op == 0xBF {
+                code := buf_get(text_code, p + 1) | (buf_get(text_code, p + 2) << 8) | (buf_get(text_code, p + 3) << 16) | (buf_get(text_code, p + 4) << 24)
+                if code == 101 or code == 254 or code == 255 {
+                    return true
+                }
+            }
+        }
+    }
+    if rlen >= 20 {
+        mut p := s_off
+        while p + 8 <= e_off {
+            if buf_get(text_code, p) == 0x15 and buf_get(text_code, p + 1) == 0x7C and buf_get(text_code, p + 2) == 0x4A and buf_get(text_code, p + 3) == 0x7F {
+                return true
+            }
+            p += 1
+        }
+    }
+    return false
+}
+
+// Dead-Code Elimination (DCE) & Symbol Stripping Analysis for ELF64
+fn elf64_dce_strip_analysis(text_code: ByteBuf, fn_ranges: IntBuf, is_strip: bool) -> i64 {
+    t_len := buf_len(text_code)
+    rcnt := ibuf_len(fn_ranges) / 2
+    if rcnt <= 0 or not is_strip { return 0 }
+
+    live_ranges := ibuf_new(rcnt + 8)
+    scanned_ranges := ibuf_new(rcnt + 8)
+    mut i := 0
+    while i < rcnt {
+        ibuf_push(live_ranges, 0)
+        ibuf_push(scanned_ranges, 0)
+        i += 1
+    }
+    ibuf_set(live_ranges, 0, 1)
+
+    // Mark safety trap routines permanently live
+    i = 0
+    while i < rcnt {
+        s_off := ibuf_get(fn_ranges, i * 2)
+        e_off := ibuf_get(fn_ranges, i * 2 + 1)
+        if is_elf64_safety_trap_range(text_code, s_off, e_off) {
+            ibuf_set(live_ranges, i, 1)
+        }
+        i += 1
+    }
+
+    // Fixed-point iteration until no new ranges are marked live
+    mut changed := true
+    while changed {
+        changed = false
+        mut ri := 0
+        while ri < rcnt {
+            if ibuf_get(live_ranges, ri) == 1 and ibuf_get(scanned_ranges, ri) == 0 {
+                ibuf_set(scanned_ranges, ri, 1)
+                f_start := ibuf_get(fn_ranges, ri * 2)
+                f_end := ibuf_get(fn_ranges, ri * 2 + 1)
+                mut p := f_start
+                while p < f_end {
+                    b := buf_get(text_code, p)
+                    mut target_off := -1
+
+                    // 0xE8 (CALL rel32) or 0xE9 (JMP rel32)
+                    if (b == 0xE8 or b == 0xE9) and p + 5 <= f_end {
+                        disp := buf_get(text_code, p + 1) | (buf_get(text_code, p + 2) << 8) | (buf_get(text_code, p + 3) << 16) | (buf_get(text_code, p + 4) << 24)
+                        mut s_disp := disp
+                        if (s_disp & 0x80000000) != 0 { s_disp = s_disp - 0x100000000 }
+                        target_off = p + 5 + s_disp
+                    } else if b == 0x0F and p + 6 <= f_end {
+                        b2 := buf_get(text_code, p + 1)
+                        // 0x0F 0x80 .. 0x8F (Jcc near rel32)
+                        if b2 >= 0x80 and b2 <= 0x8F {
+                            disp := buf_get(text_code, p + 2) | (buf_get(text_code, p + 3) << 8) | (buf_get(text_code, p + 4) << 16) | (buf_get(text_code, p + 5) << 24)
+                            mut s_disp := disp
+                            if (s_disp & 0x80000000) != 0 { s_disp = s_disp - 0x100000000 }
+                            target_off = p + 6 + s_disp
+                        }
+                    }
+
+                    if target_off >= 0 and target_off < t_len {
+                        mut k := 0
+                        while k < rcnt {
+                            if ibuf_get(live_ranges, k) == 0 {
+                                s_off := ibuf_get(fn_ranges, k * 2)
+                                e_off := ibuf_get(fn_ranges, k * 2 + 1)
+                                if target_off >= s_off and target_off < e_off {
+                                    ibuf_set(live_ranges, k, 1)
+                                    changed = true
+                                    break
+                                }
+                            }
+                            k += 1
+                        }
+                    }
+                    p += 1
+                }
+            }
+            ri += 1
+        }
+    }
+
+    mut stripped_count := 0
+    i = 0
+    while i < rcnt {
+        if ibuf_get(live_ranges, i) == 0 {
+            stripped_count += 1
+        }
+        i += 1
+    }
+    buf_free(move live_ranges)
+    buf_free(move scanned_ranges)
+    return stripped_count
+}
+
 fn build_elf64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBuf, machine: i64, elf_out: ByteBuf) {
     mut seg_align := 0x10000
     if machine == 62 { seg_align = 0x1000 }
@@ -236,7 +360,7 @@ fn build_elf64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBuf,
     emit_elf64_shdr(elf_out, nm_text,   1, 6, text_va,                  0x1000,                  tlen,           16)
     emit_elf64_shdr(elf_out, nm_rodata, 1, 2, rdata_va,                 rdata_foff,              rdata_only_len, 16)
     emit_elf64_shdr(elf_out, nm_eh,     1, 2, rdata_va + eh_off_in_ro,  rdata_foff + eh_off_in_ro, eh_size,      8)
-    emit_elf64_shdr(elf_out, nm_data,   1, 3, data_va,                  data_foff,               d_memsz,        16)
+    emit_elf64_shdr(elf_out, nm_data,   1, 3, data_va,                  data_foff,               d_filesz,       16)
     emit_elf64_shdr(elf_out, nm_shstr,  3, 0, 0,                        shstr_foff,              buf_len(shstr), 1)
 
     buf_free(move shstr)
@@ -294,7 +418,9 @@ fn build_macho64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBu
     if rlen < 8 { rlen = 8 }
 
     data_foff := text_seg_sz
-    data_seg_sz := 0x4000
+    mut d_raw := buf_len(data_sec)
+    if d_raw < 0x1000 { d_raw = 0x1000 }
+    data_seg_sz := align_up(d_raw, 0x4000)
     linkedit_va := data_va + data_seg_sz
     linkedit_foff := data_foff + data_seg_sz
     linkedit_sz := 0x4000
@@ -342,7 +468,7 @@ fn build_macho64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBu
     buf_push_u32(lcs, 3)
     buf_push_u32(lcs, 1)
     buf_push_u32(lcs, 0)
-    emit_macho_section64(lcs, "__data", "__DATA", data_va, 0x1000, data_foff, 4, 0)
+    emit_macho_section64(lcs, "__data", "__DATA", data_va, d_raw, data_foff, 4, 0)
 
     // 4. LC_SEGMENT_64 ("__LINKEDIT") = 72 bytes
     buf_push_u32(lcs, 0x19)
@@ -462,10 +588,10 @@ fn build_macho64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBu
 
 // --- 3. Bare-Metal / Unikernel `Multiboot2` (`0xE85250D6`) `ELF64` Builder (`--target unikernel-x64`) ---
 // Physical load address `0x100000` (1 MB):
-//   - File offset `0x1000` (`0x100000`): 24-byte Multiboot2 Header (`0xE85250D6`) + 64-bit UART/Stack Kernel Entry -> `text_code` (`0x100040`)
+//   - File offset `0x1000` (`0x100000`): 24-byte Multiboot2 Header (`0xE85250D6`) + 64-bit Stack/SSE/CR4 Init -> `text_code` (`0x100050`)
 fn unikernel_compute_layout(text_len: i64, rdata_len: i64, layout_out: IntBuf) {
-    // `.text` user code starts at `0x100040` (right after 64-byte Multiboot2 header + kernel stack/COM1 init)
-    text_va := 0x100040
+    // `.text` user code starts at `0x100050` (right after Multiboot2 header + full CR0/CR4 SSE boot stub)
+    text_va := 0x100050
     mut tlen := text_len
     if tlen < 16 { tlen = 16 }
     rdata_va := align_up(text_va + tlen, 0x1000)
@@ -493,11 +619,13 @@ fn build_unikernel_multiboot2(text_code: ByteBuf, rdata: ByteBuf, data_sec: Byte
 
     mut tlen := buf_len(text_code)
     if tlen < 1 { tlen = 1 }
-    rx_sz := 0x40 + tlen
+    rx_sz := 0x50 + tlen
     mut rlen := buf_len(rdata)
     if rlen < 16 { rlen = 16 }
     mut dlen := buf_len(data_sec)
     if dlen < 64 { dlen = 64 }
+    mut d_memsz := align_up(dlen + 0x10000, 0x1000)
+    if d_memsz < 0x20000 { d_memsz = 0x20000 }
 
     // ELF64 Header (64 bytes) with 3 PT_LOAD segments at 1 MB physical RAM (`0x100000`)
     buf_push(kernel_out, 0x7F)
@@ -523,9 +651,9 @@ fn build_unikernel_multiboot2(text_code: ByteBuf, rdata: ByteBuf, data_sec: Byte
     buf_push_u16(kernel_out, 0)
     buf_push_u16(kernel_out, 0)
 
-    emit_elf64_phdr(kernel_out, 1, 5, 0x1000,     boot_va,  rx_sz, rx_sz, 0x1000)
-    emit_elf64_phdr(kernel_out, 1, 4, rdata_foff, rdata_va, rlen,  rlen,  0x1000)
-    emit_elf64_phdr(kernel_out, 1, 6, data_foff,  data_va,  dlen,  0x20000, 0x1000)
+    emit_elf64_phdr(kernel_out, 1, 5, 0x1000,     boot_va,  rx_sz, rx_sz,   0x1000)
+    emit_elf64_phdr(kernel_out, 1, 4, rdata_foff, rdata_va, rlen,  rlen,    0x1000)
+    emit_elf64_phdr(kernel_out, 1, 6, data_foff,  data_va,  dlen,  d_memsz, 0x1000)
 
     // Pad to `0x1000` (`boot_va = 0x100000`)
     ub_zeros(kernel_out, 0x1000 - buf_len(kernel_out))
@@ -546,27 +674,139 @@ fn build_unikernel_multiboot2(text_code: ByteBuf, rdata: ByteBuf, data_sec: Byte
     // 8 bytes NOP padding to `0x100020` (`entry_va`)
     ub_zeros(kernel_out, 8)
 
-    // [0x100020 .. 0x100040]: Bare-Metal 64-bit Stack Setup (`RSP = data_va + 0x1FF00`) + COM1 (`0x3F8`) Init -> `text_code`
-    // `CLI` (`FA`); `MOV RSP, imm64` (`48 BC <u64>`); `MOV DX, 0x3F9; XOR AL, AL; OUT DX, AL` -> pad with `NOP` (`0x90`) to `0x1040`
-    buf_push(kernel_out, 0xFA)
+    // [0x100020 .. 0x100050]: Bare-Metal 64-bit Stack Setup + full CR0/CR4 SSE enable
+    buf_push(kernel_out, 0xFA) // CLI
+    buf_push(kernel_out, 0xFC) // CLD
     buf_push(kernel_out, 0x48)
     buf_push(kernel_out, 0xBC)
-    buf_push_u64(kernel_out, data_va + 0x1FF00)
-    // Enable SSE/XMM in Bare-Metal (`MOV RAX, CR0; AND AX, 0xFFFB; OR AX, 2; MOV CR0, RAX; MOV RAX, CR4; OR AX, 0x600; MOV CR4, RAX`)
-    buf_push(kernel_out, 0x0F)
-    buf_push(kernel_out, 0x20)
-    buf_push(kernel_out, 0xC0)
-    buf_push(kernel_out, 0x66)
-    buf_push(kernel_out, 0x83)
-    buf_push(kernel_out, 0xE0)
-    buf_push(kernel_out, 0xFB)
-    buf_push(kernel_out, 0x66)
-    buf_push(kernel_out, 0x83)
-    buf_push(kernel_out, 0xC8)
-    buf_push(kernel_out, 0x02)
-    buf_push(kernel_out, 0x0F)
-    buf_push(kernel_out, 0x22)
-    buf_push(kernel_out, 0xC0)
+    buf_push_u64(kernel_out, data_va + d_memsz - 0x100)
+    // MOV RAX, CR0; AND AX, 0xFFF3 (clear EM & TS); OR AX, 2 (set MP); MOV CR0, RAX
+    buf_push(kernel_out, 0x0F); buf_push(kernel_out, 0x20); buf_push(kernel_out, 0xC0)
+    buf_push(kernel_out, 0x66); buf_push(kernel_out, 0x83); buf_push(kernel_out, 0xE0); buf_push(kernel_out, 0xF3)
+    buf_push(kernel_out, 0x66); buf_push(kernel_out, 0x83); buf_push(kernel_out, 0xC8); buf_push(kernel_out, 0x02)
+    buf_push(kernel_out, 0x0F); buf_push(kernel_out, 0x22); buf_push(kernel_out, 0xC0)
+    // MOV RAX, CR4; OR AX, 0x0600 (set OSFXSR | OSXMMEXCPT); MOV CR4, RAX
+    buf_push(kernel_out, 0x0F); buf_push(kernel_out, 0x20); buf_push(kernel_out, 0xE0)
+    buf_push(kernel_out, 0x66); buf_push(kernel_out, 0x0D); buf_push(kernel_out, 0x00); buf_push(kernel_out, 0x06)
+    buf_push(kernel_out, 0x0F); buf_push(kernel_out, 0x22); buf_push(kernel_out, 0xE0)
+    while buf_len(kernel_out) < 0x1050 {
+        buf_push(kernel_out, 0x90)
+    }
+
+    // Emit `text_code` at `0x1050` (`text_va = 0x100050`)
+    mut ti := 0
+    while ti < buf_len(text_code) {
+        buf_push(kernel_out, buf_get(text_code, ti))
+        ti += 1
+    }
+    if buf_len(text_code) == 0 {
+        buf_push(kernel_out, 0xF4) // HLT
+    }
+
+    ub_zeros(kernel_out, rdata_foff - buf_len(kernel_out))
+    mut ri := 0
+    while ri < buf_len(rdata) {
+        buf_push(kernel_out, buf_get(rdata, ri))
+        ri += 1
+    }
+    if buf_len(rdata) < rlen {
+        ub_zeros(kernel_out, rlen - buf_len(rdata))
+    }
+
+    ub_zeros(kernel_out, data_foff - buf_len(kernel_out))
+    mut di := 0
+    while di < buf_len(data_sec) {
+        buf_push(kernel_out, buf_get(data_sec, di))
+        di += 1
+    }
+    if buf_len(data_sec) < dlen {
+        ub_zeros(kernel_out, dlen - buf_len(data_sec))
+    }
+}
+
+// --- 4. Zero-OS Freestanding Ring 0-3 Direct ELF64 Kernel Builder (`--target freestanding-x64`) ---
+fn freestanding_compute_layout(text_len: i64, rdata_len: i64, layout_out: IntBuf) {
+    text_va := 0x100040
+    mut tlen := text_len
+    if tlen < 16 { tlen = 16 }
+    rdata_va := align_up(text_va + tlen, 0x1000)
+    mut rlen := rdata_len
+    if rlen < 16 { rlen = 16 }
+    data_va := align_up(rdata_va + rlen + 64, 0x1000)
+    ibuf_push(layout_out, text_va)
+    ibuf_push(layout_out, rdata_va)
+    ibuf_push(layout_out, data_va)
+}
+
+fn build_freestanding_x64_kernel(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBuf, kernel_out: ByteBuf) {
+    lay := ibuf_new(6)
+    freestanding_compute_layout(buf_len(text_code), buf_len(rdata), lay)
+    text_va := ibuf_get(lay, 0)
+    rdata_va := ibuf_get(lay, 1)
+    data_va := ibuf_get(lay, 2)
+    buf_free(move lay)
+
+    boot_va := 0x100000
+    entry_va := 0x100000
+    rdata_foff := 0x1000 + (rdata_va - boot_va)
+    data_foff := 0x1000 + (data_va - boot_va)
+
+    mut tlen := buf_len(text_code)
+    if tlen < 1 { tlen = 1 }
+    rx_sz := 0x40 + tlen
+    mut rlen := buf_len(rdata)
+    if rlen < 16 { rlen = 16 }
+    mut dlen := buf_len(data_sec)
+    if dlen < 64 { dlen = 64 }
+    mut d_memsz := align_up(dlen + 0x10000, 0x1000)
+    if d_memsz < 0x20000 { d_memsz = 0x20000 }
+
+    // ELF64 Header (64 bytes) with 3 PT_LOAD segments at 1 MB physical RAM (`0x100000`)
+    buf_push(kernel_out, 0x7F)
+    buf_push(kernel_out, 69)
+    buf_push(kernel_out, 76)
+    buf_push(kernel_out, 70)
+    buf_push(kernel_out, 2)
+    buf_push(kernel_out, 1)
+    buf_push(kernel_out, 1)
+    buf_push(kernel_out, 0)
+    ub_zeros(kernel_out, 8)
+    buf_push_u16(kernel_out, 2)  // ET_EXEC
+    buf_push_u16(kernel_out, 62) // EM_X86_64
+    buf_push_u32(kernel_out, 1)
+    buf_push_u64(kernel_out, entry_va)
+    buf_push_u64(kernel_out, 64)
+    buf_push_u64(kernel_out, 0)
+    buf_push_u32(kernel_out, 0)
+    buf_push_u16(kernel_out, 64)
+    buf_push_u16(kernel_out, 56)
+    buf_push_u16(kernel_out, 3)
+    buf_push_u16(kernel_out, 64)
+    buf_push_u16(kernel_out, 0)
+    buf_push_u16(kernel_out, 0)
+
+    emit_elf64_phdr(kernel_out, 1, 5, 0x1000,     boot_va,  rx_sz, rx_sz,   0x1000)
+    emit_elf64_phdr(kernel_out, 1, 4, rdata_foff, rdata_va, rlen,  rlen,    0x1000)
+    emit_elf64_phdr(kernel_out, 1, 6, data_foff,  data_va,  dlen,  d_memsz, 0x1000)
+
+    // Pad to `0x1000` (`boot_va = 0x100000`)
+    ub_zeros(kernel_out, 0x1000 - buf_len(kernel_out))
+
+    // [0x100000 .. 0x100040]: Freestanding 64-bit Entry + full CR0/CR4 SSE enable
+    buf_push(kernel_out, 0xFA) // CLI
+    buf_push(kernel_out, 0xFC) // CLD
+    buf_push(kernel_out, 0x48)
+    buf_push(kernel_out, 0xBC)
+    buf_push_u64(kernel_out, data_va + d_memsz - 0x100)
+    // MOV RAX, CR0; AND AX, 0xFFF3 (clear EM & TS); OR AX, 2 (set MP); MOV CR0, RAX
+    buf_push(kernel_out, 0x0F); buf_push(kernel_out, 0x20); buf_push(kernel_out, 0xC0)
+    buf_push(kernel_out, 0x66); buf_push(kernel_out, 0x83); buf_push(kernel_out, 0xE0); buf_push(kernel_out, 0xF3)
+    buf_push(kernel_out, 0x66); buf_push(kernel_out, 0x83); buf_push(kernel_out, 0xC8); buf_push(kernel_out, 0x02)
+    buf_push(kernel_out, 0x0F); buf_push(kernel_out, 0x22); buf_push(kernel_out, 0xC0)
+    // MOV RAX, CR4; OR AX, 0x0600 (set OSFXSR | OSXMMEXCPT); MOV CR4, RAX
+    buf_push(kernel_out, 0x0F); buf_push(kernel_out, 0x20); buf_push(kernel_out, 0xE0)
+    buf_push(kernel_out, 0x66); buf_push(kernel_out, 0x0D); buf_push(kernel_out, 0x00); buf_push(kernel_out, 0x06)
+    buf_push(kernel_out, 0x0F); buf_push(kernel_out, 0x22); buf_push(kernel_out, 0xE0)
     while buf_len(kernel_out) < 0x1040 {
         buf_push(kernel_out, 0x90)
     }

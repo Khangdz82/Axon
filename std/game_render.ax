@@ -1,0 +1,410 @@
+// Axon Software Rasterizer, 2D/3D Camera & Sprite Batcher (std/game_render.ax)
+// 100% Pure Axon: Zero GC, Zero external dependencies, Perceus ref counting.
+// Features:
+//   - RGBA Framebuffer with floating-point Z-buffer depth testing
+//   - Fast Bresenham line drawing with integer arithmetic and bounds clipping
+//   - Scanline triangle rasterizer with barycentric interpolation and Z-buffer
+//   - Sprite batcher with deferred flush rendering
+//   - 2D camera with zoom, rotation, world-to-screen and screen-to-world transforms
+//   - 3D camera projection to viewport coordinates
+
+use std::os
+
+struct Framebuffer {
+    width: i64
+    height: i64
+    color_ptr: i64  // width * height * 8 bytes (i64 color per pixel)
+    depth_ptr: i64  // width * height * 4 bytes (f32 depth per pixel)
+}
+
+fn fb_new(w: i64, h: i64) -> Framebuffer {
+    mut width := w
+    mut height := h
+    if width < 1 { width = 1 }
+    if height < 1 { height = 1 }
+    if width > 16384 { width = 16384 }
+    if height > 16384 { height = 16384 }
+    total_pixels := width * height
+
+    cp := mem_alloc_aligned(total_pixels * 8 + 64)
+    if cp == 0 {
+        return Framebuffer(width = 0, height = 0, color_ptr = 0, depth_ptr = 0)
+    }
+    dp := mem_alloc_aligned(total_pixels * 4 + 64)
+    if dp == 0 {
+        mem_free_aligned(cp)
+        return Framebuffer(width = 0, height = 0, color_ptr = 0, depth_ptr = 0)
+    }
+
+    mut i := 0
+    while i < total_pixels {
+        ptr_write_i64(cp, i, 0)
+        ptr_write_f32(dp, i, 1.0)
+        i += 1
+    }
+
+    return Framebuffer(
+        width = width,
+        height = height,
+        color_ptr = cp,
+        depth_ptr = dp
+    )
+}
+
+fn fb_free(move fb: Framebuffer) {
+    if fb.color_ptr != 0 { mem_free_aligned(fb.color_ptr) }
+    if fb.depth_ptr != 0 { mem_free_aligned(fb.depth_ptr) }
+}
+
+@no_alloc
+fn fb_clear(fb: Framebuffer, color: i64, depth: f64 = 1.0) {
+    if fb.color_ptr == 0 or fb.depth_ptr == 0 or fb.width <= 0 or fb.height <= 0 { return }
+    total := fb.width * fb.height
+    mut i := 0
+    while i < total {
+        ptr_write_i64(fb.color_ptr, i, color)
+        ptr_write_f32(fb.depth_ptr, i, depth)
+        i += 1
+    }
+}
+
+@no_alloc
+fn fb_set_pixel(fb: Framebuffer, x: i64, y: i64, color: i64) {
+    if fb.color_ptr == 0 or x < 0 or x >= fb.width or y < 0 or y >= fb.height { return }
+    ptr_write_i64(fb.color_ptr, y * fb.width + x, color)
+}
+
+@no_alloc
+fn fb_get_pixel(fb: Framebuffer, x: i64, y: i64) -> i64 {
+    if fb.color_ptr == 0 or x < 0 or x >= fb.width or y < 0 or y >= fb.height { return 0 }
+    return ptr_read_i64(fb.color_ptr, y * fb.width + x)
+}
+
+@no_alloc
+fn fb_get_depth(fb: Framebuffer, x: i64, y: i64) -> f64 {
+    if fb.depth_ptr == 0 or x < 0 or x >= fb.width or y < 0 or y >= fb.height { return 1.0 }
+    return ptr_read_f32(fb.depth_ptr, y * fb.width + x)
+}
+
+// --- Bresenham Line Drawing (Liang-Barsky viewport clipped, overflow-safe) ---
+@no_alloc
+fn fb_draw_line(fb: Framebuffer, x0_in: i64, y0_in: i64, x1_in: i64, y1_in: i64, color: i64) {
+    if fb.color_ptr == 0 or fb.width <= 0 or fb.height <= 0 { return }
+
+    // Clip segment in f64 to [0, width-1] x [0, height-1] so extreme coordinates cannot overflow or DoS CPU
+    fx0 := x0_in as f64
+    fy0 := y0_in as f64
+    fdx := (x1_in as f64) - fx0
+    fdy := (y1_in as f64) - fy0
+    max_x_f := (fb.width - 1) as f64
+    max_y_f := (fb.height - 1) as f64
+
+    mut t0 := 0.0
+    mut t1 := 1.0
+
+    // X min/max clip
+    if fdx == 0.0 {
+        if fx0 < 0.0 or fx0 > max_x_f { return }
+    } else {
+        mut tx_a := (0.0 - fx0) / fdx
+        mut tx_b := (max_x_f - fx0) / fdx
+        if tx_a > tx_b { tmp := tx_a; tx_a = tx_b; tx_b = tmp }
+        if tx_a > t0 { t0 = tx_a }
+        if tx_b < t1 { t1 = tx_b }
+        if t0 > t1 { return }
+    }
+    // Y min/max clip
+    if fdy == 0.0 {
+        if fy0 < 0.0 or fy0 > max_y_f { return }
+    } else {
+        mut ty_a := (0.0 - fy0) / fdy
+        mut ty_b := (max_y_f - fy0) / fdy
+        if ty_a > ty_b { tmp := ty_a; ty_a = ty_b; ty_b = tmp }
+        if ty_a > t0 { t0 = ty_a }
+        if ty_b < t1 { t1 = ty_b }
+        if t0 > t1 { return }
+    }
+
+    mut x0 := (fx0 + t0 * fdx + 0.5) as i64
+    mut y0 := (fy0 + t0 * fdy + 0.5) as i64
+    mut x1 := (fx0 + t1 * fdx + 0.5) as i64
+    mut y1 := (fy0 + t1 * fdy + 0.5) as i64
+    if x0 < 0 { x0 = 0 }; if x0 >= fb.width { x0 = fb.width - 1 }
+    if y0 < 0 { y0 = 0 }; if y0 >= fb.height { y0 = fb.height - 1 }
+    if x1 < 0 { x1 = 0 }; if x1 >= fb.width { x1 = fb.width - 1 }
+    if y1 < 0 { y1 = 0 }; if y1 >= fb.height { y1 = fb.height - 1 }
+
+    mut dx := x1 - x0
+    if dx < 0 { dx = 0 - dx }
+    mut dy := y1 - y0
+    if dy < 0 { dy = 0 - dy }
+    dy = 0 - dy
+
+    mut sx := 1
+    if x0 >= x1 { sx = -1 }
+    mut sy := 1
+    if y0 >= y1 { sy = -1 }
+
+    mut err := dx + dy
+    max_steps := fb.width + fb.height + 4
+    mut steps := 0
+
+    while steps < max_steps {
+        fb_set_pixel(fb, x0, y0, color)
+        if x0 == x1 and y0 == y1 { break }
+        e2 := 2 * err
+        if e2 >= dy {
+            err = err + dy
+            x0 = x0 + sx
+        }
+        if e2 <= dx {
+            err = err + dx
+            y0 = y0 + sy
+        }
+        steps += 1
+    }
+}
+
+// --- Scanline Triangle Rasterizer with Z-Buffer ---
+@no_alloc
+fn r_min(a: f64, b: f64) -> f64 { if a < b { return a }; return b }
+@no_alloc
+fn r_max(a: f64, b: f64) -> f64 { if a > b { return a }; return b }
+
+@no_alloc
+fn fb_draw_triangle_depth(
+    fb: Framebuffer,
+    x0: f64, y0: f64, z0: f64,
+    x1: f64, y1: f64, z1: f64,
+    x2: f64, y2: f64, z2: f64,
+    color: i64
+) {
+    if fb.color_ptr == 0 or fb.depth_ptr == 0 or fb.width <= 0 or fb.height <= 0 { return }
+    // Triangle area (cross product of edge01 and edge02); also rejects NaN
+    area := (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
+    if not (area >= 0.000001 or (0.0 - area) >= 0.000001) { return }
+    inv_area := 1.0 / area
+
+    // Bounding box clamped in f64 BEFORE casting to i64 (prevents INT64_MIN UB on huge/Inf coords)
+    mut min_x_f := r_min(x0, r_min(x1, x2))
+    mut max_x_f := r_max(x0, r_max(x1, x2)) + 1.0
+    mut min_y_f := r_min(y0, r_min(y1, y2))
+    mut max_y_f := r_max(y0, r_max(y1, y2)) + 1.0
+    fw := (fb.width - 1) as f64
+    fh := (fb.height - 1) as f64
+    if not (max_x_f >= 0.0 and min_x_f <= fw and max_y_f >= 0.0 and min_y_f <= fh) { return }
+
+    if min_x_f < 0.0 { min_x_f = 0.0 }
+    if min_y_f < 0.0 { min_y_f = 0.0 }
+    if max_x_f > fw { max_x_f = fw }
+    if max_y_f > fh { max_y_f = fh }
+
+    mut min_x := min_x_f as i64
+    mut max_x := max_x_f as i64
+    mut min_y := min_y_f as i64
+    mut max_y := max_y_f as i64
+
+    if min_x < 0 { min_x = 0 }
+    if min_y < 0 { min_y = 0 }
+    if max_x >= fb.width { max_x = fb.width - 1 }
+    if max_y >= fb.height { max_y = fb.height - 1 }
+
+    mut y := min_y
+    mut row_idx := min_y * fb.width
+    while y <= max_y {
+        fy := (y as f64) + 0.5
+        mut x := min_x
+        mut idx := row_idx + min_x
+        while x <= max_x {
+            fx := (x as f64) + 0.5
+
+            // Barycentric coordinates
+            w0 := ((x1 - fx) * (y2 - fy) - (y1 - fy) * (x2 - fx)) * inv_area
+            w1 := ((x2 - fx) * (y0 - fy) - (y2 - fy) * (x0 - fx)) * inv_area
+            w2 := 1.0 - w0 - w1
+
+            // Point is inside triangle if all barycentric weights share same sign as area
+            if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0 {
+                z := w0 * z0 + w1 * z1 + w2 * z2
+                cur_z := ptr_read_f32(fb.depth_ptr, idx)
+                if z >= 0.0 and (1.0 - z) >= 0.0 and (cur_z - z) > 0.0 {
+                    ptr_write_f32(fb.depth_ptr, idx, z)
+                    ptr_write_i64(fb.color_ptr, idx, color)
+                }
+            }
+            x += 1
+            idx += 1
+        }
+        row_idx = row_idx + fb.width
+        y += 1
+    }
+}
+
+// --- Sprite Batcher ---
+// Stores quad commands: (x, y, w, h, color) in memory buffer
+struct RenderSpriteBatch {
+    capacity: i64
+    count: i64
+    data_ptr: i64 // capacity * 5 * 8 bytes
+}
+
+fn render_batch_new(cap: i64 = 1024) -> RenderSpriteBatch {
+    mut c := cap
+    if c < 32 { c = 32 }
+    if c > 1048576 { c = 1048576 }
+    p := mem_alloc_aligned(c * 40 + 64)
+    if p == 0 {
+        return RenderSpriteBatch(capacity = 0, count = 0, data_ptr = 0)
+    }
+    return RenderSpriteBatch(capacity = c, count = 0, data_ptr = p)
+}
+
+fn render_batch_free(move sb: RenderSpriteBatch) {
+    if sb.data_ptr != 0 { mem_free_aligned(sb.data_ptr) }
+}
+
+fn render_batch_draw(mut sb: RenderSpriteBatch, x: f64, y: f64, w: f64, h: f64, color: i64) {
+    if sb.data_ptr == 0 or sb.count < 0 or sb.count >= sb.capacity { return }
+    base := sb.count * 5
+    ptr_write_f32(sb.data_ptr, base * 2,     x)
+    ptr_write_f32(sb.data_ptr, base * 2 + 1, y)
+    ptr_write_f32(sb.data_ptr, base * 2 + 2, w)
+    ptr_write_f32(sb.data_ptr, base * 2 + 3, h)
+    ptr_write_i64(sb.data_ptr, base + 4,     color)
+    sb.count = sb.count + 1
+}
+
+fn render_batch_flush(mut sb: RenderSpriteBatch, fb: Framebuffer) {
+    if sb.data_ptr == 0 or fb.color_ptr == 0 or fb.width <= 0 or fb.height <= 0 {
+        sb.count = 0
+        return
+    }
+    fw := (fb.width - 1) as f64
+    fh := (fb.height - 1) as f64
+    mut i := 0
+    while i < sb.count {
+        base := i * 5
+        x_val := ptr_read_f32(sb.data_ptr, base * 2)
+        y_val := ptr_read_f32(sb.data_ptr, base * 2 + 1)
+        w_val := ptr_read_f32(sb.data_ptr, base * 2 + 2)
+        h_val := ptr_read_f32(sb.data_ptr, base * 2 + 3)
+        color := ptr_read_i64(sb.data_ptr, base + 4)
+
+        if w_val > 0.0 and h_val > 0.0 {
+            mut fx0 := x_val
+            mut fy0 := y_val
+            mut fx1 := x_val + w_val
+            mut fy1 := y_val + h_val
+            if fx1 >= 0.0 and fx0 <= fw and fy1 >= 0.0 and fy0 <= fh {
+                if fx0 < 0.0 { fx0 = 0.0 }
+                if fy0 < 0.0 { fy0 = 0.0 }
+                if fx1 > fw { fx1 = fw }
+                if fy1 > fh { fy1 = fh }
+
+                mut x0 := fx0 as i64
+                mut y0 := fy0 as i64
+                mut x1 := fx1 as i64
+                mut y1 := fy1 as i64
+
+                if x0 < 0 { x0 = 0 }
+                if y0 < 0 { y0 = 0 }
+                if x1 >= fb.width { x1 = fb.width - 1 }
+                if y1 >= fb.height { y1 = fb.height - 1 }
+
+                mut py := y0
+                while py <= y1 {
+                    mut px := x0
+                    while px <= x1 {
+                        ptr_write_i64(fb.color_ptr, py * fb.width + px, color)
+                        px += 1
+                    }
+                    py += 1
+                }
+            }
+        }
+        i += 1
+    }
+    sb.count = 0
+}
+
+// --- Camera2D ---
+struct RenderCamera2D {
+    target_x: f64
+    target_y: f64
+    offset_x: f64
+    offset_y: f64
+    zoom: f64
+    rotation: f64
+}
+
+fn render_camera2d_new(off_x: f64, off_y: f64, zoom: f64 = 1.0) -> RenderCamera2D {
+    mut z := zoom
+    if not (z >= 0.0001) { z = 1.0 }
+    return RenderCamera2D(
+        target_x = 0.0,
+        target_y = 0.0,
+        offset_x = off_x,
+        offset_y = off_y,
+        zoom = z,
+        rotation = 0.0
+    )
+}
+
+struct RenderVec2 {
+    x: f64
+    y: f64
+}
+
+@no_alloc
+fn render_camera2d_world_to_screen(cam: RenderCamera2D, wx: f64, wy: f64) -> RenderVec2 {
+    dx := (wx - cam.target_x) * cam.zoom
+    dy := (wy - cam.target_y) * cam.zoom
+    return RenderVec2(x = dx + cam.offset_x, y = dy + cam.offset_y)
+}
+
+@no_alloc
+fn render_camera2d_screen_to_world(cam: RenderCamera2D, sx: f64, sy: f64) -> RenderVec2 {
+    if not (cam.zoom >= 0.000001) {
+        return RenderVec2(x = cam.target_x, y = cam.target_y)
+    }
+    inv_z := 1.0 / cam.zoom
+    dx := (sx - cam.offset_x) * inv_z
+    dy := (sy - cam.offset_y) * inv_z
+    return RenderVec2(x = dx + cam.target_x, y = dy + cam.target_y)
+}
+
+// --- Camera3D ---
+struct RenderCamera3D {
+    pos_x: f64; pos_y: f64; pos_z: f64
+    tgt_x: f64; tgt_y: f64; tgt_z: f64
+    fov_deg: f64
+    near_z: f64
+    far_z: f64
+}
+
+fn render_camera3d_new(px: f64, py: f64, pz: f64, tx: f64, ty: f64, tz: f64, fov: f64 = 60.0) -> RenderCamera3D {
+    return RenderCamera3D(
+        pos_x = px, pos_y = py, pos_z = pz,
+        tgt_x = tx, tgt_y = ty, tgt_z = tz,
+        fov_deg = fov,
+        near_z = 0.1,
+        far_z = 1000.0
+    )
+}
+
+// Simple pinhole camera projection to viewport coordinates
+@no_alloc
+fn render_camera3d_project_to_screen(cam: RenderCamera3D, wx: f64, wy: f64, wz: f64, screen_w: f64, screen_h: f64) -> RenderVec2 {
+    dx := wx - cam.pos_x
+    dy := wy - cam.pos_y
+    dz := wz - cam.pos_z
+
+    if not (dz > 0.1) {
+        return RenderVec2(x = -9999.0, y = -9999.0)
+    }
+
+    fl := (screen_h * 0.5) / 0.577350269 // tan(30 deg) for 60 fov
+    proj_x := screen_w * 0.5 + (dx / dz) * fl
+    proj_y := screen_h * 0.5 - (dy / dz) * fl
+    return RenderVec2(x = proj_x, y = proj_y)
+}

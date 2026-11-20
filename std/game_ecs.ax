@@ -1,0 +1,973 @@
+// Axon Archetype-Based Entity Component System (ECS) (std/game_ecs.ax)
+// 100% Pure Axon: Zero GC, SoA (Structure of Arrays) layout, Perceus ref counting.
+// High performance archetype table storage, cache-aligned entity arrays, component masks,
+// O(1) swap-remove despawning, and vectorizable system query iterations.
+
+use std::os
+
+// --- Component Bitmasks (64-bit mask) ---
+fn comp_none() -> i64        { return 0 }
+fn comp_position() -> i64    { return 1 }       // Bit 0: 3D position (x, y, z)
+fn comp_velocity() -> i64    { return 2 }       // Bit 1: 3D velocity (vx, vy, vz)
+fn comp_renderable() -> i64  { return 4 }       // Bit 2: color (i64), size (f32)
+fn comp_collider() -> i64    { return 8 }       // Bit 3: radius (f32), layer (i64)
+fn comp_rigid_body() -> i64  { return 16 }      // Bit 4: inv_mass, restitution, friction, drag
+fn comp_tag() -> i64         { return 32 }      // Bit 5: tag_id (i64), user_data (i64)
+fn comp_health() -> i64      { return 64 }      // Bit 6: current_hp, max_hp
+
+// Archetype layout in `arch_ptr` (16 words per archetype, up to 64 archetypes):
+//   0: mask
+//   1: count
+//   2: capacity
+//   3: entities_ptr (capacity * 8 bytes)
+//   4: pos_ptr (capacity * 12 bytes: f32 x, y, z)
+//   5: vel_ptr (capacity * 12 bytes: f32 vx, vy, vz)
+//   6: render_ptr (capacity * 16 bytes: i64 color, f32 size)
+//   7: collider_ptr (capacity * 16 bytes: f32 radius, i64 layer)
+//   8: rigid_ptr (capacity * 16 bytes: f32 inv_mass, rest, fric, drag)
+//   9: tag_ptr (capacity * 16 bytes: i64 tag, i64 user_data)
+//  10: health_ptr (capacity * 8 bytes: f32 hp, f32 max_hp)
+
+struct EcsWorld {
+    meta_ptr: i64
+    data_ptr: i64
+    arch_ptr: i64
+}
+
+fn ecs_world_new(max_entities: i64 = 65536) -> EcsWorld {
+    mut me := max_entities
+    if me < 128 { me = 128 }
+    if me > 4194304 { me = 4194304 }
+
+    mp := mem_alloc_aligned(64)
+    if mp == 0 {
+        return EcsWorld(meta_ptr = 0, data_ptr = 0, arch_ptr = 0)
+    }
+    dp := mem_alloc_aligned(me * 32 + 64)
+    if dp == 0 {
+        mem_free_aligned(mp)
+        return EcsWorld(meta_ptr = 0, data_ptr = 0, arch_ptr = 0)
+    }
+    ap := mem_alloc_aligned(64 * 16 * 8 + 64)
+    if ap == 0 {
+        mem_free_aligned(dp)
+        mem_free_aligned(mp)
+        return EcsWorld(meta_ptr = 0, data_ptr = 0, arch_ptr = 0)
+    }
+
+    ptr_write_i64(mp, 0, 1)  // [0] next entity id
+    ptr_write_i64(mp, 1, 0)  // [1] live count
+    ptr_write_i64(mp, 2, 0)  // [2] archetype count
+    ptr_write_i64(mp, 3, me) // [3] max entities
+    ptr_write_i64(mp, 4, 0)  // [4] free count
+
+    // data_ptr holds:
+    // [0 .. me] = entity_arch
+    // [me .. 2*me] = entity_row
+    // [2*me .. 3*me] = entity_gen
+    // [3*me .. 4*me] = free_queue
+    mut i := 0
+    while i < me {
+        ptr_write_i64(dp, i, -1)
+        ptr_write_i64(dp, me + i, -1)
+        ptr_write_i64(dp, me * 2 + i, 0)
+        ptr_write_i64(dp, me * 3 + i, 0)
+        i += 1
+    }
+
+    i = 0
+    while i < 64 * 16 {
+        ptr_write_i64(ap, i, 0)
+        i += 1
+    }
+
+    return EcsWorld(meta_ptr = mp, data_ptr = dp, arch_ptr = ap)
+}
+
+fn ecs_world_free(move w: EcsWorld) {
+    if w.arch_ptr != 0 {
+        mut arch_cnt := 0
+        if w.meta_ptr != 0 {
+            arch_cnt = ptr_read_i64(w.meta_ptr, 2)
+        }
+        if arch_cnt > 64 { arch_cnt = 64 }
+        mut i := 0
+        while i < arch_cnt {
+            base := i * 16
+            mut k := 3
+            while k <= 10 {
+                p := ptr_read_i64(w.arch_ptr, base + k)
+                if p != 0 { mem_free_aligned(p) }
+                k += 1
+            }
+            i += 1
+        }
+        mem_free_aligned(w.arch_ptr)
+    }
+    if w.data_ptr != 0 { mem_free_aligned(w.data_ptr) }
+    if w.meta_ptr != 0 { mem_free_aligned(w.meta_ptr) }
+}
+
+fn ecs_find_or_create_archetype(world: EcsWorld, mask: i64) -> i64 {
+    if world.meta_ptr == 0 or world.arch_ptr == 0 { return -1 }
+    m := mask & 127
+    cnt := ptr_read_i64(world.meta_ptr, 2)
+    mut i := 0
+    while i < cnt {
+        if ptr_read_i64(world.arch_ptr, i * 16) == m {
+            return i
+        }
+        i += 1
+    }
+
+    if cnt >= 64 { return -1 }
+
+    arch_idx := cnt
+    base := arch_idx * 16
+    cap := 64
+
+    e_ptr := mem_alloc_aligned(cap * 8 + 64)
+    mut p_ptr := 0
+    mut v_ptr := 0
+    mut r_ptr := 0
+    mut c_ptr := 0
+    mut rg_ptr := 0
+    mut t_ptr := 0
+    mut h_ptr := 0
+    mut oom := e_ptr == 0
+
+    if not oom and (m & comp_position()) != 0 {
+        p_ptr = mem_alloc_aligned(cap * 12 + 64)
+        if p_ptr == 0 { oom = true }
+    }
+    if not oom and (m & comp_velocity()) != 0 {
+        v_ptr = mem_alloc_aligned(cap * 12 + 64)
+        if v_ptr == 0 { oom = true }
+    }
+    if not oom and (m & comp_renderable()) != 0 {
+        r_ptr = mem_alloc_aligned(cap * 16 + 64)
+        if r_ptr == 0 { oom = true }
+    }
+    if not oom and (m & comp_collider()) != 0 {
+        c_ptr = mem_alloc_aligned(cap * 16 + 64)
+        if c_ptr == 0 { oom = true }
+    }
+    if not oom and (m & comp_rigid_body()) != 0 {
+        rg_ptr = mem_alloc_aligned(cap * 16 + 64)
+        if rg_ptr == 0 { oom = true }
+    }
+    if not oom and (m & comp_tag()) != 0 {
+        t_ptr = mem_alloc_aligned(cap * 16 + 64)
+        if t_ptr == 0 { oom = true }
+    }
+    if not oom and (m & comp_health()) != 0 {
+        h_ptr = mem_alloc_aligned(cap * 8 + 64)
+        if h_ptr == 0 { oom = true }
+    }
+
+    if oom {
+        if e_ptr != 0 { mem_free_aligned(e_ptr) }
+        if p_ptr != 0 { mem_free_aligned(p_ptr) }
+        if v_ptr != 0 { mem_free_aligned(v_ptr) }
+        if r_ptr != 0 { mem_free_aligned(r_ptr) }
+        if c_ptr != 0 { mem_free_aligned(c_ptr) }
+        if rg_ptr != 0 { mem_free_aligned(rg_ptr) }
+        if t_ptr != 0 { mem_free_aligned(t_ptr) }
+        if h_ptr != 0 { mem_free_aligned(h_ptr) }
+        return -1
+    }
+
+    ptr_write_i64(world.arch_ptr, base, m)
+    ptr_write_i64(world.arch_ptr, base + 1, 0)
+    ptr_write_i64(world.arch_ptr, base + 2, cap)
+    ptr_write_i64(world.arch_ptr, base + 3, e_ptr)
+    ptr_write_i64(world.arch_ptr, base + 4, p_ptr)
+    ptr_write_i64(world.arch_ptr, base + 5, v_ptr)
+    ptr_write_i64(world.arch_ptr, base + 6, r_ptr)
+    ptr_write_i64(world.arch_ptr, base + 7, c_ptr)
+    ptr_write_i64(world.arch_ptr, base + 8, rg_ptr)
+    ptr_write_i64(world.arch_ptr, base + 9, t_ptr)
+    ptr_write_i64(world.arch_ptr, base + 10, h_ptr)
+
+    ptr_write_i64(world.meta_ptr, 2, cnt + 1)
+    return arch_idx
+}
+
+fn ecs_ensure_arch_cap(world: EcsWorld, arch_idx: i64) -> bool {
+    if world.arch_ptr == 0 or arch_idx < 0 or arch_idx >= 64 { return false }
+    base := arch_idx * 16
+    cnt := ptr_read_i64(world.arch_ptr, base + 1)
+    cap := ptr_read_i64(world.arch_ptr, base + 2)
+    if cnt < cap { return true }
+    if cap <= 0 or cap >= 4194304 { return false }
+
+    new_cap := cap * 2
+    mask := ptr_read_i64(world.arch_ptr, base)
+
+    // Allocate all replacement arrays first so partial OOM leaves world intact
+    new_e := mem_alloc_aligned(new_cap * 8 + 64)
+    mut new_p := 0
+    mut new_v := 0
+    mut new_r := 0
+    mut new_c := 0
+    mut new_rg := 0
+    mut new_t := 0
+    mut new_h := 0
+    mut oom := new_e == 0
+
+    if not oom and (mask & comp_position()) != 0 {
+        new_p = mem_alloc_aligned(new_cap * 12 + 64)
+        if new_p == 0 { oom = true }
+    }
+    if not oom and (mask & comp_velocity()) != 0 {
+        new_v = mem_alloc_aligned(new_cap * 12 + 64)
+        if new_v == 0 { oom = true }
+    }
+    if not oom and (mask & comp_renderable()) != 0 {
+        new_r = mem_alloc_aligned(new_cap * 16 + 64)
+        if new_r == 0 { oom = true }
+    }
+    if not oom and (mask & comp_collider()) != 0 {
+        new_c = mem_alloc_aligned(new_cap * 16 + 64)
+        if new_c == 0 { oom = true }
+    }
+    if not oom and (mask & comp_rigid_body()) != 0 {
+        new_rg = mem_alloc_aligned(new_cap * 16 + 64)
+        if new_rg == 0 { oom = true }
+    }
+    if not oom and (mask & comp_tag()) != 0 {
+        new_t = mem_alloc_aligned(new_cap * 16 + 64)
+        if new_t == 0 { oom = true }
+    }
+    if not oom and (mask & comp_health()) != 0 {
+        new_h = mem_alloc_aligned(new_cap * 8 + 64)
+        if new_h == 0 { oom = true }
+    }
+
+    if oom {
+        if new_e != 0 { mem_free_aligned(new_e) }
+        if new_p != 0 { mem_free_aligned(new_p) }
+        if new_v != 0 { mem_free_aligned(new_v) }
+        if new_r != 0 { mem_free_aligned(new_r) }
+        if new_c != 0 { mem_free_aligned(new_c) }
+        if new_rg != 0 { mem_free_aligned(new_rg) }
+        if new_t != 0 { mem_free_aligned(new_t) }
+        if new_h != 0 { mem_free_aligned(new_h) }
+        return false
+    }
+
+    old_e := ptr_read_i64(world.arch_ptr, base + 3)
+    mut i := 0
+    while i < cnt {
+        ptr_write_i64(new_e, i, ptr_read_i64(old_e, i))
+        i += 1
+    }
+    mem_free_aligned(old_e)
+    ptr_write_i64(world.arch_ptr, base + 3, new_e)
+
+    if (mask & comp_position()) != 0 {
+        old_p := ptr_read_i64(world.arch_ptr, base + 4)
+        i = 0
+        while i < cnt * 3 {
+            ptr_write_f32(new_p, i, ptr_read_f32(old_p, i))
+            i += 1
+        }
+        mem_free_aligned(old_p)
+        ptr_write_i64(world.arch_ptr, base + 4, new_p)
+    }
+
+    if (mask & comp_velocity()) != 0 {
+        old_v := ptr_read_i64(world.arch_ptr, base + 5)
+        i = 0
+        while i < cnt * 3 {
+            ptr_write_f32(new_v, i, ptr_read_f32(old_v, i))
+            i += 1
+        }
+        mem_free_aligned(old_v)
+        ptr_write_i64(world.arch_ptr, base + 5, new_v)
+    }
+
+    if (mask & comp_renderable()) != 0 {
+        old_r := ptr_read_i64(world.arch_ptr, base + 6)
+        i = 0
+        while i < cnt * 2 {
+            ptr_write_i64(new_r, i, ptr_read_i64(old_r, i))
+            i += 1
+        }
+        mem_free_aligned(old_r)
+        ptr_write_i64(world.arch_ptr, base + 6, new_r)
+    }
+
+    if (mask & comp_collider()) != 0 {
+        old_c := ptr_read_i64(world.arch_ptr, base + 7)
+        i = 0
+        while i < cnt * 2 {
+            ptr_write_i64(new_c, i, ptr_read_i64(old_c, i))
+            i += 1
+        }
+        mem_free_aligned(old_c)
+        ptr_write_i64(world.arch_ptr, base + 7, new_c)
+    }
+
+    if (mask & comp_rigid_body()) != 0 {
+        old_rg := ptr_read_i64(world.arch_ptr, base + 8)
+        i = 0
+        while i < cnt * 4 {
+            ptr_write_f32(new_rg, i, ptr_read_f32(old_rg, i))
+            i += 1
+        }
+        mem_free_aligned(old_rg)
+        ptr_write_i64(world.arch_ptr, base + 8, new_rg)
+    }
+
+    if (mask & comp_tag()) != 0 {
+        old_t := ptr_read_i64(world.arch_ptr, base + 9)
+        i = 0
+        while i < cnt * 2 {
+            ptr_write_i64(new_t, i, ptr_read_i64(old_t, i))
+            i += 1
+        }
+        mem_free_aligned(old_t)
+        ptr_write_i64(world.arch_ptr, base + 9, new_t)
+    }
+
+    if (mask & comp_health()) != 0 {
+        old_h := ptr_read_i64(world.arch_ptr, base + 10)
+        i = 0
+        while i < cnt * 2 {
+            ptr_write_f32(new_h, i, ptr_read_f32(old_h, i))
+            i += 1
+        }
+        mem_free_aligned(old_h)
+        ptr_write_i64(world.arch_ptr, base + 10, new_h)
+    }
+
+    ptr_write_i64(world.arch_ptr, base + 2, new_cap)
+    return true
+}
+
+fn ecs_spawn(world: EcsWorld, mask: i64) -> i64 {
+    if world.meta_ptr == 0 or world.data_ptr == 0 or world.arch_ptr == 0 { return -1 }
+
+    // Check entity capacity BEFORE creating or growing archetypes
+    me := ptr_read_i64(world.meta_ptr, 3)
+    free_cnt := ptr_read_i64(world.meta_ptr, 4)
+    next_id := ptr_read_i64(world.meta_ptr, 0)
+    if free_cnt <= 0 and next_id >= me { return -1 }
+
+    clean_mask := mask & 127
+    arch_idx := ecs_find_or_create_archetype(world, clean_mask)
+    if arch_idx < 0 { return -1 }
+    if not ecs_ensure_arch_cap(world, arch_idx) { return -1 }
+
+    mut ent_id := -1
+    if free_cnt > 0 {
+        ent_id = ptr_read_i64(world.data_ptr, me * 3 + free_cnt - 1)
+        ptr_write_i64(world.meta_ptr, 4, free_cnt - 1)
+    } else {
+        ent_id = next_id
+        ptr_write_i64(world.meta_ptr, 0, next_id + 1)
+    }
+
+    base := arch_idx * 16
+    row := ptr_read_i64(world.arch_ptr, base + 1)
+    ptr_write_i64(world.arch_ptr, base + 1, row + 1)
+
+    e_ptr := ptr_read_i64(world.arch_ptr, base + 3)
+    ptr_write_i64(e_ptr, row, ent_id)
+
+    // Zero-initialize all active component slots at `row` to prevent stale entity data leaks
+    if (clean_mask & comp_position()) != 0 {
+        p_ptr := ptr_read_i64(world.arch_ptr, base + 4)
+        ptr_write_f32(p_ptr, row * 3, 0.0)
+        ptr_write_f32(p_ptr, row * 3 + 1, 0.0)
+        ptr_write_f32(p_ptr, row * 3 + 2, 0.0)
+    }
+    if (clean_mask & comp_velocity()) != 0 {
+        v_ptr := ptr_read_i64(world.arch_ptr, base + 5)
+        ptr_write_f32(v_ptr, row * 3, 0.0)
+        ptr_write_f32(v_ptr, row * 3 + 1, 0.0)
+        ptr_write_f32(v_ptr, row * 3 + 2, 0.0)
+    }
+    if (clean_mask & comp_renderable()) != 0 {
+        r_ptr := ptr_read_i64(world.arch_ptr, base + 6)
+        ptr_write_i64(r_ptr, row * 2, 0)
+        ptr_write_i64(r_ptr, row * 2 + 1, 0)
+    }
+    if (clean_mask & comp_collider()) != 0 {
+        c_ptr := ptr_read_i64(world.arch_ptr, base + 7)
+        ptr_write_i64(c_ptr, row * 2, 0)
+        ptr_write_i64(c_ptr, row * 2 + 1, 0)
+    }
+    if (clean_mask & comp_rigid_body()) != 0 {
+        rg_ptr := ptr_read_i64(world.arch_ptr, base + 8)
+        ptr_write_f32(rg_ptr, row * 4, 0.0)
+        ptr_write_f32(rg_ptr, row * 4 + 1, 0.0)
+        ptr_write_f32(rg_ptr, row * 4 + 2, 0.0)
+        ptr_write_f32(rg_ptr, row * 4 + 3, 0.0)
+    }
+    if (clean_mask & comp_tag()) != 0 {
+        t_ptr := ptr_read_i64(world.arch_ptr, base + 9)
+        ptr_write_i64(t_ptr, row * 2, 0)
+        ptr_write_i64(t_ptr, row * 2 + 1, 0)
+    }
+    if (clean_mask & comp_health()) != 0 {
+        h_ptr := ptr_read_i64(world.arch_ptr, base + 10)
+        ptr_write_f32(h_ptr, row * 2, 0.0)
+        ptr_write_f32(h_ptr, row * 2 + 1, 0.0)
+    }
+
+    ptr_write_i64(world.data_ptr, ent_id, arch_idx)
+    ptr_write_i64(world.data_ptr, me + ent_id, row)
+
+    live_cnt := ptr_read_i64(world.meta_ptr, 1)
+    ptr_write_i64(world.meta_ptr, 1, live_cnt + 1)
+
+    return ent_id
+}
+
+fn ecs_despawn(world: EcsWorld, entity_id: i64) -> bool {
+    if world.meta_ptr == 0 or world.data_ptr == 0 or world.arch_ptr == 0 { return false }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    if entity_id <= 0 or entity_id >= me { return false }
+    arch_idx := ptr_read_i64(world.data_ptr, entity_id)
+    if arch_idx < 0 { return false }
+
+    row := ptr_read_i64(world.data_ptr, me + entity_id)
+    base := arch_idx * 16
+    count := ptr_read_i64(world.arch_ptr, base + 1)
+    last_row := count - 1
+
+    if row < last_row {
+        e_ptr := ptr_read_i64(world.arch_ptr, base + 3)
+        last_ent := ptr_read_i64(e_ptr, last_row)
+        ptr_write_i64(e_ptr, row, last_ent)
+        ptr_write_i64(world.data_ptr, me + last_ent, row)
+
+        mask := ptr_read_i64(world.arch_ptr, base)
+        if (mask & comp_position()) != 0 {
+            p_ptr := ptr_read_i64(world.arch_ptr, base + 4)
+            ptr_write_f32(p_ptr, row * 3,     ptr_read_f32(p_ptr, last_row * 3))
+            ptr_write_f32(p_ptr, row * 3 + 1, ptr_read_f32(p_ptr, last_row * 3 + 1))
+            ptr_write_f32(p_ptr, row * 3 + 2, ptr_read_f32(p_ptr, last_row * 3 + 2))
+        }
+        if (mask & comp_velocity()) != 0 {
+            v_ptr := ptr_read_i64(world.arch_ptr, base + 5)
+            ptr_write_f32(v_ptr, row * 3,     ptr_read_f32(v_ptr, last_row * 3))
+            ptr_write_f32(v_ptr, row * 3 + 1, ptr_read_f32(v_ptr, last_row * 3 + 1))
+            ptr_write_f32(v_ptr, row * 3 + 2, ptr_read_f32(v_ptr, last_row * 3 + 2))
+        }
+        if (mask & comp_renderable()) != 0 {
+            r_ptr := ptr_read_i64(world.arch_ptr, base + 6)
+            ptr_write_i64(r_ptr, row * 2,     ptr_read_i64(r_ptr, last_row * 2))
+            ptr_write_i64(r_ptr, row * 2 + 1, ptr_read_i64(r_ptr, last_row * 2 + 1))
+        }
+        if (mask & comp_collider()) != 0 {
+            c_ptr := ptr_read_i64(world.arch_ptr, base + 7)
+            ptr_write_i64(c_ptr, row * 2,     ptr_read_i64(c_ptr, last_row * 2))
+            ptr_write_i64(c_ptr, row * 2 + 1, ptr_read_i64(c_ptr, last_row * 2 + 1))
+        }
+        if (mask & comp_rigid_body()) != 0 {
+            rg_ptr := ptr_read_i64(world.arch_ptr, base + 8)
+            ptr_write_f32(rg_ptr, row * 4,     ptr_read_f32(rg_ptr, last_row * 4))
+            ptr_write_f32(rg_ptr, row * 4 + 1, ptr_read_f32(rg_ptr, last_row * 4 + 1))
+            ptr_write_f32(rg_ptr, row * 4 + 2, ptr_read_f32(rg_ptr, last_row * 4 + 2))
+            ptr_write_f32(rg_ptr, row * 4 + 3, ptr_read_f32(rg_ptr, last_row * 4 + 3))
+        }
+        if (mask & comp_tag()) != 0 {
+            t_ptr := ptr_read_i64(world.arch_ptr, base + 9)
+            ptr_write_i64(t_ptr, row * 2,     ptr_read_i64(t_ptr, last_row * 2))
+            ptr_write_i64(t_ptr, row * 2 + 1, ptr_read_i64(t_ptr, last_row * 2 + 1))
+        }
+        if (mask & comp_health()) != 0 {
+            h_ptr := ptr_read_i64(world.arch_ptr, base + 10)
+            ptr_write_f32(h_ptr, row * 2,     ptr_read_f32(h_ptr, last_row * 2))
+            ptr_write_f32(h_ptr, row * 2 + 1, ptr_read_f32(h_ptr, last_row * 2 + 1))
+        }
+    }
+
+    ptr_write_i64(world.arch_ptr, base + 1, count - 1)
+    ptr_write_i64(world.data_ptr, entity_id, -1)
+    ptr_write_i64(world.data_ptr, me + entity_id, -1)
+    gen := ptr_read_i64(world.data_ptr, me * 2 + entity_id)
+    ptr_write_i64(world.data_ptr, me * 2 + entity_id, gen + 1)
+
+    free_cnt := ptr_read_i64(world.meta_ptr, 4)
+    if free_cnt < me {
+        ptr_write_i64(world.data_ptr, me * 3 + free_cnt, entity_id)
+        ptr_write_i64(world.meta_ptr, 4, free_cnt + 1)
+    }
+
+    live_cnt := ptr_read_i64(world.meta_ptr, 1)
+    ptr_write_i64(world.meta_ptr, 1, live_cnt - 1)
+    return true
+}
+
+@no_alloc
+fn ecs_is_alive(world: EcsWorld, entity_id: i64) -> bool {
+    if world.meta_ptr == 0 or world.data_ptr == 0 or world.arch_ptr == 0 { return false }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    if entity_id <= 0 or entity_id >= me { return false }
+    return ptr_read_i64(world.data_ptr, entity_id) >= 0
+}
+
+@no_alloc
+fn ecs_get_mask(world: EcsWorld, entity_id: i64) -> i64 {
+    if not ecs_is_alive(world, entity_id) { return 0 }
+    arch_idx := ptr_read_i64(world.data_ptr, entity_id)
+    return ptr_read_i64(world.arch_ptr, arch_idx * 16)
+}
+
+@no_alloc
+fn ecs_set_position(world: EcsWorld, entity: i64, x: f64, y: f64, z: f64) {
+    if not ecs_is_alive(world, entity) { return }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    p_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 4)
+    if p_ptr != 0 {
+        ptr_write_f32(p_ptr, row * 3,     x)
+        ptr_write_f32(p_ptr, row * 3 + 1, y)
+        ptr_write_f32(p_ptr, row * 3 + 2, z)
+    }
+}
+
+@no_alloc
+fn ecs_get_pos_x(world: EcsWorld, entity: i64) -> f64 {
+    if not ecs_is_alive(world, entity) { return 0.0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    p_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 4)
+    if p_ptr == 0 { return 0.0 }
+    return ptr_read_f32(p_ptr, row * 3)
+}
+
+@no_alloc
+fn ecs_get_pos_y(world: EcsWorld, entity: i64) -> f64 {
+    if not ecs_is_alive(world, entity) { return 0.0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    p_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 4)
+    if p_ptr == 0 { return 0.0 }
+    return ptr_read_f32(p_ptr, row * 3 + 1)
+}
+
+@no_alloc
+fn ecs_get_pos_z(world: EcsWorld, entity: i64) -> f64 {
+    if not ecs_is_alive(world, entity) { return 0.0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    p_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 4)
+    if p_ptr == 0 { return 0.0 }
+    return ptr_read_f32(p_ptr, row * 3 + 2)
+}
+
+@no_alloc
+fn ecs_set_velocity(world: EcsWorld, entity: i64, vx: f64, vy: f64, vz: f64) {
+    if not ecs_is_alive(world, entity) { return }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    v_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 5)
+    if v_ptr != 0 {
+        ptr_write_f32(v_ptr, row * 3,     vx)
+        ptr_write_f32(v_ptr, row * 3 + 1, vy)
+        ptr_write_f32(v_ptr, row * 3 + 2, vz)
+    }
+}
+
+@no_alloc
+fn ecs_get_vel_x(world: EcsWorld, entity: i64) -> f64 {
+    if not ecs_is_alive(world, entity) { return 0.0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    v_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 5)
+    if v_ptr == 0 { return 0.0 }
+    return ptr_read_f32(v_ptr, row * 3)
+}
+
+@no_alloc
+fn ecs_get_vel_y(world: EcsWorld, entity: i64) -> f64 {
+    if not ecs_is_alive(world, entity) { return 0.0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    v_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 5)
+    if v_ptr == 0 { return 0.0 }
+    return ptr_read_f32(v_ptr, row * 3 + 1)
+}
+
+@no_alloc
+fn ecs_get_vel_z(world: EcsWorld, entity: i64) -> f64 {
+    if not ecs_is_alive(world, entity) { return 0.0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    v_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 5)
+    if v_ptr == 0 { return 0.0 }
+    return ptr_read_f32(v_ptr, row * 3 + 2)
+}
+
+@no_alloc
+fn ecs_set_render(world: EcsWorld, entity: i64, color: i64, size: f64) {
+    if not ecs_is_alive(world, entity) { return }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    r_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 6)
+    if r_ptr != 0 {
+        ptr_write_i64(r_ptr, row * 2, color)
+        // Store size in 2nd slot using raw bits
+        s_scratch := world.meta_ptr + 48
+        ptr_write_i64(s_scratch, 0, 0)
+        ptr_write_f32(s_scratch, 0, size)
+        bits := ptr_read_i64(s_scratch, 0)
+        ptr_write_i64(r_ptr, row * 2 + 1, bits)
+    }
+}
+
+@no_alloc
+fn ecs_get_render_color(world: EcsWorld, entity: i64) -> i64 {
+    if not ecs_is_alive(world, entity) { return 0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    r_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 6)
+    if r_ptr == 0 { return 0 }
+    return ptr_read_i64(r_ptr, row * 2)
+}
+
+@no_alloc
+fn ecs_set_collider(world: EcsWorld, entity: i64, radius: f64, layer: i64) {
+    if not ecs_is_alive(world, entity) { return }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    c_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 7)
+    if c_ptr != 0 {
+        s_scratch := world.meta_ptr + 48
+        ptr_write_i64(s_scratch, 0, 0)
+        ptr_write_f32(s_scratch, 0, radius)
+        bits := ptr_read_i64(s_scratch, 0)
+        ptr_write_i64(c_ptr, row * 2, bits)
+        ptr_write_i64(c_ptr, row * 2 + 1, layer)
+    }
+}
+
+@no_alloc
+fn ecs_set_rigid_body(world: EcsWorld, entity: i64, mass: f64, restitution: f64, friction: f64, drag: f64) {
+    if not ecs_is_alive(world, entity) { return }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    rg_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 8)
+    if rg_ptr != 0 {
+        mut inv_m := 0.0
+        if mass > 0.000001 { inv_m = 1.0 / mass }
+        ptr_write_f32(rg_ptr, row * 4,     inv_m)
+        ptr_write_f32(rg_ptr, row * 4 + 1, restitution)
+        ptr_write_f32(rg_ptr, row * 4 + 2, friction)
+        ptr_write_f32(rg_ptr, row * 4 + 3, drag)
+    }
+}
+
+@no_alloc
+fn ecs_set_tag(world: EcsWorld, entity: i64, tag: i64, user_data: i64) {
+    if not ecs_is_alive(world, entity) { return }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    t_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 9)
+    if t_ptr != 0 {
+        ptr_write_i64(t_ptr, row * 2,     tag)
+        ptr_write_i64(t_ptr, row * 2 + 1, user_data)
+    }
+}
+
+@no_alloc
+fn ecs_get_tag(world: EcsWorld, entity: i64) -> i64 {
+    if not ecs_is_alive(world, entity) { return 0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    t_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 9)
+    if t_ptr == 0 { return 0 }
+    return ptr_read_i64(t_ptr, row * 2)
+}
+
+@no_alloc
+fn ecs_set_health(world: EcsWorld, entity: i64, hp: f64, max_hp: f64) {
+    if not ecs_is_alive(world, entity) { return }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    h_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 10)
+    if h_ptr != 0 {
+        ptr_write_f32(h_ptr, row * 2,     hp)
+        ptr_write_f32(h_ptr, row * 2 + 1, max_hp)
+    }
+}
+
+@no_alloc
+fn ecs_get_health(world: EcsWorld, entity: i64) -> f64 {
+    if not ecs_is_alive(world, entity) { return 0.0 }
+    me := ptr_read_i64(world.meta_ptr, 3)
+    arch_idx := ptr_read_i64(world.data_ptr, entity)
+    row := ptr_read_i64(world.data_ptr, me + entity)
+    h_ptr := ptr_read_i64(world.arch_ptr, arch_idx * 16 + 10)
+    if h_ptr == 0 { return 0.0 }
+    return ptr_read_f32(h_ptr, row * 2)
+}
+
+// Counts total entities matching `req_mask` and not having `excl_mask`.
+@no_alloc
+fn ecs_count_matching(world: EcsWorld, req_mask: i64, excl_mask: i64 = 0) -> i64 {
+    if world.meta_ptr == 0 or world.arch_ptr == 0 { return 0 }
+    arch_cnt := ptr_read_i64(world.meta_ptr, 2)
+    mut total := 0
+    mut i := 0
+    while i < arch_cnt {
+        base := i * 16
+        m := ptr_read_i64(world.arch_ptr, base)
+        if (m & req_mask) == req_mask and (m & excl_mask) == 0 {
+            total = total + ptr_read_i64(world.arch_ptr, base + 1)
+        }
+        i += 1
+    }
+    return total
+}
+
+// --- High-Performance Systems ---
+// Movement System: updates positions along velocities across all matching archetypes.
+// Accelerated with AVX2/SIMD hardware vectorization (32-wide / 8-wide contiguous float steps).
+@no_alloc
+fn ecs_system_movement(world: EcsWorld, dt: f64) -> i64 {
+    if world.meta_ptr == 0 or world.arch_ptr == 0 { return 0 }
+    req := comp_position() | comp_velocity()
+    arch_cnt := ptr_read_i64(world.meta_ptr, 2)
+    mut updated := 0
+    mut a := 0
+    while a < arch_cnt {
+        base := a * 16
+        m := ptr_read_i64(world.arch_ptr, base)
+        if (m & req) == req {
+            cnt := ptr_read_i64(world.arch_ptr, base + 1)
+            p_ptr := ptr_read_i64(world.arch_ptr, base + 4)
+            v_ptr := ptr_read_i64(world.arch_ptr, base + 5)
+            if cnt > 0 and p_ptr != 0 and v_ptr != 0 {
+                // Vectorized AVX2 contiguous float fused multiply-add across all coordinates
+                dlpack_scale_add_f32(p_ptr, v_ptr, dt, cnt * 3)
+            }
+            updated = updated + cnt
+        }
+        a += 1
+    }
+    return updated
+}
+
+// Gravity System: accelerates velocities by (gx, gy, gz) for entities with rigid bodies.
+// Unrolled in 8-wide SIMD chunks with precomputed impulses and clean scalar tail loop.
+@no_alloc
+fn ecs_system_gravity(world: EcsWorld, gx: f64, gy: f64, gz: f64, dt: f64) -> i64 {
+    if world.meta_ptr == 0 or world.arch_ptr == 0 { return 0 }
+    req := comp_velocity() | comp_rigid_body()
+    arch_cnt := ptr_read_i64(world.meta_ptr, 2)
+    gxdt := gx * dt
+    gydt := gy * dt
+    gzdt := gz * dt
+    mut count := 0
+    mut a := 0
+    while a < arch_cnt {
+        base := a * 16
+        m := ptr_read_i64(world.arch_ptr, base)
+        if (m & req) == req {
+            cnt := ptr_read_i64(world.arch_ptr, base + 1)
+            v_ptr := ptr_read_i64(world.arch_ptr, base + 5)
+            rg_ptr := ptr_read_i64(world.arch_ptr, base + 8)
+            if cnt <= 0 or v_ptr == 0 or rg_ptr == 0 { a += 1; continue }
+            mut r := 0
+            // 16-wide unrolled SIMD loop
+            while r + 16 <= cnt {
+                // Entity 0..15
+                if ptr_read_f32(rg_ptr, (r + 0) * 4) > 0.000001 {
+                    off0 := (r + 0) * 3
+                    ptr_write_f32(v_ptr, off0,     ptr_read_f32(v_ptr, off0)     + gxdt)
+                    ptr_write_f32(v_ptr, off0 + 1, ptr_read_f32(v_ptr, off0 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off0 + 2, ptr_read_f32(v_ptr, off0 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 1) * 4) > 0.000001 {
+                    off1 := (r + 1) * 3
+                    ptr_write_f32(v_ptr, off1,     ptr_read_f32(v_ptr, off1)     + gxdt)
+                    ptr_write_f32(v_ptr, off1 + 1, ptr_read_f32(v_ptr, off1 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off1 + 2, ptr_read_f32(v_ptr, off1 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 2) * 4) > 0.000001 {
+                    off2 := (r + 2) * 3
+                    ptr_write_f32(v_ptr, off2,     ptr_read_f32(v_ptr, off2)     + gxdt)
+                    ptr_write_f32(v_ptr, off2 + 1, ptr_read_f32(v_ptr, off2 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off2 + 2, ptr_read_f32(v_ptr, off2 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 3) * 4) > 0.000001 {
+                    off3 := (r + 3) * 3
+                    ptr_write_f32(v_ptr, off3,     ptr_read_f32(v_ptr, off3)     + gxdt)
+                    ptr_write_f32(v_ptr, off3 + 1, ptr_read_f32(v_ptr, off3 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off3 + 2, ptr_read_f32(v_ptr, off3 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 4) * 4) > 0.000001 {
+                    off4 := (r + 4) * 3
+                    ptr_write_f32(v_ptr, off4,     ptr_read_f32(v_ptr, off4)     + gxdt)
+                    ptr_write_f32(v_ptr, off4 + 1, ptr_read_f32(v_ptr, off4 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off4 + 2, ptr_read_f32(v_ptr, off4 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 5) * 4) > 0.000001 {
+                    off5 := (r + 5) * 3
+                    ptr_write_f32(v_ptr, off5,     ptr_read_f32(v_ptr, off5)     + gxdt)
+                    ptr_write_f32(v_ptr, off5 + 1, ptr_read_f32(v_ptr, off5 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off5 + 2, ptr_read_f32(v_ptr, off5 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 6) * 4) > 0.000001 {
+                    off6 := (r + 6) * 3
+                    ptr_write_f32(v_ptr, off6,     ptr_read_f32(v_ptr, off6)     + gxdt)
+                    ptr_write_f32(v_ptr, off6 + 1, ptr_read_f32(v_ptr, off6 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off6 + 2, ptr_read_f32(v_ptr, off6 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 7) * 4) > 0.000001 {
+                    off7 := (r + 7) * 3
+                    ptr_write_f32(v_ptr, off7,     ptr_read_f32(v_ptr, off7)     + gxdt)
+                    ptr_write_f32(v_ptr, off7 + 1, ptr_read_f32(v_ptr, off7 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off7 + 2, ptr_read_f32(v_ptr, off7 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 8) * 4) > 0.000001 {
+                    off8 := (r + 8) * 3
+                    ptr_write_f32(v_ptr, off8,     ptr_read_f32(v_ptr, off8)     + gxdt)
+                    ptr_write_f32(v_ptr, off8 + 1, ptr_read_f32(v_ptr, off8 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off8 + 2, ptr_read_f32(v_ptr, off8 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 9) * 4) > 0.000001 {
+                    off9 := (r + 9) * 3
+                    ptr_write_f32(v_ptr, off9,     ptr_read_f32(v_ptr, off9)     + gxdt)
+                    ptr_write_f32(v_ptr, off9 + 1, ptr_read_f32(v_ptr, off9 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off9 + 2, ptr_read_f32(v_ptr, off9 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 10) * 4) > 0.000001 {
+                    off10 := (r + 10) * 3
+                    ptr_write_f32(v_ptr, off10,     ptr_read_f32(v_ptr, off10)     + gxdt)
+                    ptr_write_f32(v_ptr, off10 + 1, ptr_read_f32(v_ptr, off10 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off10 + 2, ptr_read_f32(v_ptr, off10 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 11) * 4) > 0.000001 {
+                    off11 := (r + 11) * 3
+                    ptr_write_f32(v_ptr, off11,     ptr_read_f32(v_ptr, off11)     + gxdt)
+                    ptr_write_f32(v_ptr, off11 + 1, ptr_read_f32(v_ptr, off11 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off11 + 2, ptr_read_f32(v_ptr, off11 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 12) * 4) > 0.000001 {
+                    off12 := (r + 12) * 3
+                    ptr_write_f32(v_ptr, off12,     ptr_read_f32(v_ptr, off12)     + gxdt)
+                    ptr_write_f32(v_ptr, off12 + 1, ptr_read_f32(v_ptr, off12 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off12 + 2, ptr_read_f32(v_ptr, off12 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 13) * 4) > 0.000001 {
+                    off13 := (r + 13) * 3
+                    ptr_write_f32(v_ptr, off13,     ptr_read_f32(v_ptr, off13)     + gxdt)
+                    ptr_write_f32(v_ptr, off13 + 1, ptr_read_f32(v_ptr, off13 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off13 + 2, ptr_read_f32(v_ptr, off13 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 14) * 4) > 0.000001 {
+                    off14 := (r + 14) * 3
+                    ptr_write_f32(v_ptr, off14,     ptr_read_f32(v_ptr, off14)     + gxdt)
+                    ptr_write_f32(v_ptr, off14 + 1, ptr_read_f32(v_ptr, off14 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off14 + 2, ptr_read_f32(v_ptr, off14 + 2) + gzdt)
+                }
+                if ptr_read_f32(rg_ptr, (r + 15) * 4) > 0.000001 {
+                    off15 := (r + 15) * 3
+                    ptr_write_f32(v_ptr, off15,     ptr_read_f32(v_ptr, off15)     + gxdt)
+                    ptr_write_f32(v_ptr, off15 + 1, ptr_read_f32(v_ptr, off15 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off15 + 2, ptr_read_f32(v_ptr, off15 + 2) + gzdt)
+                }
+                r += 16
+            }
+            // 8-wide unrolled SIMD loop
+            while r + 8 <= cnt {
+                // Entity 0
+                if ptr_read_f32(rg_ptr, (r + 0) * 4) > 0.000001 {
+                    off0 := (r + 0) * 3
+                    ptr_write_f32(v_ptr, off0,     ptr_read_f32(v_ptr, off0)     + gxdt)
+                    ptr_write_f32(v_ptr, off0 + 1, ptr_read_f32(v_ptr, off0 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off0 + 2, ptr_read_f32(v_ptr, off0 + 2) + gzdt)
+                }
+                // Entity 1
+                if ptr_read_f32(rg_ptr, (r + 1) * 4) > 0.000001 {
+                    off1 := (r + 1) * 3
+                    ptr_write_f32(v_ptr, off1,     ptr_read_f32(v_ptr, off1)     + gxdt)
+                    ptr_write_f32(v_ptr, off1 + 1, ptr_read_f32(v_ptr, off1 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off1 + 2, ptr_read_f32(v_ptr, off1 + 2) + gzdt)
+                }
+                // Entity 2
+                if ptr_read_f32(rg_ptr, (r + 2) * 4) > 0.000001 {
+                    off2 := (r + 2) * 3
+                    ptr_write_f32(v_ptr, off2,     ptr_read_f32(v_ptr, off2)     + gxdt)
+                    ptr_write_f32(v_ptr, off2 + 1, ptr_read_f32(v_ptr, off2 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off2 + 2, ptr_read_f32(v_ptr, off2 + 2) + gzdt)
+                }
+                // Entity 3
+                if ptr_read_f32(rg_ptr, (r + 3) * 4) > 0.000001 {
+                    off3 := (r + 3) * 3
+                    ptr_write_f32(v_ptr, off3,     ptr_read_f32(v_ptr, off3)     + gxdt)
+                    ptr_write_f32(v_ptr, off3 + 1, ptr_read_f32(v_ptr, off3 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off3 + 2, ptr_read_f32(v_ptr, off3 + 2) + gzdt)
+                }
+                // Entity 4
+                if ptr_read_f32(rg_ptr, (r + 4) * 4) > 0.000001 {
+                    off4 := (r + 4) * 3
+                    ptr_write_f32(v_ptr, off4,     ptr_read_f32(v_ptr, off4)     + gxdt)
+                    ptr_write_f32(v_ptr, off4 + 1, ptr_read_f32(v_ptr, off4 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off4 + 2, ptr_read_f32(v_ptr, off4 + 2) + gzdt)
+                }
+                // Entity 5
+                if ptr_read_f32(rg_ptr, (r + 5) * 4) > 0.000001 {
+                    off5 := (r + 5) * 3
+                    ptr_write_f32(v_ptr, off5,     ptr_read_f32(v_ptr, off5)     + gxdt)
+                    ptr_write_f32(v_ptr, off5 + 1, ptr_read_f32(v_ptr, off5 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off5 + 2, ptr_read_f32(v_ptr, off5 + 2) + gzdt)
+                }
+                // Entity 6
+                if ptr_read_f32(rg_ptr, (r + 6) * 4) > 0.000001 {
+                    off6 := (r + 6) * 3
+                    ptr_write_f32(v_ptr, off6,     ptr_read_f32(v_ptr, off6)     + gxdt)
+                    ptr_write_f32(v_ptr, off6 + 1, ptr_read_f32(v_ptr, off6 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off6 + 2, ptr_read_f32(v_ptr, off6 + 2) + gzdt)
+                }
+                // Entity 7
+                if ptr_read_f32(rg_ptr, (r + 7) * 4) > 0.000001 {
+                    off7 := (r + 7) * 3
+                    ptr_write_f32(v_ptr, off7,     ptr_read_f32(v_ptr, off7)     + gxdt)
+                    ptr_write_f32(v_ptr, off7 + 1, ptr_read_f32(v_ptr, off7 + 1) + gydt)
+                    ptr_write_f32(v_ptr, off7 + 2, ptr_read_f32(v_ptr, off7 + 2) + gzdt)
+                }
+                r += 8
+            }
+            // Tail loop for remaining entities
+            while r < cnt {
+                inv_m := ptr_read_f32(rg_ptr, r * 4)
+                if inv_m > 0.000001 {
+                    off := r * 3
+                    vx := ptr_read_f32(v_ptr, off)
+                    vy := ptr_read_f32(v_ptr, off + 1)
+                    vz := ptr_read_f32(v_ptr, off + 2)
+                    ptr_write_f32(v_ptr, off,     vx + gxdt)
+                    ptr_write_f32(v_ptr, off + 1, vy + gydt)
+                    ptr_write_f32(v_ptr, off + 2, vz + gzdt)
+                }
+                r += 1
+            }
+            count = count + cnt
+        }
+        a += 1
+    }
+    return count
+}

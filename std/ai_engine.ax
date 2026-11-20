@@ -19,33 +19,54 @@ fn vram_arena_new(cap_bytes: i64) -> VramArena {
     if cap < 65536 {
         cap = 65536
     }
+    if cap > 1073741824 {
+        cap = 1073741824
+    }
     base := mem_alloc_aligned(cap)
     st := mem_alloc_aligned(64)
+    if base == 0 or st == 0 {
+        if base != 0 { mem_free_aligned(base) }
+        if st != 0 { mem_free_aligned(st) }
+        return VramArena(base_ptr = 0, cap_bytes = 0, state_ptr = 0)
+    }
     ptr_write_i64(st, 0, 0)
     return VramArena(base_ptr = base, cap_bytes = cap, state_ptr = st)
 }
 
 @no_alloc
 fn vram_arena_used_bytes(a: VramArena) -> i64 {
+    if a.state_ptr == 0 { return 0 }
     return ptr_read_i64(a.state_ptr, 0)
 }
 
 @no_alloc
 fn vram_arena_alloc_f32(a: VramArena, num_floats: i64) -> i64 {
-    cur := ptr_read_i64(a.state_ptr, 0)
-    raw_bytes := num_floats * 4
-    aligned_bytes := (raw_bytes + 63) & (0 - 64)
-    next_off := cur + aligned_bytes
-    if next_off > a.cap_bytes {
+    if a.base_ptr == 0 or a.state_ptr == 0 or num_floats <= 0 {
         return 0
     }
+    cur := ptr_read_i64(a.state_ptr, 0)
+    if cur < 0 or cur > a.cap_bytes {
+        return 0
+    }
+    avail := a.cap_bytes - cur
+    if num_floats > avail / 4 {
+        return 0
+    }
+    raw_bytes := num_floats * 4
+    aligned_bytes := (raw_bytes + 63) & (0 - 64)
+    if aligned_bytes < raw_bytes or aligned_bytes > avail {
+        return 0
+    }
+    next_off := cur + aligned_bytes
     ptr_write_i64(a.state_ptr, 0, next_off)
     return a.base_ptr + cur
 }
 
 @no_alloc
 fn vram_arena_reset(a: VramArena) {
-    ptr_write_i64(a.state_ptr, 0, 0)
+    if a.state_ptr != 0 {
+        ptr_write_i64(a.state_ptr, 0, 0)
+    }
 }
 
 fn vram_arena_free(move a: VramArena) {
@@ -68,10 +89,25 @@ struct PagedKvCache {
 }
 
 fn paged_kv_new(max_blocks: i64, block_tokens: i64, head_dim: i64) -> PagedKvCache {
+    if max_blocks <= 0 or block_tokens <= 0 or head_dim <= 0 or max_blocks > 65536 or block_tokens > 4096 or head_dim > 16384 {
+        return PagedKvCache(pool_ptr = 0, block_table_ptr = 0, meta_ptr = 0, block_tokens = 1, head_dim = 1, max_blocks = 0)
+    }
+    if block_tokens > 268435456 / head_dim {
+        return PagedKvCache(pool_ptr = 0, block_table_ptr = 0, meta_ptr = 0, block_tokens = 1, head_dim = 1, max_blocks = 0)
+    }
     block_floats := block_tokens * head_dim
+    if max_blocks > 268435456 / block_floats {
+        return PagedKvCache(pool_ptr = 0, block_table_ptr = 0, meta_ptr = 0, block_tokens = 1, head_dim = 1, max_blocks = 0)
+    }
     pool := mem_alloc_aligned(max_blocks * block_floats * 4 + 64)
     btable := mem_alloc_aligned(max_blocks * 8 + 64)
     meta := mem_alloc_aligned(64)
+    if pool == 0 or btable == 0 or meta == 0 {
+        if pool != 0 { mem_free_aligned(pool) }
+        if btable != 0 { mem_free_aligned(btable) }
+        if meta != 0 { mem_free_aligned(meta) }
+        return PagedKvCache(pool_ptr = 0, block_table_ptr = 0, meta_ptr = 0, block_tokens = 1, head_dim = 1, max_blocks = 0)
+    }
     ptr_write_i64(meta, 0, 0) // allocated physical blocks
     ptr_write_i64(meta, 1, 0) // total logical tokens appended
     return PagedKvCache(
@@ -86,11 +122,13 @@ fn paged_kv_new(max_blocks: i64, block_tokens: i64, head_dim: i64) -> PagedKvCac
 
 @no_alloc
 fn paged_kv_num_tokens(kv: PagedKvCache) -> i64 {
+    if kv.meta_ptr == 0 { return 0 }
     return ptr_read_i64(kv.meta_ptr, 1)
 }
 
 @no_alloc
 fn paged_kv_num_blocks(kv: PagedKvCache) -> i64 {
+    if kv.meta_ptr == 0 { return 0 }
     return ptr_read_i64(kv.meta_ptr, 0)
 }
 
@@ -98,15 +136,19 @@ fn paged_kv_num_blocks(kv: PagedKvCache) -> i64 {
 // without ever `memcpy`-ing prior context tokens!
 @no_alloc
 fn paged_kv_append_scalar(kv: PagedKvCache, val: f64) -> i64 {
+    if kv.pool_ptr == 0 or kv.block_table_ptr == 0 or kv.meta_ptr == 0 or kv.block_tokens <= 0 or kv.max_blocks <= 0 {
+        return -1
+    }
     tok_idx := ptr_read_i64(kv.meta_ptr, 1)
     logical_blk := tok_idx / kv.block_tokens
     slot_in_blk := tok_idx % kv.block_tokens
-    if logical_blk >= kv.max_blocks {
+    if logical_blk < 0 or logical_blk >= kv.max_blocks {
         return -1
     }
     mut phys_blk := 0
     if slot_in_blk == 0 {
         phys_blk = ptr_read_i64(kv.meta_ptr, 0)
+        if phys_blk < 0 or phys_blk >= kv.max_blocks { return -1 }
         ptr_write_i64(kv.block_table_ptr, logical_blk, phys_blk)
         ptr_write_i64(kv.meta_ptr, 0, phys_blk + 1)
     } else {
@@ -124,9 +166,18 @@ fn paged_kv_append_scalar(kv: PagedKvCache, val: f64) -> i64 {
 
 @no_alloc
 fn paged_kv_read_token_f32(kv: PagedKvCache, token_idx: i64, dim_idx: i64) -> f64 {
+    if kv.pool_ptr == 0 or kv.block_table_ptr == 0 or kv.meta_ptr == 0 or kv.block_tokens <= 0 {
+        return 0.0
+    }
+    total_toks := ptr_read_i64(kv.meta_ptr, 1)
+    if token_idx < 0 or token_idx >= total_toks or dim_idx < 0 or dim_idx >= kv.head_dim {
+        return 0.0
+    }
     logical_blk := token_idx / kv.block_tokens
     slot_in_blk := token_idx % kv.block_tokens
+    if logical_blk < 0 or logical_blk >= kv.max_blocks { return 0.0 }
     phys_blk := ptr_read_i64(kv.block_table_ptr, logical_blk)
+    if phys_blk < 0 or phys_blk >= kv.max_blocks { return 0.0 }
     base_float := (phys_blk * kv.block_tokens + slot_in_blk) * kv.head_dim
     return ptr_read_f32(kv.pool_ptr, base_float + dim_idx)
 }
@@ -142,7 +193,11 @@ fn paged_kv_free(move kv: PagedKvCache) {
 // with zero JIT warm-up and hardware IEEE-754 `NaN`/`Inf` trap protection!
 @nan_guard
 fn rmsnorm_2d[sym S, comptime D: usize](x: Tensor[f32, [S, D]], eps: f64) -> f64 {
+    if S <= 0 or D <= 0 { return 0.0 }
     ptr := tensor_ptr(x)
+    if ptr == 0 { return 0.0 }
+    mut safe_eps := eps
+    if not (safe_eps >= 0.0) { safe_eps = 0.0 }
     mut row := 0
     mut checksum := 0.0
     while row < S {
@@ -154,8 +209,11 @@ fn rmsnorm_2d[sym S, comptime D: usize](x: Tensor[f32, [S, D]], eps: f64) -> f64
             sq_sum = sq_sum + (v * v)
             col += 1
         }
-        mean_sq := (sq_sum / (D * 1.0)) + eps
-        inv_rms := 1.0 / sqrt_f64(mean_sq)
+        mean_sq := (sq_sum / (D * 1.0)) + safe_eps
+        mut inv_rms := 0.0
+        if mean_sq > 0.0 {
+            inv_rms = 1.0 / sqrt_f64(mean_sq)
+        }
         col = 0
         while col < D {
             v := ptr_read_f32(ptr, row_base + col)
@@ -173,4 +231,161 @@ fn rmsnorm_2d[sym S, comptime D: usize](x: Tensor[f32, [S, D]], eps: f64) -> f64
 @nan_guard
 fn det_reduce_tensor_2d[sym B, sym S](x: Tensor[f32, [B, S]]) -> f64 {
     return det_sum_f32_ptr(tensor_ptr(x), tensor_numel(x))
+}
+
+// --- 5. FlashAttention-2 Tiled Online Softmax Kernel ---
+// Implements Tri Dao's FlashAttention-2 online running softmax algorithm:
+//   m_i = max(m_{i-1}, x)
+//   l_i = l_{i-1} * exp(m_{i-1} - m_i) + sum(exp(x - m_i))
+// Tiled across keys/values in cache blocks of 64 tokens.
+// O(1) extra memory: zero heap allocation of the S x S attention matrix.
+// Accelerated with hardware AVX2 FMA dot products (dlpack_dot_f32) and vector scale-add (dlpack_scale_add_f32).
+
+@no_alloc
+fn fast_exp_f32(x: f64) -> f64 {
+    if x <= -80.0 { return 0.0 }
+    if x >= 80.0 { return 554062238439351005257890000000000000.0 }
+    inv_ln2 := 1.4426950408889634
+    ln2_hi := 0.6931471803691238
+    ln2_lo := 0.00000000019082149292705877
+    scaled := x * inv_ln2
+    mut k := 0
+    if scaled >= 0.0 {
+        k = (scaled + 0.5) as i64
+    } else {
+        k = (scaled - 0.5) as i64
+    }
+    kf := k as f64
+    r := (x - kf * ln2_hi) - kf * ln2_lo
+    mut p := 1.0 + r * 0.16666666666666666
+    p = 1.0 + r * 0.2 * p
+    p = 1.0 + r * 0.25 * p
+    p = 1.0 + r * 0.3333333333333333 * p
+    p = 1.0 + r * 0.5 * p
+    er := 1.0 + r * p
+    mut exp_scale := 1.0
+    if k >= 0 {
+        if (k & 1) != 0 { exp_scale = exp_scale * 2.0 }
+        if (k & 2) != 0 { exp_scale = exp_scale * 4.0 }
+        if (k & 4) != 0 { exp_scale = exp_scale * 16.0 }
+        if (k & 8) != 0 { exp_scale = exp_scale * 256.0 }
+        if (k & 16) != 0 { exp_scale = exp_scale * 65536.0 }
+        if (k & 32) != 0 { exp_scale = exp_scale * 4294967296.0 }
+        if (k & 64) != 0 { exp_scale = exp_scale * 18446744073709551616.0 }
+    } else {
+        ek := 0 - k
+        if (ek & 1) != 0 { exp_scale = exp_scale * 0.5 }
+        if (ek & 2) != 0 { exp_scale = exp_scale * 0.25 }
+        if (ek & 4) != 0 { exp_scale = exp_scale * 0.0625 }
+        if (ek & 8) != 0 { exp_scale = exp_scale * 0.00390625 }
+        if (ek & 16) != 0 { exp_scale = exp_scale * 0.0000152587890625 }
+        if (ek & 32) != 0 { exp_scale = exp_scale * 0.00000000023283064365386963 }
+        if (ek & 64) != 0 { exp_scale = exp_scale * 0.00000000000000000005421010862427522 }
+    }
+    return er * exp_scale
+}
+
+fn flash_attention_2_tiled(q: i64, k: i64, v: i64, out: i64, seq_len: i64, head_dim: i64, scratch: i64 = 0) {
+    if q == 0 or k == 0 or v == 0 or out == 0 or seq_len <= 0 or head_dim <= 0 { return }
+
+    inv_sqrt_d := 1.0 / sqrt_f64(head_dim as f64)
+    stride_bytes := head_dim * 4
+    mut block_scores := scratch
+    mut must_free := false
+    if block_scores == 0 {
+        block_scores = mem_alloc_aligned(32 * 4 + 64)
+        if block_scores == 0 { return }
+        must_free = true
+    }
+
+    mut qi := 0
+    while qi < seq_len {
+        q_row_ptr := q + qi * stride_bytes
+        out_row_ptr := out + qi * stride_bytes
+
+        mut d := 0
+        while d < head_dim {
+            ptr_write_f32(out_row_ptr, d, 0.0)
+            d += 1
+        }
+
+        mut m := 0.0
+        mut has_m := false
+        mut l := 0.0
+        mut l_comp := 0.0
+
+        mut block_start := 0
+        while block_start < seq_len {
+            mut block_len := 32
+            if block_start + block_len > seq_len {
+                block_len = seq_len - block_start
+            }
+
+            mut m_block := 0.0
+            mut bi := 0
+            while bi < block_len {
+                key_idx := block_start + bi
+                k_row_ptr := k + key_idx * stride_bytes
+                score := dlpack_dot_f32(q_row_ptr, k_row_ptr, head_dim) * inv_sqrt_d
+                ptr_write_f32(block_scores, bi, score)
+                if bi == 0 or score > m_block {
+                    m_block = score
+                }
+                bi += 1
+            }
+
+            mut m_new := m_block
+            if has_m and m > m_new {
+                m_new = m
+            }
+            mut alpha := 0.0
+            if has_m {
+                alpha = fast_exp_f32(m - m_new)
+            }
+            l = l * alpha
+            l_comp = l_comp * alpha
+
+            if has_m and alpha != 1.0 {
+                d = 0
+                while d < head_dim {
+                    cur_val := ptr_read_f32(out_row_ptr, d)
+                    ptr_write_f32(out_row_ptr, d, cur_val * alpha)
+                    d += 1
+                }
+            }
+
+            bi = 0
+            while bi < block_len {
+                score := ptr_read_f32(block_scores, bi)
+                p := fast_exp_f32(score - m_new)
+                y := p - l_comp
+                t := l + y
+                l_comp = (t - l) - y
+                l = t
+
+                key_idx := block_start + bi
+                v_row_ptr := v + key_idx * stride_bytes
+                dlpack_scale_add_f32(out_row_ptr, v_row_ptr, p, head_dim)
+                bi += 1
+            }
+
+            m = m_new
+            has_m = true
+            block_start += 32
+        }
+
+        inv_l := 1.0 / (l + 0.000000000001)
+        d = 0
+        while d < head_dim {
+            cur_o := ptr_read_f32(out_row_ptr, d)
+            ptr_write_f32(out_row_ptr, d, cur_o * inv_l)
+            d += 1
+        }
+
+        qi += 1
+    }
+
+    if must_free {
+        mem_free_aligned(block_scores)
+    }
 }

@@ -265,14 +265,42 @@ fn rx_compile_branch(pattern: str, b_start: i64, b_end: i64, code: IntBuf) -> i6
 
 fn regex_compile(pattern: str) -> Regex ! i64 {
     n := str_len(pattern)
+    if n > 65536 {
+        return err(413)
+    }
     if n == 0 {
         code := ibuf_new(4)
         ibuf_push(code, 255) // OP_MATCH
         return ok(Regex(code = code, has_start_anchor = false, has_end_anchor = false))
     }
 
+    // Pre-count unescaped top-level '|' alternations to size `branches` safely
+    mut pipe_cnt := 0
+    mut pk := 0
+    mut p_in_bracket := false
+    while pk < n {
+        pch := str_byte(pattern, pk)
+        if pch == 92 and pk + 1 < n {
+            pk += 2
+        } else if pch == 91 and not p_in_bracket {
+            p_in_bracket = true
+            pk += 1
+        } else if pch == 93 and p_in_bracket {
+            p_in_bracket = false
+            pk += 1
+        } else if pch == 124 and not p_in_bracket {
+            pipe_cnt += 1
+            pk += 1
+        } else {
+            pk += 1
+        }
+    }
+    if pipe_cnt > 2048 {
+        return err(413)
+    }
+
     // Split top-level '|' branches (respecting '\' escapes and '[...]' classes)
-    branches := ibuf_new(16)
+    branches := ibuf_new(pipe_cnt * 2 + 4)
     mut seg_start := 0
     mut k := 0
     mut in_bracket := false
@@ -355,6 +383,20 @@ fn regex_compile(pattern: str) -> Regex ! i64 {
     return ok(Regex(code = code, has_start_anchor = has_start, has_end_anchor = has_end))
 }
 
+fn regex_free(move rx: Regex) {
+    buf_free(move rx.code)
+}
+
+fn rx_consume_fuel(fuel: IntBuf, cost: i64) -> bool {
+    rem := ibuf_get(fuel, 0)
+    if rem < cost {
+        ibuf_set(fuel, 0, 0)
+        return false
+    }
+    ibuf_set(fuel, 0, rem - cost)
+    return true
+}
+
 fn rx_match_charset(code: IntBuf, pc: i64, ch: i64) -> bool {
     is_neg := ibuf_get(code, pc + 1)
     item_count := ibuf_get(code, pc + 3)
@@ -378,18 +420,23 @@ fn rx_match_charset(code: IntBuf, pc: i64, ch: i64) -> bool {
     return in_set
 }
 
-fn rx_exec_vm(code: IntBuf, start_pc: i64, text: str, text_start: i64, budget: IntBuf) -> i64 {
+fn rx_exec_vm(code: IntBuf, start_pc: i64, text: str, text_start: i64, fuel: IntBuf, depth: i64 = 0) -> i64 {
+    if depth > 128 {
+        return -2
+    }
     tlen := str_len(text)
+    if text_start < 0 or text_start > tlen {
+        return -1
+    }
     mut pc := start_pc
     mut tp := text_start
     clen := ibuf_len(code)
+    text_p := text as i64
 
-    while pc < clen {
-        rem := ibuf_get(budget, 0)
-        if rem <= 0 {
+    while pc >= 0 and pc < clen {
+        if not rx_consume_fuel(fuel, 1) {
             return -2
         }
-        ibuf_set(budget, 0, rem - 1)
 
         op := ibuf_get(code, pc)
 
@@ -399,39 +446,40 @@ fn rx_exec_vm(code: IntBuf, start_pc: i64, text: str, text_start: i64, budget: I
             pc = ibuf_get(code, pc + 1)
         } else if op == 70 { // OP_ALT
             alt_pc := ibuf_get(code, pc + 1)
-            r1 := rx_exec_vm(code, pc + 2, text, tp, budget)
+            r1 := rx_exec_vm(code, pc + 2, text, tp, fuel, depth + 1)
             if r1 == -2 { return -2 }
             if r1 >= 0 { return (tp - text_start) + r1 }
-            r2 := rx_exec_vm(code, alt_pc, text, tp, budget)
-            if r2 == -2 { return -2 }
-            if r2 >= 0 { return (tp - text_start) + r2 }
-            return -1
+            // Tail-step to alt_pc iteratively to prevent linear stack exhaustion on long a|b|c|... chains
+            pc = alt_pc
         } else if op == 11 { // OP_START (^)
             if tp != 0 { return -1 }
             pc += 1
         } else if op == 12 { // OP_END ($)
             if tp != tlen { return -1 }
             pc += 1
-        } else if op == 1 { // OP_CHAR
-            expected := ibuf_get(code, pc + 1)
-            if tp >= tlen or str_byte(text, tp) != expected { return -1 }
-            tp += 1
-            pc += 2
+        } else if op == 1 { // OP_CHAR (unrolled fast literal scan with fuel accounting)
+            while pc + 1 < clen and ibuf_get(code, pc) == 1 {
+                expected := ibuf_get(code, pc + 1)
+                if tp >= tlen or ptr_read_u8(text_p + tp, 0) != expected { return -1 }
+                tp += 1
+                pc += 2
+                if not rx_consume_fuel(fuel, 1) { return -2 }
+            }
         } else if op == 2 { // OP_ANY (.)
             if tp >= tlen { return -1 }
-            ch := str_byte(text, tp)
+            ch := ptr_read_u8(text_p + tp, 0)
             if ch == 10 or ch == 13 { return -1 }
             tp += 1
             pc += 1
         } else if op >= 3 and op <= 8 { // OP_CLASS
-            if tp >= tlen or not rx_match_class(op, str_byte(text, tp)) { return -1 }
+            if tp >= tlen or not rx_match_class(op, ptr_read_u8(text_p + tp, 0)) { return -1 }
             tp += 1
             pc += 1
         } else if op == 9 { // OP_RANGE
             min_c := ibuf_get(code, pc + 1)
             max_c := ibuf_get(code, pc + 2)
             if tp >= tlen { return -1 }
-            ch := str_byte(text, tp)
+            ch := ptr_read_u8(text_p + tp, 0)
             if ch < min_c or ch > max_c { return -1 }
             tp += 1
             pc += 3
@@ -439,7 +487,7 @@ fn rx_exec_vm(code: IntBuf, start_pc: i64, text: str, text_start: i64, budget: I
             min_c := ibuf_get(code, pc + 1)
             max_c := ibuf_get(code, pc + 2)
             if tp >= tlen { return -1 }
-            ch := str_byte(text, tp)
+            ch := ptr_read_u8(text_p + tp, 0)
             if ch >= min_c and ch <= max_c { return -1 }
             tp += 1
             pc += 3
@@ -448,14 +496,15 @@ fn rx_exec_vm(code: IntBuf, start_pc: i64, text: str, text_start: i64, budget: I
             max_cap := if op == 22 { 1 } else { tlen - tp }
             mut count := 0
             while count < max_cap and tp + count < tlen {
-                ch := str_byte(text, tp + count)
+                if not rx_consume_fuel(fuel, 1) { return -2 }
+                ch := ptr_read_u8(text_p + tp + count, 0)
                 if ch == 10 or ch == 13 { break }
                 count += 1
             }
             if count < min_req { return -1 }
             mut try_cnt := count
             while try_cnt >= min_req {
-                sub_res := rx_exec_vm(code, pc + 1, text, tp + try_cnt, budget)
+                sub_res := rx_exec_vm(code, pc + 1, text, tp + try_cnt, fuel, depth + 1)
                 if sub_res == -2 { return -2 }
                 if sub_res >= 0 {
                     return (tp - text_start) + try_cnt + sub_res
@@ -468,13 +517,14 @@ fn rx_exec_vm(code: IntBuf, start_pc: i64, text: str, text_start: i64, budget: I
             min_req := if op == 31 { 1 } else { 0 }
             max_cap := if op == 32 { 1 } else { tlen - tp }
             mut count := 0
-            while count < max_cap and tp + count < tlen and str_byte(text, tp + count) == expected {
+            while count < max_cap and tp + count < tlen and ptr_read_u8(text_p + tp + count, 0) == expected {
+                if not rx_consume_fuel(fuel, 1) { return -2 }
                 count += 1
             }
             if count < min_req { return -1 }
             mut try_cnt := count
             while try_cnt >= min_req {
-                sub_res := rx_exec_vm(code, pc + 2, text, tp + try_cnt, budget)
+                sub_res := rx_exec_vm(code, pc + 2, text, tp + try_cnt, fuel, depth + 1)
                 if sub_res == -2 { return -2 }
                 if sub_res >= 0 {
                     return (tp - text_start) + try_cnt + sub_res
@@ -487,13 +537,14 @@ fn rx_exec_vm(code: IntBuf, start_pc: i64, text: str, text_start: i64, budget: I
             min_req := if op == 41 { 1 } else { 0 }
             max_cap := if op == 42 { 1 } else { tlen - tp }
             mut count := 0
-            while count < max_cap and tp + count < tlen and rx_match_class(cls_op, str_byte(text, tp + count)) {
+            while count < max_cap and tp + count < tlen and rx_match_class(cls_op, ptr_read_u8(text_p + tp + count, 0)) {
+                if not rx_consume_fuel(fuel, 1) { return -2 }
                 count += 1
             }
             if count < min_req { return -1 }
             mut try_cnt := count
             while try_cnt >= min_req {
-                sub_res := rx_exec_vm(code, pc + 2, text, tp + try_cnt, budget)
+                sub_res := rx_exec_vm(code, pc + 2, text, tp + try_cnt, fuel, depth + 1)
                 if sub_res == -2 { return -2 }
                 if sub_res >= 0 {
                     return (tp - text_start) + try_cnt + sub_res
@@ -511,7 +562,8 @@ fn rx_exec_vm(code: IntBuf, start_pc: i64, text: str, text_start: i64, budget: I
             max_cap := if is_opt { 1 } else { tlen - tp }
             mut count := 0
             while count < max_cap and tp + count < tlen {
-                ch := str_byte(text, tp + count)
+                if not rx_consume_fuel(fuel, 1) { return -2 }
+                ch := ptr_read_u8(text_p + tp + count, 0)
                 in_range := (ch >= min_c and ch <= max_c)
                 matched := if is_neg { not in_range } else { in_range }
                 if not matched { break }
@@ -520,7 +572,7 @@ fn rx_exec_vm(code: IntBuf, start_pc: i64, text: str, text_start: i64, budget: I
             if count < min_req { return -1 }
             mut try_cnt := count
             while try_cnt >= min_req {
-                sub_res := rx_exec_vm(code, pc + 3, text, tp + try_cnt, budget)
+                sub_res := rx_exec_vm(code, pc + 3, text, tp + try_cnt, fuel, depth + 1)
                 if sub_res == -2 { return -2 }
                 if sub_res >= 0 {
                     return (tp - text_start) + try_cnt + sub_res
@@ -532,8 +584,10 @@ fn rx_exec_vm(code: IntBuf, start_pc: i64, text: str, text_start: i64, budget: I
             quant := ibuf_get(code, pc + 2)
             item_count := ibuf_get(code, pc + 3)
             next_pc := pc + 4 + item_count * 2
+            item_cost := if item_count > 1 { item_count } else { 1 }
             if quant == 0 {
-                if tp >= tlen or not rx_match_charset(code, pc, str_byte(text, tp)) {
+                if not rx_consume_fuel(fuel, item_cost) { return -2 }
+                if tp >= tlen or not rx_match_charset(code, pc, ptr_read_u8(text_p + tp, 0)) {
                     return -1
                 }
                 tp += 1
@@ -543,7 +597,8 @@ fn rx_exec_vm(code: IntBuf, start_pc: i64, text: str, text_start: i64, budget: I
                 max_cap := if quant == 3 { 1 } else { tlen - tp }
                 mut count := 0
                 while count < max_cap and tp + count < tlen {
-                    if not rx_match_charset(code, pc, str_byte(text, tp + count)) {
+                    if not rx_consume_fuel(fuel, item_cost) { return -2 }
+                    if not rx_match_charset(code, pc, ptr_read_u8(text_p + tp + count, 0)) {
                         break
                     }
                     count += 1
@@ -551,7 +606,7 @@ fn rx_exec_vm(code: IntBuf, start_pc: i64, text: str, text_start: i64, budget: I
                 if count < min_req { return -1 }
                 mut try_cnt := count
                 while try_cnt >= min_req {
-                    sub_res := rx_exec_vm(code, next_pc, text, tp + try_cnt, budget)
+                    sub_res := rx_exec_vm(code, next_pc, text, tp + try_cnt, fuel, depth + 1)
                     if sub_res == -2 { return -2 }
                     if sub_res >= 0 {
                         return (tp - text_start) + try_cnt + sub_res
@@ -569,27 +624,37 @@ fn rx_exec_vm(code: IntBuf, start_pc: i64, text: str, text_start: i64, budget: I
 }
 
 fn rx_exec_at_pc(code: IntBuf, start_pc: i64, text: str, text_start: i64) -> i64 {
-    budget := ibuf_new(1)
-    ibuf_push(budget, 200000)
-    res := rx_exec_vm(code, start_pc, text, text_start, budget)
-    buf_free(move budget)
+    fuel := ibuf_new(1)
+    mut budget := str_len(text) * 4
+    if budget < 25000 { budget = 25000 }
+    if budget > 2000000 { budget = 2000000 }
+    ibuf_push(fuel, budget)
+    res := rx_exec_vm(code, start_pc, text, text_start, fuel, 0)
+    buf_free(move fuel)
     if res == -2 { return -1 }
     return res
 }
 
 fn rx_exec_at(code: IntBuf, text: str, text_start: i64) -> i64 {
+    if ibuf_len(code) > 0 and ibuf_get(code, 0) == 11 and text_start != 0 {
+        return -1
+    }
     return rx_exec_at_pc(code, 0, text, text_start)
 }
 
 fn regex_find(pattern: str, text: str) -> RegexMatch ! i64 {
     rx := regex_compile(pattern) or return err(400)
     tlen := str_len(text)
-    budget := ibuf_new(1)
-    ibuf_push(budget, 200000)
+
+    fuel := ibuf_new(1)
+    mut budget := tlen * 4
+    if budget < 25000 { budget = 25000 }
+    if budget > 2000000 { budget = 2000000 }
+    ibuf_push(fuel, budget)
 
     if rx.has_start_anchor {
-        matched_len := rx_exec_vm(rx.code, 0, text, 0, budget)
-        buf_free(move budget)
+        matched_len := rx_exec_vm(rx.code, 0, text, 0, fuel, 0)
+        buf_free(move fuel)
         buf_free(move rx.code)
         if matched_len >= 0 {
             return ok(RegexMatch(start = 0, end = matched_len, len = matched_len))
@@ -599,19 +664,19 @@ fn regex_find(pattern: str, text: str) -> RegexMatch ! i64 {
 
     mut i := 0
     while i <= tlen {
-        matched_len := rx_exec_vm(rx.code, 0, text, i, budget)
+        matched_len := rx_exec_vm(rx.code, 0, text, i, fuel, 0)
         if matched_len == -2 {
             break
         }
         if matched_len >= 0 {
-            buf_free(move budget)
+            buf_free(move fuel)
             buf_free(move rx.code)
             return ok(RegexMatch(start = i, end = i + matched_len, len = matched_len))
         }
         i += 1
     }
 
-    buf_free(move budget)
+    buf_free(move fuel)
     buf_free(move rx.code)
     return err(404)
 }

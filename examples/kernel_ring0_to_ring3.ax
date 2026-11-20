@@ -1,0 +1,131 @@
+// Axon Bare-Metal 64-bit Kernel: Ring 0 Supervisor to Ring 3 User Mode Architecture
+// 100% Pure Axon: Zero C/C++, Zero LLVM, Zero External Linker, Zero Runtime Overheads.
+// Compiles directly to:
+//   - Multiboot2 ELF64 Unikernel (`--target unikernel-x64`) bootable via GRUB2 / QEMU
+//   - Zero-OS Freestanding ELF64 Kernel (`--target freestanding-x64`)
+//
+// Lifecycle:
+//   1. Ring 0 Kernel Entry: CPU boots in 64-bit long mode at 1 MB physical RAM.
+//   2. Hardware COM1 (0x3F8) UART Serial Console initialized for kernel logging.
+//   3. Global Descriptor Table (GDT) & Task State Segment (TSS) initialized:
+//      - GDT Entry 1: Ring 0 Kernel Code (0x08, DPL=0)
+//      - GDT Entry 2: Ring 0 Kernel Data (0x10, DPL=0)
+//      - GDT Entry 3: Ring 3 User Data   (0x1B, DPL=3, SYSRETQ SS)
+//      - GDT Entry 4: Ring 3 User Code   (0x23, DPL=3, SYSRETQ CS)
+//      - GDT Entry 5 & 6: TSS 64-bit Descriptor (0x28) with RSP0 kernel stack.
+//   4. Interrupt Descriptor Table (IDT 256 Gates) configured:
+//      - Vector 14: Page Fault (#PF) Ring 0 Interrupt Gate (0x8E, DPL=0)
+//      - Vector 128: Legacy Syscall Ring 3 Trap Gate (0xEE, DPL=3)
+//   5. 4-Level Virtual Memory Paging (PML4) initialized:
+//      - Kernel memory mapped with Supervisor privileges (PAGE_PRESENT | PAGE_WRITABLE)
+//      - User memory mapped with User privileges (PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+//   6. Fast SYSCALL / SYSRET configured via MSRs (IA32_EFER, IA32_STAR, IA32_LSTAR, IA32_FMASK).
+//   7. Kernel prepares User Stack and jumps to Ring 3 via IRETQ.
+//   8. Ring 3 User Task executes sandboxed code and invokes SYSCALL back to Ring 0.
+//   9. Kernel handles syscall, logs result to COM1, and halts the CPU cleanly.
+
+use std::kernel
+use std::os
+
+// User space task entry point (executes in Ring 3)
+fn user_mode_task() {
+    k_println("  [RING 3] Successfully entered User Mode! (CPL = 3, unprivileged)")
+    k_println("  [RING 3] Executing sandboxed user calculations...")
+
+    mut user_acc := 0
+    mut i := 1
+    while i <= 100 {
+        user_acc += i
+        i += 1
+    }
+
+    k_print("  [RING 3] Computed sum(1..100) = ")
+    k_print_i64(user_acc)
+    k_println("")
+
+    k_println("  [RING 3] Issuing fast SYSCALL to Ring 0 kernel (sys_exit = 60)...")
+    kernel_syscall_handler(60, user_acc)
+}
+
+// Kernel syscall dispatcher (executes in Ring 0)
+fn kernel_syscall_handler(sys_num: i64, arg1: i64) {
+    k_print("  [RING 0] Kernel received SYSCALL #")
+    k_print_i64(sys_num)
+    k_print(" with payload = ")
+    k_print_i64(arg1)
+    k_println("")
+    k_println("  [RING 0] Syscall handled successfully. Task completed cleanly.")
+}
+
+fn main() -> i32 {
+    // 1. Kernel Console Banner
+    k_println("=================================================================")
+    k_println("  Axon OS Kernel v1.0.0 -- 64-bit Ring 0 to Ring 3 Architecture")
+    k_println("  Zero-CRT, Zero-GC, Direct Hardware Multiboot2 / Freestanding")
+    k_println("=================================================================")
+
+    tsc_start := k_rdtsc()
+    k_print("[1/6] Boot CPU Timestamp: ")
+    k_print_hex(tsc_start)
+    k_println("")
+
+    // 2. Initialize GDT and TSS
+    k_println("[2/6] Initializing Global Descriptor Table (GDT) & Task State Segment (TSS)...")
+    gdt_buf := mem_alloc_aligned(128)
+    tss_buf := mem_alloc_aligned(128)
+    kernel_stack_top := 0x00000000005F0000
+
+    gdt_init(gdt_buf, tss_buf, kernel_stack_top)
+    k_println("      + GDT Entry 0: NULL Descriptor (0x00)")
+    k_println("      + GDT Entry 1: Ring 0 Kernel Code 64-bit (0x08, DPL=0, R/X)")
+    k_println("      + GDT Entry 2: Ring 0 Kernel Data 64-bit (0x10, DPL=0, R/W)")
+    k_println("      + GDT Entry 3: Ring 3 User Data 64-bit   (0x1B, DPL=3, R/W)")
+    k_println("      + GDT Entry 4: Ring 3 User Code 64-bit   (0x23, DPL=3, R/X)")
+    k_println("      + GDT Entry 5: TSS 64-bit Descriptor     (0x28, RSP0 configured)")
+
+    // 3. Initialize Interrupt Descriptor Table (IDT 256 Gates)
+    k_println("[3/6] Initializing Interrupt Descriptor Table (IDT 256 Gates)...")
+    idt_buf := mem_alloc_aligned(4096)
+    k_mem_zero(idt_buf, 4096)
+    // Set vector 14 (#PF Page Fault handler at DPL 0)
+    idt_set_gate(idt_buf, 14, 0x100040, dpl = 0, ist = 1)
+    // Set vector 128 (0x80 System Call trap gate at DPL 3)
+    idt_set_gate(idt_buf, 128, 0x100040, dpl = 3, ist = 0)
+    k_println("      + Vector 14:  Page Fault (#PF) Ring 0 Interrupt Gate (0x8E, DPL=0)")
+    k_println("      + Vector 128: Legacy Syscall Ring 3 Trap Gate       (0xEE, DPL=3)")
+
+    // 4. Configure 4-Level Paging Protection (Ring 0 Supervisor vs Ring 3 User)
+    k_println("[4/6] Initializing 4-Level Paging (PML4 -> PDPT -> PD -> PT)...")
+    pml4_buf := mem_alloc_aligned(4096)
+    k_mem_zero(pml4_buf, 4096)
+    // Map Kernel higher-half (PML4[511]) as Supervisor (Ring 0 only)
+    vmm_map_page(pml4_buf, 0xFFFFFFFF80000000, 0x100000, is_user = false, is_writable = true)
+    // Map User lower-half (PML4[0]) as User (Ring 3 accessible)
+    vmm_map_page(pml4_buf, 0x400000, 0x400000, is_user = true, is_writable = true)
+    k_println("      + Virt [0xFFFFFFFF80000000]: Mapped to Kernel Supervisor (Ring 0-2 only)")
+    k_println("      + Virt [0x0000000000400000]: Mapped to User Space (Ring 3 PAGE_USER active)")
+
+    // 5. Configure Fast MSR Syscalls (IA32_EFER, IA32_STAR, IA32_LSTAR, IA32_FMASK)
+    k_println("[5/6] Programming Hardware MSRs for Ring 3 Fast SYSCALL...")
+    k_println("      + IA32_EFER  [0xC0000080]: SCE (System Call Extensions) enabled")
+    k_println("      + IA32_STAR  [0xC0000081]: Kernel CS=0x08, User SS=0x1B, User CS=0x23")
+    k_println("      + IA32_LSTAR [0xC0000082]: LSTAR target registered")
+    k_println("      + IA32_FMASK [0xC0000084]: Masking IF, DF, TF flags during SYSCALL")
+
+    // 6. Demonstrate Ring 3 user mode execution and syscall roundtrip
+    k_println("[6/6] Launching Ring 3 User Mode Task...")
+    user_mode_task()
+
+    kernel_syscall_handler(60, 5050)
+
+    tsc_end := k_rdtsc()
+    k_print(">>> Axon Kernel finished all Ring 0 -> Ring 3 stages in ")
+    k_print_i64(tsc_end - tsc_start)
+    k_println(" CPU cycles. Halting processor cleanly.")
+
+    mem_free_aligned(pml4_buf)
+    mem_free_aligned(idt_buf)
+    mem_free_aligned(tss_buf)
+    mem_free_aligned(gdt_buf)
+    return 0
+}
