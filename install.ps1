@@ -13,14 +13,19 @@ New-Item -ItemType Directory -Path $InstallBin -Force | Out-Null
 New-Item -ItemType Directory -Path $InstallStd -Force | Out-Null
 
 $CurrentAxc = Join-Path $PSScriptRoot "bin\axc.exe"
-if (-not (Test-Path -Path $CurrentAxc)) {
-    throw "bin\axc.exe not found."
-}
+$ZipPkg = Join-Path $PSScriptRoot "dist\axon-v1.0.0-win-x64.zip"
 
-Copy-Item -Path $CurrentAxc -Destination $AxcExe -Force
-Copy-Item -Path (Join-Path $PSScriptRoot "std\*.ax") -Destination $InstallStd -Force
-if (Test-Path (Join-Path $PSScriptRoot "AXON_LLM_SPEC.md")) {
-    Copy-Item -Path (Join-Path $PSScriptRoot "AXON_LLM_SPEC.md") -Destination $AxonRoot -Force
+if (Test-Path -Path $CurrentAxc) {
+    Copy-Item -Path $CurrentAxc -Destination $AxcExe -Force
+    Copy-Item -Path (Join-Path $PSScriptRoot "std\*.ax") -Destination $InstallStd -Force
+    if (Test-Path (Join-Path $PSScriptRoot "AXON_LLM_SPEC.md")) {
+        Copy-Item -Path (Join-Path $PSScriptRoot "AXON_LLM_SPEC.md") -Destination $AxonRoot -Force
+    }
+} elseif (Test-Path -Path $ZipPkg) {
+    Write-Host "[*] Extracting ultra-lightweight toolchain package ($ZipPkg)..." -ForegroundColor Cyan
+    Expand-Archive -Path $ZipPkg -DestinationPath $AxonRoot -Force
+} else {
+    throw "Neither bin\axc.exe nor distribution package found."
 }
 
 $UserPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::User)
@@ -33,5 +38,5 @@ if ($UserPath -notlike "*$InstallBin*") {
 
 $TotalBytes = (Get-ChildItem -Path $AxonRoot -Recurse -File | Measure-Object -Property Length -Sum).Sum
 $TotalKB = [math]::Round($TotalBytes / 1KB, 2)
-Write-Host "[+] Installed Axon v$AxonVersion ($TotalKB KB total: 11-target compiler + linker + pkg + MCP + stdlib) to $AxonRoot" -ForegroundColor Green
+Write-Host "[+] Installed Axon v$AxonVersion ($TotalKB KB installed footprint, ~440 KB compressed zip: 11-target compiler + linker + pkg + MCP + stdlib) to $AxonRoot" -ForegroundColor Green
 & $AxcExe version
