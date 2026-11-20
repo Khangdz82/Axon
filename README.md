@@ -16,8 +16,7 @@ The entire compiler (`compiler_ax/`, `17` modules, `23,763` lines) is written in
 - **Documentation & Learning:**
   - **English Complete Guide (16 Chapters):** [`LEARN_AXON_EN.md`](LEARN_AXON_EN.md)
   - **Giáo trình Tiếng Việt (16 Chương):** [`LEARN_AXON_VI.md`](LEARN_AXON_VI.md)
-  - **AI Coding Agents Spec (`axc check --json`, `axc mcp`):** [`AXON_LLM_SPEC.md`](AXON_LLM_SPEC.md)
-  - **Milestone Tracker & Architecture Memory:** [`PROGRESS.md`](PROGRESS.md) | [`memory.md`](memory.md)
+  - **AI Coding Agents Guide & Full-Stack Recipes:** [`AGENTS.md`](AGENTS.md) | [`docs/AGENT_FULLSTACK_GUIDE.md`](docs/AGENT_FULLSTACK_GUIDE.md) | [`AXON_LLM_SPEC.md`](AXON_LLM_SPEC.md)
 
 ---
 
@@ -189,20 +188,21 @@ Measured live on **Intel Core i5-10400F (6C/12T), 31.87 GB RAM, Windows 10 x64**
 │   └── axc-macos-arm64         # Cross-compiled Axon v1.0.0 Apple Silicon compiler (720.06 KB / 737,344 B)
 ├── playground/
 │   └── index.html              # Zero-dependency browser Axon -> WASM32+SIMD128 IDE & runner
-├── compiler_ax/                # 17 pure Axon compiler modules (23,763 lines)
-├── std/                        # 34 pure Axon standard library modules (9,710 lines)
-├── examples/                   # Quickstart & benchmark examples (`hello.ax`, `v5_showcase.ax`, ...)
+├── compiler_ax/                # 18 pure Axon compiler modules (self-hosted, zero LLVM/C/Rust)
+├── std/                        # 78 pure Axon stdlib modules (net, tls, postgres, mysql, sqlite, grpc, gui, ffi, sys, vec, ai, game, crypto)
+├── examples/                   # Quickstart, native HTML/Tailwind UI, kernel & 9-language benchmark suite
 ├── tests/
-│   ├── pass/                   # 27 end-to-end native, AI, Game2D/3D, stdlib & security tests
-│   ├── fail_compile/           # 25 static compile-time rejection gates
+│   ├── pass/                   # 56 end-to-end native, full-stack, AI, Game2D/3D, generics & security tests
+│   ├── fail_compile/           # 34 static compile-time rejection gates (incl. E0503 unsafe)
+│   ├── audit/                  # Continuous parser, MCP security & memory-leak soak fuzzers
 │   └── wasm/                   # WASM32 dynamic growth test + Node WASI runner (`wasi_run.mjs`)
 ├── docs/
-│   └── BENCHMARK_REPORT.md     # Reproducible B1-B10 benchmark report & honest caveats
+│   ├── AGENT_FULLSTACK_GUIDE.md # Complete copy-paste full-stack production recipes for AI agents
+│   └── BENCHMARK_REPORT.md     # Reproducible benchmark report
+├── AGENTS.md                   # Mandatory AI coding agent rules & 78-module lookup matrix
 ├── AXON_LLM_SPEC.md            # Compact spec for AI coding agents (`axc mcp`)
 ├── LEARN_AXON_EN.md            # Complete 16-chapter English textbook
-├── LEARN_AXON_VI.md            # Complete 16-chapter Vietnamese textbook
-├── PROGRESS.md                 # Full milestone tracker (M0-M36, v5.0-v1.0.0)
-└── memory.md                   # Canonical project architecture & invariant summary
+└── LEARN_AXON_VI.md            # Complete 16-chapter Vietnamese textbook
 ```
 
 ```powershell

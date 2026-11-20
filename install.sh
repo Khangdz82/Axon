@@ -20,13 +20,8 @@ elif [ "${OS_NAME}" = "Linux" ] && [ "${ARCH_NAME}" = "x86_64" ] && [ -f "./bin/
     cp "./bin/axc-linux-x64" "${AXC_BIN}"
 elif [ "${OS_NAME}" = "Darwin" ] && [ "${ARCH_NAME}" = "arm64" ] && [ -f "./bin/axc-macos-arm64" ]; then
     cp "./bin/axc-macos-arm64" "${AXC_BIN}"
-elif command -v cargo >/dev/null 2>&1; then
-    echo "[*] Building Stage-0 native compiler from bootstrap_archive/axc_native..."
-    cargo build --release --manifest-path bootstrap_archive/axc_native/Cargo.toml
-    cp "bootstrap_archive/axc_native/target/release/axc" "${AXC_BIN}"
-    cargo clean --manifest-path bootstrap_archive/axc_native/Cargo.toml
 else
-    echo "[-] No prebuilt ./bin/axc binary for ${OS_NAME}-${ARCH_NAME} and cargo is unavailable." >&2
+    echo "[-] No prebuilt ./bin/axc binary for ${OS_NAME}-${ARCH_NAME}. Cross-compile with: axc build compiler_ax/main.ax --target <target> -o bin/axc" >&2
     exit 1
 fi
 
