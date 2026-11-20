@@ -841,8 +841,27 @@ fn parse_prec(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 
     return parse_prec_lvl(toks, pool, nodes, extra)
 }
 
-fn parse_mul_div(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
+fn parse_pow(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
     mut lhs := parse_unary(toks, pool, nodes, extra)
+    if p_peek(toks, nodes) == tk_starstar() {
+        if not p_depth_enter(toks, nodes, extra) {
+            return lhs
+        }
+        sp := p_span(toks, nodes)
+        p_advance(nodes)
+        rhs := parse_pow(toks, pool, nodes, extra)
+        p_depth_leave(extra)
+        bn := ast_alloc(nodes, nk_binary(), sp)
+        ast_set(nodes, bn, 1, op_pow())
+        ast_set(nodes, bn, 2, lhs)
+        ast_set(nodes, bn, 3, rhs)
+        return bn
+    }
+    return lhs
+}
+
+fn parse_mul_div(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
+    mut lhs := parse_pow(toks, pool, nodes, extra)
     while true {
         info := binop_prec_and_code(p_peek(toks, nodes))
         if (info >> 8) != 10 {
@@ -850,7 +869,7 @@ fn parse_mul_div(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i
         }
         sp := p_span(toks, nodes)
         p_advance(nodes)
-        rhs := parse_unary(toks, pool, nodes, extra)
+        rhs := parse_pow(toks, pool, nodes, extra)
         bn := ast_alloc(nodes, nk_binary(), sp)
         ast_set(nodes, bn, 1, info & 255)
         ast_set(nodes, bn, 2, lhs)
@@ -921,6 +940,35 @@ fn parse_bitwise(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i
 fn parse_cmp(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
     mut lhs := parse_bitwise(toks, pool, nodes, extra)
     while true {
+        if p_peek(toks, nodes) == tk_not() and p_peek_at(toks, nodes, 1) == tk_in() {
+            sp := p_span(toks, nodes)
+            p_advance(nodes)
+            p_advance(nodes)
+            min_e := parse_bitwise(toks, pool, nodes, extra)
+            p_expect(toks, nodes, tk_dotdot())
+            max_e := parse_bitwise(toks, pool, nodes, extra)
+            rn := ast_alloc(nodes, nk_in_range(), sp)
+            ast_set(nodes, rn, 1, 1)
+            ast_set(nodes, rn, 2, lhs)
+            ast_set(nodes, rn, 3, min_e)
+            ast_set(nodes, rn, 4, max_e)
+            lhs = rn
+            continue
+        }
+        if p_peek(toks, nodes) == tk_in() {
+            sp := p_span(toks, nodes)
+            p_advance(nodes)
+            min_e := parse_bitwise(toks, pool, nodes, extra)
+            p_expect(toks, nodes, tk_dotdot())
+            max_e := parse_bitwise(toks, pool, nodes, extra)
+            rn := ast_alloc(nodes, nk_in_range(), sp)
+            ast_set(nodes, rn, 1, 0)
+            ast_set(nodes, rn, 2, lhs)
+            ast_set(nodes, rn, 3, min_e)
+            ast_set(nodes, rn, 4, max_e)
+            lhs = rn
+            continue
+        }
         info := binop_prec_and_code(p_peek(toks, nodes))
         if (info >> 8) != 4 {
             break
@@ -1031,6 +1079,31 @@ fn parse_prec_lvl(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> 
             lhs = nc
         }
     }
+    // Python ternary expression: `lhs if cond else rhs`
+    if p_peek(toks, nodes) == tk_if() and lhs > 0 and tok_line(toks, p_pos(nodes)) == span_line(ast_span(nodes, lhs)) {
+        if not p_depth_enter(toks, nodes, extra) {
+            return lhs
+        }
+        sp_if := p_span(toks, nodes)
+        p_advance(nodes)
+        cond := parse_or_lvl(toks, pool, nodes, extra)
+        p_expect(toks, nodes, tk_else())
+        rhs := parse_prec_lvl(toks, pool, nodes, extra)
+        p_depth_leave(extra)
+        tb := ast_alloc(nodes, nk_block(), sp_if)
+        ast_set(nodes, tb, 1, 0)
+        ast_set(nodes, tb, 2, 0)
+        ast_set(nodes, tb, 3, lhs)
+        eb := ast_alloc(nodes, nk_block(), sp_if)
+        ast_set(nodes, eb, 1, 0)
+        ast_set(nodes, eb, 2, 0)
+        ast_set(nodes, eb, 3, rhs)
+        inid := ast_alloc(nodes, nk_if_expr(), sp_if)
+        ast_set(nodes, inid, 1, cond)
+        ast_set(nodes, inid, 2, tb)
+        ast_set(nodes, inid, 3, eb)
+        lhs = inid
+    }
     return lhs
 }
 
@@ -1041,6 +1114,46 @@ fn parse_expr(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 
 // --- Statements & Blocks ---
 fn parse_stmt(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
     return parse_stmt_body(toks, pool, nodes, extra)
+}
+
+fn parse_elif_chain(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
+    if not p_depth_enter(toks, nodes, extra) {
+        return 0
+    }
+    sp := p_span(toks, nodes)
+    p_advance(nodes)
+    sub_cond := parse_expr(toks, pool, nodes, extra)
+    p_eat(toks, nodes, tk_colon())
+    sub_then := parse_block(toks, pool, nodes, extra)
+    mut sub_else := 0
+    if p_eat(toks, nodes, tk_else()) {
+        p_eat(toks, nodes, tk_colon())
+        if p_peek(toks, nodes) == tk_if() {
+            sub_sub_if := parse_stmt(toks, pool, nodes, extra)
+            eb := ast_alloc(nodes, nk_block(), sp)
+            eoff := ibuf_len(extra)
+            ibuf_push(extra, sub_sub_if)
+            ast_set(nodes, eb, 1, eoff)
+            ast_set(nodes, eb, 2, 1)
+            sub_else = eb
+        } else {
+            sub_else = parse_block(toks, pool, nodes, extra)
+        }
+    } else if p_peek(toks, nodes) == tk_elif() {
+        next_elif := parse_elif_chain(toks, pool, nodes, extra)
+        eb := ast_alloc(nodes, nk_block(), sp)
+        eoff := ibuf_len(extra)
+        ibuf_push(extra, next_elif)
+        ast_set(nodes, eb, 1, eoff)
+        ast_set(nodes, eb, 2, 1)
+        sub_else = eb
+    }
+    p_depth_leave(extra)
+    inid := ast_alloc(nodes, nk_if(), sp)
+    ast_set(nodes, inid, 1, sub_cond)
+    ast_set(nodes, inid, 2, sub_then)
+    ast_set(nodes, inid, 3, sub_else)
+    return inid
 }
 
 fn parse_stmt_body(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i64 {
@@ -1220,7 +1333,7 @@ fn parse_stmt_body(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) ->
         return rn
     }
 
-    // 5. `break` & `continue`
+    // 5. `break` & `continue` & `pass`
     if k == tk_break() {
         p_advance(nodes)
         p_skip_semis(toks, nodes)
@@ -1231,14 +1344,24 @@ fn parse_stmt_body(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) ->
         p_skip_semis(toks, nodes)
         return ast_alloc(nodes, nk_continue(), sp)
     }
+    if k == tk_pass() {
+        p_advance(nodes)
+        p_skip_semis(toks, nodes)
+        pb := ast_alloc(nodes, nk_block(), sp)
+        ast_set(nodes, pb, 1, 0)
+        ast_set(nodes, pb, 2, 0)
+        return pb
+    }
 
-    // 6. `if cond { ... } [else if ... / else { ... }]`
+    // 6. `if cond { ... } [elif ... / else if ... / else { ... }]`
     if k == tk_if() {
         p_advance(nodes)
         cond := parse_expr(toks, pool, nodes, extra)
+        p_eat(toks, nodes, tk_colon())
         then_b := parse_block(toks, pool, nodes, extra)
         mut else_b := 0
         if p_eat(toks, nodes, tk_else()) {
+            p_eat(toks, nodes, tk_colon())
             if p_peek(toks, nodes) == tk_if() {
                 if p_depth_enter(toks, nodes, extra) {
                     sub_if := parse_stmt(toks, pool, nodes, extra)
@@ -1253,6 +1376,14 @@ fn parse_stmt_body(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) ->
             } else {
                 else_b = parse_block(toks, pool, nodes, extra)
             }
+        } else if p_peek(toks, nodes) == tk_elif() {
+            sub_if := parse_elif_chain(toks, pool, nodes, extra)
+            eb := ast_alloc(nodes, nk_block(), sp)
+            eoff := ibuf_len(extra)
+            ibuf_push(extra, sub_if)
+            ast_set(nodes, eb, 1, eoff)
+            ast_set(nodes, eb, 2, 1)
+            else_b = eb
         }
         inid := ast_alloc(nodes, nk_if(), sp)
         ast_set(nodes, inid, 1, cond)
@@ -1265,6 +1396,7 @@ fn parse_stmt_body(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) ->
     if k == tk_while() {
         p_advance(nodes)
         cond := parse_expr(toks, pool, nodes, extra)
+        p_eat(toks, nodes, tk_colon())
         body := parse_block(toks, pool, nodes, extra)
         wn := ast_alloc(nodes, nk_while(), sp)
         ast_set(nodes, wn, 1, cond)
@@ -1280,9 +1412,41 @@ fn parse_stmt_body(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) ->
         vsoff := tok_soff(toks, vt)
         vslen := tok_slen(toks, vt)
         p_expect(toks, nodes, tk_in())
+        if p_peek(toks, nodes) == tk_ident() {
+            rt := p_pos(nodes)
+            if pool_str_eq_lit(pool, tok_soff(toks, rt), tok_slen(toks, rt), "range") and p_peek_at(toks, nodes, 1) == tk_lparen() {
+                p_advance(nodes)
+                p_advance(nodes)
+                r_first := parse_expr(toks, pool, nodes, extra)
+                mut r_start := 0
+                mut r_end := 0
+                if p_eat(toks, nodes, tk_comma()) {
+                    r_start = r_first
+                    r_end = parse_expr(toks, pool, nodes, extra)
+                } else {
+                    z_nid := ast_alloc(nodes, nk_int(), sp)
+                    ast_set(nodes, z_nid, 1, 0)
+                    r_start = z_nid
+                    r_end = r_first
+                }
+                p_expect(toks, nodes, tk_rparen())
+                p_eat(toks, nodes, tk_colon())
+                body := parse_block(toks, pool, nodes, extra)
+                mut rkind := nk_for_range()
+                if is_par { rkind = nk_par_for_range() }
+                fr := ast_alloc(nodes, rkind, sp)
+                ast_set(nodes, fr, 1, vsoff)
+                ast_set(nodes, fr, 2, vslen)
+                ast_set(nodes, fr, 3, r_start)
+                ast_set(nodes, fr, 4, r_end)
+                ast_set(nodes, fr, 5, body)
+                return fr
+            }
+        }
         first_e := parse_expr(toks, pool, nodes, extra)
         if p_eat(toks, nodes, tk_dotdot()) {
             end_e := parse_expr(toks, pool, nodes, extra)
+            p_eat(toks, nodes, tk_colon())
             body := parse_block(toks, pool, nodes, extra)
             mut rkind := nk_for_range()
             if is_par { rkind = nk_par_for_range() }
@@ -1294,6 +1458,7 @@ fn parse_stmt_body(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) ->
             ast_set(nodes, fr, 5, body)
             return fr
         }
+        p_eat(toks, nodes, tk_colon())
         body := parse_block(toks, pool, nodes, extra)
         mut ekind := nk_for_each()
         if is_par { ekind = nk_par_for_each() }
@@ -1335,13 +1500,15 @@ fn parse_stmt_body(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) ->
 
     lhs := parse_expr(toks, pool, nodes, extra)
     ak := p_peek(toks, nodes)
-    if ak == tk_eq() or ak == tk_pluseq() or ak == tk_minuseq() or ak == tk_stareq() or ak == tk_slasheq() {
+    if ak == tk_eq() or ak == tk_pluseq() or ak == tk_minuseq() or ak == tk_stareq() or ak == tk_slasheq() or ak == tk_starstareq() or ak == tk_percenteq() {
         p_advance(nodes)
         mut aop := aop_eq()
-        if ak == tk_pluseq()  { aop = aop_add() }
-        if ak == tk_minuseq() { aop = aop_sub() }
-        if ak == tk_stareq()  { aop = aop_mul() }
-        if ak == tk_slasheq() { aop = aop_div() }
+        if ak == tk_pluseq()      { aop = aop_add() }
+        if ak == tk_minuseq()     { aop = aop_sub() }
+        if ak == tk_stareq()      { aop = aop_mul() }
+        if ak == tk_slasheq()     { aop = aop_div() }
+        if ak == tk_starstareq()  { aop = aop_pow() }
+        if ak == tk_percenteq()   { aop = aop_mod() }
         rhs := parse_expr(toks, pool, nodes, extra)
         p_skip_semis(toks, nodes)
         asn := ast_alloc(nodes, nk_assign(), sp)
@@ -1707,6 +1874,8 @@ fn parse_fn_decl(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: IntBuf) -> i
         ret_ty = ast_alloc(nodes, nk_ty_unit(), sp)
     }
 
+    p_eat(toks, nodes, tk_colon())
+
     mut body := 0
     if p_peek(toks, nodes) == tk_lbrace() {
         body = parse_block(toks, pool, nodes, extra)
@@ -1820,6 +1989,7 @@ fn parse_program_into_ast(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: Int
                 }
                 p_eat(toks, nodes, tk_rbrack())
             }
+            p_eat(toks, nodes, tk_colon())
             p_expect(toks, nodes, tk_lbrace())
             fmark := scratch_mark(extra)
             mut fcnt := 0
@@ -1861,6 +2031,7 @@ fn parse_program_into_ast(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: Int
             ibuf_set(nodes, 14, 0)
             p_advance(nodes)
             it := p_expect(toks, nodes, tk_ident())
+            p_eat(toks, nodes, tk_colon())
             p_expect(toks, nodes, tk_lbrace())
             mmark := scratch_mark(extra)
             mut mcnt := 0
@@ -1884,6 +2055,7 @@ fn parse_program_into_ast(toks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: Int
             it := p_expect(toks, nodes, tk_ident())
             ibuf_set(nodes, 5, tok_soff(toks, it))
             ibuf_set(nodes, 6, tok_slen(toks, it))
+            p_eat(toks, nodes, tk_colon())
             p_expect(toks, nodes, tk_lbrace())
             while p_peek(toks, nodes) != tk_rbrace() and p_peek(toks, nodes) != tk_eof() and ibuf_get(nodes, 2) == 0 {
                 if p_peek(toks, nodes) == tk_attr() {

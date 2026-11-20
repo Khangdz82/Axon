@@ -22,7 +22,7 @@ struct CodegenCtx {
     state: IntBuf
 }
 
-// Runtime Helper IDs (`10000001..10000049`, flags in `state[100 + hid - 10000000]`, offsets in `state[150 + hid - 10000000]`)
+// Runtime Helper IDs (`10000001..10000060`, flags in `state[100 + hid - 10000000]`, offsets in `state[170 + hid - 10000000]`)
 fn h_id_base() -> i64        { return 10000000 }
 fn h_print_bytes() -> i64    { return 10000001 }
 fn h_print_i64() -> i64      { return 10000002 }
@@ -73,6 +73,7 @@ fn h_ai_gemv_bnn() -> i64     { return 10000046 }
 fn h_ai_l2_batch() -> i64     { return 10000047 }
 fn h_ai_rmsnorm() -> i64      { return 10000048 }
 fn h_ai_swiglu() -> i64       { return 10000049 }
+fn h_pow_i64() -> i64         { return 10000050 }
 
 // Fixup Kinds
 fn fx_iat() -> i64    { return 1 }
@@ -281,13 +282,13 @@ fn cg_is_win64(cg: CodegenCtx) -> bool {
 }
 
 fn cg_mark_helper_used(cg: CodegenCtx, hid: i64) {
-    if hid >= 10000001 and hid <= 10000049 {
+    if hid >= 10000001 and hid <= 10000060 {
         ibuf_set(cg.state, 100 + (hid - 10000000), 1)
     }
 }
 
 fn cg_is_helper_used(cg: CodegenCtx, hid: i64) -> bool {
-    if hid >= 10000001 and hid <= 10000049 {
+    if hid >= 10000001 and hid <= 10000060 {
         return ibuf_get(cg.state, 100 + (hid - 10000000)) == 1
     }
     return false
@@ -368,7 +369,7 @@ fn cg_store_rax_data(cg: CodegenCtx, data_off: i64) {
 }
 
 fn cg_reg_helper(cg: CodegenCtx, hid: i64, start_off: i64, end_off: i64) {
-    ibuf_set(cg.state, 150 + (hid - 10000000), start_off)
+    ibuf_set(cg.state, 170 + (hid - 10000000), start_off)
     ibuf_push(cg.fn_ranges, start_off)
     ibuf_push(cg.fn_ranges, end_off)
 }
@@ -1064,6 +1065,38 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
         cg_reg_helper(cg, h_str_concat(), s_sc, buf_len(c))
     }
 
+    if cg_is_helper_used(cg, h_pow_i64()) {
+        mc_align16(c)
+        s_pw := buf_len(c)
+        mc_mov_rax_imm(c, 1)
+        mc_b3(c, 0x48, 0x85, 0xD2)     // TEST RDX, RDX
+        jz_ret := mc_jcc32(c, 0x84)    // JZ ret_1
+        jg_pos := mc_jcc8(c, 0x7F)     // JG pos
+        mc_b2(c, 0x31, 0xC0)           // XOR EAX, EAX (exp < 0 -> 0)
+        mc_b1(c, 0xC3)                 // RET
+        mc_patch_jcc8(c, jg_pos, buf_len(c))
+        top_pw := buf_len(c)
+        mc_b3(c, 0xF6, 0xC2, 0x01)     // TEST DL, 1
+        jz_skip := mc_jcc8(c, 0x74)
+        mc_b4(c, 0x48, 0x0F, 0xAF, 0xC1) // IMUL RAX, RCX
+        if ibuf_get(cg.state, 0) == 1 {
+            cg_jmp_fn(cg, 0x80, h_sec_trap())
+        }
+        mc_patch_jcc8(c, jz_skip, buf_len(c))
+        mc_b3(c, 0x48, 0xD1, 0xEA)     // SHR RDX, 1
+        jz_done := mc_jcc8(c, 0x74)    // exit BEFORE squaring base on final bit
+        mc_b4(c, 0x48, 0x0F, 0xAF, 0xC9) // IMUL RCX, RCX
+        if ibuf_get(cg.state, 0) == 1 {
+            cg_jmp_fn(cg, 0x80, h_sec_trap())
+        }
+        jmp_pw := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_pw, top_pw)
+        mc_patch_jcc8(c, jz_done, buf_len(c))
+        mc_patch_rel32(c, jz_ret, buf_len(c))
+        mc_b1(c, 0xC3)
+        cg_reg_helper(cg, h_pow_i64(), s_pw, buf_len(c))
+    }
+
     // 1. `h_detect_cpuid`: Runtime CPUID + OS XGETBV check -> `g_simd_tier` (`0=Scalar`, `1=AVX2+FMA3`, `2=AVX-512F`)
     //    and Win64 `GetSystemInfo` -> `g_cpu_threads` (`1..8`).
     if cg_is_helper_used(cg, h_detect_cpuid()) {
@@ -1627,6 +1660,9 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
     if cg_is_helper_used(cg, h_print_i64()) {
         cg_mark_helper_used(cg, h_print_bytes())
     }
+    if cg_is_helper_used(cg, h_pow_i64()) and ibuf_get(cg.state, 0) == 1 {
+        cg_mark_helper_used(cg, h_sec_trap())
+    }
     if cg_is_helper_used(cg, h_sec_trap()) {
         cg_mark_helper_used(cg, h_print_bytes())
     }
@@ -1646,6 +1682,8 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
     if cg_is_helper_used(cg, h_ai_pool_dispatch()) {
         cg_mark_helper_used(cg, h_alloc_mem())
         cg_mark_helper_used(cg, h_ai_pool_worker())
+        cg_mark_helper_used(cg, h_sec_trap())
+        cg_mark_helper_used(cg, h_print_bytes())
     }
 
     emit_v7_core_helpers_used(cg)

@@ -12,24 +12,39 @@ Axon (`.ax`) is a zero-GC, zero-lifetime-annotation (`0 'a`), self-hosted native
 - 11 native targets (`--target`): `win-x64`, `linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`, `wasm32`, `unikernel-x64`, `freestanding-x64`, `freestanding-riscv64`, `spirv`, `ptx`.
 
 ## 2. Core Syntax Rules (Write Idiomatic Axon on First Try)
-1. **Bindings:**
-   - Immutable by default: `x := 42` or `x: i64 = 42`
+1. **Pythonic Function & Syntax Ergonomics:**
+   - Functions can be declared with `def` or `fn`: `def calculate(a: int, b: int = 10) -> int:` or `fn calculate(...)`
+   - Optional trailing colon `:` before `{` on `def`/`fn`, `if`, `elif`, `else`, `while`, `for`, and `struct` headers
+   - `elif` statement chains: `if x > 0: { ... } elif x < 0: { ... } else: { ... }`
+   - Placeholder `pass` statement for empty bodies or branches
+   - Python-style `#` line comments alongside C-style `//`
+   - Python-style boolean literals: `True` / `False` (in addition to `true` / `false`)
+   - Unit/null values: `None`, `nil`, `null` with type alias `NoneType`
+   - Primitive type aliases: `int` (`i64`), `float` (`f64`)
+   - Exponentiation operator `**` and in-place `**=`, `%=`: `2 ** 10 == 1024` (fast binary exponentiation in CPU registers)
+   - Python ternary expression: `val = a if cond else b`
+   - Range membership operator: `if x in 0..100: { ... }` and `if x not in 0..100: { ... }`
+   - Range iteration: `for i in range(10): { ... }` and `for i in range(start, end): { ... }`
+   - Universal `len(x)` intrinsic for `str`, `ByteBuf`, `IntBuf`
+2. **Bindings:**
+   - Immutable by default: `x := 42` or `x: int = 42`
    - Mutable: `mut total := 0` (mutating without `mut` triggers `E0301`)
-2. **Types:**
-   - Primitives: `i32`, `i64`, `u8`, `u32`, `u64`, `usize`, `f32`, `f64`, `bool`, `str`, `dec` (`10.25d` exact 4-decimal scaled `i64`)
+3. **Types:**
+   - Primitives: `int`/`i64`, `float`/`f64`, `i32`, `u8`, `u32`, `u64`, `usize`, `f32`, `bool`, `str`, `dec` (`10.25d` exact 4-decimal scaled `i64`), `NoneType`
    - SIMD Math: `vec3`, `vec4`, `quat`, `mat4` (`std::math3d`)
    - Owned Buffers & Tables: `ByteBuf`, `IntBuf`, `Table[T]` (`Table[Particle]::with_capacity(n)`)
    - Security: `tainted[str]` (`std::taint`)
    - AI Tensors: `Tensor[f32, [B, S, D]]`, `ShardedTensor[f32, [M, N]]` (`std::ai_engine`)
-3. **Boolean & Arithmetic Operators:**
+4. **Boolean & Arithmetic Operators:**
    - Short-circuit words: `and`, `or`, `not` (never `&&`, `||`, `!` for booleans; `!` is reserved for `T ! Error`)
+   - Arithmetic: `+`, `-`, `*`, `/`, `%`, `**`
    - Wrapping integer ops: `+%`, `-%`, `*%`
-4. **Functions, Named Arguments & Struct Constructors:**
+5. **Functions, Named Arguments & Struct Constructors:**
    - Named arguments and struct fields ALWAYS use `=` (not `:`):
-     `ev := TradeEvent(order_id = 9001, symbol = "BTCUSD", filled = true)`
-   - Mutable inout parameter: `fn update(mut acc: i64)` called as `update(mut acc)`
-   - Linear move parameter: `fn consume(move buf: ByteBuf)` called as `consume(move buf)`
-5. **Zero-Cost Error Unions (`T ! Error`):**
+     `ev := TradeEvent(order_id = 9001, symbol = "BTCUSD", filled = True)`
+   - Mutable inout parameter: `def update(mut acc: int):` called as `update(mut acc)`
+   - Linear move parameter: `def consume(move buf: ByteBuf):` called as `consume(move buf)`
+6. **Zero-Cost Error Unions (`T ! Error`):**
    ```axon
    fn parse_port(raw: i64) -> i64 ! i64 {
        if raw <= 0 or raw > 65535 { return err(400) }

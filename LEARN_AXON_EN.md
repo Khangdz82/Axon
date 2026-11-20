@@ -120,6 +120,7 @@ Reassigning an immutable binding is caught at compile time with **`[SAFETY ERROR
 ### 2.3. Short-Circuit Booleans & Checked vs. Wrapping Arithmetic
 
 - **Short-circuit `and` / `or`:** `i < n and str_byte(s, i) == 65` never evaluates the right-hand side when `i < n` is false.
+- **Power Operator `**` and In-Place `**=`, `%=`:** Axon supports Pythonic arithmetic exponentiation `**` (`2 ** 10 == 1024`), lowered directly to register-only binary exponentiation by squaring with zero runtime calls, and folded at compile time for constant expressions.
 - **Compile-Time & Runtime Division Guards:** Dividing or taking modulo by a constant `0` is rejected at compile time with **`[SAFETY ERROR E0406]`**, while dynamic divisors emit hardware guards for both `/ 0` and `INT64_MIN / -1`.
 - **Hardware Overflow Protection:** Under `@shield`, `+`, `-`, and `*` trap on signed CPU overflow (`JO`).
 - **Explicit Wrapping Operators (`+%`, `-%`, `*%`):** Cryptographic hashes and PRNGs opt into two's-complement modular wraparound explicitly:
@@ -128,6 +129,60 @@ Reassigning an immutable binding is caught at compile time with **`[SAFETY ERROR
 mut hash := -3750763034362895579
 hash = (hash ^ byte_val) *% 1099511628211
 ```
+
+### 2.4. Deep Pythonic Ergonomics (Maximum Utilitarian Readability)
+
+To empower engineers coming from Python, TypeScript, and modern systems languages to write clear, bug-free native code instantly, Axon provides zero-cost Pythonic ergonomics:
+
+1. **`def` Function Declaration:** Define functions using either `def` or `fn`:
+   ```axon
+   def add(a: int, b: int = 10) -> int: {
+       return a + b
+   }
+   ```
+2. **Optional Block Colons (`:`):** Add a trailing `:` before `{` across `def`/`fn`, `if`, `elif`, `else`, `while`, `for`, and `struct` headers for natural readability.
+3. **`elif` Chains & `pass` Placeholder:**
+   ```axon
+   if status: {
+       pass
+   } elif score > 50: {
+       println("Passed")
+   } else: {
+       println("Failed")
+   }
+   ```
+   `pass` emits 0 instructions and serves as a verified stub for empty blocks.
+4. **Python `#` Line Comments:** Use `#` comments alongside C-style `//`.
+5. **Pythonic Literals & Type Aliases:**
+   - Booleans: `True`, `False` (in addition to `true`, `false`).
+   - Unit/Nil: `None`, `nil`, `null`, and `NoneType`.
+   - Primitive aliases: `int` (`i64`), `float` (`f64`).
+6. **Python Ternary Expressions:**
+   ```axon
+   label := "Active" if count > 0 else "Inactive"
+   ```
+   Desugars directly to an optimized `nk_if_expr`.
+7. **Range Membership (`in` and `not in`):**
+   ```axon
+   if x in 0..100: {
+       println("In range")
+   }
+   if y not in 100..200: {
+       println("Out of range")
+   }
+   ```
+   Emits zero heap allocations and lowers directly into simple branch tests.
+8. **Pythonic `range()` Loops:**
+   ```axon
+   for i in range(10): {
+       println(f"step {i}")
+   }
+   for i in range(1, 10): {
+       println(f"index {i}")
+   }
+   ```
+9. **Universal `len(x)`:**
+   $O(1)$ length queries across `str`, `ByteBuf`, and `IntBuf`.
 
 ---
 
