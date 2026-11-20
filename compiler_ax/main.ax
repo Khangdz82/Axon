@@ -431,29 +431,82 @@ fn compile_for_target_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBu
 
 fn mcp_is_safe_path(p: str) -> bool {
     n := str_len(p)
-    if n <= 0 or n >= 480 {
+    if n <= 0 or n >= 260 {
+        return false
+    }
+
+    // Must not start with `/` or `\`
+    b0 := str_byte(p, 0)
+    if b0 == 47 or b0 == 92 {
+        return false
+    }
+
+    // Strict character whitelist: only [a-zA-Z0-9/\\._-]
+    mut i := 0
+    while i < n {
+        b := str_byte(p, i)
+        is_alnum := (b >= 97 and b <= 122) or (b >= 65 and b <= 90) or (b >= 48 and b <= 57)
+        is_sep := (b == 47 or b == 92 or b == 46 or b == 95 or b == 45)
+        if not is_alnum and not is_sep {
+            return false
+        }
+
+        // Ban any directory traversal `..`
+        if b == 46 and i + 1 < n and str_byte(p, i + 1) == 46 {
+            return false
+        }
+        i += 1
+    }
+
+    // Must end with safe extensions: `.ax`, `.h`, `.toml`, or `.json`
+    mut has_ext := false
+    if n >= 3 and str_slice(p, n - 3, n) == ".ax" { has_ext = true }
+    else if n >= 2 and str_slice(p, n - 2, n) == ".h" { has_ext = true }
+    else if n >= 5 and str_slice(p, n - 5, n) == ".toml" { has_ext = true }
+    else if n >= 5 and str_slice(p, n - 5, n) == ".json" { has_ext = true }
+    if not has_ext {
+        return false
+    }
+
+    // Check for Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+    mut last_sep := -1
+    mut bi := 0
+    while bi < n {
+        b := str_byte(p, bi)
+        if b == 47 or b == 92 { last_sep = bi }
+        bi += 1
+    }
+    base_start := last_sep + 1
+    base_len := n - base_start
+    if base_len >= 3 {
+        c0 := str_byte(p, base_start)
+        c1 := str_byte(p, base_start + 1)
+        c2 := str_byte(p, base_start + 2)
+        u0 := if c0 >= 97 and c0 <= 122 { c0 - 32 } else { c0 }
+        u1 := if c1 >= 97 and c1 <= 122 { c1 - 32 } else { c1 }
+        u2 := if c2 >= 97 and c2 <= 122 { c2 - 32 } else { c2 }
+        if u0 == 67 and u1 == 79 and u2 == 78 { return false } // CON
+        if u0 == 80 and u1 == 82 and u2 == 78 { return false } // PRN
+        if u0 == 65 and u1 == 85 and u2 == 88 { return false } // AUX
+        if u0 == 78 and u1 == 85 and u2 == 76 { return false } // NUL
+        if (u0 == 67 and u1 == 79 and u2 == 77) or (u0 == 76 and u1 == 80 and u2 == 84) { return false } // COM / LPT
+    }
+
+    return true
+}
+
+fn mcp_is_safe_args(a: str) -> bool {
+    n := str_len(a)
+    if n > 256 {
         return false
     }
     mut i := 0
     while i < n {
-        b := str_byte(p, i)
-        if b < 32 {
+        b := str_byte(a, i)
+        is_alnum := (b >= 97 and b <= 122) or (b >= 65 and b <= 90) or (b >= 48 and b <= 57)
+        is_safe_punct := (b == 32 or b == 45 or b == 95 or b == 61 or b == 46 or b == 47 or b == 92)
+        if not is_alnum and not is_safe_punct {
             return false
-        }
-        if b == 46 and i + 1 < n and str_byte(p, i + 1) == 46 {
-            mut left_sep := i == 0
-            if i > 0 {
-                lb := str_byte(p, i - 1)
-                if lb == 47 or lb == 92 { left_sep = true }
-            }
-            mut right_sep := i + 2 == n
-            if i + 2 < n {
-                rb := str_byte(p, i + 2)
-                if rb == 47 or rb == 92 { right_sep = true }
-            }
-            if left_sep and right_sep {
-                return false
-            }
         }
         i += 1
     }
@@ -530,6 +583,7 @@ fn run_mcp_server_stdio() -> i32 {
                     mcp_emit_tools_list_resp(raw_id)
                 } else if method == "tools/call" {
                     tname := mcp_json_get_str(line, "name", scratch)
+                    args_str := mcp_json_get_str(line, "args", scratch)
                     if tname == "axon_check" {
                         code_str := mcp_json_get_str(line, "code", scratch)
                         mut fpath := mcp_json_get_str(line, "path", scratch)
@@ -561,6 +615,8 @@ fn run_mcp_server_stdio() -> i32 {
                         if str_len(fpath) == 0 { fpath = "main.ax" }
                         if not mcp_is_safe_path(fpath) {
                             mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe path")
+                        } else if str_len(args_str) > 0 and not mcp_is_safe_args(args_str) {
+                            mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe characters in `args`")
                         } else {
                             cmd_run := buf_new(str_len(fpath) + 64)
                             buf_push_str(cmd_run, "bin\\axc.exe test ")
@@ -572,7 +628,6 @@ fn run_mcp_server_stdio() -> i32 {
                     } else if tname == "axon_run" {
                         code_str := mcp_json_get_str(line, "code", scratch)
                         mut fpath := mcp_json_get_str(line, "path", scratch)
-                        args_str := mcp_json_get_str(line, "args", scratch)
                         if str_len(code_str) > 0 {
                             cbuf := buf_new(str_len(code_str))
                             buf_push_str(cbuf, code_str)
@@ -583,6 +638,8 @@ fn run_mcp_server_stdio() -> i32 {
                         if str_len(fpath) == 0 { fpath = "main.ax" }
                         if not mcp_is_safe_path(fpath) {
                             mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe path")
+                        } else if str_len(args_str) > 0 and not mcp_is_safe_args(args_str) {
+                            mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe characters in `args`")
                         } else {
                             cmd_run := buf_new(str_len(fpath) + str_len(args_str) + 64)
                             buf_push_str(cmd_run, "bin\\axc.exe run ")
@@ -629,6 +686,8 @@ fn run_mcp_server_stdio() -> i32 {
                         if str_len(fpath) == 0 { fpath = "main.ax" }
                         if not mcp_is_safe_path(fpath) {
                             mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe path")
+                        } else if str_len(args_str) > 0 and not mcp_is_safe_args(args_str) {
+                            mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe characters in `args`")
                         } else {
                             pool := buf_new(2097152)
                             nodes := ibuf_new(1048576)
@@ -668,6 +727,8 @@ fn run_mcp_server_stdio() -> i32 {
                         if str_len(fpath) == 0 { fpath = "main.ax" }
                         if not mcp_is_safe_path(fpath) {
                             mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe path")
+                        } else if str_len(args_str) > 0 and not mcp_is_safe_args(args_str) {
+                            mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe characters in `args`")
                         } else {
                             pool := buf_new(2097152)
                             nodes := ibuf_new(1048576)
@@ -793,6 +854,8 @@ fn run_mcp_server_stdio() -> i32 {
                         if str_len(fpath) == 0 { fpath = "main.ax" }
                         if not mcp_is_safe_path(fpath) {
                             mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe path")
+                        } else if str_len(args_str) > 0 and not mcp_is_safe_args(args_str) {
+                            mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe characters in `args`")
                         } else {
                             cmd_run := buf_new(str_len(fpath) + 64)
                             buf_push_str(cmd_run, "bin\\axc.exe run ")
@@ -830,6 +893,8 @@ fn run_mcp_server_stdio() -> i32 {
                         if str_len(fpath) == 0 { fpath = "main.ax" }
                         if not mcp_is_safe_path(fpath) {
                             mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe path")
+                        } else if str_len(args_str) > 0 and not mcp_is_safe_args(args_str) {
+                            mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe characters in `args`")
                         } else {
                             pool := buf_new(2097152)
                             nodes := ibuf_new(1048576)
@@ -914,6 +979,8 @@ fn run_mcp_server_stdio() -> i32 {
                         if str_len(fpath) == 0 { fpath = "main.ax" }
                         if not mcp_is_safe_path(fpath) {
                             mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe path")
+                        } else if str_len(args_str) > 0 and not mcp_is_safe_args(args_str) {
+                            mcp_emit_tool_text_resp(raw_id, true, "Invalid or unsafe characters in `args`")
                         } else {
                             pool := buf_new(2097152)
                             nodes := ibuf_new(1048576)
