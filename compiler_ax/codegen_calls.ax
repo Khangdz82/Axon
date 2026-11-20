@@ -200,6 +200,30 @@ fn is_nonshadowed_const_int(cg: CodegenCtx, vars: IntBuf, enid: i64) -> bool {
     return not expr_has_shadowed_ident(cg, vars, enid)
 }
 
+fn immut_local_const_int_node(cg: CodegenCtx, vars: IntBuf, nid: i64) -> i64 {
+    if nid <= 0 { return -1 }
+    k := ast_kind(cg.nodes, nid)
+    if k != nk_ident() and k != nk_move_ident() { return -1 }
+    vb := cg_var_find(cg.pool, vars, ast_get(cg.nodes, nid, 1), ast_get(cg.nodes, nid, 2))
+    if vb < 0 or ibuf_get(vars, vb + 3) != ty_int() { return -1 }
+    snid := ibuf_get(vars, vb + 4)
+    if snid <= 0 or ast_kind(cg.nodes, snid) != nk_var_decl() { return -1 }
+    if ast_get(cg.nodes, snid, 3) != 0 or (ast_get(cg.nodes, snid, 6) & 1) != 0 { return -1 }
+    ie := ast_get(cg.nodes, snid, 5)
+    if ie <= 0 or ast_kind(cg.nodes, ie) != nk_int() { return -1 }
+    return ie
+}
+
+fn is_folded_const_int_ax(cg: CodegenCtx, vars: IntBuf, nid: i64) -> bool {
+    return is_nonshadowed_const_int(cg, vars, nid) or immut_local_const_int_node(cg, vars, nid) > 0
+}
+
+fn eval_folded_const_int_ax(cg: CodegenCtx, vars: IntBuf, nid: i64) -> i64 {
+    ie := immut_local_const_int_node(cg, vars, nid)
+    if ie > 0 { return ast_get(cg.nodes, ie, 1) }
+    return eval_const_int_val(cg.pool, cg.nodes, cg.sym, nid)
+}
+
 fn emit_fast_val_arg(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, enid: i64) -> i64 {
     if is_nonshadowed_const_int(cg, vars, enid) {
         return -1
@@ -732,11 +756,10 @@ fn try_emit_v7_domain_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, bre
         mc_b3(c, 0x48, 0x85, 0xC9); jz_bo := mc_jcc32(c, 0x84)
         mc_b3(c, 0x4D, 0x85, 0xC9); jle_br := mc_jcc32(c, 0x8E)
         mc_b3(c, 0x4D, 0x85, 0xD2); jle_bd := mc_jcc32(c, 0x8E)
-        // Dispatch AVX2 (`words >= 8`): Zero-spill `YMM0..YMM5` fast-path (`8..127` words) & Harley-Seal (`>= 128` words)
+        // Dispatch AVX2 Harley-Seal (`words >= 256`); use 2-row-tiled hardware `POPCNT` for `words < 256`.
         cg_mov_rax_data(cg, data_off_simd_tier())
         mc_b4(c, 0x48, 0x83, 0xF8, 0x02); jl_hs_sc1 := mc_jcc32(c, 0x8C)
-        mc_b4(c, 0x49, 0x83, 0xFA, 0x08); jl_hs_sc2 := mc_jcc32(c, 0x8C)
-        mc_b4(c, 0x49, 0x83, 0xFA, 0x7F); jle_avx_sm := mc_jcc32(c, 0x8E)
+        mc_b3(c, 0x49, 0x81, 0xFA); mc_u32(c, 256); jl_hs_sc2 := mc_jcc32(c, 0x8C)
         // Save Win64 non-volatile XMM6..XMM15 (`160 bytes`) + 32 bytes LUT/mask = `192 bytes`
         mc_b3(c, 0x48, 0x81, 0xEC); mc_u32(c, 192)
         mut xi := 0
@@ -846,66 +869,74 @@ fn try_emit_v7_domain_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, bre
         mc_b3(c, 0xC5, 0xF8, 0x77)       // VZEROUPPER
         mc_b3(c, 0x48, 0x81, 0xC4); mc_u32(c, 192)
         jmp_hs_done := mc_jmp32(c)
-        // Zero-spill AVX2 POPCNT (`8 <= words <= 127`) using ONLY `YMM0..YMM5` (0 `XMM6..15` stack saves!)
-        mc_patch_rel32(c, jle_avx_sm, buf_len(c))
-        mc_b4(c, 0x48, 0x83, 0xEC, 32)
-        mc_mov_rax_imm(c, 0x0302020102010100); mc_b4(c, 0x48, 0x89, 0x04, 0x24)
-        mc_mov_rax_imm(c, 0x0403030203020201); mc_b4(c, 0x48, 0x89, 0x44, 0x24); mc_b1(c, 8)
-        mc_mov_rax_imm(c, 0x0F0F0F0F0F0F0F0F)
-        mc_b4(c, 0x48, 0x89, 0x44, 0x24); mc_b1(c, 16)
-        mc_b4(c, 0x48, 0x89, 0x44, 0x24); mc_b1(c, 24)
-        mc_b4(c, 0xC4, 0xE2, 0x7D, 0x5A); mc_b2(c, 0x04, 0x24)       // VBROADCASTI128 YMM0, [RSP]
-        mc_b4(c, 0xC4, 0xE2, 0x7D, 0x5A); mc_b3(c, 0x4C, 0x24, 0x10) // VBROADCASTI128 YMM1, [RSP+16]
-        mc_vex256(c, 1, 2, 2, 2, 0xEF)                               // VPXOR YMM2, YMM2, YMM2 (0)
-        mc_b3(c, 0x4D, 0x89, 0xD4); mc_b4(c, 0x49, 0xC1, 0xE4, 0x03) // R12 = words * 8
-        mc_b3(c, 0x4D, 0x89, 0xD5); mc_b4(c, 0x49, 0x83, 0xE5, 0xFC); mc_b4(c, 0x49, 0xC1, 0xE5, 0x03) // R13 = (words & ~3) * 8
-        mc_b2(c, 0x31, 0xFF)                                         // XOR EDI, EDI
-        lp_asm_row := buf_len(c)
-        mc_b3(c, 0x4C, 0x89, 0xDB)     // RBX = R11
-        mc_b3(c, 0x4C, 0x89, 0xC2)     // RDX = R8
-        mc_vex256(c, 1, 3, 3, 3, 0xEF) // YMM3 = sum64
-        mc_b2(c, 0x31, 0xF6)           // XOR ESI, ESI
-        lp_asm_blk := buf_len(c)
-        mc_b3(c, 0x4C, 0x39, 0xEE); jge_asm_rem := mc_jcc8(c, 0x7D)
-        mc_avx_load_xor(c, 4, 0)                      // YMM4 = [RBX] ^ [RDX]
-        mc_vex256(c, 1, 5, 4, 1, 0xDB)                // VPAND YMM5, YMM4, YMM1
-        mc_vex256(c, 1, 2, 4, 4, 0x71); mc_b1(c, 4)   // VPSRLW YMM4, YMM4, 4
-        mc_vex256(c, 1, 4, 4, 1, 0xDB)                // VPAND YMM4, YMM4, YMM1
-        mc_vex256(c, 2, 5, 0, 5, 0x00)                // VPSHUFB YMM5, YMM0, YMM5
-        mc_vex256(c, 2, 4, 0, 4, 0x00)                // VPSHUFB YMM4, YMM0, YMM4
-        mc_vex256(c, 1, 4, 4, 5, 0xFC)                // VPADDB YMM4, YMM4, YMM5
-        mc_vex256(c, 1, 4, 4, 2, 0xF6)                // VPSADBW YMM4, YMM4, YMM2
-        mc_vex256(c, 1, 3, 3, 4, 0xD4)                // VPADDQ YMM3, YMM3, YMM4
-        mc_b4(c, 0x48, 0x83, 0xC3, 32); mc_b4(c, 0x48, 0x83, 0xC2, 32); mc_b4(c, 0x48, 0x83, 0xC6, 32)
-        jmp_asm_blk := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_asm_blk, lp_asm_blk)
-        mc_patch_jcc8(c, jge_asm_rem, buf_len(c))
-        mc_b4(c, 0xC4, 0xE3, 0x7D, 0x39); mc_b2(c, 0xDC, 0x01) // VEXTRACTI128 XMM4, YMM3, 1
-        mc_b4(c, 0xC5, 0xE1, 0xD4, 0xDC)                       // VPADDQ XMM3, XMM3, XMM4
-        mc_b4(c, 0xC5, 0xD9, 0x73, 0xDB); mc_b1(c, 0x08)       // VPSRLDQ XMM4, XMM3, 8
-        mc_b4(c, 0xC5, 0xE1, 0xD4, 0xDC)                       // VPADDQ XMM3, XMM3, XMM4
-        mc_b4(c, 0xC4, 0xC1, 0xF9, 0x7E); mc_b1(c, 0xDE)       // VMOVQ R14, XMM3
-        lp_asm_t := buf_len(c)
-        mc_b3(c, 0x4C, 0x39, 0xE6); jge_asm_td := mc_jcc8(c, 0x7D)
-        mc_b3(c, 0x48, 0x8B, 0x03); mc_b3(c, 0x48, 0x33, 0x02)
-        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0)
-        mc_b3(c, 0x49, 0x01, 0xC6)
-        mc_b4(c, 0x48, 0x83, 0xC3, 8); mc_b4(c, 0x48, 0x83, 0xC2, 8); mc_b4(c, 0x48, 0x83, 0xC6, 8)
-        jmp_asm_t := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_asm_t, lp_asm_t)
-        mc_patch_jcc8(c, jge_asm_td, buf_len(c))
-        mc_b4(c, 0x4C, 0x89, 0x34, 0xF9) // MOV [RCX + RDI*8], R14
-        mc_b3(c, 0x4D, 0x01, 0xE3)       // ADD R11, R12
-        mc_b3(c, 0x48, 0xFF, 0xC7)       // INC RDI
-        mc_b3(c, 0x4C, 0x39, 0xCF)       // CMP RDI, R9
-        jl_asm_row := mc_jcc32(c, 0x8C); mc_patch_rel32(c, jl_asm_row, lp_asm_row)
-        mc_b3(c, 0xC5, 0xF8, 0x77)       // VZEROUPPER
-        mc_b4(c, 0x48, 0x83, 0xC4, 32)
-        jmp_asm_done := mc_jmp32(c)
-        // Scalar 8-word (64B cache-line) 4-register-independent POPCNT fallback
+        // 2-row-tiled 4-word unrolled hardware POPCNT (`words < 256` or scalar CPU):
+        // Shares L1 activation reads across row `r` & `r+1` with independent `POPCNT` chains & zero VZEROUPPER.
         hs_sc_start := buf_len(c)
         mc_patch_rel32(c, jl_hs_sc1, hs_sc_start)
         mc_patch_rel32(c, jl_hs_sc2, hs_sc_start)
-        mc_b2(c, 0x31, 0xFF)                    // XOR EDI, EDI (r = 0)
+        mc_b3(c, 0x4D, 0x89, 0xD4); mc_b4(c, 0x49, 0xC1, 0xE4, 0x03) // R12 = words * 8 (row_bytes)
+        mc_b2(c, 0x31, 0xFF)                                         // XOR EDI, EDI (r = 0)
+        lp_b2_row := buf_len(c)
+        mc_b4(c, 0x48, 0x8D, 0x47, 0x01)        // LEA RAX, [RDI + 1]
+        mc_b3(c, 0x4C, 0x39, 0xC8)              // CMP RAX, R9
+        jge_b_odd := mc_jcc32(c, 0x8D)          // JGE odd_row_check
+        mc_b4(c, 0x4D, 0x8D, 0x3C, 0x23)        // LEA R15, [R11 + R12] (row1 ptr)
+        mc_b2(c, 0x31, 0xDB)                    // XOR EBX, EBX (sum0)
+        mc_b2(c, 0x31, 0xD2)                    // XOR EDX, EDX (sum1)
+        mc_b2(c, 0x31, 0xF6)                    // XOR ESI, ESI (w = 0)
+        lp_b2_w4 := buf_len(c)
+        mc_b4(c, 0x48, 0x8D, 0x46, 0x04)        // LEA RAX, [RSI + 4]
+        mc_b3(c, 0x4C, 0x39, 0xD0)              // CMP RAX, R10
+        jg_b2_tl := mc_jcc32(c, 0x8F)           // JG pair_tail
+        mut wi := 0
+        while wi < 4 {
+            off := wi * 8
+            if off == 0 {
+                mc_b4(c, 0x49, 0x8B, 0x04, 0xF0)        // MOV RAX, [R8 + RSI*8]
+                mc_b3(c, 0x49, 0x89, 0xC6)              // MOV R14, RAX
+                mc_b4(c, 0x49, 0x33, 0x04, 0xF3)        // XOR RAX, [R11 + RSI*8]
+                mc_b4(c, 0x4D, 0x33, 0x34, 0xF7)        // XOR R14, [R15 + RSI*8]
+            } else {
+                mc_b4(c, 0x49, 0x8B, 0x44, 0xF0); mc_b1(c, off)
+                mc_b3(c, 0x49, 0x89, 0xC6)
+                mc_b4(c, 0x49, 0x33, 0x44, 0xF3); mc_b1(c, off)
+                mc_b4(c, 0x4D, 0x33, 0x74, 0xF7); mc_b1(c, off)
+            }
+            mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0) // POPCNT RAX, RAX
+            mc_b4(c, 0xF3, 0x4D, 0x0F, 0xB8); mc_b1(c, 0xF6) // POPCNT R14, R14
+            mc_b2(c, 0x01, 0xC3)                             // ADD EBX, EAX
+            mc_b3(c, 0x44, 0x01, 0xF2)                       // ADD EDX, R14D
+            wi += 1
+        }
+        mc_b4(c, 0x48, 0x83, 0xC6, 0x04)        // ADD RSI, 4
+        jmp_b2_w4 := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_b2_w4, lp_b2_w4)
+        mc_patch_rel32(c, jg_b2_tl, buf_len(c))
+        lp_b2_t1 := buf_len(c)
+        mc_b3(c, 0x4C, 0x39, 0xD6)              // CMP RSI, R10
+        jge_b2_td := mc_jcc8(c, 0x7D)
+        mc_b4(c, 0x49, 0x8B, 0x04, 0xF0)
+        mc_b3(c, 0x49, 0x89, 0xC6)
+        mc_b4(c, 0x49, 0x33, 0x04, 0xF3)
+        mc_b4(c, 0x4D, 0x33, 0x34, 0xF7)
+        mc_b4(c, 0xF3, 0x48, 0x0F, 0xB8); mc_b1(c, 0xC0)
+        mc_b4(c, 0xF3, 0x4D, 0x0F, 0xB8); mc_b1(c, 0xF6)
+        mc_b2(c, 0x01, 0xC3)
+        mc_b3(c, 0x44, 0x01, 0xF2)
+        mc_b3(c, 0x48, 0xFF, 0xC6)
+        jmp_b2_t1 := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_b2_t1, lp_b2_t1)
+        mc_patch_jcc8(c, jge_b2_td, buf_len(c))
+        mc_b4(c, 0x48, 0x89, 0x1C, 0xF9)                 // MOV [RCX + RDI*8], RBX
+        mc_b4(c, 0x48, 0x89, 0x54, 0xF9); mc_b1(c, 8)    // MOV [RCX + RDI*8 + 8], RDX
+        mc_b3(c, 0x4D, 0x01, 0xE3)                       // ADD R11, R12
+        mc_b3(c, 0x4D, 0x01, 0xE3)                       // ADD R11, R12
+        mc_b4(c, 0x48, 0x83, 0xC7, 0x02)                 // ADD RDI, 2
+        jmp_b2_row := mc_jmp32(c); mc_patch_rel32(c, jmp_b2_row, lp_b2_row)
+        mc_patch_rel32(c, jge_b_odd, buf_len(c))
         lp_b_out := buf_len(c)
+        mc_b3(c, 0x4C, 0x39, 0xCF)              // CMP RDI, R9
+        jge_b_all := mc_jcc32(c, 0x8D)
         mc_b2(c, 0x31, 0xDB)                    // XOR EBX, EBX (sum0 = 0)
         mc_b2(c, 0x31, 0xD2)                    // XOR EDX, EDX (sum1 = 0)
         mc_b3(c, 0x45, 0x31, 0xFF)              // XOR R15D, R15D (sum2 = 0)
@@ -973,7 +1004,7 @@ fn try_emit_v7_domain_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, bre
         mc_patch_rel32(c, jl_b_out, lp_b_out)
         b_done := buf_len(c)
         mc_patch_rel32(c, jmp_hs_done, b_done)
-        mc_patch_rel32(c, jmp_asm_done, b_done)
+        mc_patch_rel32(c, jge_b_all, b_done)
         mc_patch_rel32(c, jz_bw, b_done)
         mc_patch_rel32(c, jz_ba, b_done)
         mc_patch_rel32(c, jz_bo, b_done)

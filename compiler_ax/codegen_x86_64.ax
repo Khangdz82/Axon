@@ -305,12 +305,15 @@ fn cg_slot_reg(cg: CodegenCtx, slot: i64) -> i64 {
     return 0
 }
 
+fn cg_fpromo_base(cg: CodegenCtx) -> i64 { return 256 + ibuf_get(cg.sym, 8) }
+fn cg_gpromo_base(cg: CodegenCtx) -> i64 { return 256 + ibuf_get(cg.sym, 8) + 24 }
+
 fn find_promo_reg_by_name(cg: CodegenCtx, soff: i64, slen: i64) -> i64 {
     mask := ibuf_get(cg.state, 98)
     if mask == 0 or ibuf_get(cg.state, 22) > 0 { return 0 }
     mut r := 1
     while r <= 5 {
-        if (mask & (1 << r)) != 0 {
+        if (mask & (1 << r)) != 0 and ibuf_get(cg.state, 230 + r) == 0 {
             csoff := ibuf_get(cg.state, 236 + (r - 1) * 2)
             cslen := ibuf_get(cg.state, 237 + (r - 1) * 2)
             if cslen == slen and pool_str_eq2(cg.pool, csoff, slen, soff) {
@@ -318,6 +321,19 @@ fn find_promo_reg_by_name(cg: CodegenCtx, soff: i64, slen: i64) -> i64 {
             }
         }
         r += 1
+    }
+    gb := cg_gpromo_base(cg)
+    ecnt := ibuf_get(cg.state, gb)
+    mut ei := 0
+    while ei < ecnt {
+        bo := gb + 1 + ei * 3
+        er := ibuf_get(cg.state, bo + 2)
+        if er > 0 and ibuf_get(cg.state, 230 + er) == 0 {
+            if ibuf_get(cg.state, bo + 1) == slen and pool_str_eq2(cg.pool, ibuf_get(cg.state, bo), slen, soff) {
+                return er
+            }
+        }
+        ei += 1
     }
     return 0
 }
@@ -371,6 +387,11 @@ fn mc_ucomisd_freg_xmm0(c: ByteBuf, fr: i64) {
     mc_b3(c, 0x0F, 0x2E, 0xC0 | (freg_hw(fr) << 3))
 }
 
+fn cg_set_freg_slot(cg: CodegenCtx, fr: i64, slot: i64) {
+    if fr >= 1 and fr <= 5 { ibuf_set(cg.state, 162 + fr, slot) }
+    else if fr >= 6 and fr <= 8 { ibuf_set(cg.state, cg_fpromo_base(cg) + (fr - 6), slot) }
+}
+
 fn cg_slot_freg(cg: CodegenCtx, slot: i64) -> i64 {
     if slot <= 0 or ibuf_get(cg.state, 161) == 0 { return 0 }
     if ibuf_get(cg.state, 163) == slot { return 1 }
@@ -378,17 +399,29 @@ fn cg_slot_freg(cg: CodegenCtx, slot: i64) -> i64 {
     if ibuf_get(cg.state, 165) == slot { return 3 }
     if ibuf_get(cg.state, 166) == slot { return 4 }
     if ibuf_get(cg.state, 167) == slot { return 5 }
+    fb := cg_fpromo_base(cg)
+    if ibuf_get(cg.state, fb) == slot { return 6 }
+    if ibuf_get(cg.state, fb + 1) == slot { return 7 }
+    if ibuf_get(cg.state, fb + 2) == slot { return 8 }
     return 0
 }
 
 fn find_promo_freg_by_name(cg: CodegenCtx, soff: i64, slen: i64) -> i64 {
     fmask := ibuf_get(cg.state, 161)
     if fmask == 0 or ibuf_get(cg.state, 22) > 0 { return 0 }
+    fb := cg_fpromo_base(cg)
     mut fr := 1
-    while fr <= 5 {
+    while fr <= 8 {
         if (fmask & (1 << fr)) != 0 {
-            csoff := ibuf_get(cg.state, 246 + (fr - 1) * 2)
-            cslen := ibuf_get(cg.state, 247 + (fr - 1) * 2)
+            mut csoff := 0
+            mut cslen := 0
+            if fr <= 5 {
+                csoff = ibuf_get(cg.state, 246 + (fr - 1) * 2)
+                cslen = ibuf_get(cg.state, 247 + (fr - 1) * 2)
+            } else {
+                csoff = ibuf_get(cg.state, fb + 8 + (fr - 6) * 2)
+                cslen = ibuf_get(cg.state, fb + 9 + (fr - 6) * 2)
+            }
             if cslen == slen and pool_str_eq2(cg.pool, csoff, slen, soff) {
                 return fr
             }
@@ -418,7 +451,7 @@ fn emit_restore_callee_regs_ax(cg: CodegenCtx) {
         fsave := ibuf_get(cg.state, 162)
         mut fidx := 0
         mut fr := 1
-        while fr <= 5 {
+        while fr <= 8 {
             if (fmask & (1 << fr)) != 0 {
                 mc_load_freg_ups(cg.code, fsave + fidx * 2 + 1, fr)
                 fidx += 1
@@ -475,16 +508,34 @@ fn emit_gpreg_addsub_imm(cg: CodegenCtx, r: i64, is_add: bool, imm: i64) {
 }
 
 fn scan_cand_find(pool: ByteBuf, cands: IntBuf, soff: i64, slen: i64) -> i64 {
-    cnt := ibuf_len(cands) / 4
+    cnt := ibuf_len(cands) / 6
     mut i := 0
     while i < cnt {
-        b := i * 4
+        b := i * 6
         if ibuf_get(cands, b + 1) == slen and pool_str_eq2(pool, ibuf_get(cands, b), slen, soff) {
             return b
         }
         i += 1
     }
     return -1
+}
+
+fn scan_push_cand(cands: IntBuf, soff: i64, slen: i64, ok: i64, w: i64, fp: i64, be: i64) {
+    if ibuf_len(cands) + 6 <= 1536 {
+        ibuf_push(cands, soff)
+        ibuf_push(cands, slen)
+        ibuf_push(cands, ok)
+        ibuf_push(cands, w)
+        ibuf_push(cands, fp)
+        ibuf_push(cands, be)
+    }
+}
+
+fn scan_pos_next(cg: CodegenCtx) -> i64 {
+    idx := cg_fpromo_base(cg) + 121
+    p := ibuf_get(cg.state, idx) + 1
+    ibuf_set(cg.state, idx, p)
+    return p
 }
 
 fn scan_infer_int_bool(cg: CodegenCtx, cands: IntBuf, nid: i64) -> bool {
@@ -599,12 +650,21 @@ fn scan_walk_ast_ax(cg: CodegenCtx, cands: IntBuf, nid: i64, ldepth: i64) {
             scan_walk_ast_ax(cg, cands, ast_get(nodes, ub, 3), ldepth)
             return
         }
+        cmark := ibuf_len(cands)
         off := ast_get(nodes, nid, 1)
         cnt := ast_get(nodes, nid, 2)
         mut i := 0
         while i < cnt {
             scan_walk_ast_ax(cg, cands, ibuf_get(extra, off + i), ldepth)
             i += 1
+        }
+        bend := scan_pos_next(cg)
+        mut ci := cmark
+        while ci < ibuf_len(cands) {
+            if ibuf_get(cands, ci + 5) == 0 {
+                ibuf_set(cands, ci + 5, bend)
+            }
+            ci += 6
         }
         return
     }
@@ -638,13 +698,13 @@ fn scan_walk_ast_ax(cg: CodegenCtx, cands: IntBuf, nid: i64, ldepth: i64) {
         if cb >= 0 {
             ibuf_set(cands, cb + 2, 0)
             ibuf_set(cands, cb + 3, -1) // Disqualify duplicate/shadowed var name
-        } else if ibuf_len(cands) + 4 <= 1024 {
-            ibuf_push(cands, vsoff)
-            ibuf_push(cands, vslen)
-            ibuf_push(cands, ok_scalar)
+        } else {
+            if ast_get(nodes, nid, 3) == 0 and (ptag & 1) == 0 and ok_scalar == 1 and init_e > 0 and ast_kind(nodes, init_e) == nk_int() {
+                ok_scalar = 0
+            }
             mut init_w := -1
             if ok_scalar != 0 { init_w = 1 + ldepth * 64 }
-            ibuf_push(cands, init_w)
+            scan_push_cand(cands, vsoff, vslen, ok_scalar, init_w, scan_pos_next(cg), 0)
         }
         return
     }
@@ -658,9 +718,7 @@ fn scan_walk_ast_ax(cg: CodegenCtx, cands: IntBuf, nid: i64, ldepth: i64) {
             nl := ibuf_get(extra, noff + i * 2 + 1)
             cb := scan_cand_find(cg.pool, cands, ns, nl)
             if cb >= 0 { ibuf_set(cands, cb + 3, -1) }
-            else if ibuf_len(cands) + 4 <= 1024 {
-                ibuf_push(cands, ns); ibuf_push(cands, nl); ibuf_push(cands, 0); ibuf_push(cands, -1)
-            }
+            else { scan_push_cand(cands, ns, nl, 0, -1, 0, 999999999) }
             i += 1
         }
         return
@@ -696,15 +754,27 @@ fn scan_walk_ast_ax(cg: CodegenCtx, cands: IntBuf, nid: i64, ldepth: i64) {
         return
     }
     if k == nk_while() {
-        scan_walk_ast_ax(cg, cands, ast_get(nodes, nid, 1), ldepth + 1)
-        scan_walk_ast_ax(cg, cands, ast_get(nodes, nid, 2), ldepth + 1)
+        mut next_d := ldepth + 1
+        if ldepth >= 1 {
+            cond := ast_get(nodes, nid, 1)
+            if cond > 0 and ast_kind(nodes, cond) == nk_binary() {
+                cop := ast_get(nodes, cond, 1)
+                crhs := ast_get(nodes, cond, 3)
+                if (cop == op_lt() or cop == op_lte()) and crhs > 0 and ast_kind(nodes, crhs) == nk_int() {
+                    lim := ast_get(nodes, crhs, 1)
+                    if lim >= 0 and lim <= 32 { next_d = ldepth }
+                }
+            }
+        }
+        scan_walk_ast_ax(cg, cands, ast_get(nodes, nid, 1), next_d)
+        scan_walk_ast_ax(cg, cands, ast_get(nodes, nid, 2), next_d)
         return
     }
     if k == nk_for_range() or k == nk_par_for_range() {
         vs := ast_get(nodes, nid, 1); vl := ast_get(nodes, nid, 2)
         cb := scan_cand_find(cg.pool, cands, vs, vl)
         if cb >= 0 { ibuf_set(cands, cb + 3, -1) }
-        else if ibuf_len(cands) + 4 <= 1024 { ibuf_push(cands, vs); ibuf_push(cands, vl); ibuf_push(cands, 0); ibuf_push(cands, -1) }
+        else { scan_push_cand(cands, vs, vl, 0, -1, 0, 999999999) }
         scan_walk_ast_ax(cg, cands, ast_get(nodes, nid, 3), ldepth)
         scan_walk_ast_ax(cg, cands, ast_get(nodes, nid, 4), ldepth)
         scan_walk_ast_ax(cg, cands, ast_get(nodes, nid, 5), ldepth + 1)
@@ -715,7 +785,7 @@ fn scan_walk_ast_ax(cg: CodegenCtx, cands: IntBuf, nid: i64, ldepth: i64) {
         vs := ast_get(nodes, nid, 1); vl := ast_get(nodes, nid, 2)
         cb := scan_cand_find(cg.pool, cands, vs, vl)
         if cb >= 0 { ibuf_set(cands, cb + 3, -1) }
-        else if ibuf_len(cands) + 4 <= 1024 { ibuf_push(cands, vs); ibuf_push(cands, vl); ibuf_push(cands, 0); ibuf_push(cands, -1) }
+        else { scan_push_cand(cands, vs, vl, 0, -1, 0, 999999999) }
         scan_walk_ast_ax(cg, cands, ast_get(nodes, nid, 3), ldepth)
         scan_walk_ast_ax(cg, cands, ast_get(nodes, nid, 4), ldepth + 1)
         return
@@ -809,11 +879,14 @@ fn scan_promo_vars_ax(cg: CodegenCtx, p_base: i64, p_cnt: i64, body_nid: i64) {
     while zi < 5 { ibuf_set(cg.state, 163 + zi, 0); zi += 1 }
     zi = 0
     while zi < 10 { ibuf_set(cg.state, 246 + zi, 0); zi += 1 }
+    fb := cg_fpromo_base(cg)
+    zi = 0
+    while zi < 128 { ibuf_set(cg.state, fb + zi, 0); zi += 1 }
     if body_nid <= 0 { return }
 
-    cands := ibuf_new(1024)
+    cands := ibuf_new(1536)
     mut pi := 0
-    while pi < p_cnt and ibuf_len(cands) + 4 <= 1024 {
+    while pi < p_cnt {
         po := p_base + pi * 6
         pmode := ibuf_get(cg.sym, po + 2)
         pty := ibuf_get(cg.sym, po + 3)
@@ -826,29 +899,29 @@ fn scan_promo_vars_ax(cg: CodegenCtx, p_base: i64, p_cnt: i64, body_nid: i64) {
                 ok = 2; w = 1
             }
         }
-        ibuf_push(cands, ibuf_get(cg.sym, po))
-        ibuf_push(cands, ibuf_get(cg.sym, po + 1))
-        ibuf_push(cands, ok)
-        ibuf_push(cands, w)
+        scan_push_cand(cands, ibuf_get(cg.sym, po), ibuf_get(cg.sym, po + 1), ok, w, 0, 999999999)
         pi += 1
     }
 
     scan_walk_ast_ax(cg, cands, body_nid, 0)
 
-    // Pick top 5 highest-weighted eligible scalar candidates -> `RBX, R12, R13, R14, R15`
+    // Linear-scan / disjoint-block GPR promotion -> `RBX, R12, R13, R14, R15`
     mut min_gpr_w := 64
     if ast_kind(cg.nodes, body_nid) == nk_block() and ast_get(cg.nodes, body_nid, 2) <= 10 {
         min_gpr_w = 3
     }
-    cnt := ibuf_len(cands) / 4
+    cnt := ibuf_len(cands) / 6
+    gb := cg_gpromo_base(cg)
+    r_ivs := ibuf_new(192) // `[reg, first_pos, blk_end]`
     mut mask := 0
-    mut reg := 1
-    while reg <= 5 {
+    mut prim_cnt := 0
+    mut total_pick := 0
+    while total_pick < 24 {
         mut best_b := -1
         mut best_w := min_gpr_w
         mut i := 0
         while i < cnt {
-            b := i * 4
+            b := i * 6
             w := ibuf_get(cands, b + 3)
             if ibuf_get(cands, b + 2) == 1 and w > best_w {
                 best_w = w
@@ -858,23 +931,69 @@ fn scan_promo_vars_ax(cg: CodegenCtx, p_base: i64, p_cnt: i64, body_nid: i64) {
         }
         if best_b < 0 { break }
         ibuf_set(cands, best_b + 3, -2)
-        ibuf_set(cg.state, 236 + (reg - 1) * 2, ibuf_get(cands, best_b))
-        ibuf_set(cg.state, 237 + (reg - 1) * 2, ibuf_get(cands, best_b + 1))
-        mask = mask | (1 << reg)
-        reg += 1
+        fp := ibuf_get(cands, best_b + 4)
+        mut be := ibuf_get(cands, best_b + 5)
+        if be == 0 { be = 999999999 }
+        mut chosen_r := 0
+        mut r := 1
+        while r <= 5 {
+            mut fits := true
+            mut iv := 0
+            while iv < ibuf_len(r_ivs) {
+                if ibuf_get(r_ivs, iv) == r {
+                    af := ibuf_get(r_ivs, iv + 1)
+                    ae := ibuf_get(r_ivs, iv + 2)
+                    if not (be < af or ae < fp) {
+                        fits = false
+                        break
+                    }
+                }
+                iv += 3
+            }
+            if fits {
+                chosen_r = r
+                break
+            }
+            r += 1
+        }
+        if chosen_r > 0 {
+            ibuf_push(r_ivs, chosen_r)
+            ibuf_push(r_ivs, fp)
+            ibuf_push(r_ivs, be)
+            if (mask & (1 << chosen_r)) == 0 {
+                ibuf_set(cg.state, 236 + (chosen_r - 1) * 2, ibuf_get(cands, best_b))
+                ibuf_set(cg.state, 237 + (chosen_r - 1) * 2, ibuf_get(cands, best_b + 1))
+                mask = mask | (1 << chosen_r)
+                prim_cnt += 1
+            } else {
+                ecnt := ibuf_get(cg.state, gb)
+                if ecnt < 30 {
+                    eo := gb + 1 + ecnt * 3
+                    ibuf_set(cg.state, eo, ibuf_get(cands, best_b))
+                    ibuf_set(cg.state, eo + 1, ibuf_get(cands, best_b + 1))
+                    ibuf_set(cg.state, eo + 2, chosen_r)
+                    ibuf_set(cg.state, gb, ecnt + 1)
+                }
+            }
+            total_pick += 1
+        } else if prim_cnt >= 5 {
+            // Still check remaining disjoint inner-loop candidates even if top-level saturated!
+            total_pick += 1
+        }
     }
+    buf_free(move r_ivs)
     ibuf_set(cg.state, 98, mask)
 
-    // Pick top 5 loop-hot `f64` variables -> `XMM6..XMM10` (only when loop calls cannot clobber XMM6..10!)
+    // Pick top 8 loop-hot `f64` variables -> `XMM6..XMM13` (only when loop calls cannot clobber XMM6..13!)
     if ibuf_get(cg.state, 96) == 0 {
         mut fmask := 0
         mut freg := 1
-        while freg <= 5 {
+        while freg <= 8 {
             mut best_b := -1
             mut best_w := 64
             mut i := 0
             while i < cnt {
-                b := i * 4
+                b := i * 6
                 w := ibuf_get(cands, b + 3)
                 if ibuf_get(cands, b + 2) == 2 and w > best_w {
                     best_w = w
@@ -884,8 +1003,13 @@ fn scan_promo_vars_ax(cg: CodegenCtx, p_base: i64, p_cnt: i64, body_nid: i64) {
             }
             if best_b < 0 { break }
             ibuf_set(cands, best_b + 3, -2)
-            ibuf_set(cg.state, 246 + (freg - 1) * 2, ibuf_get(cands, best_b))
-            ibuf_set(cg.state, 247 + (freg - 1) * 2, ibuf_get(cands, best_b + 1))
+            if freg <= 5 {
+                ibuf_set(cg.state, 246 + (freg - 1) * 2, ibuf_get(cands, best_b))
+                ibuf_set(cg.state, 247 + (freg - 1) * 2, ibuf_get(cands, best_b + 1))
+            } else {
+                ibuf_set(cg.state, fb + 8 + (freg - 6) * 2, ibuf_get(cands, best_b))
+                ibuf_set(cg.state, fb + 9 + (freg - 6) * 2, ibuf_get(cands, best_b + 1))
+            }
             fmask = fmask | (1 << freg)
             freg += 1
         }
@@ -1160,8 +1284,8 @@ fn emit_int_expr_depth_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: I
     p := cg.pool
     k := ast_kind(cg.nodes, enid)
 
-    if is_nonshadowed_const_int(cg, vars, enid) {
-        mc_mov_rax_imm(c, eval_const_int_val(p, cg.nodes, cg.sym, enid))
+    if is_folded_const_int_ax(cg, vars, enid) {
+        mc_mov_rax_imm(c, eval_folded_const_int_ax(cg, vars, enid))
         return
     }
     if k == nk_int() or k == nk_bool() {
@@ -1200,8 +1324,12 @@ fn emit_int_expr_depth_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: I
         op := ast_get(cg.nodes, enid, 1)
         lhs := ast_get(cg.nodes, enid, 2)
         rhs := ast_get(cg.nodes, enid, 3)
-        if is_nonshadowed_const_int(cg, vars, rhs) {
-            imm := eval_const_int_val(p, cg.nodes, cg.sym, rhs)
+        if is_folded_const_int_ax(cg, vars, rhs) {
+            imm := eval_folded_const_int_ax(cg, vars, rhs)
+            if op == op_bit_and() and imm == 255 and ast_kind(cg.nodes, lhs) == nk_call() and pool_str_eq_lit(p, ast_get(cg.nodes, lhs, 1), ast_get(cg.nodes, lhs, 2), "ptr_read_u8") {
+                emit_int_expr_depth_ax(cg, vars, drops, breaks, lhs, depth)
+                return
+            }
             if can_imm_binop_ax(op, imm) {
                 emit_int_expr_depth_ax(cg, vars, drops, breaks, lhs, depth)
                 emit_rax_op_imm(cg, op, imm)
@@ -1293,6 +1421,23 @@ fn emit_int_expr_depth_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: I
         if idx_slot > 0 {
             ptr_slot := local_scalar_slot_ax(cg, vars, e0)
             pr_p := cg_slot_reg(cg, ptr_slot)
+            pr_i := cg_slot_reg(cg, idx_slot)
+            if pr_p > 0 and pr_i > 0 {
+                // Direct 1-instruction SIB `[base_reg + idx_reg]` / `[base_reg + idx_reg*8]`!
+                b_hw := gpreg_hw(pr_p); b_hi := gpreg_hi(pr_p)
+                x_hw := gpreg_hw(pr_i); x_hi := gpreg_hi(pr_i)
+                mut scale := 0
+                if is_qword { scale = 3 }
+                mut rex := 0x40 | (x_hi << 1) | b_hi
+                if is_qword { rex = rex | 0x08 }
+                if rex != 0x40 { mc_b1(c, rex) }
+                if is_qword { mc_b1(c, 0x8B) } else { mc_b2(c, 0x0F, 0xB6) }
+                mut modrm := 0x04
+                if b_hw == 5 { modrm = 0x44 } // R13 base requires disp8=0
+                mc_b2(c, modrm, (scale << 6) | (x_hw << 3) | b_hw)
+                if b_hw == 5 { mc_b1(c, 0) }
+                return
+            }
             if pr_p > 0 {
                 mc_mov_rcx_gpreg(c, pr_p)
             } else if ptr_slot > 0 {
@@ -1301,7 +1446,6 @@ fn emit_int_expr_depth_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: I
                 emit_int_expr_depth_ax(cg, vars, drops, breaks, e0, depth)
                 mc_b3(c, 0x48, 0x89, 0xC1)
             }
-            pr_i := cg_slot_reg(cg, idx_slot)
             if pr_i > 0 { mc_mov_rdx_gpreg(c, pr_i) }
             else        { mc_load_rdx(c, idx_slot, 0) }
         } else {
@@ -1432,8 +1576,18 @@ fn emit_f64_expr_depth_ax(cg: CodegenCtx, vars: IntBuf, enid: i64, depth: i64) {
     rhs := ast_get(cg.nodes, enid, 3)
     op2 := f64_op2_code(op)
     if const_f64_rdata_ok(cg, vars, rhs) {
+        rbits := const_f64_bits_ax(cg, rhs)
         emit_f64_expr_depth_ax(cg, vars, lhs, depth)
-        mc_sse_xmm0_rdata(cg, 0xF2, op2, const_f64_bits_ax(cg, rhs), false)
+        if (op == op_mul() or op == op_wrap_mul()) and rbits == 0x4000000000000000 {
+            mc_b4(c, 0xF2, 0x0F, 0x58, 0xC0) // ADDSD XMM0, XMM0 (x * 2.0)
+        } else {
+            mc_sse_xmm0_rdata(cg, 0xF2, op2, rbits, false)
+        }
+        return
+    }
+    if (op == op_mul() or op == op_wrap_mul()) and const_f64_rdata_ok(cg, vars, lhs) and const_f64_bits_ax(cg, lhs) == 0x4000000000000000 {
+        emit_f64_expr_depth_ax(cg, vars, rhs, depth)
+        mc_b4(c, 0xF2, 0x0F, 0x58, 0xC0) // ADDSD XMM0, XMM0 (2.0 * x)
         return
     }
     rslot := local_f64_slot_ax(cg, vars, rhs)
@@ -1447,8 +1601,13 @@ fn emit_f64_expr_depth_ax(cg: CodegenCtx, vars: IntBuf, enid: i64, depth: i64) {
     is_comm := op == op_add() or op == op_wrap_add() or op == op_mul() or op == op_wrap_mul()
     if is_comm {
         if const_f64_rdata_ok(cg, vars, lhs) {
+            lbits := const_f64_bits_ax(cg, lhs)
             emit_f64_expr_depth_ax(cg, vars, rhs, depth)
-            mc_sse_xmm0_rdata(cg, 0xF2, op2, const_f64_bits_ax(cg, lhs), false)
+            if (op == op_mul() or op == op_wrap_mul()) and lbits == 0x4000000000000000 {
+                mc_b4(c, 0xF2, 0x0F, 0x58, 0xC0) // ADDSD XMM0, XMM0 (2.0 * x)
+            } else {
+                mc_sse_xmm0_rdata(cg, 0xF2, op2, lbits, false)
+            }
             return
         }
         lslot := local_f64_slot_ax(cg, vars, lhs)
@@ -1662,8 +1821,13 @@ fn emit_scalar_binop_ax(cg: CodegenCtx, op: i64, lslot: i64, loff: i64, rslot: i
     return dst
 }
 
-// Emits fused `CMP` + inverted `Jcc rel32` for `if`/`while` conditions without allocating boolean scratch slots.
-fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, cond_nid: i64) -> i64 {
+fn mc_jcc32_cond(c: ByteBuf, false_cc: i64, jump_if_true: bool) -> i64 {
+    if jump_if_true { return mc_jcc32(c, false_cc ^ 1) }
+    return mc_jcc32(c, false_cc)
+}
+
+// Emits fused `CMP`/`UCOMISD` + `Jcc rel32` for `if`/`while` conditions without allocating boolean scratch slots.
+fn emit_cond_branch_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, cond_nid: i64, jump_if_true: bool) -> i64 {
     c := cg.code
     saved_slot := ibuf_get(cg.state, 4)
     saved_drops := ibuf_len(drops)
@@ -1681,8 +1845,8 @@ fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
                 else if op == op_lte() { inv_jcc = 0x8F }
                 else if op == op_gt() { inv_jcc = 0x8E }
                 else if op == op_gte() { inv_jcc = 0x8C }
-                if is_nonshadowed_const_int(cg, vars, rhs) {
-                    imm := eval_const_int_val(cg.pool, cg.nodes, cg.sym, rhs)
+                if is_folded_const_int_ax(cg, vars, rhs) {
+                    imm := eval_folded_const_int_ax(cg, vars, rhs)
                     if imm >= -2147483648 and imm <= 2147483647 {
                         l_slot := local_scalar_slot_ax(cg, vars, lhs)
                         l_reg := cg_slot_reg(cg, l_slot)
@@ -1699,7 +1863,7 @@ fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
                             }
                         }
                         if ibuf_len(drops) == saved_drops { ibuf_set(cg.state, 4, saved_slot) }
-                        return mc_jcc32(c, inv_jcc)
+                        return mc_jcc32_cond(c, inv_jcc, jump_if_true)
                     }
                 }
                 r_slot := local_scalar_slot_ax(cg, vars, rhs)
@@ -1720,7 +1884,7 @@ fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
                         mc_cmp_rax_slot(c, r_slot, 0)
                     }
                     if ibuf_len(drops) == saved_drops { ibuf_set(cg.state, 4, saved_slot) }
-                    return mc_jcc32(c, inv_jcc)
+                    return mc_jcc32_cond(c, inv_jcc, jump_if_true)
                 }
                 if not expr_has_real_call_ax(cg, rhs) {
                     emit_int_expr_to_rax(cg, vars, drops, breaks, lhs)
@@ -1728,7 +1892,7 @@ fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
                     emit_int_expr_to_rax(cg, vars, drops, breaks, rhs)
                     mc_b3(c, 0x49, 0x39, 0xC1) // CMP R9, RAX (lhs - rhs)
                     if ibuf_len(drops) == saved_drops { ibuf_set(cg.state, 4, saved_slot) }
-                    return mc_jcc32(c, inv_jcc)
+                    return mc_jcc32_cond(c, inv_jcc, jump_if_true)
                 }
                 emit_int_expr_to_rax(cg, vars, drops, breaks, lhs)
                 lt := cg_alloc_slots(cg, 1)
@@ -1738,7 +1902,7 @@ fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
                 mc_load_rax(c, lt, 0)
                 mc_b3(c, 0x48, 0x39, 0xC8)
                 if ibuf_len(drops) == saved_drops { ibuf_set(cg.state, 4, saved_slot) }
-                return mc_jcc32(c, inv_jcc)
+                return mc_jcc32_cond(c, inv_jcc, jump_if_true)
             }
             if pure_f64_ty_ax(cg, vars, lhs) and pure_f64_ty_ax(cg, vars, rhs) {
                 if op == op_gt() or op == op_gte() {
@@ -1758,8 +1922,8 @@ fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
                         }
                     }
                     if ibuf_len(drops) == saved_drops { ibuf_set(cg.state, 4, saved_slot) }
-                    if op == op_gt() { return mc_jcc32(c, 0x86) }
-                    return mc_jcc32(c, 0x82)
+                    if op == op_gt() { return mc_jcc32_cond(c, 0x86, jump_if_true) }
+                    return mc_jcc32_cond(c, 0x82, jump_if_true)
                 } else if op == op_lt() or op == op_lte() {
                     emit_f64_expr_to_xmm0(cg, vars, rhs)
                     if const_f64_rdata_ok(cg, vars, lhs) {
@@ -1777,8 +1941,8 @@ fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
                         }
                     }
                     if ibuf_len(drops) == saved_drops { ibuf_set(cg.state, 4, saved_slot) }
-                    if op == op_lt() { return mc_jcc32(c, 0x86) }
-                    return mc_jcc32(c, 0x82)
+                    if op == op_lt() { return mc_jcc32_cond(c, 0x86, jump_if_true) }
+                    return mc_jcc32_cond(c, 0x82, jump_if_true)
                 }
             }
             lr := emit_expr_ax(cg, vars, drops, breaks, lhs)
@@ -1791,8 +1955,8 @@ fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
                 else if op == op_gt() { inv_jcc = 0x8E }
                 else if op == op_gte() { inv_jcc = 0x8C }
 
-                if is_nonshadowed_const_int(cg, vars, rhs) {
-                    imm := eval_const_int_val(cg.pool, cg.nodes, cg.sym, rhs)
+                if is_folded_const_int_ax(cg, vars, rhs) {
+                    imm := eval_folded_const_int_ax(cg, vars, rhs)
                     if imm >= -2147483648 and imm <= 2147483647 {
                         mc_load_rax(c, er_slot(lr), 0)
                         if imm == 0 {
@@ -1806,7 +1970,7 @@ fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
                         if ibuf_len(drops) == saved_drops {
                             ibuf_set(cg.state, 4, saved_slot)
                         }
-                        return mc_jcc32(c, inv_jcc)
+                        return mc_jcc32_cond(c, inv_jcc, jump_if_true)
                     }
                 }
 
@@ -1818,7 +1982,7 @@ fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
                     if ibuf_len(drops) == saved_drops {
                         ibuf_set(cg.state, 4, saved_slot)
                     }
-                    return mc_jcc32(c, inv_jcc)
+                    return mc_jcc32_cond(c, inv_jcc, jump_if_true)
                 }
 
                 dst := emit_scalar_binop_ax(cg, op, er_slot(lr), 0, er_slot(rr), 0, ty_int())
@@ -1827,7 +1991,7 @@ fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
                 if ibuf_len(drops) == saved_drops {
                     ibuf_set(cg.state, 4, saved_slot)
                 }
-                return mc_jcc32(c, 0x84)
+                return mc_jcc32_cond(c, 0x84, jump_if_true)
             } else if lty == ty_float() {
                 rr := emit_expr_ax(cg, vars, drops, breaks, rhs)
                 if er_ty(rr) == ty_float() {
@@ -1835,15 +1999,15 @@ fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
                         mc_sse_xmm0_slot(c, 0xF2, 0x10, er_slot(lr), 0)
                         mc_sse_xmm0_slot(c, 0x66, 0x2E, er_slot(rr), 0)
                         if ibuf_len(drops) == saved_drops { ibuf_set(cg.state, 4, saved_slot) }
-                        if op == op_gt() { return mc_jcc32(c, 0x86) } // JBE (false or NaN)
-                        return mc_jcc32(c, 0x82) // JB (false or NaN)
+                        if op == op_gt() { return mc_jcc32_cond(c, 0x86, jump_if_true) } // JBE (false or NaN)
+                        return mc_jcc32_cond(c, 0x82, jump_if_true) // JB (false or NaN)
                     } else if op == op_lt() or op == op_lte() {
                         // Swap operands: (l < r) == (r > l); (l <= r) == (r >= l) -> single JBE/JB NaN-safe!
                         mc_sse_xmm0_slot(c, 0xF2, 0x10, er_slot(rr), 0)
                         mc_sse_xmm0_slot(c, 0x66, 0x2E, er_slot(lr), 0)
                         if ibuf_len(drops) == saved_drops { ibuf_set(cg.state, 4, saved_slot) }
-                        if op == op_lt() { return mc_jcc32(c, 0x86) } // JBE
-                        return mc_jcc32(c, 0x82) // JB
+                        if op == op_lt() { return mc_jcc32_cond(c, 0x86, jump_if_true) } // JBE
+                        return mc_jcc32_cond(c, 0x82, jump_if_true) // JB
                     }
                     mc_sse_xmm0_slot(c, 0xF2, 0x10, er_slot(lr), 0)
                     mc_sse_xmm0_slot(c, 0x66, 0x2E, er_slot(rr), 0)
@@ -1858,13 +2022,13 @@ fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
                     }
                     mc_b2(c, 0x84, 0xC0) // TEST AL, AL
                     if ibuf_len(drops) == saved_drops { ibuf_set(cg.state, 4, saved_slot) }
-                    return mc_jcc32(c, 0x84)
+                    return mc_jcc32_cond(c, 0x84, jump_if_true)
                 }
                 dst := emit_scalar_binop_ax(cg, op, er_slot(lr), 0, er_slot(rr), 0, ty_float())
                 mc_load_rax(c, dst, 0)
                 mc_b3(c, 0x48, 0x85, 0xC0)
                 if ibuf_len(drops) == saved_drops { ibuf_set(cg.state, 4, saved_slot) }
-                return mc_jcc32(c, 0x84)
+                return mc_jcc32_cond(c, 0x84, jump_if_true)
             }
         }
     }
@@ -1875,7 +2039,11 @@ fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: 
     if ibuf_len(drops) == saved_drops {
         ibuf_set(cg.state, 4, saved_slot)
     }
-    return mc_jcc32(c, 0x84)
+    return mc_jcc32_cond(c, 0x84, jump_if_true)
+}
+
+fn emit_cond_jump_false_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, cond_nid: i64) -> i64 {
+    return emit_cond_branch_ax(cg, vars, drops, breaks, cond_nid, false)
 }
 
 fn emit_perceus_drops_ax(cg: CodegenCtx, drops: IntBuf) {
@@ -3667,7 +3835,7 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
                     dst_slot := cg_alloc_slots(cg, 1)
                     fr_d := find_promo_freg_by_name(cg, vsoff, vslen)
                     if fr_d > 0 {
-                        ibuf_set(cg.state, 162 + fr_d, dst_slot)
+                        cg_set_freg_slot(cg, fr_d, dst_slot)
                         mc_mov_freg_xmm0(c, fr_d)
                     } else {
                         mc_sse_xmm0_slot(c, 0xF2, 0x11, dst_slot, 0)
@@ -3746,7 +3914,7 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
         } else if ibuf_get(cg.state, 22) == 0 and final_ty == ty_float() {
             fr_f := find_promo_freg_by_name(cg, vsoff, vslen)
             if fr_f > 0 {
-                ibuf_set(cg.state, 162 + fr_f, dst_slot)
+                cg_set_freg_slot(cg, fr_f, dst_slot)
                 mc_load_freg_sd(c, dst_slot, fr_f)
             }
         }
@@ -3809,8 +3977,8 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
             lty := lv & 0xFFFFFFFF
             mut pr := 0
             if sub_off == 0 { pr = cg_slot_reg(cg, bslot) }
-            if (aop == aop_add() or aop == aop_sub()) and lty == ty_int() and is_nonshadowed_const_int(cg, vars, rhs) {
-                imm := eval_const_int_val(cg.pool, cg.nodes, cg.sym, rhs)
+            if (aop == aop_add() or aop == aop_sub()) and lty == ty_int() and is_folded_const_int_ax(cg, vars, rhs) {
+                imm := eval_folded_const_int_ax(cg, vars, rhs)
                 if imm >= -2147483647 and imm <= 2147483647 {
                     if pr > 0 {
                         emit_gpreg_addsub_imm(cg, pr, aop == aop_add(), imm)
@@ -3834,8 +4002,8 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
                     return
                 }
             }
-            if aop == aop_eq() and (lty == ty_int() or lty == ty_bool()) and is_nonshadowed_const_int(cg, vars, rhs) {
-                imm_v := eval_const_int_val(cg.pool, cg.nodes, cg.sym, rhs)
+            if aop == aop_eq() and (lty == ty_int() or lty == ty_bool()) and is_folded_const_int_ax(cg, vars, rhs) {
+                imm_v := eval_folded_const_int_ax(cg, vars, rhs)
                 if pr > 0 {
                     mc_mov_gpreg_imm(c, pr, imm_v)
                 } else {
@@ -4016,9 +4184,31 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
     }
 
     if k == nk_if() {
-        jz_pos := emit_cond_jump_false_ax(cg, vars, drops, breaks, ast_get(cg.nodes, snid, 1))
-        emit_block_ax(cg, vars, drops, breaks, ast_get(cg.nodes, snid, 2))
+        tb := ast_get(cg.nodes, snid, 2)
         eb := ast_get(cg.nodes, snid, 3)
+        if eb <= 0 and ast_kind(cg.nodes, tb) == nk_block() and ast_get(cg.nodes, tb, 2) == 1 {
+            st0 := ibuf_get(cg.extra, ast_get(cg.nodes, tb, 1))
+            stk0 := ast_kind(cg.nodes, st0)
+            if stk0 == nk_break() {
+                jtrue := emit_cond_branch_ax(cg, vars, drops, breaks, ast_get(cg.nodes, snid, 1), true)
+                ibuf_push(breaks, jtrue)
+                return
+            }
+            if stk0 == nk_continue() {
+                ctgt := ibuf_get(cg.state, 10)
+                if ctgt == -2 {
+                    jtrue := emit_cond_branch_ax(cg, vars, drops, breaks, ast_get(cg.nodes, snid, 1), true)
+                    ibuf_push(breaks, 0 - jtrue)
+                    return
+                } else if ctgt >= 0 {
+                    jtrue := emit_cond_branch_ax(cg, vars, drops, breaks, ast_get(cg.nodes, snid, 1), true)
+                    mc_patch_rel32(c, jtrue, ctgt)
+                    return
+                }
+            }
+        }
+        jz_pos := emit_cond_jump_false_ax(cg, vars, drops, breaks, ast_get(cg.nodes, snid, 1))
+        emit_block_ax(cg, vars, drops, breaks, tb)
         if eb <= 0 {
             mc_patch_rel32(c, jz_pos, buf_len(c))
         } else {
@@ -4058,22 +4248,36 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
             return
         }
 
+        if try_emit_unrolled4_while_ax(cg, vars, drops, breaks, snid) {
+            return
+        }
+
         prev_cont := ibuf_get(cg.state, 10)
         prev_bmark := ibuf_get(cg.state, 11)
         bmark := ibuf_len(breaks)
 
-        loop_top := buf_len(c)
-        jz_exit := emit_cond_jump_false_ax(cg, vars, drops, breaks, ast_get(cg.nodes, snid, 1))
-
-        ibuf_set(cg.state, 10, loop_top)
+        // Bottom-tested loop rotation: `JMP cond; body: ...; cond: Jcc body` (1 branch per iter!)
+        jmp_cond := mc_jmp32(c)
+        body_pos := buf_len(c)
+        ibuf_set(cg.state, 10, -2) // forward `continue` mode via negative offsets in `breaks`
         ibuf_set(cg.state, 11, bmark)
         emit_block_ax(cg, vars, drops, breaks, ast_get(cg.nodes, snid, 2))
 
-        jb_top := mc_jmp32(c)
-        mc_patch_rel32(c, jb_top, loop_top)
+        cond_pos := buf_len(c)
+        mc_patch_rel32(c, jmp_cond, cond_pos)
+        mut ci := bmark
+        while ci < ibuf_len(breaks) {
+            ent := ibuf_get(breaks, ci)
+            if ent < 0 {
+                mc_patch_rel32(c, 0 - ent, cond_pos)
+                ibuf_set(breaks, ci, 0)
+            }
+            ci += 1
+        }
+        jtrue_body := emit_cond_branch_ax(cg, vars, drops, breaks, ast_get(cg.nodes, snid, 1), true)
+        mc_patch_rel32(c, jtrue_body, body_pos)
 
         exit_pos := buf_len(c)
-        mc_patch_rel32(c, jz_exit, exit_pos)
         mut bi := bmark
         while bi < ibuf_len(breaks) {
             bpos := ibuf_get(breaks, bi)
@@ -4209,7 +4413,10 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
 
     if k == nk_continue() {
         ctgt := ibuf_get(cg.state, 10)
-        if ctgt >= 0 {
+        if ctgt == -2 {
+            cpos := mc_jmp32(c)
+            ibuf_push(breaks, 0 - cpos)
+        } else if ctgt >= 0 {
             cpos := mc_jmp32(c)
             mc_patch_rel32(c, cpos, ctgt)
         }
@@ -4226,15 +4433,10 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
     }
 }
 
-fn emit_block_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, bnid: i64) {
-    if bnid <= 0 {
-        return
-    }
+fn emit_block_slice_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, off: i64, cnt: i64) {
     saved_vcnt := ibuf_len(vars) / 5
     saved_slot := ibuf_get(cg.state, 4)
     saved_drops := ibuf_len(drops)
-    off := ast_get(cg.nodes, bnid, 1)
-    cnt := ast_get(cg.nodes, bnid, 2)
     mut i := 0
     while i < cnt {
         emit_stmt_ax(cg, vars, drops, breaks, ibuf_get(cg.extra, off + i))
@@ -4251,13 +4453,284 @@ fn emit_block_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, bn
         }
         if ibuf_get(cg.state, 161) != 0 {
             pfr_pop := cg_slot_freg(cg, pop_slot)
-            if pfr_pop > 0 { ibuf_set(cg.state, 162 + pfr_pop, 0) }
+            if pfr_pop > 0 { cg_set_freg_slot(cg, pfr_pop, 0) }
         }
         vi += 1
     }
     if ibuf_len(drops) == saved_drops {
         ibuf_set(cg.state, 4, saved_slot)
     }
+}
+
+fn emit_block_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, bnid: i64) {
+    if bnid <= 0 { return }
+    emit_block_slice_ax(cg, vars, drops, breaks, ast_get(cg.nodes, bnid, 1), ast_get(cg.nodes, bnid, 2))
+}
+
+fn scan_unroll_body_ok_ax(cg: CodegenCtx, nid: i64, idx_soff: i64, idx_slen: i64, lim_soff: i64, lim_slen: i64) -> bool {
+    if nid <= 0 { return true }
+    k := ast_kind(cg.nodes, nid)
+    if k == nk_int() or k == nk_float() or k == nk_bool() or k == nk_ident() or k == nk_move_ident() or k == nk_break() {
+        return true
+    }
+    if k == nk_block() {
+        off := ast_get(cg.nodes, nid, 1)
+        cnt := ast_get(cg.nodes, nid, 2)
+        mut i := 0
+        while i < cnt {
+            if not scan_unroll_body_ok_ax(cg, ibuf_get(cg.extra, off + i), idx_soff, idx_slen, lim_soff, lim_slen) { return false }
+            i += 1
+        }
+        return true
+    }
+    if k == nk_var_decl() {
+        if (ast_get(cg.nodes, nid, 6) & 1) != 0 { return false }
+        vs := ast_get(cg.nodes, nid, 1); vl := ast_get(cg.nodes, nid, 2)
+        if vl == idx_slen and pool_str_eq2(cg.pool, vs, vl, idx_soff) { return false }
+        if lim_slen > 0 and vl == lim_slen and pool_str_eq2(cg.pool, vs, vl, lim_soff) { return false }
+        return scan_unroll_body_ok_ax(cg, ast_get(cg.nodes, nid, 5), idx_soff, idx_slen, lim_soff, lim_slen)
+    }
+    if k == nk_assign() {
+        tgt := ast_get(cg.nodes, nid, 2)
+        if tgt <= 0 { return false }
+        tk := ast_kind(cg.nodes, tgt)
+        if tk != nk_ident() and tk != nk_move_ident() { return false }
+        ts := ast_get(cg.nodes, tgt, 1); tl := ast_get(cg.nodes, tgt, 2)
+        if tl == idx_slen and pool_str_eq2(cg.pool, ts, tl, idx_soff) { return false }
+        if lim_slen > 0 and tl == lim_slen and pool_str_eq2(cg.pool, ts, tl, lim_soff) { return false }
+        return scan_unroll_body_ok_ax(cg, ast_get(cg.nodes, nid, 3), idx_soff, idx_slen, lim_soff, lim_slen)
+    }
+    if k == nk_if() {
+        if not scan_unroll_body_ok_ax(cg, ast_get(cg.nodes, nid, 1), idx_soff, idx_slen, lim_soff, lim_slen) { return false }
+        if not scan_unroll_body_ok_ax(cg, ast_get(cg.nodes, nid, 2), idx_soff, idx_slen, lim_soff, lim_slen) { return false }
+        return scan_unroll_body_ok_ax(cg, ast_get(cg.nodes, nid, 3), idx_soff, idx_slen, lim_soff, lim_slen)
+    }
+    if k == nk_expr_stmt() or k == nk_cast() {
+        return scan_unroll_body_ok_ax(cg, ast_get(cg.nodes, nid, 1), idx_soff, idx_slen, lim_soff, lim_slen)
+    }
+    if k == nk_unary() {
+        return scan_unroll_body_ok_ax(cg, ast_get(cg.nodes, nid, 2), idx_soff, idx_slen, lim_soff, lim_slen)
+    }
+    if k == nk_binary() {
+        return scan_unroll_body_ok_ax(cg, ast_get(cg.nodes, nid, 2), idx_soff, idx_slen, lim_soff, lim_slen) and scan_unroll_body_ok_ax(cg, ast_get(cg.nodes, nid, 3), idx_soff, idx_slen, lim_soff, lim_slen)
+    }
+    if k == nk_call() {
+        cs := ast_get(cg.nodes, nid, 1); cl := ast_get(cg.nodes, nid, 2)
+        p := cg.pool
+        pure_bi := pool_str_eq_lit(p, cs, cl, "ushr64") or pool_str_eq_lit(p, cs, cl, "popcnt64") or pool_str_eq_lit(p, cs, cl, "ptr_read_u8") or pool_str_eq_lit(p, cs, cl, "ptr_read_i64") or pool_str_eq_lit(p, cs, cl, "ptr_write_u8") or pool_str_eq_lit(p, cs, cl, "ptr_write_i64") or pool_str_eq_lit(p, cs, cl, "ptr_read_f32") or pool_str_eq_lit(p, cs, cl, "ptr_write_f32")
+        if not pure_bi { return false }
+        aoff := ast_get(cg.nodes, nid, 3); acnt := ast_get(cg.nodes, nid, 4)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(cg.extra, aoff + i)
+            if not scan_unroll_body_ok_ax(cg, ast_get(cg.nodes, ca, 4), idx_soff, idx_slen, lim_soff, lim_slen) { return false }
+            i += 1
+        }
+        return true
+    }
+    return false
+}
+
+fn try_emit_unrolled4_while_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, snid: i64) -> bool {
+    cond := ast_get(cg.nodes, snid, 1)
+    bnid := ast_get(cg.nodes, snid, 2)
+    if cond <= 0 or bnid <= 0 or ast_kind(cg.nodes, cond) != nk_binary() or ast_get(cg.nodes, cond, 1) != op_lt() { return false }
+    if ast_kind(cg.nodes, bnid) != nk_block() { return false }
+    cnt := ast_get(cg.nodes, bnid, 2)
+    if cnt < 2 or cnt > 8 { return false }
+    lhs := ast_get(cg.nodes, cond, 2)
+    rhs := ast_get(cg.nodes, cond, 3)
+    if lhs <= 0 or (ast_kind(cg.nodes, lhs) != nk_ident() and ast_kind(cg.nodes, lhs) != nk_move_ident()) { return false }
+    idx_slot := local_scalar_slot_ax(cg, vars, lhs)
+    if idx_slot <= 0 or immut_local_const_int_node(cg, vars, lhs) > 0 { return false }
+    idx_soff := ast_get(cg.nodes, lhs, 1); idx_slen := ast_get(cg.nodes, lhs, 2)
+    vb_i := cg_var_find(cg.pool, vars, idx_soff, idx_slen)
+    if vb_i < 0 or ibuf_get(vars, vb_i + 3) != ty_int() { return false }
+
+    mut lim_imm := 0
+    mut use_imm := false
+    mut lim_slot := 0
+    mut lim_soff := 0
+    mut lim_slen := 0
+    if is_folded_const_int_ax(cg, vars, rhs) {
+        lim_imm = eval_folded_const_int_ax(cg, vars, rhs)
+        if lim_imm < -2147483645 or lim_imm > 2147483647 { return false }
+        use_imm = true
+    } else {
+        lim_slot = local_scalar_slot_ax(cg, vars, rhs)
+        if lim_slot <= 0 { return false }
+        lim_soff = ast_get(cg.nodes, rhs, 1); lim_slen = ast_get(cg.nodes, rhs, 2)
+        if lim_slen == idx_slen and pool_str_eq2(cg.pool, lim_soff, lim_slen, idx_soff) { return false }
+    }
+
+    boff := ast_get(cg.nodes, bnid, 1)
+    st_last := ibuf_get(cg.extra, boff + cnt - 1)
+    if st_last <= 0 or ast_kind(cg.nodes, st_last) != nk_assign() or ast_get(cg.nodes, st_last, 1) != aop_add() { return false }
+    if not ast_is_ident_lit(cg, ast_get(cg.nodes, st_last, 2), idx_soff, idx_slen) { return false }
+    inc_r := ast_get(cg.nodes, st_last, 3)
+    if inc_r <= 0 or ast_kind(cg.nodes, inc_r) != nk_int() or ast_get(cg.nodes, inc_r, 1) != 1 { return false }
+
+    mut si := 0
+    while si < cnt - 1 {
+        if not scan_unroll_body_ok_ax(cg, ibuf_get(cg.extra, boff + si), idx_soff, idx_slen, lim_soff, lim_slen) {
+            return false
+        }
+        si += 1
+    }
+
+    c := cg.code
+    prev_cont := ibuf_get(cg.state, 10)
+    prev_bmark := ibuf_get(cg.state, 11)
+    bmark := ibuf_len(breaks)
+    ibuf_set(cg.state, 10, -1)
+    ibuf_set(cg.state, 11, bmark)
+
+    // 4x unrolled main loop (`idx < limit - 3`)
+    jmp_cmp4 := mc_jmp32(c)
+    body4_pos := buf_len(c)
+    mut u := 0
+    while u < 4 {
+        emit_block_slice_ax(cg, vars, drops, breaks, boff, cnt - 1)
+        emit_stmt_ax(cg, vars, drops, breaks, st_last)
+        u += 1
+    }
+    cmp4_pos := buf_len(c)
+    mc_patch_rel32(c, jmp_cmp4, cmp4_pos)
+    idx_reg := cg_slot_reg(cg, idx_slot)
+    if use_imm {
+        lim3 := lim_imm - 3
+        if idx_reg > 0 {
+            mc_cmp_gpreg_imm(c, idx_reg, lim3)
+        } else {
+            mc_load_rax(c, idx_slot, 0)
+            if lim3 == 0 { mc_b3(c, 0x48, 0x85, 0xC0) }
+            else if lim3 >= -128 and lim3 <= 127 { mc_b4(c, 0x48, 0x83, 0xF8, lim3 & 255) }
+            else { mc_b2(c, 0x48, 0x3D); mc_u32(c, lim3) }
+        }
+        jl_b4 := mc_jcc32(c, 0x8C)
+        mc_patch_rel32(c, jl_b4, body4_pos)
+    } else {
+        lim_reg := cg_slot_reg(cg, lim_slot)
+        if lim_reg > 0 { mc_mov_rax_gpreg(c, lim_reg) }
+        else           { mc_load_rax(c, lim_slot, 0) }
+        mc_b4(c, 0x48, 0x83, 0xE8, 0x03) // SUB RAX, 3
+        jo_tail := mc_jcc8(c, 0x70)       // Signed underflow guard -> tail loop
+        if idx_reg > 0 {
+            mc_cmp_rax_gpreg(c, idx_reg)  // (limit - 3) - idx > 0 => JG
+        } else {
+            mc_cmp_rax_slot(c, idx_slot, 0)
+        }
+        jg_b4 := mc_jcc32(c, 0x8F)
+        mc_patch_rel32(c, jg_b4, body4_pos)
+        mc_patch_jcc8(c, jo_tail, buf_len(c))
+    }
+
+    // 1x remainder tail loop (`0..3` iterations)
+    jmp_cmp1 := mc_jmp32(c)
+    body1_pos := buf_len(c)
+    emit_block_slice_ax(cg, vars, drops, breaks, boff, cnt - 1)
+    emit_stmt_ax(cg, vars, drops, breaks, st_last)
+    mc_patch_rel32(c, jmp_cmp1, buf_len(c))
+    jtrue1 := emit_cond_branch_ax(cg, vars, drops, breaks, cond, true)
+    mc_patch_rel32(c, jtrue1, body1_pos)
+
+    exit_pos := buf_len(c)
+    mut bi := bmark
+    while bi < ibuf_len(breaks) {
+        bpos := ibuf_get(breaks, bi)
+        if bpos > 0 {
+            mc_patch_rel32(c, bpos, exit_pos)
+            ibuf_set(breaks, bi, 0)
+        }
+        bi += 1
+    }
+    ibuf_set(cg.state, 10, prev_cont)
+    ibuf_set(cg.state, 11, prev_bmark)
+    return true
+}
+
+fn ast_is_ident_lit(cg: CodegenCtx, nid: i64, soff: i64, slen: i64) -> bool {
+    if nid <= 0 { return false }
+    k := ast_kind(cg.nodes, nid)
+    if k != nk_ident() and k != nk_move_ident() { return false }
+    return ast_get(cg.nodes, nid, 2) == slen and pool_str_eq2(cg.pool, ast_get(cg.nodes, nid, 1), slen, soff)
+}
+
+fn ast_is_self_sub_call(cg: CodegenCtx, nid: i64, fn_soff: i64, fn_slen: i64, p_soff: i64, p_slen: i64, d: i64) -> bool {
+    if nid <= 0 or ast_kind(cg.nodes, nid) != nk_call() { return false }
+    if ast_get(cg.nodes, nid, 2) != fn_slen or ast_get(cg.nodes, nid, 4) != 1 { return false }
+    if not pool_str_eq2(cg.pool, ast_get(cg.nodes, nid, 1), fn_slen, fn_soff) { return false }
+    arg_e := ast_get(cg.nodes, ibuf_get(cg.extra, ast_get(cg.nodes, nid, 3)), 4)
+    if arg_e <= 0 or ast_kind(cg.nodes, arg_e) != nk_binary() or ast_get(cg.nodes, arg_e, 1) != op_sub() { return false }
+    lhs := ast_get(cg.nodes, arg_e, 2)
+    rhs := ast_get(cg.nodes, arg_e, 3)
+    return ast_is_ident_lit(cg, lhs, p_soff, p_slen) and rhs > 0 and ast_kind(cg.nodes, rhs) == nk_int() and ast_get(cg.nodes, rhs, 1) == d
+}
+
+// Shrink-wrapping + binary self-recursive accumulator tail-call transformation:
+// `[if p <= 1 { return p }; return self(p-1) + self(p-2)]` -> leaf 3-insn fast-return + register accumulator loop!
+fn try_emit_fast_rec_fn_ax(cg: CodegenCtx, fidx: i64, fn_soff: i64, fn_slen: i64, p_base: i64, p_cnt: i64, ret_ty: i64, fast_abi: i64, fn_flags: i64, body_nid: i64) -> bool {
+    if fast_abi != 1 or p_cnt != 1 or ret_ty != ty_int() or body_nid <= 0 { return false }
+    if (fn_flags & (fnflag_shield() | fnflag_nan_guard() | fnflag_whitebox())) != 0 { return false }
+    if ibuf_get(cg.sym, p_base + 2) == pmode_mut() or ibuf_get(cg.sym, p_base + 3) != ty_int() { return false }
+    if ast_kind(cg.nodes, body_nid) != nk_block() or ast_get(cg.nodes, body_nid, 2) != 2 { return false }
+    p_soff := ibuf_get(cg.sym, p_base)
+    p_slen := ibuf_get(cg.sym, p_base + 1)
+    boff := ast_get(cg.nodes, body_nid, 1)
+    s0 := ibuf_get(cg.extra, boff)
+    s1 := ibuf_get(cg.extra, boff + 1)
+    if s0 <= 0 or s1 <= 0 or ast_kind(cg.nodes, s0) != nk_if() or ast_get(cg.nodes, s0, 3) > 0 { return false }
+    if ast_kind(cg.nodes, s1) != nk_return() { return false }
+    c0 := ast_get(cg.nodes, s0, 1)
+    tb0 := ast_get(cg.nodes, s0, 2)
+    if c0 <= 0 or ast_kind(cg.nodes, c0) != nk_binary() or tb0 <= 0 or ast_kind(cg.nodes, tb0) != nk_block() or ast_get(cg.nodes, tb0, 2) != 1 { return false }
+    cop := ast_get(cg.nodes, c0, 1)
+    cl := ast_get(cg.nodes, c0, 2)
+    cr := ast_get(cg.nodes, c0, 3)
+    mut base_ok := false
+    if cop == op_lte() and ast_is_ident_lit(cg, cl, p_soff, p_slen) and cr > 0 and ast_kind(cg.nodes, cr) == nk_int() and ast_get(cg.nodes, cr, 1) == 1 { base_ok = true }
+    else if cop == op_lt() and ast_is_ident_lit(cg, cl, p_soff, p_slen) and cr > 0 and ast_kind(cg.nodes, cr) == nk_int() and ast_get(cg.nodes, cr, 1) == 2 { base_ok = true }
+    if not base_ok { return false }
+    rs0 := ibuf_get(cg.extra, ast_get(cg.nodes, tb0, 1))
+    if rs0 <= 0 or ast_kind(cg.nodes, rs0) != nk_return() or not ast_is_ident_lit(cg, ast_get(cg.nodes, rs0, 1), p_soff, p_slen) { return false }
+    re1 := ast_get(cg.nodes, s1, 1)
+    if re1 <= 0 or ast_kind(cg.nodes, re1) != nk_binary() or ast_get(cg.nodes, re1, 1) != op_add() { return false }
+    rl := ast_get(cg.nodes, re1, 2)
+    rr := ast_get(cg.nodes, re1, 3)
+    pair_ok := (ast_is_self_sub_call(cg, rl, fn_soff, fn_slen, p_soff, p_slen, 1) and ast_is_self_sub_call(cg, rr, fn_soff, fn_slen, p_soff, p_slen, 2)) or (ast_is_self_sub_call(cg, rl, fn_soff, fn_slen, p_soff, p_slen, 2) and ast_is_self_sub_call(cg, rr, fn_soff, fn_slen, p_soff, p_slen, 1))
+    if not pair_ok { return false }
+
+    c := cg.code
+    shd := ibuf_get(cg.state, 0)
+    // Leaf shrink-wrapped fastpath (`n <= 1` -> `MOV RAX, RCX; RET`, 0 frame overhead!)
+    mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)             // ENDBR64
+    mc_b4(c, 0x48, 0x83, 0xF9, 0x01)             // CMP RCX, 1
+    jg_enter := mc_jcc8(c, 0x7F)                 // JG enter_frame
+    mc_b3(c, 0x48, 0x89, 0xC8)                   // MOV RAX, RCX
+    mc_b1(c, 0xC3)                               // RET
+    mc_patch_jcc8(c, jg_enter, buf_len(c))
+    mc_b4(c, 0x55, 0x48, 0x89, 0xE5)             // PUSH RBP; MOV RBP, RSP
+    mc_b4(c, 0x48, 0x83, 0xEC, 0x30)             // SUB RSP, 48 (16B aligned)
+    mc_b4(c, 0x48, 0x89, 0x5D, 0xF8)             // MOV [RBP-8], RBX
+    mc_b4(c, 0x4C, 0x89, 0x65, 0xF0)             // MOV [RBP-16], R12
+    mc_b3(c, 0x48, 0x89, 0xCB)                   // MOV RBX, RCX (n)
+    mc_b3(c, 0x45, 0x31, 0xE4)                   // XOR R12D, R12D (acc = 0)
+    lp := buf_len(c)
+    mc_b4(c, 0x48, 0x8D, 0x4B, 0xFF)             // LEA RCX, [RBX - 1]
+    cg_call_fn(cg, fidx)
+    mc_b3(c, 0x49, 0x01, 0xC4)                   // ADD R12, RAX
+    if shd != 0 { cg_jmp_fn(cg, 0x80, h_sec_trap()) }
+    mc_b4(c, 0x48, 0x83, 0xEB, 0x02)             // SUB RBX, 2
+    mc_b4(c, 0x48, 0x83, 0xFB, 0x01)             // CMP RBX, 1
+    jg_lp := mc_jcc8(c, 0x7F)                    // JG lp
+    mc_patch_jcc8(c, jg_lp, lp)
+    mc_b3(c, 0x4C, 0x89, 0xE0)                   // MOV RAX, R12
+    mc_b3(c, 0x48, 0x01, 0xD8)                   // ADD RAX, RBX
+    if shd != 0 { cg_jmp_fn(cg, 0x80, h_sec_trap()) }
+    mc_b4(c, 0x48, 0x8B, 0x5D, 0xF8)             // MOV RBX, [RBP-8]
+    mc_b4(c, 0x4C, 0x8B, 0x65, 0xF0)             // MOV R12, [RBP-16]
+    mc_b2(c, 0xC9, 0xC3)                         // LEAVE; RET
+    return true
 }
 
 fn compile_single_fn_ax(cg: CodegenCtx, fidx: i64) {
@@ -4291,6 +4764,10 @@ fn compile_single_fn_ax(cg: CodegenCtx, fidx: i64) {
     ibuf_set(cg.state, 23, 0)
     ibuf_set(cg.state, 24, 0)
     ibuf_set(cg.state, 25, 0)
+
+    if try_emit_fast_rec_fn_ax(cg, fidx, fn_soff, fn_slen, p_base, p_cnt, ret_ty, fast_abi, fn_flags, body_nid) {
+        return
+    }
 
     // Prolog: `ENDBR64; PUSH RBP; MOV RBP, RSP` + compact 13B frame setup (`SUB RSP, imm32; NOP6` or `CALL h_chkstk`)
     mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
@@ -4334,7 +4811,7 @@ fn compile_single_fn_ax(cg: CodegenCtx, fidx: i64) {
     if fpromo_mask != 0 {
         mut kf_save := 0
         mut fr := 1
-        while fr <= 5 {
+        while fr <= 8 {
             if (fpromo_mask & (1 << fr)) != 0 { kf_save += 1 }
             fr += 1
         }
@@ -4342,7 +4819,7 @@ fn compile_single_fn_ax(cg: CodegenCtx, fidx: i64) {
         ibuf_set(cg.state, 162, fsave_base)
         mut fsi := 0
         fr = 1
-        while fr <= 5 {
+        while fr <= 8 {
             if (fpromo_mask & (1 << fr)) != 0 {
                 mc_store_freg_ups(c, fsave_base + fsi * 2 + 1, fr)
                 fsi += 1
@@ -4390,7 +4867,7 @@ fn compile_single_fn_ax(cg: CodegenCtx, fidx: i64) {
             if pslots == 1 and pty == ty_float() {
                 fr_p := find_promo_freg_by_name(cg, pn_soff, pn_slen)
                 if fr_p > 0 {
-                    ibuf_set(cg.state, 162 + fr_p, pslot)
+                    cg_set_freg_slot(cg, fr_p, pslot)
                     mc_load_freg_sd(c, pslot, fr_p)
                 }
             }
@@ -4968,7 +5445,7 @@ fn compile_module_x86_64_v7(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: In
     fixups := ibuf_new(fix_cap)
     fn_ranges := ibuf_new(f_cnt * 4 + 256)
     interns := ibuf_new(int_cap)
-    state_need := f_cnt + 280
+    state_need := f_cnt + 400
     state := ibuf_new(state_need + 64)
     mut zi := 0
     while zi < state_need {

@@ -3164,15 +3164,19 @@ fn emit_ai_gemv_gemm_helpers(cg: CodegenCtx) {
     if cg_is_helper_used(cg, h_ai_gemm_f32()) {
         mc_align16(c)
         s_wk := buf_len(c)
-        // Stack locals: `[RSP+0..7] = k`, `[RSP+8..15] = n`, `[RSP+16..23] = B`, `[RSP+24..31] = b_stride (n*4)`
-        mc_ai_enter(c, 0x48)
+        // Stack locals: `[RSP+0]=k`, `[RSP+8]=n`, `[RSP+16]=B`, `[RSP+24]=b_stride(n*4)`,
+        // `[RSP+32]=r0`, `[RSP+40]=a_stride(k*4)`, `[RSP+48..175]=XMM6..XMM13`
+        mc_ai_enter(c, 0xB8)
         mc_b3(c, 0x4D, 0x89, 0xC4) // R12 = pool
         mc_b4(c, 0x49, 0x8B, 0x44, 0x24); mc_b1(c, 56) // m
         mc_ai_row_range(c)         // R14 = r0, R15 = r1
         mc_b3(c, 0x4D, 0x39, 0xFE)
         jge_gm_e := mc_jcc32(c, 0x8D)
+        mc_b4(c, 0x4C, 0x89, 0x74, 0x24); mc_b1(c, 32) // [RSP+32] = r0
         mc_b4(c, 0x49, 0x8B, 0x44, 0x24); mc_b1(c, 64) // k
         mc_b4(c, 0x48, 0x89, 0x04, 0x24)               // [RSP] = k
+        mc_b3(c, 0x48, 0xC1, 0xE0); mc_b1(c, 2)        // RAX = k*4
+        mc_b4(c, 0x48, 0x89, 0x44, 0x24); mc_b1(c, 40) // [RSP+40] = a_stride
         mc_b4(c, 0x49, 0x8B, 0x4C, 0x24); mc_b1(c, 72) // n
         mc_b4(c, 0x48, 0x89, 0x4C, 0x24); mc_b1(c, 8)  // [RSP+8] = n
         mc_b4(c, 0x49, 0x8B, 0x44, 0x24); mc_b1(c, 40) // B
@@ -3187,6 +3191,22 @@ fn emit_ai_gemv_gemm_helpers(cg: CodegenCtx) {
         mc_b3(c, 0x48, 0x85, 0xC0)
         jz_gm_sc := mc_jcc32(c, 0x84)
 
+        // Preserve Win64 non-volatile XMM6..XMM13 for 4x16 FMA micro-kernel
+        mut gxi := 0
+        while gxi < 8 {
+            xreg := 6 + gxi
+            mut xr_bit := 1
+            if (xreg & 8) != 0 { xr_bit = 0 }
+            off_x := 48 + gxi * 16
+            mc_b4(c, 0xC4, (xr_bit << 7) | 0x61, 0x7A, 0x7F)
+            if off_x < 128 {
+                mc_b3(c, 0x44 | ((xreg & 7) << 3), 0x24, off_x)
+            } else {
+                mc_b2(c, 0x84 | ((xreg & 7) << 3), 0x24); mc_u32(c, off_x)
+            }
+            gxi += 1
+        }
+
         // Outer j loop by 16 (`R10 = j = 0; j + 16 <= n`)
         mc_b3(c, 0x45, 0x31, 0xD2) // XOR R10D, R10D
         lp_gm_j16 := buf_len(c)
@@ -3194,8 +3214,69 @@ fn emit_ai_gemv_gemm_helpers(cg: CodegenCtx) {
         mc_b4(c, 0x48, 0x3B, 0x44, 0x24); mc_b1(c, 8)
         jg_gm_j8 := mc_jcc32(c, 0x8F)
 
-        // Pair i = r0 .. r1-2 (`R13 = i`)
-        mc_b3(c, 0x4D, 0x89, 0xF5) // R13 = r0
+        // 4x16 row block `i = r0 .. r1-4` (`YMM0..YMM7` saturate dual FMA ports)
+        mc_b4(c, 0x4C, 0x8B, 0x6C, 0x24); mc_b1(c, 32) // R13 = r0
+        lp_gm_i4 := buf_len(c)
+        mc_b4(c, 0x49, 0x8D, 0x45, 0x03) // LEA RAX, [R13 + 3]
+        mc_b3(c, 0x4C, 0x39, 0xF8)
+        jge_gm_i2 := mc_jcc32(c, 0x8D)
+        mc_b4(c, 0x48, 0x8B, 0x1C, 0x24)               // RBX = k
+        mc_b4(c, 0x4C, 0x8B, 0x64, 0x24); mc_b1(c, 40) // R12 = a_stride (k*4)
+        mc_b3(c, 0x4C, 0x89, 0xE8); mc_b4(c, 0x48, 0x0F, 0xAF, 0xC3) // i*k
+        mc_b4(c, 0x49, 0x8D, 0x3C, 0x81)               // RDI = A0
+        mc_b4(c, 0x4A, 0x8D, 0x34, 0x27)               // RSI = RDI + R12 (Wait: R12 uses REX.X -> 4A!)
+        mc_b3(c, 0x49, 0x89, 0xF0); mc_b3(c, 0x4D, 0x01, 0xE0) // R8  = RSI + R12 (A2)
+        mc_b3(c, 0x4D, 0x89, 0xC6); mc_b3(c, 0x4D, 0x01, 0xE6) // R14 = R8  + R12 (A3)
+        mc_b4(c, 0x48, 0x8B, 0x54, 0x24); mc_b1(c, 16) // RDX = B
+        mc_b4(c, 0x4A, 0x8D, 0x14, 0x92)               // RDX = B + j*4
+        mc_b4(c, 0x48, 0x8B, 0x4C, 0x24); mc_b1(c, 24) // RCX = b_stride
+        mut yz := 0
+        while yz < 8 {
+            mc_vex2(c, yz, 1, 0, 0x57, 0xC0 | (yz << 3) | yz)
+            yz += 1
+        }
+        mc_b3(c, 0x48, 0x85, 0xDB)
+        jle_p4_e := mc_jcc8(c, 0x7E)
+        lp_p4 := buf_len(c)
+        mc_vex3(c, 1, 0, 0, 2, 0, 0, 1, 1, 0x18); mc_b1(c, 0x07) // VBROADCASTSS YMM8,  [RDI]
+        mc_vex3(c, 1, 0, 0, 2, 0, 0, 1, 1, 0x18); mc_b1(c, 0x0E) // VBROADCASTSS YMM9,  [RSI]
+        mc_vex3(c, 1, 0, 1, 2, 0, 0, 1, 1, 0x18); mc_b1(c, 0x10) // VBROADCASTSS YMM10, [R8]
+        mc_vex3(c, 1, 0, 1, 2, 0, 0, 1, 1, 0x18); mc_b1(c, 0x1E) // VBROADCASTSS YMM11, [R14]
+        mc_vex3(c, 1, 0, 0, 1, 0, 0, 1, 0, 0x10); mc_b1(c, 0x22) // VMOVUPS YMM12, [RDX]
+        mc_vex3(c, 1, 0, 0, 1, 0, 0, 1, 0, 0x10); mc_b2(c, 0x6A, 32) // VMOVUPS YMM13, [RDX+32]
+        mc_vex3(c, 0, 0, 1, 2, 0, 8,  1, 1, 0xB8); mc_b1(c, 0xC4) // VFMADD231PS YMM0, YMM8,  YMM12
+        mc_vex3(c, 0, 0, 1, 2, 0, 8,  1, 1, 0xB8); mc_b1(c, 0xCD) // VFMADD231PS YMM1, YMM8,  YMM13
+        mc_vex3(c, 0, 0, 1, 2, 0, 9,  1, 1, 0xB8); mc_b1(c, 0xD4) // VFMADD231PS YMM2, YMM9,  YMM12
+        mc_vex3(c, 0, 0, 1, 2, 0, 9,  1, 1, 0xB8); mc_b1(c, 0xDD) // VFMADD231PS YMM3, YMM9,  YMM13
+        mc_vex3(c, 0, 0, 1, 2, 0, 10, 1, 1, 0xB8); mc_b1(c, 0xE4) // VFMADD231PS YMM4, YMM10, YMM12
+        mc_vex3(c, 0, 0, 1, 2, 0, 10, 1, 1, 0xB8); mc_b1(c, 0xED) // VFMADD231PS YMM5, YMM10, YMM13
+        mc_vex3(c, 0, 0, 1, 2, 0, 11, 1, 1, 0xB8); mc_b1(c, 0xF4) // VFMADD231PS YMM6, YMM11, YMM12
+        mc_vex3(c, 0, 0, 1, 2, 0, 11, 1, 1, 0xB8); mc_b1(c, 0xFD) // VFMADD231PS YMM7, YMM11, YMM13
+        mc_b4(c, 0x48, 0x83, 0xC7, 0x04) // ADD RDI, 4
+        mc_b4(c, 0x48, 0x83, 0xC6, 0x04) // ADD RSI, 4
+        mc_b4(c, 0x49, 0x83, 0xC0, 0x04) // ADD R8, 4
+        mc_b4(c, 0x49, 0x83, 0xC6, 0x04) // ADD R14, 4
+        mc_b3(c, 0x48, 0x01, 0xCA)       // ADD RDX, RCX
+        mc_b3(c, 0x48, 0xFF, 0xCB)       // DEC RBX
+        jnz_p4 := mc_jcc8(c, 0x75); mc_patch_jcc8(c, jnz_p4, lp_p4)
+        mc_patch_jcc8(c, jle_p4_e, buf_len(c))
+        // Store 4 rows x 16 cols
+        mc_b4(c, 0x48, 0x8B, 0x44, 0x24); mc_b1(c, 8) // RAX = n
+        mc_b4(c, 0x49, 0x0F, 0xAF, 0xC5)               // RAX = i*n
+        mc_b3(c, 0x4C, 0x01, 0xD0)                     // RAX = i*n + j
+        mc_b4(c, 0x49, 0x8D, 0x3C, 0x83)               // RDI = C + (i*n+j)*4
+        mc_vex2(c, 0, 1, 0, 0x11, 0x07); mc_vex2(c, 0, 1, 0, 0x11, 0x4F); mc_b1(c, 0x20)
+        mc_b3(c, 0x48, 0x01, 0xCF)
+        mc_vex2(c, 0, 1, 0, 0x11, 0x17); mc_vex2(c, 0, 1, 0, 0x11, 0x5F); mc_b1(c, 0x20)
+        mc_b3(c, 0x48, 0x01, 0xCF)
+        mc_vex2(c, 0, 1, 0, 0x11, 0x27); mc_vex2(c, 0, 1, 0, 0x11, 0x6F); mc_b1(c, 0x20)
+        mc_b3(c, 0x48, 0x01, 0xCF)
+        mc_vex2(c, 0, 1, 0, 0x11, 0x37); mc_vex2(c, 0, 1, 0, 0x11, 0x7F); mc_b1(c, 0x20)
+        mc_b4(c, 0x49, 0x83, 0xC5, 0x04) // i += 4
+        jmp_i4 := mc_jmp32(c); mc_patch_rel32(c, jmp_i4, lp_gm_i4)
+
+        // Pair i = .. r1-2 (`R13 = i`)
+        mc_patch_rel32(c, jge_gm_i2, buf_len(c))
         lp_gm_i2 := buf_len(c)
         mc_b4(c, 0x49, 0x8D, 0x45, 0x01)
         mc_b3(c, 0x4C, 0x39, 0xF8)
@@ -3276,6 +3357,21 @@ fn emit_ai_gemv_gemm_helpers(cg: CodegenCtx) {
 
         // Tail columns `j .. n-1` (scalar SSE2 / fallback if simd_tier==0 starting at j=0)
         mc_patch_rel32(c, jg_gm_j8, buf_len(c))
+        mut grx := 0
+        while grx < 8 {
+            xreg := 6 + grx
+            mut xr_bit := 1
+            if (xreg & 8) != 0 { xr_bit = 0 }
+            off_x := 48 + grx * 16
+            mc_b4(c, 0xC4, (xr_bit << 7) | 0x61, 0x7A, 0x6F)
+            if off_x < 128 {
+                mc_b3(c, 0x44 | ((xreg & 7) << 3), 0x24, off_x)
+            } else {
+                mc_b2(c, 0x84 | ((xreg & 7) << 3), 0x24); mc_u32(c, off_x)
+            }
+            grx += 1
+        }
+        mc_b4(c, 0x4C, 0x8B, 0x74, 0x24); mc_b1(c, 32) // Restore R14 = r0 for tail loop
         mc_b3(c, 0xC5, 0xF8, 0x77) // VZEROUPPER (guarded: AVX2 path only)
         jmp_jtail := mc_jmp32(c)
         mc_patch_rel32(c, jz_gm_sc, buf_len(c))
@@ -3317,7 +3413,7 @@ fn emit_ai_gemv_gemm_helpers(cg: CodegenCtx) {
         jmp_jt := mc_jmp32(c); mc_patch_rel32(c, jmp_jt, lp_gm_jt)
         mc_patch_rel32(c, jge_gm_all, buf_len(c))
         mc_patch_rel32(c, jge_gm_e, buf_len(c))
-        mc_ai_leave(c, 0x48)
+        mc_ai_leave(c, 0xB8)
         mc_ai_emit_batch_pub(cg, h_ai_gemm_f32(), s_wk, 3, 5, 16384)
     }
 }
