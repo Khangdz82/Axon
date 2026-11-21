@@ -1,0 +1,364 @@
+// Axon Standard Memory Leak Prevention, Arena & Slab Pool Subsystem (`std/mem_guard.ax`)
+// 100% Pure Axon: Deterministic Zero-Leak Verification, O(1) Frame Arena, and O(1) Slab Object Pool.
+// Eliminates memory leaks, double-frees, and heap fragmentation in Desktop UI, AI Serving, and Game Engines.
+
+// --- 1. Deterministic Memory Leak Guard & Auto-Sweeper ---
+// Hash table layout in `table_ptr` (`cap` entries, power-of-2, 2 i64 per slot: `[ptr, size_bytes]`):
+//   `ptr == 0`: empty slot
+//   `ptr == -1`: tombstone slot
+// `meta_ptr` layout (8 i64s):
+//   0: active_blocks
+//   1: active_bytes
+//   2: total_allocs
+//   3: total_frees
+//   4: peak_bytes
+//   5: double_free_errors
+//   6: cap (power of 2)
+
+struct LeakGuard {
+    table_ptr: i64
+    meta_ptr: i64
+}
+
+fn leak_guard_new(max_tracked: i64 = 4096) -> LeakGuard {
+    unsafe {
+    mut cap := 1024
+    while cap < max_tracked * 2 and cap < 262144 {
+        cap = cap * 2
+    }
+    tbl := mem_alloc_aligned(cap * 16 + 64)
+    meta := mem_alloc_aligned(64)
+    if tbl == 0 or meta == 0 {
+        if tbl != 0 { mem_free_aligned(tbl) }
+        if meta != 0 { mem_free_aligned(meta) }
+        return LeakGuard(table_ptr = 0, meta_ptr = 0)
+    }
+    mut i := 0
+    total_words := cap * 2
+    while i < total_words {
+        ptr_write_i64(tbl, i, 0)
+        i += 1
+    }
+    i = 0
+    while i < 8 {
+        ptr_write_i64(meta, i, 0)
+        i += 1
+    }
+    ptr_write_i64(meta, 6, cap)
+    return LeakGuard(table_ptr = tbl, meta_ptr = meta)
+    }
+}
+
+fn leak_guard_alloc(g: LeakGuard, size_bytes: i64) -> i64 {
+    unsafe {
+    if g.table_ptr == 0 or g.meta_ptr == 0 or size_bytes <= 0 { return 0 }
+    cap := ptr_read_i64(g.meta_ptr, 6)
+    active := ptr_read_i64(g.meta_ptr, 0)
+    if active * 4 >= cap * 3 { return 0 } // Load factor cap (75%)
+
+    p := mem_alloc_aligned(size_bytes)
+    if p == 0 { return 0 }
+
+    mask := cap - 1
+    mut slot := ((p *% 0x9E3779B97F4A7C15) >> 12) & mask
+    mut probes := 0
+    while probes < cap {
+        cur_p := ptr_read_i64(g.table_ptr, slot * 2)
+        if cur_p == 0 or cur_p == -1 {
+            ptr_write_i64(g.table_ptr, slot * 2, p)
+            ptr_write_i64(g.table_ptr, slot * 2 + 1, size_bytes)
+            new_act := active + 1
+            new_bytes := ptr_read_i64(g.meta_ptr, 1) + size_bytes
+            ptr_write_i64(g.meta_ptr, 0, new_act)
+            ptr_write_i64(g.meta_ptr, 1, new_bytes)
+            ptr_write_i64(g.meta_ptr, 2, ptr_read_i64(g.meta_ptr, 2) + 1)
+            if new_bytes > ptr_read_i64(g.meta_ptr, 4) {
+                ptr_write_i64(g.meta_ptr, 4, new_bytes)
+            }
+            return p
+        }
+        slot = (slot + 1) & mask
+        probes += 1
+    }
+    mem_free_aligned(p)
+    return 0
+    }
+}
+
+fn leak_guard_free(g: LeakGuard, p: i64) -> bool {
+    unsafe {
+    if g.table_ptr == 0 or g.meta_ptr == 0 or p <= 0 { return false }
+    cap := ptr_read_i64(g.meta_ptr, 6)
+    mask := cap - 1
+    mut slot := ((p *% 0x9E3779B97F4A7C15) >> 12) & mask
+    mut probes := 0
+    while probes < cap {
+        cur_p := ptr_read_i64(g.table_ptr, slot * 2)
+        if cur_p == 0 {
+            // Pointer not found -> invalid or double free blocked!
+            ptr_write_i64(g.meta_ptr, 5, ptr_read_i64(g.meta_ptr, 5) + 1)
+            return false
+        }
+        if cur_p == p {
+            sz := ptr_read_i64(g.table_ptr, slot * 2 + 1)
+            ptr_write_i64(g.table_ptr, slot * 2, -1)
+            ptr_write_i64(g.table_ptr, slot * 2 + 1, 0)
+            ptr_write_i64(g.meta_ptr, 0, ptr_read_i64(g.meta_ptr, 0) - 1)
+            ptr_write_i64(g.meta_ptr, 1, ptr_read_i64(g.meta_ptr, 1) - sz)
+            ptr_write_i64(g.meta_ptr, 3, ptr_read_i64(g.meta_ptr, 3) + 1)
+            mem_free_aligned(p)
+            return true
+        }
+        slot = (slot + 1) & mask
+        probes += 1
+    }
+    ptr_write_i64(g.meta_ptr, 5, ptr_read_i64(g.meta_ptr, 5) + 1)
+    return false
+    }
+}
+
+@no_alloc
+fn leak_guard_active_blocks(g: LeakGuard) -> i64 {
+    unsafe {
+    if g.meta_ptr == 0 { return 0 }
+    return ptr_read_i64(g.meta_ptr, 0)
+    }
+}
+
+@no_alloc
+fn leak_guard_active_bytes(g: LeakGuard) -> i64 {
+    unsafe {
+    if g.meta_ptr == 0 { return 0 }
+    return ptr_read_i64(g.meta_ptr, 1)
+    }
+}
+
+@no_alloc
+fn leak_guard_total_allocs(g: LeakGuard) -> i64 {
+    unsafe {
+    if g.meta_ptr == 0 { return 0 }
+    return ptr_read_i64(g.meta_ptr, 2)
+    }
+}
+
+@no_alloc
+fn leak_guard_peak_bytes(g: LeakGuard) -> i64 {
+    unsafe {
+    if g.meta_ptr == 0 { return 0 }
+    return ptr_read_i64(g.meta_ptr, 4)
+    }
+}
+
+@no_alloc
+fn leak_guard_double_frees(g: LeakGuard) -> i64 {
+    unsafe {
+    if g.meta_ptr == 0 { return 0 }
+    return ptr_read_i64(g.meta_ptr, 5)
+    }
+}
+
+@no_alloc
+fn leak_guard_is_clean(g: LeakGuard) -> bool {
+    unsafe {
+    if g.meta_ptr == 0 { return false }
+    return ptr_read_i64(g.meta_ptr, 0) == 0 and ptr_read_i64(g.meta_ptr, 1) == 0 and ptr_read_i64(g.meta_ptr, 5) == 0
+    }
+}
+
+// Reclaims any remaining unfreed allocations automatically and returns number of swept leaks
+fn leak_guard_sweep_leaks(g: LeakGuard) -> i64 {
+    unsafe {
+    if g.table_ptr == 0 or g.meta_ptr == 0 { return 0 }
+    cap := ptr_read_i64(g.meta_ptr, 6)
+    mut swept := 0
+    mut i := 0
+    while i < cap {
+        p := ptr_read_i64(g.table_ptr, i * 2)
+        if p > 0 {
+            mem_free_aligned(p)
+            ptr_write_i64(g.table_ptr, i * 2, 0)
+            ptr_write_i64(g.table_ptr, i * 2 + 1, 0)
+            swept += 1
+        }
+        i += 1
+    }
+    ptr_write_i64(g.meta_ptr, 0, 0)
+    ptr_write_i64(g.meta_ptr, 1, 0)
+    return swept
+    }
+}
+
+fn leak_guard_destroy(move g: LeakGuard) {
+    unsafe {
+    _ := leak_guard_sweep_leaks(g)
+    if g.table_ptr != 0 { mem_free_aligned(g.table_ptr) }
+    if g.meta_ptr != 0 { mem_free_aligned(g.meta_ptr) }
+    }
+}
+
+// --- 2. Ultra-Fast O(1) Per-Frame Bump Arena (`FrameArena`) ---
+
+struct FrameArena {
+    base_ptr: i64
+    meta_ptr: i64 // [0] = offset, [1] = cap_bytes, [2] = alloc_count, [3] = reset_count
+}
+
+fn frame_arena_new(cap_bytes: i64) -> FrameArena {
+    unsafe {
+    mut cap := cap_bytes
+    if cap < 4096 { cap = 4096 }
+    base := mem_alloc_aligned(cap + 64)
+    meta := mem_alloc_aligned(64)
+    if base == 0 or meta == 0 {
+        if base != 0 { mem_free_aligned(base) }
+        if meta != 0 { mem_free_aligned(meta) }
+        return FrameArena(base_ptr = 0, meta_ptr = 0)
+    }
+    ptr_write_i64(meta, 0, 0)
+    ptr_write_i64(meta, 1, cap)
+    ptr_write_i64(meta, 2, 0)
+    ptr_write_i64(meta, 3, 0)
+    return FrameArena(base_ptr = base, meta_ptr = meta)
+    }
+}
+
+@no_alloc
+fn frame_arena_alloc(a: FrameArena, size_bytes: i64) -> i64 {
+    unsafe {
+    if a.base_ptr == 0 or a.meta_ptr == 0 or size_bytes <= 0 { return 0 }
+    cur := ptr_read_i64(a.meta_ptr, 0)
+    cap := ptr_read_i64(a.meta_ptr, 1)
+    aligned := (size_bytes + 63) & (0 - 64)
+    if aligned < size_bytes or cur + aligned > cap { return 0 }
+    ptr_write_i64(a.meta_ptr, 0, cur + aligned)
+    ptr_write_i64(a.meta_ptr, 2, ptr_read_i64(a.meta_ptr, 2) + 1)
+    return a.base_ptr + cur
+    }
+}
+
+@no_alloc
+fn frame_arena_reset(a: FrameArena) {
+    unsafe {
+    if a.meta_ptr != 0 {
+        ptr_write_i64(a.meta_ptr, 0, 0)
+        ptr_write_i64(a.meta_ptr, 3, ptr_read_i64(a.meta_ptr, 3) + 1)
+    }
+    }
+}
+
+@no_alloc
+fn frame_arena_used(a: FrameArena) -> i64 {
+    unsafe {
+    if a.meta_ptr == 0 { return 0 }
+    return ptr_read_i64(a.meta_ptr, 0)
+    }
+}
+
+@no_alloc
+fn frame_arena_remaining(a: FrameArena) -> i64 {
+    unsafe {
+    if a.meta_ptr == 0 { return 0 }
+    return ptr_read_i64(a.meta_ptr, 1) - ptr_read_i64(a.meta_ptr, 0)
+    }
+}
+
+fn frame_arena_free(move a: FrameArena) {
+    unsafe {
+    if a.base_ptr != 0 { mem_free_aligned(a.base_ptr) }
+    if a.meta_ptr != 0 { mem_free_aligned(a.meta_ptr) }
+    }
+}
+
+// --- 3. Fixed-Size O(1) Slab Object Pool (`ObjectPool`) with Double-Release Protection ---
+
+struct ObjectPool {
+    slab_ptr: i64
+    free_stack_ptr: i64
+    in_use_ptr: i64
+    meta_ptr: i64 // [0] = slot_bytes, [1] = capacity, [2] = free_top, [3] = active_count
+}
+
+fn obj_pool_new(slot_bytes: i64, capacity: i64) -> ObjectPool {
+    unsafe {
+    mut sb := (slot_bytes + 15) & (0 - 16)
+    if sb < 16 { sb = 16 }
+    mut cap := capacity
+    if cap < 16 { cap = 16 }
+    slab := mem_alloc_aligned(sb * cap + 64)
+    fstack := mem_alloc_aligned(cap * 8 + 64)
+    inuse := mem_alloc_aligned(cap + 64)
+    meta := mem_alloc_aligned(64)
+    if slab == 0 or fstack == 0 or inuse == 0 or meta == 0 {
+        if slab != 0 { mem_free_aligned(slab) }
+        if fstack != 0 { mem_free_aligned(fstack) }
+        if inuse != 0 { mem_free_aligned(inuse) }
+        if meta != 0 { mem_free_aligned(meta) }
+        return ObjectPool(slab_ptr = 0, free_stack_ptr = 0, in_use_ptr = 0, meta_ptr = 0)
+    }
+    mut i := 0
+    while i < cap {
+        ptr_write_i64(fstack, i, cap - 1 - i)
+        ptr_write_u8(inuse, i, 0)
+        i += 1
+    }
+    ptr_write_i64(meta, 0, sb)
+    ptr_write_i64(meta, 1, cap)
+    ptr_write_i64(meta, 2, cap)
+    ptr_write_i64(meta, 3, 0)
+    return ObjectPool(slab_ptr = slab, free_stack_ptr = fstack, in_use_ptr = inuse, meta_ptr = meta)
+    }
+}
+
+@no_alloc
+fn obj_pool_acquire(p: ObjectPool) -> i64 {
+    unsafe {
+    if p.meta_ptr == 0 { return -1 }
+    top := ptr_read_i64(p.meta_ptr, 2)
+    if top <= 0 { return -1 }
+    ntop := top - 1
+    idx := ptr_read_i64(p.free_stack_ptr, ntop)
+    ptr_write_i64(p.meta_ptr, 2, ntop)
+    ptr_write_i64(p.meta_ptr, 3, ptr_read_i64(p.meta_ptr, 3) + 1)
+    ptr_write_u8(p.in_use_ptr, idx, 1)
+    return idx
+    }
+}
+
+@no_alloc
+fn obj_pool_ptr(p: ObjectPool, idx: i64) -> i64 {
+    unsafe {
+    if p.meta_ptr == 0 or idx < 0 or idx >= ptr_read_i64(p.meta_ptr, 1) { return 0 }
+    return p.slab_ptr + idx * ptr_read_i64(p.meta_ptr, 0)
+    }
+}
+
+@no_alloc
+fn obj_pool_release(p: ObjectPool, idx: i64) -> bool {
+    unsafe {
+    if p.meta_ptr == 0 or idx < 0 or idx >= ptr_read_i64(p.meta_ptr, 1) { return false }
+    if ptr_read_u8(p.in_use_ptr, idx) == 0 { return false } // Double-release blocked!
+    ptr_write_u8(p.in_use_ptr, idx, 0)
+    top := ptr_read_i64(p.meta_ptr, 2)
+    ptr_write_i64(p.free_stack_ptr, top, idx)
+    ptr_write_i64(p.meta_ptr, 2, top + 1)
+    ptr_write_i64(p.meta_ptr, 3, ptr_read_i64(p.meta_ptr, 3) - 1)
+    return true
+    }
+}
+
+@no_alloc
+fn obj_pool_active_count(p: ObjectPool) -> i64 {
+    unsafe {
+    if p.meta_ptr == 0 { return 0 }
+    return ptr_read_i64(p.meta_ptr, 3)
+    }
+}
+
+fn obj_pool_free(move p: ObjectPool) {
+    unsafe {
+    if p.slab_ptr != 0 { mem_free_aligned(p.slab_ptr) }
+    if p.free_stack_ptr != 0 { mem_free_aligned(p.free_stack_ptr) }
+    if p.in_use_ptr != 0 { mem_free_aligned(p.in_use_ptr) }
+    if p.meta_ptr != 0 { mem_free_aligned(p.meta_ptr) }
+    }
+}

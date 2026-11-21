@@ -293,18 +293,22 @@ fn fast_exp_f32(x: f64) -> f64 {
         if (k & 2) != 0 { exp_scale = exp_scale * 4.0 }
         if (k & 4) != 0 { exp_scale = exp_scale * 16.0 }
         if (k & 8) != 0 { exp_scale = exp_scale * 256.0 }
-        if (k & 16) != 0 { exp_scale = exp_scale * 65536.0 }
-        if (k & 32) != 0 { exp_scale = exp_scale * 4294967296.0 }
-        if (k & 64) != 0 { exp_scale = exp_scale * 18446744073709551616.0 }
+        if k >= 16 {
+            if (k & 16) != 0 { exp_scale = exp_scale * 65536.0 }
+            if (k & 32) != 0 { exp_scale = exp_scale * 4294967296.0 }
+            if (k & 64) != 0 { exp_scale = exp_scale * 18446744073709551616.0 }
+        }
     } else {
         ek := 0 - k
         if (ek & 1) != 0 { exp_scale = exp_scale * 0.5 }
         if (ek & 2) != 0 { exp_scale = exp_scale * 0.25 }
         if (ek & 4) != 0 { exp_scale = exp_scale * 0.0625 }
         if (ek & 8) != 0 { exp_scale = exp_scale * 0.00390625 }
-        if (ek & 16) != 0 { exp_scale = exp_scale * 0.0000152587890625 }
-        if (ek & 32) != 0 { exp_scale = exp_scale * 0.00000000023283064365386963 }
-        if (ek & 64) != 0 { exp_scale = exp_scale * 0.00000000000000000005421010862427522 }
+        if ek >= 16 {
+            if (ek & 16) != 0 { exp_scale = exp_scale * 0.0000152587890625 }
+            if (ek & 32) != 0 { exp_scale = exp_scale * 0.00000000023283064365386963 }
+            if (ek & 64) != 0 { exp_scale = exp_scale * 0.00000000000000000005421010862427522 }
+        }
     }
     return er * exp_scale
 }
@@ -413,5 +417,132 @@ fn flash_attention_2_tiled(q: i64, k: i64, v: i64, out: i64, seq_len: i64, head_
     if must_free {
         mem_free_aligned(block_scores)
     }
+    }
+}
+
+// --- 7. High-Speed `@no_alloc` LLaMA/Mistral Inference Kernels (RMSNorm, RoPE, SwiGLU, Softmax, Q8 GEMV) ---
+
+@no_alloc
+fn ai_rmsnorm_f32(out_ptr: i64, x_ptr: i64, weight_ptr: i64, dim: i64, eps: f64 = 0.00001) {
+    unsafe {
+    if out_ptr == 0 or x_ptr == 0 or weight_ptr == 0 or dim <= 0 { return }
+    mut ss := 0.0
+    mut i := 0
+    while i < dim {
+        v := ptr_read_f32(x_ptr, i)
+        ss = ss + v * v
+        i += 1
+    }
+    inv_rms := 1.0 / sqrt_f64(ss / (dim as f64) + eps)
+    i = 0
+    while i < dim {
+        ptr_write_f32(out_ptr, i, ptr_read_f32(x_ptr, i) * inv_rms * ptr_read_f32(weight_ptr, i))
+        i += 1
+    }
+    }
+}
+
+@no_alloc
+fn ai_rope_inplace_f32(qk_ptr: i64, head_dim: i64, pos: i64) {
+    unsafe {
+    if qk_ptr == 0 or head_dim <= 1 { return }
+    mut i := 0
+    p_f := pos as f64
+    mut freq := 1.0
+    step_decay := 0.8659643233600653 // 10000^(-2/64)
+    while i + 1 < head_dim {
+        angle := p_f * freq
+        // Fast 2nd-order Padé/Chebyshev rotation (norm-preserving to 1e-6)
+        mut a := angle
+        while a > 3.141592653589793 { a = a - 6.283185307179586 }
+        while a < -3.141592653589793 { a = a + 6.283185307179586 }
+        t := a * 0.5
+        t2 := t * t
+        inv := 1.0 / (1.0 + t2)
+        c := (1.0 - t2) * inv
+        s := (2.0 * t) * inv
+        x0 := ptr_read_f32(qk_ptr, i)
+        x1 := ptr_read_f32(qk_ptr, i + 1)
+        ptr_write_f32(qk_ptr, i, x0 * c - x1 * s)
+        ptr_write_f32(qk_ptr, i + 1, x0 * s + x1 * c)
+        freq = freq * step_decay
+        i += 2
+    }
+    }
+}
+
+@no_alloc
+fn ai_swiglu_f32(out_ptr: i64, gate_ptr: i64, up_ptr: i64, dim: i64) {
+    unsafe {
+    if out_ptr == 0 or gate_ptr == 0 or up_ptr == 0 or dim <= 0 { return }
+    mut i := 0
+    while i < dim {
+        g := ptr_read_f32(gate_ptr, i)
+        u := ptr_read_f32(up_ptr, i)
+        sig := 1.0 / (1.0 + fast_exp_f32(0.0 - g))
+        ptr_write_f32(out_ptr, i, (g * sig) * u)
+        i += 1
+    }
+    }
+}
+
+@no_alloc
+fn ai_softmax_inplace_f32(x_ptr: i64, n: i64) {
+    unsafe {
+    if x_ptr == 0 or n <= 0 { return }
+    mut max_v := ptr_read_f32(x_ptr, 0)
+    mut i := 1
+    while i < n {
+        v := ptr_read_f32(x_ptr, i)
+        if v > max_v { max_v = v }
+        i += 1
+    }
+    mut sum := 0.0
+    i = 0
+    while i < n {
+        e := fast_exp_f32(ptr_read_f32(x_ptr, i) - max_v)
+        ptr_write_f32(x_ptr, i, e)
+        sum = sum + e
+        i += 1
+    }
+    inv := 1.0 / (sum + 0.000000000001)
+    i = 0
+    while i < n {
+        ptr_write_f32(x_ptr, i, ptr_read_f32(x_ptr, i) * inv)
+        i += 1
+    }
+    }
+}
+
+@no_alloc
+fn ai_argmax_f32(x_ptr: i64, n: i64) -> i64 {
+    unsafe {
+    if x_ptr == 0 or n <= 0 { return -1 }
+    mut best_idx := 0
+    mut best_val := ptr_read_f32(x_ptr, 0)
+    mut i := 1
+    while i < n {
+        v := ptr_read_f32(x_ptr, i)
+        if v > best_val {
+            best_val = v
+            best_idx = i
+        }
+        i += 1
+    }
+    return best_idx
+    }
+}
+
+@no_alloc
+fn ai_q8_dot_i64(qa_ptr: i64, qb_ptr: i64, n: i64) -> i64 {
+    unsafe {
+    if qa_ptr == 0 or qb_ptr == 0 or n <= 0 { return 0 }
+    mut acc := 0
+    mut i := 0
+    while i < n {
+        acc += ptr_read_i64(qa_ptr, i) * ptr_read_i64(qb_ptr, i)
+        i += 1
+    }
+    return acc
     }
 }

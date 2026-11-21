@@ -1,0 +1,200 @@
+// Axon High-Throughput O(1) LRU Cache & 64-Bit Multi-Hash Bloom Filter (`std/cache.ax`)
+// 100% Pure Axon, Zero-GC, `@no_alloc` hot paths for databases, web servers, and AI token/embedding caches.
+
+// --- 1. O(1) Flat-Array Open-Addressed Clock/LRU Cache (`LruCache`) ---
+// `slots_ptr` (`cap` power-of-2 entries, 4 i64s per slot: `[key, val, age_tick, state]`):
+//   `state == 0`: empty, `state == 1`: occupied
+// `meta_ptr` (8 i64s):
+//   0: cap, 1: count, 2: tick, 3: hits, 4: misses, 5: evictions
+
+struct LruCache {
+    slots_ptr: i64
+    meta_ptr: i64
+}
+
+fn lru_new(capacity: i64 = 1024) -> LruCache {
+    unsafe {
+    mut cap := 256
+    while cap < capacity * 2 and cap < 262144 { cap = cap * 2 }
+    sp := mem_alloc_aligned(cap * 32 + 64)
+    mp := mem_alloc_aligned(64)
+    if sp == 0 or mp == 0 {
+        if sp != 0 { mem_free_aligned(sp) }
+        if mp != 0 { mem_free_aligned(mp) }
+        return LruCache(slots_ptr = 0, meta_ptr = 0)
+    }
+    mut i := 0
+    total := cap * 4
+    while i < total {
+        ptr_write_i64(sp, i, 0)
+        i += 1
+    }
+    i = 0
+    while i < 8 {
+        ptr_write_i64(mp, i, 0)
+        i += 1
+    }
+    ptr_write_i64(mp, 0, cap)
+    return LruCache(slots_ptr = sp, meta_ptr = mp)
+    }
+}
+
+@no_alloc
+fn lru_put(c: LruCache, key: i64, val: i64) {
+    unsafe {
+    if c.slots_ptr == 0 or c.meta_ptr == 0 { return }
+    cap := ptr_read_i64(c.meta_ptr, 0)
+    mask := cap - 1
+    tick := ptr_read_i64(c.meta_ptr, 2) + 1
+    ptr_write_i64(c.meta_ptr, 2, tick)
+
+    mut slot := ((key *% 0x9E3779B97F4A7C15) >> 15) & mask
+    mut oldest_slot := slot
+    mut oldest_tick := tick + 1
+    mut probes := 0
+    while probes < 16 {
+        base := slot * 4
+        st := ptr_read_i64(c.slots_ptr, base + 3)
+        if st == 0 {
+            ptr_write_i64(c.slots_ptr, base, key)
+            ptr_write_i64(c.slots_ptr, base + 1, val)
+            ptr_write_i64(c.slots_ptr, base + 2, tick)
+            ptr_write_i64(c.slots_ptr, base + 3, 1)
+            ptr_write_i64(c.meta_ptr, 1, ptr_read_i64(c.meta_ptr, 1) + 1)
+            return
+        }
+        if ptr_read_i64(c.slots_ptr, base) == key {
+            ptr_write_i64(c.slots_ptr, base + 1, val)
+            ptr_write_i64(c.slots_ptr, base + 2, tick)
+            return
+        }
+        t := ptr_read_i64(c.slots_ptr, base + 2)
+        if t < oldest_tick {
+            oldest_tick = t
+            oldest_slot = slot
+        }
+        slot = (slot + 1) & mask
+        probes += 1
+    }
+    // Bounded-window LRU eviction: evict least-recently-used slot in the 16-slot probe window
+    eb := oldest_slot * 4
+    ptr_write_i64(c.slots_ptr, eb, key)
+    ptr_write_i64(c.slots_ptr, eb + 1, val)
+    ptr_write_i64(c.slots_ptr, eb + 2, tick)
+    ptr_write_i64(c.slots_ptr, eb + 3, 1)
+    ptr_write_i64(c.meta_ptr, 5, ptr_read_i64(c.meta_ptr, 5) + 1)
+    }
+}
+
+@no_alloc
+fn lru_get(c: LruCache, key: i64, default_val: i64 = -1) -> i64 {
+    unsafe {
+    if c.slots_ptr == 0 or c.meta_ptr == 0 { return default_val }
+    cap := ptr_read_i64(c.meta_ptr, 0)
+    mask := cap - 1
+    mut slot := ((key *% 0x9E3779B97F4A7C15) >> 15) & mask
+    mut probes := 0
+    while probes < 16 {
+        base := slot * 4
+        st := ptr_read_i64(c.slots_ptr, base + 3)
+        if st == 0 { break }
+        if ptr_read_i64(c.slots_ptr, base) == key {
+            tick := ptr_read_i64(c.meta_ptr, 2) + 1
+            ptr_write_i64(c.meta_ptr, 2, tick)
+            ptr_write_i64(c.slots_ptr, base + 2, tick)
+            ptr_write_i64(c.meta_ptr, 3, ptr_read_i64(c.meta_ptr, 3) + 1)
+            return ptr_read_i64(c.slots_ptr, base + 1)
+        }
+        slot = (slot + 1) & mask
+        probes += 1
+    }
+    ptr_write_i64(c.meta_ptr, 4, ptr_read_i64(c.meta_ptr, 4) + 1)
+    return default_val
+    }
+}
+
+@no_alloc
+fn lru_hits(c: LruCache) -> i64 {
+    unsafe {
+    if c.meta_ptr == 0 { return 0 }
+    return ptr_read_i64(c.meta_ptr, 3)
+    }
+}
+
+@no_alloc
+fn lru_misses(c: LruCache) -> i64 {
+    unsafe {
+    if c.meta_ptr == 0 { return 0 }
+    return ptr_read_i64(c.meta_ptr, 4)
+    }
+}
+
+fn lru_free(move c: LruCache) {
+    unsafe {
+    if c.slots_ptr != 0 { mem_free_aligned(c.slots_ptr) }
+    if c.meta_ptr != 0 { mem_free_aligned(c.meta_ptr) }
+    }
+}
+
+// --- 2. 64-Bit 3-Hash Kirsch-Mitzenmacher Bloom Filter (`BloomFilter`) ---
+
+struct BloomFilter {
+    bits_ptr: i64
+    word_mask: i64
+}
+
+fn bloom_new(num_bits: i64 = 65536) -> BloomFilter {
+    unsafe {
+    mut words := 1024
+    while words * 64 < num_bits and words < 1048576 { words = words * 2 }
+    bp := mem_alloc_aligned(words * 8 + 64)
+    if bp == 0 { return BloomFilter(bits_ptr = 0, word_mask = 0) }
+    mut i := 0
+    while i < words {
+        ptr_write_i64(bp, i, 0)
+        i += 1
+    }
+    return BloomFilter(bits_ptr = bp, word_mask = words - 1)
+    }
+}
+
+@no_alloc
+fn bloom_add(bf: BloomFilter, key: i64) {
+    unsafe {
+    if bf.bits_ptr == 0 { return }
+    h1 := key *% 0x9E3779B97F4A7C15
+    h2 := (key ^ (key >> 27)) *% 0xBF58476D1CE4E5B9
+    mut k := 0
+    while k < 3 {
+        h := h1 +% k *% h2
+        w := (h >> 12) & bf.word_mask
+        bit := 1 << (h & 63)
+        ptr_write_i64(bf.bits_ptr, w, ptr_read_i64(bf.bits_ptr, w) | bit)
+        k += 1
+    }
+    }
+}
+
+@no_alloc
+fn bloom_may_contain(bf: BloomFilter, key: i64) -> bool {
+    unsafe {
+    if bf.bits_ptr == 0 { return false }
+    h1 := key *% 0x9E3779B97F4A7C15
+    h2 := (key ^ (key >> 27)) *% 0xBF58476D1CE4E5B9
+    mut k := 0
+    while k < 3 {
+        h := h1 +% k *% h2
+        w := (h >> 12) & bf.word_mask
+        bit := 1 << (h & 63)
+        if (ptr_read_i64(bf.bits_ptr, w) & bit) == 0 { return false }
+        k += 1
+    }
+    return true
+    }
+}
+
+fn bloom_free(move bf: BloomFilter) {
+    unsafe {
+    if bf.bits_ptr != 0 { mem_free_aligned(bf.bits_ptr) }
+    }
+}
