@@ -27,6 +27,7 @@ struct GuiWindow {
     sdl2: i64
     last_char: i64
     scroll_delta: i64
+    needs_redraw: bool
 }
 
 fn _gui_utf8_to_utf16(k32: i64, s: str) -> i64 {
@@ -144,7 +145,7 @@ fn _gui_win32_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64
         width = w, height = h, mouse_x = 0, mouse_y = 0,
         mouse_down = false, key_escape = false, is_open = true,
         user32 = u32, gdi32 = g32, sdl2 = 0,
-        last_char = 0, scroll_delta = 0
+        last_char = 0, scroll_delta = 0, needs_redraw = true
     ))
 }
 
@@ -171,7 +172,7 @@ fn _gui_sdl2_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64 
         width = w, height = h, mouse_x = 0, mouse_y = 0,
         mouse_down = false, key_escape = false, is_open = true,
         user32 = 0, gdi32 = 0, sdl2 = sdl,
-        last_char = 0, scroll_delta = 0
+        last_char = 0, scroll_delta = 0, needs_redraw = true
     ))
 }
 
@@ -210,9 +211,54 @@ fn gui_set_title(win: GuiWindow, title: str) {
     }
 }
 
+// Event-driven OS kernel sleep (0.00% idle CPU): wakes immediately on mouse, keyboard, paint, or resize
+fn gui_wait_event(win: GuiWindow, timeout_ms: i64 = 250) {
+    if not win.is_open { return }
+    if win.backend == 1 and win.user32 != 0 {
+        f_mw := ffi_sym(win.user32, "MsgWaitForMultipleObjects")
+        if f_mw != 0 {
+            _ := ffi_call5(f_mw, 0, 0, 0, timeout_ms, 0x04FF) // QS_ALLINPUT
+            return
+        }
+    }
+    sleep_ms(16)
+}
+
+// Set native Win32 window & taskbar icon from 32-bit BGRA pixel buffer (zero external .ico file)
+fn gui_set_icon_bgra(win: GuiWindow, w: i64, h: i64, pixels: ByteBuf) {
+    if not win.is_open or win.backend != 1 or w <= 0 or h <= 0 { return }
+    if buf_len(pixels) < w * h * 4 { return }
+    f_cbm  := ffi_sym(win.gdi32, "CreateBitmap")
+    f_delo := ffi_sym(win.gdi32, "DeleteObject")
+    f_ci   := ffi_sym(win.user32, "CreateIconIndirect")
+    f_sm   := ffi_sym(win.user32, "SendMessageW")
+    if f_cbm == 0 or f_ci == 0 or f_sm == 0 { return }
+
+    px_ptr := unsafe { (pixels as i64) + 16 }
+    hbm_col := ffi_call5(f_cbm, w, h, 1, 32, px_ptr)
+    mask_buf := ffi_alloc((w * h) / 8 + 32)
+    hbm_msk := ffi_call5(f_cbm, w, h, 1, 1, mask_buf)
+    ffi_free(mask_buf)
+    if hbm_col != 0 and hbm_msk != 0 {
+        ii := ffi_alloc(32)
+        ffi_write_u32_le(ii, 0, 1) // fIcon = TRUE
+        ffi_write_i64(ii, 2, hbm_msk) // offset 16: hbmMask
+        ffi_write_i64(ii, 3, hbm_col) // offset 24: hbmColor
+        hico := ffi_call1(f_ci, ii)
+        ffi_free(ii)
+        if hico != 0 {
+            _ := ffi_call4(f_sm, win.hwnd, 0x0080, 0, hico) // ICON_SMALL
+            _ := ffi_call4(f_sm, win.hwnd, 0x0080, 1, hico) // ICON_BIG
+        }
+    }
+    if hbm_col != 0 { _ := ffi_call1(f_delo, hbm_col) }
+    if hbm_msk != 0 { _ := ffi_call1(f_delo, hbm_msk) }
+}
+
 fn gui_poll_events(mut win: GuiWindow) -> bool {
     win.last_char = 0
     win.scroll_delta = 0
+    win.needs_redraw = false
     if not win.is_open { return false }
     if win.backend == 1 {
         f_isw  := ffi_sym(win.user32, "IsWindow")
@@ -223,53 +269,56 @@ fn gui_poll_events(mut win: GuiWindow) -> bool {
         f_peek := ffi_sym(win.user32, "PeekMessageW")
         f_tr   := ffi_sym(win.user32, "TranslateMessage")
         f_disp := ffi_sym(win.user32, "DispatchMessageW")
-        msg := ffi_alloc(64)
+        f_val  := ffi_sym(win.user32, "ValidateRect")
+        buf := ffi_alloc(64)
         mut guard := 0
         while guard < 64 {
             guard += 1
-            got := ffi_call5(f_peek, msg, win.hwnd, 0, 0, 1) & 0xFFFFFFFF // PM_REMOVE
+            got := ffi_call5(f_peek, buf, win.hwnd, 0, 0, 1) & 0xFFFFFFFF // PM_REMOVE
             if got == 0 { break }
-            mcode := ffi_read_u32_le(msg, 8)
+            mcode := ffi_read_u32_le(buf, 8)
             if mcode == 0x0012 or mcode == 0x0010 or mcode == 0x0002 { // WM_QUIT/WM_CLOSE/WM_DESTROY
                 win.is_open = false
                 break
             }
-            if mcode == 0x0102 { // WM_CHAR
-                ch := ffi_read_i64(msg, 2) & 0xFFFF
+            if mcode == 0x000F { // WM_PAINT
+                win.needs_redraw = true
+                if f_val != 0 { _ := ffi_call2(f_val, win.hwnd, 0) }
+                continue
+            }
+            if mcode == 0x0005 or mcode == 0x0006 or mcode == 0x0007 or mcode == 0x02E0 { // WM_SIZE/ACTIVATE/SETFOCUS/DPICHANGED
+                win.needs_redraw = true
+            } else if mcode == 0x0102 { // WM_CHAR
+                ch := ffi_read_i64(buf, 2) & 0xFFFF
                 if ch > 0 { win.last_char = ch }
             } else if mcode == 0x020A { // WM_MOUSEWHEEL
-                delta := ffi_sext32((ffi_read_i64(msg, 2) >> 16) & 0xFFFF)
+                delta := ffi_sext32((ffi_read_i64(buf, 2) >> 16) & 0xFFFF)
                 win.scroll_delta += delta
             }
-            _ := ffi_call1(f_tr, msg)
-            _ := ffi_call1(f_disp, msg)
+            _ := ffi_call1(f_tr, buf)
+            _ := ffi_call1(f_disp, buf)
         }
-        ffi_free(msg)
 
-        // Update client dimensions on resize + poll cursor & keys
+        // Reuse single 64B scratch buffer for client rect + cursor coords (zero extra heap churn)
         f_rect := ffi_sym(win.user32, "GetClientRect")
         if f_rect != 0 {
-            rc := ffi_alloc(32)
-            _ := ffi_call2(f_rect, win.hwnd, rc)
-            cw := ffi_sext32(ffi_read_u32_le(rc, 8))
-            ch := ffi_sext32(ffi_read_u32_le(rc, 12))
-            ffi_free(rc)
+            _ := ffi_call2(f_rect, win.hwnd, buf)
+            cw := ffi_sext32(ffi_read_u32_le(buf, 8))
+            ch := ffi_sext32(ffi_read_u32_le(buf, 12))
             if cw > 100 and ch > 100 {
                 win.width = cw
                 win.height = ch
             }
         }
 
-        // Poll mouse coordinates & button/escape state
         f_cp := ffi_sym(win.user32, "GetCursorPos")
         f_sc := ffi_sym(win.user32, "ScreenToClient")
         f_ks := ffi_sym(win.user32, "GetAsyncKeyState")
-        pt := ffi_alloc(16)
-        _ := ffi_call1(f_cp, pt)
-        _ := ffi_call2(f_sc, win.hwnd, pt)
-        win.mouse_x = ffi_sext32(ffi_read_u32_le(pt, 0))
-        win.mouse_y = ffi_sext32(ffi_read_u32_le(pt, 4))
-        ffi_free(pt)
+        _ := ffi_call1(f_cp, buf)
+        _ := ffi_call2(f_sc, win.hwnd, buf)
+        win.mouse_x = ffi_sext32(ffi_read_u32_le(buf, 0))
+        win.mouse_y = ffi_sext32(ffi_read_u32_le(buf, 4))
+        ffi_free(buf)
         win.mouse_down = (ffi_call1(f_ks, 0x01) & 0x8000) != 0
         win.key_escape = (ffi_call1(f_ks, 0x1B) & 0x8000) != 0
         return win.is_open
