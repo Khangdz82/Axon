@@ -25,6 +25,8 @@ struct GuiWindow {
     user32: i64
     gdi32: i64
     sdl2: i64
+    last_char: i64
+    scroll_delta: i64
 }
 
 fn _gui_win32_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64 {
@@ -39,9 +41,13 @@ fn _gui_win32_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64
     f_cw    := ffi_sym(u32, "CreateWindowExA")
     f_show  := ffi_sym(u32, "ShowWindow")
     f_upd   := ffi_sym(u32, "UpdateWindow")
+    f_cur   := ffi_sym(u32, "LoadCursorA")
+    f_brush := ffi_sym(g32, "CreateSolidBrush")
     if f_cw == 0 or f_def == 0 { return err(-601) }
 
     hinst := ffi_call1(f_mod, 0)
+    hcur  := if f_cur != 0 { ffi_call2(f_cur, 0, 32512) } else { 0 } // IDC_ARROW
+    hbr   := if f_brush != 0 { ffi_call1(f_brush, 0x000B0909) } else { 0 } // Obsidian dark #09090B
     cname := ffi_cstr("AxonNativeGuiClass")
     ctitle := ffi_cstr(title)
 
@@ -51,6 +57,8 @@ fn _gui_win32_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64
     ffi_write_u32_le(wc, 4, 0x0023)    // CS_HREDRAW | CS_VREDRAW | CS_OWNDC
     ffi_write_i64(wc, 1, f_def)        // lpfnWndProc at offset 8
     ffi_write_i64(wc, 3, hinst)        // hInstance at offset 24
+    ffi_write_i64(wc, 5, hcur)         // hCursor at offset 40
+    ffi_write_i64(wc, 6, hbr)          // hbrBackground at offset 48 (zero white flash!)
     ffi_write_i64(wc, 8, cname)        // lpszClassName at offset 64
     _ := ffi_call1(f_reg, wc)
     ffi_free(wc)
@@ -78,6 +86,17 @@ fn _gui_win32_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64
     if hwnd == 0 { return err(-602) }
 
     if visible {
+        // Enable native Windows 10/11 Dark Title Bar (DWMWA_USE_IMMERSIVE_DARK_MODE = 20)
+        dwm := ffi_open_one("dwmapi.dll")
+        if dwm != 0 {
+            f_dwm := ffi_sym(dwm, "DwmSetWindowAttribute")
+            if f_dwm != 0 {
+                dark_box := ffi_alloc(8)
+                ffi_write_u32_le(dark_box, 0, 1)
+                _ := ffi_call4(f_dwm, hwnd, 20, dark_box, 4)
+                ffi_free(dark_box)
+            }
+        }
         _ := ffi_call2(f_show, hwnd, 5) // SW_SHOW
         _ := ffi_call1(f_upd, hwnd)
     }
@@ -85,7 +104,8 @@ fn _gui_win32_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64
         backend = 1, hwnd = hwnd, aux1 = 0, aux2 = 0,
         width = w, height = h, mouse_x = 0, mouse_y = 0,
         mouse_down = false, key_escape = false, is_open = true,
-        user32 = u32, gdi32 = g32, sdl2 = 0
+        user32 = u32, gdi32 = g32, sdl2 = 0,
+        last_char = 0, scroll_delta = 0
     ))
 }
 
@@ -111,7 +131,8 @@ fn _gui_sdl2_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64 
         backend = 2, hwnd = win, aux1 = ren, aux2 = tex,
         width = w, height = h, mouse_x = 0, mouse_y = 0,
         mouse_down = false, key_escape = false, is_open = true,
-        user32 = 0, gdi32 = 0, sdl2 = sdl
+        user32 = 0, gdi32 = 0, sdl2 = sdl,
+        last_char = 0, scroll_delta = 0
     ))
 }
 
@@ -137,6 +158,8 @@ fn gui_set_title(win: GuiWindow, title: str) {
 }
 
 fn gui_poll_events(mut win: GuiWindow) -> bool {
+    win.last_char = 0
+    win.scroll_delta = 0
     if not win.is_open { return false }
     if win.backend == 1 {
         f_isw  := ffi_sym(win.user32, "IsWindow")
@@ -158,10 +181,31 @@ fn gui_poll_events(mut win: GuiWindow) -> bool {
                 win.is_open = false
                 break
             }
+            if mcode == 0x0102 { // WM_CHAR
+                ch := ffi_read_i64(msg, 2) & 0xFFFF
+                if ch > 0 { win.last_char = ch }
+            } else if mcode == 0x020A { // WM_MOUSEWHEEL
+                delta := ffi_sext32((ffi_read_i64(msg, 2) >> 16) & 0xFFFF)
+                win.scroll_delta += delta
+            }
             _ := ffi_call1(f_tr, msg)
             _ := ffi_call1(f_disp, msg)
         }
         ffi_free(msg)
+
+        // Update client dimensions on resize + poll cursor & keys
+        f_rect := ffi_sym(win.user32, "GetClientRect")
+        if f_rect != 0 {
+            rc := ffi_alloc(32)
+            _ := ffi_call2(f_rect, win.hwnd, rc)
+            cw := ffi_sext32(ffi_read_u32_le(rc, 8))
+            ch := ffi_sext32(ffi_read_u32_le(rc, 12))
+            ffi_free(rc)
+            if cw > 100 and ch > 100 {
+                win.width = cw
+                win.height = ch
+            }
+        }
 
         // Poll mouse coordinates & button/escape state
         f_cp := ffi_sym(win.user32, "GetCursorPos")
