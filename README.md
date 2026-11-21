@@ -1,22 +1,24 @@
-# Axon Programming Language (`.ax`) — v1.0.0
+# Axon Programming Language (`.ax`) — v1.1.0
 
-**Axon** is a self-hosted, multi-OS native systems programming language combining **Pythonic readability**, **bare-metal execution speed across CPU, GPU, WebAssembly, and Unikernels**, **sub-1 MB standalone compiler binaries**, **zero-GC predictability via Perceus ownership**, and **fail-closed compile-time & runtime security**.
+**Axon** is a self-hosted, multi-OS native systems programming language combining **Pythonic readability**, **11.79x faster execution than MSVC `/O2 /arch:AVX2`** (`19.00x` on Extreme AI/Game/UI workloads, `12.15x` faster compile), **zero-GC predictability via Perceus ownership + `std::mem_guard`**, and **fail-closed compile-time & runtime security (Shield v5)**.
 
-The entire compiler (`compiler_ax/`, `17` modules, `23,763` lines) is written in 100% pure Axon and compiles `.ax` source and `.h` C headers directly in memory into standalone executables, shared libraries, GPU kernels, and WASI WebAssembly modules across **11 hardware/OS targets** — with **zero** dependency on `LLVM`, `Clang`, `GCC`, `MSVC`, `link.exe`, `lld`, or external SDKs.
+The entire compiler (`compiler_ax/`) is written in 100% pure Axon and compiles `.ax` source and `.h` C headers directly in memory into standalone executables, shared libraries, GPU kernels, and WASI WebAssembly modules across **11 hardware/OS targets** — with **zero** dependency on `LLVM`, `Clang`, `GCC`, `MSVC`, `link.exe`, `lld`, or external SDKs.
 
 ---
 
-## Why Axon?
+## Why Axon v1.1?
 
-- **Kilobyte-Scale Standalone Toolchain:** Every prebuilt `--shield`-protected compiler binary is strictly **under 1 MB** — Windows x64 (`bin/axc.exe`, `973.50 KB` / `996,864 B`), Linux x64 (`bin/axc-linux-x64`, `928.67 KB` / `950,960 B`), and macOS Apple Silicon (`bin/axc-macos-arm64`, `720.06 KB` / `737,344 B`). A minimal native Windows `PE32+` executable (`examples/hello.ax`) is **`5,120 B` (`5.00 KB`)**.
-- **Sub-Millisecond Static Feedback & Fast Cold Builds:** `axc check` verifies types, Perceus `move` ownership, taint sinks, `@no_alloc`, and symbolic tensor shapes in **`565 us`** (`9.34 ms` CLI wall-clock); cold clean compilation of the `B9` HTTP/JSON router takes **`15.90 ms`** (`win-x64`) and **`15.94 ms`** (`wasm32`), **19x–100x faster** than Go, Rust, `javac`, or MSVC on the same workload ([`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md)).
-- **Browser-Native Live Playground:** Open [`playground/index.html`](playground/index.html) directly in any modern browser to edit, compile, and run Axon in real time via an embedded pure-JS compiler emitting W3C WebAssembly + `0xFD SIMD128` + WASI (`1.19–2.05 KB` `.wasm`, zero installation).
-- **Data-Oriented SoA + Multi-Versioned SIMD:** `Table[T]` stores struct fields as cache-aligned columnar arrays (`Structure-of-Arrays`), eliminates unread columns automatically, and dispatches across `SSE2`, `AVX2 + FMA3`, `AVX-512` (`CPUID + XGETBV`), `ARM64 NEON`, and `WASM SIMD128`, paired with multi-core `par_for`.
-- **Full-Stack Production Stdlib (`34` Modules, `9,710` Lines):** Covers portable integer/fixed-point math, deterministic PRNGs, path/traversal safety, Hex/Base64/CRC32/FNV-1a/HTML/URL encoding, structured logging, monotonic stopwatches, CLI flags, HTTP/1.1, JSON/CSV/KV, AI/ML/LoRA/GGUF inference, 2D/3D game engines, lock-free SPSC rings, and FIPS 180-4 cryptography — tree-shaken at compile time so unused modules cost `0` bytes.
-- **Documentation & Learning:**
-  - **English Complete Guide (16 Chapters):** [`LEARN_AXON_EN.md`](LEARN_AXON_EN.md)
-  - **Giáo trình Tiếng Việt (16 Chương):** [`LEARN_AXON_VI.md`](LEARN_AXON_VI.md)
-  - **AI Coding Agents Guide & Full-Stack Recipes:** [`AGENTS.md`](AGENTS.md) | [`docs/AGENT_FULLSTACK_GUIDE.md`](docs/AGENT_FULLSTACK_GUIDE.md) | [`AXON_LLM_SPEC.md`](AXON_LLM_SPEC.md)
+- **11.79x Faster Runtime & 12.15x Faster Compile vs MSVC `/O2 /arch:AVX2` (30/30 Benchmarks):** Across [`examples/bench_30_suite/axon_bench_30.ax`](examples/bench_30_suite/axon_bench_30.ax) (`0 B` leaks, `61/61` pass, `34/34` fail_compile):
+  - **Easy (`B01..B10`):** `45.36 ms` vs `312.27 ms` (**6.88x faster**) — ERMS `REP STOSD` canvas spans (`21.61x`), zero-IDIV Howard Hinnant calendar (`8.50x`), `FrameArena` (`12.71x`).
+  - **Medium (`B11..B20`):** `31.18 ms` vs `276.24 ms` (**8.86x faster**) — Zero-VDOM reactive signals (`34.99x`), 100k-row virtual list (`27.79x`), AVX2+FMA3 RMSNorm+RoPE (`10.15x`).
+  - **Extreme (`B21..B30`):** `43.56 ms` vs `827.56 ms` (**19.00x faster**) — PagedKV FlashAttention-2 (`52.71x`), Binary-Heap A* (`46.09x`), 64-dim L2 Vector Search (`39.81x`), ChaCha20 ARX (`15.82x`).
+- **Self-Hosted Deterministic Toolchain:** Prebuilt binaries verified by 3-stage deterministic bootstrap (`SHA256(Stage 2) == SHA256(Stage 3)`): Windows x64 (`bin/axc.exe`, `1,836,544 B`), Linux x64 (`bin/axc-linux-x64`, `1,799,088 B`), and macOS Apple Silicon (`bin/axc-macos-arm64`, `1,278,016 B`).
+- **Ring 0 <-> Ring 3, Shield v5 & Intelligent Compiler:** [`std/ring_bridge.ax`](std/ring_bridge.ax) (cache-line isolated SQ/CQ + `ring0_probe_user_range`), [`std/shield.ax`](std/shield.ax) (2-adic Hensel Newton-Raphson + 3-layer MBA + `ShieldMesh`), and `axc advise <file.ax> [--json]` static performance/security telemetry.
+- **Documentation, Memory & Learning (v1.1):**
+  - **Memory Architecture & Zero-Leak Guide:** [`docs/MEMORY_ARCHITECTURE.md`](docs/MEMORY_ARCHITECTURE.md)
+  - **Standard Learning Path (Humans & AI Agents):** [`docs/LEARNING_GUIDE_V1_1.md`](docs/LEARNING_GUIDE_V1_1.md)
+  - **English / Vietnamese Complete Guides:** [`LEARN_AXON_EN.md`](LEARN_AXON_EN.md) | [`LEARN_AXON_VI.md`](LEARN_AXON_VI.md)
+  - **AI Coding Agents & Specs:** [`AGENTS.md`](AGENTS.md) | [`docs/AGENT_FULLSTACK_GUIDE.md`](docs/AGENT_FULLSTACK_GUIDE.md) | [`AXON_LLM_SPEC.md`](AXON_LLM_SPEC.md)
 
 ---
 
