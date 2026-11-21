@@ -27,10 +27,14 @@ fn leak_guard_new(max_tracked: i64 = 4096) -> LeakGuard {
         cap = cap * 2
     }
     tbl := mem_alloc_aligned(cap * 16 + 64)
-    meta := mem_alloc_aligned(64)
-    if tbl == 0 or meta == 0 {
+    meta := mem_alloc_aligned(128)
+    slab := mem_alloc_aligned(524288 + 64)
+    fstack := mem_alloc_aligned(512 * 8 + 64)
+    if tbl == 0 or meta == 0 or slab == 0 or fstack == 0 {
         if tbl != 0 { mem_free_aligned(tbl) }
         if meta != 0 { mem_free_aligned(meta) }
+        if slab != 0 { mem_free_aligned(slab) }
+        if fstack != 0 { mem_free_aligned(fstack) }
         return LeakGuard(table_ptr = 0, meta_ptr = 0)
     }
     mut i := 0
@@ -40,79 +44,117 @@ fn leak_guard_new(max_tracked: i64 = 4096) -> LeakGuard {
         i += 1
     }
     i = 0
-    while i < 8 {
+    while i < 12 {
         ptr_write_i64(meta, i, 0)
         i += 1
     }
     ptr_write_i64(meta, 6, cap)
+    ptr_write_i64(meta, 7, slab)
+    ptr_write_i64(meta, 8, fstack)
     return LeakGuard(table_ptr = tbl, meta_ptr = meta)
     }
 }
 
 fn leak_guard_alloc(g: LeakGuard, size_bytes: i64) -> i64 {
     unsafe {
-    if g.table_ptr == 0 or g.meta_ptr == 0 or size_bytes <= 0 { return 0 }
-    cap := ptr_read_i64(g.meta_ptr, 6)
-    active := ptr_read_i64(g.meta_ptr, 0)
+    tbl := g.table_ptr
+    meta := g.meta_ptr
+    if tbl == 0 or meta == 0 or size_bytes <= 0 { return 0 }
+    cap := ptr_read_i64(meta, 6)
+    active := ptr_read_i64(meta, 0)
     if active * 4 >= cap * 3 { return 0 } // Load factor cap (75%)
 
-    p := mem_alloc_aligned(size_bytes)
-    if p == 0 { return 0 }
+    mut p := 0
+    mut from_mag := false
+    if size_bytes <= 1024 {
+        ftop := ptr_read_i64(meta, 9)
+        if ftop > 0 {
+            p = ptr_read_i64(ptr_read_i64(meta, 8), ftop - 1)
+            ptr_write_i64(meta, 9, ftop - 1)
+            from_mag = true
+        } else {
+            bump := ptr_read_i64(meta, 10)
+            if bump < 512 {
+                p = ptr_read_i64(meta, 7) + bump * 1024
+                ptr_write_i64(meta, 10, bump + 1)
+                from_mag = true
+            }
+        }
+    }
+    if p == 0 {
+        p = mem_alloc_aligned(size_bytes)
+        if p == 0 { return 0 }
+    }
 
     mask := cap - 1
-    mut slot := ((p *% 0x9E3779B97F4A7C15) >> 12) & mask
+    mut slot := ushr64((ushr64(p, 10) ^ ushr64(p, 6) ^ p) *% 0x9E3779B97F4A7C15, 48) & mask
     mut probes := 0
     while probes < cap {
-        cur_p := ptr_read_i64(g.table_ptr, slot * 2)
+        s2 := slot * 2
+        cur_p := ptr_read_i64(tbl, s2)
         if cur_p == 0 or cur_p == -1 {
-            ptr_write_i64(g.table_ptr, slot * 2, p)
-            ptr_write_i64(g.table_ptr, slot * 2 + 1, size_bytes)
+            ptr_write_i64(tbl, s2, p)
+            ptr_write_i64(tbl, s2 + 1, size_bytes)
             new_act := active + 1
-            new_bytes := ptr_read_i64(g.meta_ptr, 1) + size_bytes
-            ptr_write_i64(g.meta_ptr, 0, new_act)
-            ptr_write_i64(g.meta_ptr, 1, new_bytes)
-            ptr_write_i64(g.meta_ptr, 2, ptr_read_i64(g.meta_ptr, 2) + 1)
-            if new_bytes > ptr_read_i64(g.meta_ptr, 4) {
-                ptr_write_i64(g.meta_ptr, 4, new_bytes)
+            new_bytes := ptr_read_i64(meta, 1) + size_bytes
+            ptr_write_i64(meta, 0, new_act)
+            ptr_write_i64(meta, 1, new_bytes)
+            ptr_write_i64(meta, 2, ptr_read_i64(meta, 2) + 1)
+            if new_bytes > ptr_read_i64(meta, 4) {
+                ptr_write_i64(meta, 4, new_bytes)
             }
             return p
         }
         slot = (slot + 1) & mask
         probes += 1
     }
-    mem_free_aligned(p)
+    if not from_mag {
+        mem_free_aligned(p)
+    }
     return 0
     }
 }
 
 fn leak_guard_free(g: LeakGuard, p: i64) -> bool {
     unsafe {
-    if g.table_ptr == 0 or g.meta_ptr == 0 or p <= 0 { return false }
-    cap := ptr_read_i64(g.meta_ptr, 6)
+    tbl := g.table_ptr
+    meta := g.meta_ptr
+    if tbl == 0 or meta == 0 or p <= 0 { return false }
+    cap := ptr_read_i64(meta, 6)
     mask := cap - 1
-    mut slot := ((p *% 0x9E3779B97F4A7C15) >> 12) & mask
+    mut slot := ushr64((ushr64(p, 10) ^ ushr64(p, 6) ^ p) *% 0x9E3779B97F4A7C15, 48) & mask
     mut probes := 0
     while probes < cap {
-        cur_p := ptr_read_i64(g.table_ptr, slot * 2)
+        s2 := slot * 2
+        cur_p := ptr_read_i64(tbl, s2)
         if cur_p == 0 {
             // Pointer not found -> invalid or double free blocked!
-            ptr_write_i64(g.meta_ptr, 5, ptr_read_i64(g.meta_ptr, 5) + 1)
+            ptr_write_i64(meta, 5, ptr_read_i64(meta, 5) + 1)
             return false
         }
         if cur_p == p {
-            sz := ptr_read_i64(g.table_ptr, slot * 2 + 1)
-            ptr_write_i64(g.table_ptr, slot * 2, -1)
-            ptr_write_i64(g.table_ptr, slot * 2 + 1, 0)
-            ptr_write_i64(g.meta_ptr, 0, ptr_read_i64(g.meta_ptr, 0) - 1)
-            ptr_write_i64(g.meta_ptr, 1, ptr_read_i64(g.meta_ptr, 1) - sz)
-            ptr_write_i64(g.meta_ptr, 3, ptr_read_i64(g.meta_ptr, 3) + 1)
-            mem_free_aligned(p)
+            sz := ptr_read_i64(tbl, s2 + 1)
+            next_p := ptr_read_i64(tbl, ((slot + 1) & mask) * 2)
+            tomb := if next_p == 0 { 0 } else { -1 }
+            ptr_write_i64(tbl, s2, tomb)
+            ptr_write_i64(tbl, s2 + 1, 0)
+            ptr_write_i64(meta, 0, ptr_read_i64(meta, 0) - 1)
+            ptr_write_i64(meta, 1, ptr_read_i64(meta, 1) - sz)
+            ptr_write_i64(meta, 3, ptr_read_i64(meta, 3) + 1)
+            slab := ptr_read_i64(meta, 7)
+            if slab != 0 and p >= slab and p < slab + 524288 {
+                ftop := ptr_read_i64(meta, 9)
+                ptr_write_i64(ptr_read_i64(meta, 8), ftop, p)
+                ptr_write_i64(meta, 9, ftop + 1)
+            } else {
+                mem_free_aligned(p)
+            }
             return true
         }
         slot = (slot + 1) & mask
         probes += 1
     }
-    ptr_write_i64(g.meta_ptr, 5, ptr_read_i64(g.meta_ptr, 5) + 1)
+    ptr_write_i64(meta, 5, ptr_read_i64(meta, 5) + 1)
     return false
     }
 }
@@ -170,12 +212,15 @@ fn leak_guard_sweep_leaks(g: LeakGuard) -> i64 {
     unsafe {
     if g.table_ptr == 0 or g.meta_ptr == 0 { return 0 }
     cap := ptr_read_i64(g.meta_ptr, 6)
+    slab := ptr_read_i64(g.meta_ptr, 7)
     mut swept := 0
     mut i := 0
     while i < cap {
         p := ptr_read_i64(g.table_ptr, i * 2)
         if p > 0 {
-            mem_free_aligned(p)
+            if slab == 0 or p < slab or p >= slab + 524288 {
+                mem_free_aligned(p)
+            }
             ptr_write_i64(g.table_ptr, i * 2, 0)
             ptr_write_i64(g.table_ptr, i * 2 + 1, 0)
             swept += 1
@@ -184,6 +229,8 @@ fn leak_guard_sweep_leaks(g: LeakGuard) -> i64 {
     }
     ptr_write_i64(g.meta_ptr, 0, 0)
     ptr_write_i64(g.meta_ptr, 1, 0)
+    ptr_write_i64(g.meta_ptr, 9, 0)
+    ptr_write_i64(g.meta_ptr, 10, 0)
     return swept
     }
 }
@@ -191,8 +238,14 @@ fn leak_guard_sweep_leaks(g: LeakGuard) -> i64 {
 fn leak_guard_destroy(move g: LeakGuard) {
     unsafe {
     _ := leak_guard_sweep_leaks(g)
+    if g.meta_ptr != 0 {
+        slab := ptr_read_i64(g.meta_ptr, 7)
+        fstack := ptr_read_i64(g.meta_ptr, 8)
+        if slab != 0 { mem_free_aligned(slab) }
+        if fstack != 0 { mem_free_aligned(fstack) }
+        mem_free_aligned(g.meta_ptr)
+    }
     if g.table_ptr != 0 { mem_free_aligned(g.table_ptr) }
-    if g.meta_ptr != 0 { mem_free_aligned(g.meta_ptr) }
     }
 }
 

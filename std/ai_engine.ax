@@ -426,19 +426,7 @@ fn flash_attention_2_tiled(q: i64, k: i64, v: i64, out: i64, seq_len: i64, head_
 fn ai_rmsnorm_f32(out_ptr: i64, x_ptr: i64, weight_ptr: i64, dim: i64, eps: f64 = 0.00001) {
     unsafe {
     if out_ptr == 0 or x_ptr == 0 or weight_ptr == 0 or dim <= 0 { return }
-    mut ss := 0.0
-    mut i := 0
-    while i < dim {
-        v := ptr_read_f32(x_ptr, i)
-        ss = ss + v * v
-        i += 1
-    }
-    inv_rms := 1.0 / sqrt_f64(ss / (dim as f64) + eps)
-    i = 0
-    while i < dim {
-        ptr_write_f32(out_ptr, i, ptr_read_f32(x_ptr, i) * inv_rms * ptr_read_f32(weight_ptr, i))
-        i += 1
-    }
+    _ := avx_rmsnorm_f32(x_ptr, weight_ptr, out_ptr, dim, eps)
     }
 }
 
@@ -450,9 +438,46 @@ fn ai_rope_inplace_f32(qk_ptr: i64, head_dim: i64, pos: i64) {
     p_f := pos as f64
     mut freq := 1.0
     step_decay := 0.8659643233600653 // 10000^(-2/64)
+    while i + 3 < head_dim {
+        mut a0 := p_f * freq
+        freq1 := freq * step_decay
+        mut a1 := p_f * freq1
+        freq = freq1 * step_decay
+        if a0 > 3.141592653589793 {
+            k0 := (a0 * 0.15915494309189535) as i64
+            a0 = a0 - (k0 as f64) * 6.283185307179586
+            if a0 > 3.141592653589793 { a0 = a0 - 6.283185307179586 }
+        } else if a0 < -3.141592653589793 {
+            k0 := (a0 * 0.15915494309189535) as i64
+            a0 = a0 - (k0 as f64) * 6.283185307179586
+            if a0 < -3.141592653589793 { a0 = a0 + 6.283185307179586 }
+        }
+        if a1 > 3.141592653589793 {
+            k1 := (a1 * 0.15915494309189535) as i64
+            a1 = a1 - (k1 as f64) * 6.283185307179586
+            if a1 > 3.141592653589793 { a1 = a1 - 6.283185307179586 }
+        } else if a1 < -3.141592653589793 {
+            k1 := (a1 * 0.15915494309189535) as i64
+            a1 = a1 - (k1 as f64) * 6.283185307179586
+            if a1 < -3.141592653589793 { a1 = a1 + 6.283185307179586 }
+        }
+        t0 := a0 * 0.5; t0_2 := t0 * t0; d0 := 1.0 + t0_2
+        t1 := a1 * 0.5; t1_2 := t1 * t1; d1 := 1.0 + t1_2
+        inv01 := 1.0 / (d0 * d1)
+        inv0 := d1 * inv01
+        inv1 := d0 * inv01
+        c0 := (1.0 - t0_2) * inv0; s0 := (2.0 * t0) * inv0
+        c1 := (1.0 - t1_2) * inv1; s1 := (2.0 * t1) * inv1
+        x0 := ptr_read_f32(qk_ptr, i);     x1 := ptr_read_f32(qk_ptr, i + 1)
+        x2 := ptr_read_f32(qk_ptr, i + 2); x3 := ptr_read_f32(qk_ptr, i + 3)
+        ptr_write_f32(qk_ptr, i,     x0 * c0 - x1 * s0)
+        ptr_write_f32(qk_ptr, i + 1, x0 * s0 + x1 * c0)
+        ptr_write_f32(qk_ptr, i + 2, x2 * c1 - x3 * s1)
+        ptr_write_f32(qk_ptr, i + 3, x2 * s1 + x3 * c1)
+        i += 4
+    }
     while i + 1 < head_dim {
         angle := p_f * freq
-        // Fast 2nd-order Padé/Chebyshev rotation (norm-preserving to 1e-6)
         mut a := angle
         while a > 3.141592653589793 { a = a - 6.283185307179586 }
         while a < -3.141592653589793 { a = a + 6.283185307179586 }
@@ -475,19 +500,7 @@ fn ai_rope_inplace_f32(qk_ptr: i64, head_dim: i64, pos: i64) {
 fn ai_swiglu_f32(out_ptr: i64, gate_ptr: i64, up_ptr: i64, dim: i64) {
     unsafe {
     if out_ptr == 0 or gate_ptr == 0 or up_ptr == 0 or dim <= 0 { return }
-    mut i := 0
-    while i < dim {
-        g := ptr_read_f32(gate_ptr, i)
-        u := ptr_read_f32(up_ptr, i)
-        nx := 0.0 - g
-        mut e := 1.0 + nx * (0.00390625 + nx * 0.00000762939453125)
-        if e < 0.0 { e = 0.0 }
-        e = e * e; e = e * e; e = e * e; e = e * e
-        e = e * e; e = e * e; e = e * e; e = e * e
-        sig := 1.0 / (1.0 + e)
-        ptr_write_f32(out_ptr, i, (g * sig) * u)
-        i += 1
-    }
+    _ := avx_swiglu_f32(gate_ptr, up_ptr, out_ptr, dim)
     }
 }
 
@@ -506,10 +519,15 @@ fn ai_softmax_inplace_f32(x_ptr: i64, n: i64) {
     i = 0
     while i < n {
         dx := ptr_read_f32(x_ptr, i) - max_v
-        mut e := 1.0 + dx * (0.00390625 + dx * 0.00000762939453125)
-        if e < 0.0 { e = 0.0 }
-        e = e * e; e = e * e; e = e * e; e = e * e
-        e = e * e; e = e * e; e = e * e; e = e * e
+        mut e := 0.0
+        if dx > -18.0 {
+            t := dx * 0.0625
+            e = 1.0 + t * (1.0 + t * (0.5 + t * 0.16666666666666666))
+            e = e * e
+            e = e * e
+            e = e * e
+            e = e * e
+        }
         ptr_write_f32(x_ptr, i, e)
         sum = sum + e
         i += 1
