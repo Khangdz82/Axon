@@ -34,10 +34,30 @@ fn webview_has_browser() -> bool {
     return sys_fs_exists(edge1) or sys_fs_exists(edge2) or sys_fs_exists(chrome1)
 }
 
+// Strict URL validator: blocks OS command injection (CWE-78) & Chromium flag injection (CWE-88)
+fn _webview_is_safe_url(url: str) -> bool {
+    n := str_len(url)
+    if n < 8 or n > 2048 { return false }
+    if not str_starts_with(url, "http://") and not str_starts_with(url, "https://") {
+        return false
+    }
+    mut i := 0
+    while i < n {
+        b := str_byte(url, i)
+        is_ok := (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or (b >= 48 and b <= 57) or
+                 b == 45 or b == 46 or b == 47 or b == 58 or b == 63 or b == 61 or b == 38 or
+                 b == 95 or b == 126 or b == 37 or b == 35 or b == 43 or b == 44 or b == 64
+        if not is_ok { return false }
+        i += 1
+    }
+    return true
+}
+
 // Finds an available native Chromium/Edge binary and launches a clean `--app=` window (no browser tabs/toolbar)
 fn webview_launch_window(url: str, width: i64, height: i64) -> bool {
-    w := if width > 100 { width } else { 1200 }
-    h := if height > 100 { height } else { 800 }
+    if not _webview_is_safe_url(url) { return false }
+    w := if width > 100 and width <= 7680 { width } else { 1200 }
+    h := if height > 100 and height <= 4320 { height } else { 800 }
     nonce := (clock_ns() ^ cpu_rdtsc()) & 0x7FFFFFFF
     prof := f".axon_wv_{sys_pid()}_{nonce}"
 
@@ -58,7 +78,7 @@ fn webview_launch_window(url: str, width: i64, height: i64) -> bool {
             if f_exec != 0 {
                 c_op := ffi_cstr("open")
                 c_bin := ffi_cstr(bin)
-                args := f"--app={url} --window-size={w},{h} --user-data-dir={sys_cwd()}\\{prof} --no-first-run --disable-extensions"
+                args := f"--app=\"{url}\" --window-size={w},{h} --user-data-dir=\"{sys_cwd()}\\{prof}\" --no-first-run --disable-extensions"
                 c_args := ffi_cstr(args)
                 rc := ffi_call6(f_exec, 0, c_op, c_bin, c_args, 0, 1)
                 ffi_free(c_op); ffi_free(c_bin); ffi_free(c_args)
@@ -67,8 +87,8 @@ fn webview_launch_window(url: str, width: i64, height: i64) -> bool {
         }
     }
 
-    // Linux / macOS fallback
-    _ := os_exec(f"google-chrome --app={url} --window-size={w},{h} --no-first-run >/dev/null 2>&1 &")
+    // Linux / macOS fallback (URL strictly whitelisted above — zero shell metacharacters possible)
+    _ := os_exec(f"google-chrome --app='{url}' --window-size={w},{h} --no-first-run >/dev/null 2>&1 &")
     return true
 }
 
@@ -106,6 +126,21 @@ fn webview_next_api_req(wv: WebviewApp) -> WebviewReq ! i64 {
         req := http_parse_request(raw) or HttpRequest(method = "", path = "", query = "", version = "", body = "", content_len = 0)
         if str_len(req.method) == 0 {
             _ := tcp_send_str(sock, http_build_response(400, "text/plain; charset=utf-8", "Bad Request")) or 0
+            tcp_close(sock)
+            continue
+        }
+        // Anti-DNS-Rebinding & Anti-CSRF (CWE-352): strictly require localhost Host & same-origin Origin!
+        expected_h1 := f"127.0.0.1:{wv.port}"
+        expected_h2 := f"localhost:{wv.port}"
+        host_hdr := http_get_header(raw, "Host") or ""
+        if str_len(host_hdr) > 0 and not str_eq(host_hdr, expected_h1) and not str_eq(host_hdr, expected_h2) {
+            _ := tcp_send_str(sock, http_build_response(403, "text/plain; charset=utf-8", "Forbidden Host")) or 0
+            tcp_close(sock)
+            continue
+        }
+        origin_hdr := http_get_header(raw, "Origin") or ""
+        if str_len(origin_hdr) > 0 and not str_eq(origin_hdr, f"http://{expected_h1}") and not str_eq(origin_hdr, f"http://{expected_h2}") {
+            _ := tcp_send_str(sock, http_build_response(403, "text/plain; charset=utf-8", "Forbidden Origin")) or 0
             tcp_close(sock)
             continue
         }
