@@ -200,6 +200,55 @@ fn is_nonshadowed_const_int(cg: CodegenCtx, vars: IntBuf, enid: i64) -> bool {
     return not expr_has_shadowed_ident(cg, vars, enid)
 }
 
+fn is_folded_const_int_d_ax(cg: CodegenCtx, vars: IntBuf, nid: i64, d: i64) -> bool {
+    if nid <= 0 { return false }
+    if is_nonshadowed_const_int(cg, vars, nid) { return true }
+    k := ast_kind(cg.nodes, nid)
+    if k == nk_ident() or k == nk_move_ident() {
+        vb := cg_var_find(cg.pool, vars, ast_get(cg.nodes, nid, 1), ast_get(cg.nodes, nid, 2))
+        if vb < 0 or ibuf_get(vars, vb + 3) != ty_int() { return false }
+        snid := ibuf_get(vars, vb + 4)
+        if snid <= 0 or ast_kind(cg.nodes, snid) != nk_var_decl() { return false }
+        if ast_get(cg.nodes, snid, 3) != 0 or (ast_get(cg.nodes, snid, 6) & 1) != 0 { return false }
+        ie := ast_get(cg.nodes, snid, 5)
+        if ie <= 0 { return false }
+        if ast_kind(cg.nodes, ie) == nk_int() { return true }
+        if d > 0 and ibuf_get(cg.state, 0) == 0 { return is_folded_const_int_d_ax(cg, vars, ie, d - 1) }
+        return false
+    }
+    if d > 0 and k == nk_binary() and ibuf_get(cg.state, 0) == 0 {
+        op := ast_get(cg.nodes, nid, 1)
+        if op == op_add() or op == op_sub() or op == op_mul() or op == op_bit_and() or op == op_bit_or() or op == op_bit_xor() or op == op_shl() or op == op_shr() {
+            return is_folded_const_int_d_ax(cg, vars, ast_get(cg.nodes, nid, 2), d - 1) and is_folded_const_int_d_ax(cg, vars, ast_get(cg.nodes, nid, 3), d - 1)
+        }
+    }
+    return false
+}
+
+fn eval_folded_const_int_d_ax(cg: CodegenCtx, vars: IntBuf, nid: i64, d: i64) -> i64 {
+    if is_nonshadowed_const_int(cg, vars, nid) {
+        return eval_const_int_val(cg.pool, cg.nodes, cg.sym, nid)
+    }
+    k := ast_kind(cg.nodes, nid)
+    if k == nk_ident() or k == nk_move_ident() {
+        vb := cg_var_find(cg.pool, vars, ast_get(cg.nodes, nid, 1), ast_get(cg.nodes, nid, 2))
+        ie := ast_get(cg.nodes, ibuf_get(vars, vb + 4), 5)
+        if ast_kind(cg.nodes, ie) == nk_int() { return ast_get(cg.nodes, ie, 1) }
+        return eval_folded_const_int_d_ax(cg, vars, ie, d - 1)
+    }
+    op := ast_get(cg.nodes, nid, 1)
+    lv := eval_folded_const_int_d_ax(cg, vars, ast_get(cg.nodes, nid, 2), d - 1)
+    rv := eval_folded_const_int_d_ax(cg, vars, ast_get(cg.nodes, nid, 3), d - 1)
+    if op == op_add() { return lv +% rv }
+    if op == op_sub() { return lv -% rv }
+    if op == op_mul() { return lv *% rv }
+    if op == op_bit_and() { return lv & rv }
+    if op == op_bit_or() { return lv | rv }
+    if op == op_bit_xor() { return lv ^ rv }
+    if op == op_shl() { return lv << (rv & 63) }
+    return lv >> (rv & 63)
+}
+
 fn immut_local_const_int_node(cg: CodegenCtx, vars: IntBuf, nid: i64) -> i64 {
     if nid <= 0 { return -1 }
     k := ast_kind(cg.nodes, nid)
@@ -215,13 +264,11 @@ fn immut_local_const_int_node(cg: CodegenCtx, vars: IntBuf, nid: i64) -> i64 {
 }
 
 fn is_folded_const_int_ax(cg: CodegenCtx, vars: IntBuf, nid: i64) -> bool {
-    return is_nonshadowed_const_int(cg, vars, nid) or immut_local_const_int_node(cg, vars, nid) > 0
+    return is_folded_const_int_d_ax(cg, vars, nid, 3)
 }
 
 fn eval_folded_const_int_ax(cg: CodegenCtx, vars: IntBuf, nid: i64) -> i64 {
-    ie := immut_local_const_int_node(cg, vars, nid)
-    if ie > 0 { return ast_get(cg.nodes, ie, 1) }
-    return eval_const_int_val(cg.pool, cg.nodes, cg.sym, nid)
+    return eval_folded_const_int_d_ax(cg, vars, nid, 3)
 }
 
 fn emit_fast_val_arg(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, enid: i64) -> i64 {
@@ -1183,6 +1230,20 @@ fn try_emit_v7_domain_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, bre
             if b_hw == 5 or disp != 0 { modrm = 0x44 }
             mc_b4(c, 0x48 | (x_hi << 1) | b_hi, 0x89, modrm, sib)
             if b_hw == 5 or disp != 0 { mc_b1(c, disp & 255) }
+            return er_pack(cg_unit_slot(cg), ty_unit())
+        }
+        if psl > 0 and isl > 0 and pure_i64_ty_ax(cg, vars, e2) == ty_int() and (ibuf_get(cg.state, 24) == 0 or isl != ibuf_get(cg.state, cg_fpromo_base(cg) + 122)) {
+            // Zero-spill register/slot store when ptr & idx are local scalars (even if 1 or both spilled!)
+            pr_v := cg_slot_reg(cg, local_scalar_slot_ax(cg, vars, e2))
+            if pr_v > 0 and pr_i > 0 and gpreg_hw(pr_i) != 4 {
+                if pr_p > 0 { mc_mov_rcx_gpreg(c, pr_p) } else { mc_load_rcx(c, psl, 0) }
+                mc_b4(c, 0x48 | (gpreg_hi(pr_v) << 2) | (gpreg_hi(pr_i) << 1), 0x89, 0x04 | (gpreg_hw(pr_v) << 3), 0xC1 | (gpreg_hw(pr_i) << 3))
+                return er_pack(cg_unit_slot(cg), ty_unit())
+            }
+            emit_int_expr_to_rax(cg, vars, drops, breaks, e2)
+            if pr_p > 0 { mc_mov_rcx_gpreg(c, pr_p) } else { mc_load_rcx(c, psl, 0) }
+            if pr_i > 0 { mc_mov_rdx_gpreg(c, pr_i) } else { mc_load_rdx(c, isl, 0) }
+            mc_b4(c, 0x48, 0x89, 0x04, 0xD1)
             return er_pack(cg_unit_slot(cg), ty_unit())
         }
         pr := emit_expr_ax(cg, vars, drops, breaks, e0)
