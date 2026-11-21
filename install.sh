@@ -8,7 +8,13 @@ INSTALL_BIN="${AXON_ROOT}/bin"
 INSTALL_STD="${AXON_ROOT}/std"
 AXC_BIN="${INSTALL_BIN}/axc"
 
-echo "[*] Installing Axon v${AXON_VERSION} Self-Hosted Multi-OS Native Toolchain..."
+if [ "${1:-}" = "--uninstall" ]; then
+    rm -rf "${AXON_ROOT}"
+    echo "[+] Uninstalled Axon v${AXON_VERSION} from ${AXON_ROOT}"
+    exit 0
+fi
+
+echo "[*] Installing Axon v${AXON_VERSION} Self-Hosted Native Toolchain..."
 mkdir -p "${INSTALL_BIN}" "${INSTALL_STD}"
 
 OS_NAME="$(uname -s)"
@@ -25,17 +31,16 @@ else
     exit 1
 fi
 
+rm -f "${INSTALL_STD}"/*.ax
 cp ./std/*.ax "${INSTALL_STD}/"
-if [ -f "./AXON_LLM_SPEC.md" ]; then
-    cp "./AXON_LLM_SPEC.md" "${AXON_ROOT}/"
-fi
+for f in AXON_LLM_SPEC.md axon_mcp.json; do
+    [ -f "./${f}" ] && cp "./${f}" "${AXON_ROOT}/"
+done
 chmod +x "${AXC_BIN}"
 
-if ! echo "${PATH}" | grep -q "${INSTALL_BIN}"; then
-    SHELL_PROFILE="${HOME}/.bashrc"
-    if [ -f "${HOME}/.zshrc" ]; then
-        SHELL_PROFILE="${HOME}/.zshrc"
-    fi
+SHELL_PROFILE="${HOME}/.bashrc"
+[ -f "${HOME}/.zshrc" ] && SHELL_PROFILE="${HOME}/.zshrc"
+if ! echo "${PATH}" | grep -Fq "${INSTALL_BIN}" && ! grep -Fq "${INSTALL_BIN}" "${SHELL_PROFILE}" 2>/dev/null; then
     echo "export PATH=\"${INSTALL_BIN}:\$PATH\"" >> "${SHELL_PROFILE}"
     echo "[+] Added ${INSTALL_BIN} to PATH in ${SHELL_PROFILE}"
 fi
