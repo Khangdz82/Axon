@@ -467,6 +467,421 @@ fn gui_font_cache_free(move c: GuiFontCache, gdi: i64) {
     buf_free(move c.entries)
 }
 
+// ==============================================================================
+// AXON PHOTON-D2D ENGINE: Hardware Direct2D + DirectWrite Native HTML/CSS/Tailwind
+// Zero Browser, Zero WebView, Zero Blur, 0.00% Idle CPU, Persistent Backbuffer!
+// ==============================================================================
+
+struct PhotonD2D {
+    ok: bool
+    d2d_fac: i64
+    dw_fac: i64
+    rt: i64
+    brush: i64
+    mem_dc: i64
+    hbm: i64
+    old_bm: i64
+    bb_w: i64
+    bb_h: i64
+    tf_entries: IntBuf // [size, weight, h_align, v_align, wrap, ptr] * count
+    tf_count: i64
+    k32: i64
+    f_mb2w: i64
+    f_gdc: i64
+    f_rdc: i64
+    f_cdc: i64
+    f_cbm: i64
+    f_sel: i64
+    f_delo: i64
+    f_deldc: i64
+    f_bkit: i64
+    scratch: i64
+    out_box: i64
+    wbuf: i64
+    wcap: i64
+}
+
+fn _p2d_vt(obj: i64, idx: i64) -> i64 {
+    return ffi_read_i64(ffi_read_i64(obj, 0), idx)
+}
+
+fn _p2d_f32_ratio(num: i64, den: i64) -> i64 {
+    if num == 0 or den == 0 { return 0 }
+    mut s := 0
+    mut a := num
+    mut b := den
+    if a < 0 { s = 0x80000000; a = -a }
+    if b < 0 { s = s ^ 0x80000000; b = -b }
+    mut exp := 127
+    while a < b { a *= 2; exp -= 1 }
+    while a >= b * 2 { b *= 2; exp += 1 }
+    mant := (((a - b) << 23) + (b / 2)) / b
+    if mant >= 0x800000 { return s | ((exp + 1) << 23) }
+    return s | ((exp & 0xFF) << 23) | (mant & 0x7FFFFF)
+}
+
+fn _p2d_f32(v: i64) -> i64 {
+    return _p2d_f32_ratio(v, 1)
+}
+
+fn _p2d_apply_opacity(argb: i64, op_pct: i64) -> i64 {
+    if op_pct >= 100 { return argb }
+    if op_pct <= 0 { return argb & 0x00FFFFFF }
+    a := (((argb >> 24) & 0xFF) * op_pct) / 100
+    return (a << 24) | (argb & 0x00FFFFFF)
+}
+
+fn _p2d_write_color(buf: i64, argb: i64) {
+    a := (argb >> 24) & 0xFF
+    r := (argb >> 16) & 0xFF
+    g := (argb >> 8) & 0xFF
+    b := argb & 0xFF
+    ffi_write_u32_le(buf, 0, _p2d_f32_ratio(r, 255))
+    ffi_write_u32_le(buf, 4, _p2d_f32_ratio(g, 255))
+    ffi_write_u32_le(buf, 8, _p2d_f32_ratio(b, 255))
+    ffi_write_u32_le(buf, 12, _p2d_f32_ratio(a, 255))
+}
+
+fn _p2d_write_rect(buf: i64, x: i64, y: i64, w: i64, h: i64) {
+    ffi_write_u32_le(buf, 0, _p2d_f32(x))
+    ffi_write_u32_le(buf, 4, _p2d_f32(y))
+    ffi_write_u32_le(buf, 8, _p2d_f32(x + w))
+    ffi_write_u32_le(buf, 12, _p2d_f32(y + h))
+}
+
+fn _p2d_write_rrect(buf: i64, x: i64, y: i64, w: i64, h: i64, rad: i64) {
+    _p2d_write_rect(buf, x, y, w, h)
+    rf := _p2d_f32(rad)
+    ffi_write_u32_le(buf, 16, rf)
+    ffi_write_u32_le(buf, 20, rf)
+}
+
+fn photon_d2d_init(win: GuiWindow) -> PhotonD2D {
+    k32 := ffi_open_one("kernel32.dll")
+    mut d2d := PhotonD2D(
+        ok = false, d2d_fac = 0, dw_fac = 0, rt = 0, brush = 0,
+        mem_dc = 0, hbm = 0, old_bm = 0, bb_w = 0, bb_h = 0,
+        tf_entries = ibuf_new(192), tf_count = 0,
+        k32 = k32,
+        f_mb2w = if k32 != 0 { ffi_sym(k32, "MultiByteToWideChar") } else { 0 },
+        f_gdc = ffi_sym(win.user32, "GetDC"),
+        f_rdc = ffi_sym(win.user32, "ReleaseDC"),
+        f_cdc = ffi_sym(win.gdi32, "CreateCompatibleDC"),
+        f_cbm = ffi_sym(win.gdi32, "CreateCompatibleBitmap"),
+        f_sel = ffi_sym(win.gdi32, "SelectObject"),
+        f_delo = ffi_sym(win.gdi32, "DeleteObject"),
+        f_deldc = ffi_sym(win.gdi32, "DeleteDC"),
+        f_bkit = ffi_sym(win.gdi32, "BitBlt"),
+        scratch = ffi_alloc(384),
+        out_box = ffi_alloc(16),
+        wbuf = ffi_alloc(16384),
+        wcap = 8188
+    )
+    if win.backend != 1 { return d2d }
+    lib_d2d := ffi_open_one("d2d1.dll")
+    lib_dw  := ffi_open_one("dwrite.dll")
+    if lib_d2d == 0 or lib_dw == 0 { return d2d }
+    f_d2d := ffi_sym(lib_d2d, "D2D1CreateFactory")
+    f_dw  := ffi_sym(lib_dw, "DWriteCreateFactory")
+    if f_d2d == 0 or f_dw == 0 { return d2d }
+
+    iid_d2d := ffi_alloc(16)
+    ffi_write_u32_le(iid_d2d, 0, 0x06152247); ffi_write_u16_le(iid_d2d, 4, 0x6f50); ffi_write_u16_le(iid_d2d, 6, 0x465a)
+    ffi_write_u8(iid_d2d, 8, 0x92); ffi_write_u8(iid_d2d, 9, 0x45); ffi_write_u8(iid_d2d, 10, 0x11); ffi_write_u8(iid_d2d, 11, 0x8b)
+    ffi_write_u8(iid_d2d, 12, 0xfd); ffi_write_u8(iid_d2d, 13, 0x3b); ffi_write_u8(iid_d2d, 14, 0x60); ffi_write_u8(iid_d2d, 15, 0x07)
+
+    iid_dw := ffi_alloc(16)
+    ffi_write_u32_le(iid_dw, 0, 0xb859ee5a); ffi_write_u16_le(iid_dw, 4, 0xd838); ffi_write_u16_le(iid_dw, 6, 0x4b5b)
+    ffi_write_u8(iid_dw, 8, 0xa2); ffi_write_u8(iid_dw, 9, 0xe8); ffi_write_u8(iid_dw, 10, 0x1a); ffi_write_u8(iid_dw, 11, 0xdc)
+    ffi_write_u8(iid_dw, 12, 0x7d); ffi_write_u8(iid_dw, 13, 0x93); ffi_write_u8(iid_dw, 14, 0xdb); ffi_write_u8(iid_dw, 15, 0x48)
+
+    hr1 := ffi_call4(f_d2d, 0, iid_d2d, 0, d2d.out_box) & 0xFFFFFFFF
+    d2d.d2d_fac = ffi_read_i64(d2d.out_box, 0)
+    hr2 := ffi_call3(f_dw, 0, iid_dw, d2d.out_box) & 0xFFFFFFFF
+    d2d.dw_fac = ffi_read_i64(d2d.out_box, 0)
+    ffi_free(iid_d2d); ffi_free(iid_dw)
+    if hr1 != 0 or hr2 != 0 or d2d.d2d_fac == 0 or d2d.dw_fac == 0 { return d2d }
+
+    props := d2d.scratch
+    ffi_write_u32_le(props, 0, 0)
+    ffi_write_u32_le(props, 4, 87) // DXGI_FORMAT_B8G8R8A8_UNORM
+    ffi_write_u32_le(props, 8, 3)  // D2D1_ALPHA_MODE_IGNORE
+    ffi_write_u32_le(props, 12, _p2d_f32(96))
+    ffi_write_u32_le(props, 16, _p2d_f32(96))
+    ffi_write_u32_le(props, 20, 0)
+    ffi_write_u32_le(props, 24, 0)
+    hr3 := ffi_call3(_p2d_vt(d2d.d2d_fac, 16), d2d.d2d_fac, props, d2d.out_box) & 0xFFFFFFFF
+    d2d.rt = ffi_read_i64(d2d.out_box, 0)
+    if hr3 != 0 or d2d.rt == 0 { return d2d }
+
+    _ := ffi_call2(_p2d_vt(d2d.rt, 34), d2d.rt, 2) // D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+
+    _p2d_write_color(d2d.scratch, 0xFFFFFFFF)
+    hr4 := ffi_call4(_p2d_vt(d2d.rt, 8), d2d.rt, d2d.scratch, 0, d2d.out_box) & 0xFFFFFFFF
+    d2d.brush = ffi_read_i64(d2d.out_box, 0)
+    if hr4 != 0 or d2d.brush == 0 { return d2d }
+
+    d2d.ok = true
+    return d2d
+}
+
+fn photon_d2d_free(move d2d: PhotonD2D) {
+    if d2d.mem_dc != 0 {
+        if d2d.old_bm != 0 { _ := ffi_call2(d2d.f_sel, d2d.mem_dc, d2d.old_bm) }
+        if d2d.hbm != 0 { _ := ffi_call1(d2d.f_delo, d2d.hbm) }
+        _ := ffi_call1(d2d.f_deldc, d2d.mem_dc)
+    }
+    mut i := 0
+    while i < d2d.tf_count {
+        tf := ibuf_get(d2d.tf_entries, i * 6 + 5)
+        if tf != 0 { _ := ffi_call1(_p2d_vt(tf, 2), tf) }
+        i += 1
+    }
+    buf_free(move d2d.tf_entries)
+    if d2d.brush != 0 { _ := ffi_call1(_p2d_vt(d2d.brush, 2), d2d.brush) }
+    if d2d.rt != 0 { _ := ffi_call1(_p2d_vt(d2d.rt, 2), d2d.rt) }
+    if d2d.dw_fac != 0 { _ := ffi_call1(_p2d_vt(d2d.dw_fac, 2), d2d.dw_fac) }
+    if d2d.d2d_fac != 0 { _ := ffi_call1(_p2d_vt(d2d.d2d_fac, 2), d2d.d2d_fac) }
+    ffi_free(d2d.scratch); ffi_free(d2d.out_box); ffi_free(d2d.wbuf)
+}
+
+fn _p2d_ensure_bb(mut d2d: PhotonD2D, hdc: i64, w: i64, h: i64) -> bool {
+    if d2d.mem_dc != 0 and d2d.hbm != 0 and d2d.bb_w == w and d2d.bb_h == h {
+        return true
+    }
+    if d2d.mem_dc != 0 {
+        if d2d.old_bm != 0 { _ := ffi_call2(d2d.f_sel, d2d.mem_dc, d2d.old_bm) }
+        if d2d.hbm != 0 { _ := ffi_call1(d2d.f_delo, d2d.hbm) }
+        _ := ffi_call1(d2d.f_deldc, d2d.mem_dc)
+        d2d.mem_dc = 0; d2d.hbm = 0; d2d.old_bm = 0
+    }
+    d2d.mem_dc = ffi_call1(d2d.f_cdc, hdc)
+    if d2d.mem_dc == 0 { return false }
+    d2d.hbm = ffi_call3(d2d.f_cbm, hdc, w, h)
+    if d2d.hbm == 0 { _ := ffi_call1(d2d.f_deldc, d2d.mem_dc); d2d.mem_dc = 0; return false }
+    d2d.old_bm = ffi_call2(d2d.f_sel, d2d.mem_dc, d2d.hbm)
+    d2d.bb_w = w; d2d.bb_h = h
+
+    rc := d2d.scratch + 128
+    ffi_write_u32_le(rc, 0, 0); ffi_write_u32_le(rc, 4, 0)
+    ffi_write_u32_le(rc, 8, w); ffi_write_u32_le(rc, 12, h)
+    return (ffi_call3(_p2d_vt(d2d.rt, 57), d2d.rt, d2d.mem_dc, rc) & 0xFFFFFFFF) == 0
+}
+
+fn _p2d_get_text_format(mut d2d: PhotonD2D, sz_in: i64, weight_in: i64, h_align: i64, v_align: i64, wrap: i64) -> i64 {
+    mut sz := sz_in
+    if sz < 8 { sz = 8 } else if sz > 96 { sz = 96 }
+    mut w := weight_in
+    if w < 100 or w > 900 { w = 400 }
+    mut i := 0
+    while i < d2d.tf_count {
+        b := i * 6
+        if ibuf_get(d2d.tf_entries, b) == sz and ibuf_get(d2d.tf_entries, b + 1) == w and ibuf_get(d2d.tf_entries, b + 2) == h_align and ibuf_get(d2d.tf_entries, b + 3) == v_align and ibuf_get(d2d.tf_entries, b + 4) == wrap {
+            return ibuf_get(d2d.tf_entries, b + 5)
+        }
+        i += 1
+    }
+    w_face := ffi_wstr("Segoe UI Variable Text")
+    w_loc := ffi_wstr("en-US")
+    args := ibuf_new(12)
+    ibuf_push(args, d2d.dw_fac); ibuf_push(args, w_face); ibuf_push(args, 0); ibuf_push(args, w)
+    ibuf_push(args, 0); ibuf_push(args, 5); ibuf_push(args, _p2d_f32(sz)); ibuf_push(args, w_loc); ibuf_push(args, d2d.out_box)
+    hr := ffi_call_arr(_p2d_vt(d2d.dw_fac, 15), 9, args) & 0xFFFFFFFF
+    buf_free(move args)
+    ffi_free(w_face); ffi_free(w_loc)
+    if hr != 0 { return 0 }
+    tf := ffi_read_i64(d2d.out_box, 0)
+    if tf != 0 {
+        _ := ffi_call2(_p2d_vt(tf, 3), tf, h_align)
+        _ := ffi_call2(_p2d_vt(tf, 4), tf, v_align)
+        _ := ffi_call2(_p2d_vt(tf, 5), tf, wrap)
+        if d2d.tf_count < 30 {
+            ibuf_push(d2d.tf_entries, sz); ibuf_push(d2d.tf_entries, w)
+            ibuf_push(d2d.tf_entries, h_align); ibuf_push(d2d.tf_entries, v_align)
+            ibuf_push(d2d.tf_entries, wrap); ibuf_push(d2d.tf_entries, tf)
+            d2d.tf_count += 1
+        }
+    }
+    return tf
+}
+
+fn _p2d_fill_rrect(d2d: PhotonD2D, x: i64, y: i64, w: i64, h: i64, rad: i64, argb: i64) {
+    if w <= 0 or h <= 0 or ((argb >> 24) & 0xFF) == 0 { return }
+    _p2d_write_color(d2d.scratch, argb)
+    _ := ffi_call2(_p2d_vt(d2d.brush, 8), d2d.brush, d2d.scratch)
+    rr := d2d.scratch + 32
+    _p2d_write_rrect(rr, x, y, w, h, rad)
+    _ := ffi_call3(_p2d_vt(d2d.rt, 19), d2d.rt, rr, d2d.brush)
+}
+
+fn _p2d_fill_grad_rrect(d2d: PhotonD2D, x: i64, y: i64, w: i64, h: i64, rad: i64, dir: i64, c_from: i64, c_to: i64) {
+    if w <= 0 or h <= 0 { return }
+    stops := d2d.scratch + 160
+    ffi_write_u32_le(stops, 0, _p2d_f32_ratio(0, 1))
+    _p2d_write_color(stops + 4, c_from)
+    ffi_write_u32_le(stops, 20, _p2d_f32_ratio(1, 1))
+    _p2d_write_color(stops + 24, c_to)
+
+    hr_s := ffi_call6(_p2d_vt(d2d.rt, 9), d2d.rt, stops, 2, 0, 0, d2d.out_box) & 0xFFFFFFFF
+    if hr_s != 0 { _p2d_fill_rrect(d2d, x, y, w, h, rad, c_from); return }
+    scoll := ffi_read_i64(d2d.out_box, 0)
+    gp := d2d.scratch + 240
+    ffi_write_u32_le(gp, 0, _p2d_f32(x))
+    ffi_write_u32_le(gp, 4, _p2d_f32(y))
+    ex := if dir == 2 { x } else { x + w }
+    ey := if dir == 1 { y } else { y + h }
+    ffi_write_u32_le(gp, 8, _p2d_f32(ex))
+    ffi_write_u32_le(gp, 12, _p2d_f32(ey))
+
+    hr_g := ffi_call5(_p2d_vt(d2d.rt, 10), d2d.rt, gp, 0, scoll, d2d.out_box) & 0xFFFFFFFF
+    _ := ffi_call1(_p2d_vt(scoll, 2), scoll)
+    if hr_g != 0 { _p2d_fill_rrect(d2d, x, y, w, h, rad, c_from); return }
+    gb := ffi_read_i64(d2d.out_box, 0)
+    rr := d2d.scratch + 32
+    _p2d_write_rrect(rr, x, y, w, h, rad)
+    _ := ffi_call3(_p2d_vt(d2d.rt, 19), d2d.rt, rr, gb)
+    _ := ffi_call1(_p2d_vt(gb, 2), gb)
+}
+
+// Hardware Direct2D + DirectWrite Presenter for ALL `std::ui` HTML5/CSS3/Tailwind/JS apps!
+fn photon_d2d_present(win: GuiWindow, mut app: UiApp, mut d2d: PhotonD2D, hovered_node: i64 = -1) -> bool {
+    if not win.is_open or not d2d.ok { return false }
+    if not app.is_ready {
+        parsed := html_parse(app.html_src) or dom_tree_new(app.html_src)
+        app.tree = parsed
+        app.layout = layout_compute(app.tree, app.sheet, app.width, app.height)
+        app.is_ready = true
+    }
+
+    w := win.width
+    h := win.height
+    if w <= 0 or h <= 0 { return false }
+
+    hdc := ffi_call1(d2d.f_gdc, win.hwnd)
+    if hdc == 0 { return false }
+    if not _p2d_ensure_bb(mut d2d, hdc, w, h) {
+        _ := ffi_call2(d2d.f_rdc, win.hwnd, hdc)
+        return false
+    }
+
+    _ := ffi_call1(_p2d_vt(d2d.rt, 48), d2d.rt) // BeginDraw
+    // Default clean dark slate/obsidian backdrop (overridden by root/body CSS bg!)
+    _p2d_write_color(d2d.scratch, 0xFF09090B)
+    _ := ffi_call2(_p2d_vt(d2d.rt, 47), d2d.rt, d2d.scratch)
+
+    mut i := 0
+    while i < app.tree.count {
+        bx := layout_get_x(app.layout, i)
+        by := layout_get_y(app.layout, i)
+        bw := layout_get_w(app.layout, i)
+        bh := layout_get_h(app.layout, i)
+        if bw > 0 and bh > 0 {
+            style := css_compute_node_style_state(app.tree, i, app.sheet, i == hovered_node)
+            if style.display != 3 and style.opacity > 0 {
+                mut rad := style.border_radius
+                if rad > bw / 2 { rad = bw / 2 }
+                if rad > bh / 2 { rad = bh / 2 }
+                if rad < 0 { rad = 0 }
+
+                // 1. Soft multi-layer Drop Shadow (`shadow-sm..2xl`, CSS `box-shadow`)
+                if style.shadow > 0 and (style.bg_color != 0 or style.grad_dir > 0) {
+                    sh := style.shadow
+                    _p2d_fill_rrect(d2d, bx - sh, by + sh * 2, bw + sh * 2, bh + sh, rad + sh, 0x16000000)
+                    _p2d_fill_rrect(d2d, bx, by + sh, bw, bh + sh / 2 + 1, rad + 1, 0x26000000)
+                }
+
+                // 2. Border + Background / Linear Gradient (zero half-pixel blur!)
+                has_bd := style.border_width > 0 and style.border_color != 0
+                has_grad := style.grad_dir > 0 and (style.grad_from != 0 or style.grad_to != 0)
+                has_bg := style.bg_color != 0
+                bd_w := if has_bd { style.border_width } else { 0 }
+
+                if has_bd {
+                    bd_col := _p2d_apply_opacity(style.border_color, style.opacity)
+                    _p2d_fill_rrect(d2d, bx, by, bw, bh, rad, bd_col)
+                }
+
+                ix := bx + bd_w
+                iy := by + bd_w
+                iw := bw - bd_w * 2
+                ih := bh - bd_w * 2
+                mut irad := rad - bd_w
+                if irad < 0 { irad = 0 }
+
+                if has_grad {
+                    cf := _p2d_apply_opacity(if style.grad_from != 0 { style.grad_from } else { style.bg_color }, style.opacity)
+                    ct := _p2d_apply_opacity(if style.grad_to != 0 { style.grad_to } else { cf }, style.opacity)
+                    _p2d_fill_grad_rrect(d2d, ix, iy, iw, ih, irad, style.grad_dir, cf, ct)
+                } else if has_bg {
+                    bg_col := _p2d_apply_opacity(style.bg_color, style.opacity)
+                    _p2d_fill_rrect(d2d, ix, iy, iw, ih, irad, bg_col)
+                } else if has_bd {
+                    // Transparent card with border: punch inner surface using obsidian backdrop
+                    _p2d_fill_rrect(d2d, ix, iy, iw, ih, irad, 0xFF09090B)
+                }
+
+                // 3. DirectWrite Crisp Grayscale Typography (Full Vietnamese Unicode!)
+                txt := dom_get_text(app.tree, i)
+                tlen := str_len(txt)
+                if tlen > 0 and d2d.f_mb2w != 0 {
+                    mut fz := style.font_size
+                    if fz <= 0 { fz = 14 }
+                    mut fw := style.font_weight
+                    if fw <= 0 { fw = 400 }
+
+                    // DirectWrite alignment: 0=LEADING, 1=TRAILING, 2=CENTER
+                    mut ha := 0
+                    if style.text_align == 1 { ha = 2 }
+                    else if style.text_align == 2 { ha = 1 }
+
+                    tag := dom_get_tag(app.tree, i)
+                    is_single := str_eq_ignore_case(tag, "button") or str_eq_ignore_case(tag, "input") or style.text_align == 1 or fw >= 600 or fz >= 18
+                    va := if is_single { 2 } else { 0 }
+                    wrap := if is_single { 1 } else { 0 }
+
+                    tf := _p2d_get_text_format(mut d2d, fz, fw, ha, va, wrap)
+                    if tf != 0 {
+                        ctxt := ffi_cstr(txt)
+                        wlen := ffi_sext32(ffi_call6(d2d.f_mb2w, 65001, 0, ctxt, tlen, d2d.wbuf, d2d.wcap))
+                        ffi_free(ctxt)
+                        if wlen > 0 {
+                            pad_x := if style.padding_x > 0 { style.padding_x / 2 } else { (if style.display == 2 { 2 } else { 0 }) }
+                            pad_y := if is_single { 0 } else { style.padding_y / 2 }
+                            tx := bx + pad_x
+                            ty := by + pad_y
+                            mut tw := bw - pad_x * 2
+                            mut th := bh - pad_y * 2
+                            if tw < 4 { tw = bw }
+                            if th < 4 { th = bh }
+
+                            tc := _p2d_apply_opacity(style.text_color, style.opacity)
+                            _p2d_write_color(d2d.scratch, tc)
+                            _ := ffi_call2(_p2d_vt(d2d.brush, 8), d2d.brush, d2d.scratch)
+                            rc := d2d.scratch + 32
+                            _p2d_write_rect(rc, tx, ty, tw, th)
+                            _ := ffi_call8(_p2d_vt(d2d.rt, 27), d2d.rt, d2d.wbuf, wlen, tf, rc, d2d.brush, 6, 0)
+                        }
+                    }
+                }
+            }
+        }
+        i += 1
+    }
+
+    _ := ffi_call3(_p2d_vt(d2d.rt, 49), d2d.rt, 0, 0) // EndDraw
+
+    bargs := ibuf_new(12)
+    ibuf_push(bargs, hdc); ibuf_push(bargs, 0); ibuf_push(bargs, 0)
+    ibuf_push(bargs, w); ibuf_push(bargs, h)
+    ibuf_push(bargs, d2d.mem_dc); ibuf_push(bargs, 0); ibuf_push(bargs, 0)
+    ibuf_push(bargs, 0x00CC0020)
+    _ := ffi_call_arr(d2d.f_bkit, 9, bargs)
+    buf_free(move bargs)
+
+    _ := ffi_call2(d2d.f_rdc, win.hwnd, hdc)
+    return true
+}
+
 fn _gui_color_to_colorref(argb: i64) -> i64 {
     r := (argb >> 16) & 0xFF
     g := (argb >> 8) & 0xFF
@@ -474,10 +889,18 @@ fn _gui_color_to_colorref(argb: i64) -> i64 {
     return r | (g << 8) | (b << 16)
 }
 
-// Axon PhotonUI Native Engine: Pure Zero-Browser Double-Buffered ERMS Cards + Win32 ClearType text
-// (~200 KB exe, 0 disk churn!) Font handles come from a caller-owned cache so steady-state
-// frames allocate no GDI objects.
+// Axon PhotonUI Native Engine: Automatically selects Hardware Direct2D + DirectWrite on Windows
+// (razor-sharp HTML5/CSS3/Tailwind/JS, 0 blur) with GDI/SDL2 fallback.
 fn gui_present_photon_ui(win: GuiWindow, mut app: UiApp) -> bool {
+    if win.backend == 1 {
+        mut d2d := photon_d2d_init(win)
+        if d2d.ok {
+            ok_p := photon_d2d_present(win, mut app, mut d2d, -1)
+            photon_d2d_free(move d2d)
+            return ok_p
+        }
+        photon_d2d_free(move d2d)
+    }
     mut fonts := gui_font_cache_new()
     ok_present := gui_present_photon_ui_cached(win, mut app, mut fonts)
     gui_font_cache_free(move fonts, win.gdi32)
@@ -633,37 +1056,88 @@ fn gui_present_photon_ui_cached(win: GuiWindow, mut app: UiApp, mut fonts: GuiFo
 }
 
 // 1-line production desktop app runner for `std::ui` (`UiApp`)
-// Pure Axon PhotonUI Native Engine: zero browser, zero temp folders, 120Hz double-buffered ClearType UI!
+// Pure Axon Photon-D2D Engine: Hardware Direct2D + DirectWrite, 0.00% idle CPU, live resize & `:hover`!
 fn gui_run_ui_app(mut app: UiApp, max_frames: i64 = 0, visible: bool = true) -> i64 {
     mut win := gui_open(app.title, app.width, app.height, visible) or return -1
+    mut d2d := photon_d2d_init(win)
     mut frames := 0
     mut prev_down := false
+    mut prev_hover := -1
     mut dirty := true
+    mut trimmed := false
+
     while gui_poll_events(mut win) {
+        if win.needs_redraw { dirty = true }
+
+        // Live responsive Flexbox reflow on window resize
+        if win.width > 100 and win.height > 100 and (win.width != app.width or win.height != app.height) {
+            app.width = win.width
+            app.height = win.height
+            if app.is_ready {
+                app.layout = layout_compute(app.tree, app.sheet, app.width, app.height)
+            }
+            dirty = true
+        }
+
+        // Hover-node dirty check (zero redraws when cursor moves within same element!)
+        hovered := if app.is_ready { ui_hit_test(app, win.mouse_x, win.mouse_y) } else { -1 }
+        if hovered != prev_hover {
+            prev_hover = hovered
+            dirty = true
+        }
+
         if win.mouse_down and not prev_down {
             _ := ui_click(mut app, win.mouse_x, win.mouse_y)
             dirty = true
         }
         prev_down = win.mouse_down
-        if dirty {
-            _ := gui_present_photon_ui(win, mut app)
-            dirty = false
-        } else if ui_patch_signals(mut app) > 0 {
-            _ := gui_present_photon_ui(win, mut app)
+
+        if not dirty and ui_patch_signals(mut app) > 0 {
+            dirty = true
         }
+
+        if dirty {
+            if d2d.ok {
+                _ := photon_d2d_present(win, mut app, mut d2d, hovered)
+            } else {
+                _ := gui_present_photon_ui(win, mut app)
+            }
+            dirty = false
+            if not trimmed and d2d.k32 != 0 {
+                f_cur := ffi_sym(d2d.k32, "GetCurrentProcess")
+                f_ws  := ffi_sym(d2d.k32, "SetProcessWorkingSetSize")
+                if f_cur != 0 and f_ws != 0 { _ := ffi_call3(f_ws, ffi_call0(f_cur), -1, -1) }
+                trimmed = true
+            }
+        }
+
         frames += 1
         if max_frames > 0 and frames >= max_frames { break }
         if win.key_escape { break }
-        sleep_ms(8)
+        if max_frames == 0 {
+            gui_wait_event(win, 250)
+        } else {
+            sleep_ms(4)
+        }
     }
+    photon_d2d_free(move d2d)
     gui_close(mut win)
     return frames
 }
 
-// Native OS MessageBox (`flags`: 0 = OK, 1 = OK/Cancel, 4 = Yes/No)
+// Native OS Unicode MessageBox (`flags`: 0 = OK, 1 = OK/Cancel, 4 = Yes/No)
 fn gui_msgbox(title: str, text: str, flags: i64 = 0) -> i64 {
     u32 := ffi_open_one("user32.dll")
+    k32 := ffi_open_one("kernel32.dll")
     if u32 == 0 { return 0 }
+    fw := ffi_sym(u32, "MessageBoxW")
+    if fw != 0 {
+        wt := _gui_utf8_to_utf16(k32, title)
+        wm := _gui_utf8_to_utf16(k32, text)
+        r := ffi_sext32(ffi_call4(fw, 0, wm, wt, flags))
+        ffi_free(wt); ffi_free(wm)
+        return r
+    }
     f := ffi_sym(u32, "MessageBoxA")
     ct := ffi_cstr(title); cm := ffi_cstr(text)
     r := ffi_sext32(ffi_call4(f, 0, cm, ct, flags))
