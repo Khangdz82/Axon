@@ -248,6 +248,12 @@ fn mc_mov_rcx_gpreg(c: ByteBuf, r: i64) {
 fn mc_mov_rdx_gpreg(c: ByteBuf, r: i64) {
     mc_b3(c, 0x48 | gpreg_hi(r), 0x8B, 0xD0 | gpreg_hw(r))
 }
+fn mc_mov_r8_gpreg(c: ByteBuf, r: i64) {
+    mc_b3(c, 0x4C | gpreg_hi(r), 0x8B, 0xC0 | gpreg_hw(r))
+}
+fn mc_mov_r9_gpreg(c: ByteBuf, r: i64) {
+    mc_b3(c, 0x4C | gpreg_hi(r), 0x8B, 0xC8 | gpreg_hw(r))
+}
 
 fn mc_mov_gpreg_argreg(c: ByteBuf, r: i64, ridx: i64) {
     hi := gpreg_hi(r)
@@ -1800,6 +1806,26 @@ fn pure_f64_ty_ax(cg: CodegenCtx, vars: IntBuf, nid: i64) -> bool {
             return pure_f64_ty_ax(cg, vars, ast_get(cg.nodes, nid, 2)) and pure_f64_ty_ax(cg, vars, ast_get(cg.nodes, nid, 3))
         }
     }
+    if k == nk_call() {
+        cs := ast_get(cg.nodes, nid, 1); cl := ast_get(cg.nodes, nid, 2)
+        aoff := ast_get(cg.nodes, nid, 3); acnt := ast_get(cg.nodes, nid, 4)
+        if acnt == 1 and pool_str_eq_lit(cg.pool, cs, cl, "sqrt_f64") {
+            return pure_f64_ty_ax(cg, vars, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
+        }
+        if acnt == 2 and pool_str_eq_lit(cg.pool, cs, cl, "ptr_read_f64") {
+            e0 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4)
+            e1 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4)
+            if local_scalar_slot_ax(cg, vars, e0) > 0 {
+                if local_scalar_slot_ax(cg, vars, e1) > 0 or is_folded_const_int_ax(cg, vars, e1) { return true }
+                if ast_kind(cg.nodes, e1) == nk_binary() {
+                    bop := ast_get(cg.nodes, e1, 1)
+                    if (bop == op_add() or bop == op_wrap_add()) and local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, e1, 2)) > 0 and local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, e1, 3)) > 0 {
+                        return true
+                    }
+                }
+            }
+        }
+    }
     return false
 }
 
@@ -1860,6 +1886,43 @@ fn emit_f64_expr_depth_ax(cg: CodegenCtx, vars: IntBuf, enid: i64, depth: i64) {
     if k == nk_unary() {
         emit_f64_expr_depth_ax(cg, vars, ast_get(cg.nodes, enid, 2), depth)
         mc_sse_xmm0_rdata(cg, 0x66, 0x57, 1 << 63, true) // [V]XORPD XMM0, [signbit128]
+        return
+    }
+    if k == nk_call() {
+        cs := ast_get(cg.nodes, enid, 1); cl := ast_get(cg.nodes, enid, 2)
+        aoff := ast_get(cg.nodes, enid, 3)
+        if pool_str_eq_lit(cg.pool, cs, cl, "sqrt_f64") {
+            emit_f64_expr_depth_ax(cg, vars, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4), depth)
+            if vex { mc_vex2(c, 0, 0, 3, 0x51, 0xC0) } // VSQRTSD XMM0, XMM0, XMM0
+            else   { mc_b4(c, 0xF2, 0x0F, 0x51, 0xC0) } // SQRTSD XMM0, XMM0
+            return
+        }
+        // `ptr_read_f64(ptr_var, idx)` -> direct `[V]MOVSD XMM0, [RCX + RDX*8]` (0 GPR<->XMM crossing!)
+        e0 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4)
+        e1 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4)
+        psl := local_scalar_slot_ax(cg, vars, e0)
+        pr_p := cg_slot_reg(cg, psl)
+        if pr_p > 0 { mc_mov_rcx_gpreg(c, pr_p) } else { mc_load_rcx(c, psl, 0) }
+        if is_folded_const_int_ax(cg, vars, e1) {
+            mc_mov_reg_imm(c, 1, eval_folded_const_int_ax(cg, vars, e1))
+        } else if ast_kind(cg.nodes, e1) == nk_binary() {
+            s_a := local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, e1, 2))
+            s_b := local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, e1, 3))
+            ra := cg_slot_reg(cg, s_a); rb := cg_slot_reg(cg, s_b)
+            if ra > 0 { mc_mov_rdx_gpreg(c, ra) } else { mc_load_rdx(c, s_a, 0) }
+            if rb > 0 {
+                mc_b3(c, 0x48 | (gpreg_hi(rb) << 2), 0x01, 0xC2 | (gpreg_hw(rb) << 3)) // ADD RDX, rb
+            } else {
+                mc_load_rax(c, s_b, 0)
+                mc_b3(c, 0x48, 0x01, 0xC2) // ADD RDX, RAX
+            }
+        } else {
+            isl := local_scalar_slot_ax(cg, vars, e1)
+            ri := cg_slot_reg(cg, isl)
+            if ri > 0 { mc_mov_rdx_gpreg(c, ri) } else { mc_load_rdx(c, isl, 0) }
+        }
+        if vex { mc_vex3(c, 0, 0, 0, 1, 0, 0, 0, 3, 0x10); mc_b2(c, 0x04, 0xD1) } // VMOVSD XMM0, [RCX + RDX*8]
+        else   { mc_b4(c, 0xF2, 0x0F, 0x10, 0x04); mc_b1(c, 0xD1) }              // MOVSD  XMM0, [RCX + RDX*8]
         return
     }
     op := ast_get(cg.nodes, enid, 1)
@@ -4532,6 +4595,62 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
                 return
             }
             if (aop == aop_eq() or aop == aop_add() or aop == aop_sub() or aop == aop_mul()) and (lty == ty_int() or lty == ty_bool()) {
+                // In-place 1-insn GPR ARX & bitwise ops: `x = x ^ y`, `x = (x +% y) & 0xFFFFFFFF`, `x = ((x << k) | ushr64(x, 32-k)) & 0xFFFFFFFF`
+                if aop == aop_eq() and pr > 0 and lty == ty_int() and ast_kind(cg.nodes, rhs) == nk_binary() {
+                    rop0 := ast_get(cg.nodes, rhs, 1)
+                    rl0 := ast_get(cg.nodes, rhs, 2)
+                    rr0 := ast_get(cg.nodes, rhs, 3)
+                    if rop0 == op_bit_xor() or rop0 == op_bit_and() or rop0 == op_bit_or() or rop0 == op_wrap_add() {
+                        mut yr := 0
+                        if local_scalar_slot_ax(cg, vars, rl0) == bslot { yr = cg_slot_reg(cg, local_scalar_slot_ax(cg, vars, rr0)) }
+                        else if local_scalar_slot_ax(cg, vars, rr0) == bslot { yr = cg_slot_reg(cg, local_scalar_slot_ax(cg, vars, rl0)) }
+                        if yr > 0 {
+                            mut opc0 := 0x31
+                            if rop0 == op_bit_and() { opc0 = 0x21 }
+                            else if rop0 == op_bit_or() { opc0 = 0x09 }
+                            else if rop0 == op_wrap_add() { opc0 = 0x01 }
+                            mc_b3(c, 0x48 | (gpreg_hi(yr) << 2) | gpreg_hi(pr), opc0, 0xC0 | (gpreg_hw(yr) << 3) | gpreg_hw(pr))
+                            if ibuf_len(drops) == saved_drops { ibuf_set(cg.state, 4, saved_slot) }
+                            return
+                        }
+                    }
+                    if rop0 == op_bit_and() and is_folded_const_int_ax(cg, vars, rr0) and eval_folded_const_int_ax(cg, vars, rr0) == 0xFFFFFFFF and rl0 > 0 and ast_kind(cg.nodes, rl0) == nk_binary() {
+                        iop := ast_get(cg.nodes, rl0, 1)
+                        il := ast_get(cg.nodes, rl0, 2)
+                        ir := ast_get(cg.nodes, rl0, 3)
+                        // `(x +% y) & 0xFFFFFFFF` -> 1-insn `ADD pr32, yr32` (wraps mod 2^32 and zero-extends!)
+                        if iop == op_wrap_add() {
+                            mut yr := 0
+                            if local_scalar_slot_ax(cg, vars, il) == bslot { yr = cg_slot_reg(cg, local_scalar_slot_ax(cg, vars, ir)) }
+                            else if local_scalar_slot_ax(cg, vars, ir) == bslot { yr = cg_slot_reg(cg, local_scalar_slot_ax(cg, vars, il)) }
+                            if yr > 0 {
+                                rex32 := 0x40 | (gpreg_hi(yr) << 2) | gpreg_hi(pr)
+                                if rex32 != 0x40 { mc_b1(c, rex32) }
+                                mc_b2(c, 0x01, 0xC0 | (gpreg_hw(yr) << 3) | gpreg_hw(pr))
+                                if ibuf_len(drops) == saved_drops { ibuf_set(cg.state, 4, saved_slot) }
+                                return
+                            }
+                        }
+                        // `((x << k) | ushr64(x, 32-k)) & 0xFFFFFFFF` -> 1-insn hardware `ROL pr32, k`!
+                        if iop == op_bit_or() and il > 0 and ir > 0 and ast_kind(cg.nodes, il) == nk_binary() and ast_get(cg.nodes, il, 1) == op_shl() and ast_kind(cg.nodes, ir) == nk_call() and pool_str_eq_lit(cg.pool, ast_get(cg.nodes, ir, 1), ast_get(cg.nodes, ir, 2), "ushr64") and ast_get(cg.nodes, ir, 4) == 2 {
+                            sh_x := ast_get(cg.nodes, il, 2)
+                            sh_k := ast_get(cg.nodes, il, 3)
+                            uaoff := ast_get(cg.nodes, ir, 3)
+                            ux := ast_get(cg.nodes, ibuf_get(cg.extra, uaoff), 4)
+                            uk := ast_get(cg.nodes, ibuf_get(cg.extra, uaoff + 1), 4)
+                            if local_scalar_slot_ax(cg, vars, sh_x) == bslot and local_scalar_slot_ax(cg, vars, ux) == bslot and is_folded_const_int_ax(cg, vars, sh_k) and is_folded_const_int_ax(cg, vars, uk) {
+                                kl := eval_folded_const_int_ax(cg, vars, sh_k)
+                                kr := eval_folded_const_int_ax(cg, vars, uk)
+                                if kl >= 1 and kl <= 31 and kl + kr == 32 {
+                                    if gpreg_hi(pr) != 0 { mc_b1(c, 0x41) }
+                                    mc_b3(c, 0xC1, 0xC0 | gpreg_hw(pr), kl & 31) // ROL pr32, kl
+                                    if ibuf_len(drops) == saved_drops { ibuf_set(cg.state, 4, saved_slot) }
+                                    return
+                                }
+                            }
+                        }
+                    }
+                }
                 // In-place `x = ushr64(x, sh) <op> ptr_read_i64(base, idx)` -> 2 insns: `SHR reg, sh; <OP> reg, [base + idx*8]`
                 if aop == aop_eq() and pr > 0 and lty == ty_int() and ast_kind(cg.nodes, rhs) == nk_binary() {
                     rop := ast_get(cg.nodes, rhs, 1)
@@ -4824,6 +4943,53 @@ fn emit_stmt_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, sni
                     jtrue := emit_cond_branch_ax(cg, vars, drops, breaks, ast_get(cg.nodes, snid, 1), true)
                     mc_patch_rel32(c, jtrue, ctgt)
                     return
+                }
+            }
+            // Branchless `CMOV` conditional max/min store: `if cand > ptr_read_i64(dp, c) { ptr_write_i64(dp, c, cand) }`
+            if stk0 == nk_expr_stmt() {
+                es := ast_get(cg.nodes, st0, 1)
+                cn := ast_get(cg.nodes, snid, 1)
+                if es > 0 and ast_kind(cg.nodes, es) == nk_call() and ast_get(cg.nodes, es, 4) == 3 and pool_str_eq_lit(cg.pool, ast_get(cg.nodes, es, 1), ast_get(cg.nodes, es, 2), "ptr_write_i64") and cn > 0 and ast_kind(cg.nodes, cn) == nk_binary() {
+                    cop := ast_get(cg.nodes, cn, 1)
+                    if cop == op_gt() or cop == op_lt() {
+                        cl := ast_get(cg.nodes, cn, 2); cr := ast_get(cg.nodes, cn, 3)
+                        if cr > 0 and ast_kind(cg.nodes, cr) == nk_call() and ast_get(cg.nodes, cr, 4) == 2 and pool_str_eq_lit(cg.pool, ast_get(cg.nodes, cr, 1), ast_get(cg.nodes, cr, 2), "ptr_read_i64") {
+                            wa := ast_get(cg.nodes, es, 3)
+                            wp := local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, ibuf_get(cg.extra, wa), 4))
+                            wi := local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, ibuf_get(cg.extra, wa + 1), 4))
+                            wv := local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, ibuf_get(cg.extra, wa + 2), 4))
+                            ra := ast_get(cg.nodes, cr, 3)
+                            rp := local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, ibuf_get(cg.extra, ra), 4))
+                            ri := local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, ibuf_get(cg.extra, ra + 1), 4))
+                            cv := local_scalar_slot_ax(cg, vars, cl)
+                            if wp > 0 and wp == rp and wi > 0 and wi == ri and wv > 0 and wv == cv {
+                                pr_p := cg_slot_reg(cg, wp); pr_i := cg_slot_reg(cg, wi); pr_v := cg_slot_reg(cg, wv)
+                                if pr_v > 0 { mc_mov_rcx_gpreg(c, pr_v) } else { mc_load_rcx(c, wv, 0) }
+                                if pr_p > 0 and pr_i > 0 {
+                                    b_hw := gpreg_hw(pr_p); b_hi := gpreg_hi(pr_p)
+                                    x_hw := gpreg_hw(pr_i); x_hi := gpreg_hi(pr_i)
+                                    sib := 0xC0 | (x_hw << 3) | b_hw
+                                    mut modrm := 0x04
+                                    if b_hw == 5 { modrm = 0x44 }
+                                    rex := 0x48 | (x_hi << 1) | b_hi
+                                    mc_b4(c, rex, 0x8B, modrm, sib); if b_hw == 5 { mc_b1(c, 0) }
+                                    mc_b3(c, 0x48, 0x39, 0xC1)
+                                    if cop == op_gt() { mc_b4(c, 0x48, 0x0F, 0x4F, 0xC1) }
+                                    else              { mc_b4(c, 0x48, 0x0F, 0x4C, 0xC1) }
+                                    mc_b4(c, rex, 0x89, modrm, sib); if b_hw == 5 { mc_b1(c, 0) }
+                                    return
+                                }
+                                if pr_p > 0 { mc_mov_r8_gpreg(c, pr_p) } else { mc_load_r8(c, wp, 0) }
+                                if pr_i > 0 { mc_mov_rdx_gpreg(c, pr_i) } else { mc_load_rdx(c, wi, 0) }
+                                mc_b4(c, 0x49, 0x8B, 0x04, 0xD0) // MOV RAX, [R8 + RDX*8]
+                                mc_b3(c, 0x48, 0x39, 0xC1)       // CMP RCX, RAX
+                                if cop == op_gt() { mc_b4(c, 0x48, 0x0F, 0x4F, 0xC1) } // CMOVG RAX, RCX
+                                else              { mc_b4(c, 0x48, 0x0F, 0x4C, 0xC1) } // CMOVL RAX, RCX
+                                mc_b4(c, 0x49, 0x89, 0x04, 0xD0) // MOV [R8 + RDX*8], RAX
+                                return
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -5124,7 +5290,7 @@ fn scan_unroll_body_ok_ax(cg: CodegenCtx, nid: i64, idx_soff: i64, idx_slen: i64
     if k == nk_call() {
         cs := ast_get(cg.nodes, nid, 1); cl := ast_get(cg.nodes, nid, 2)
         p := cg.pool
-        pure_bi := pool_str_eq_lit(p, cs, cl, "ushr64") or pool_str_eq_lit(p, cs, cl, "popcnt64") or pool_str_eq_lit(p, cs, cl, "ptr_read_u8") or pool_str_eq_lit(p, cs, cl, "ptr_read_i64") or pool_str_eq_lit(p, cs, cl, "ptr_write_u8") or pool_str_eq_lit(p, cs, cl, "ptr_write_i64") or pool_str_eq_lit(p, cs, cl, "ptr_read_f32") or pool_str_eq_lit(p, cs, cl, "ptr_write_f32")
+        pure_bi := pool_str_eq_lit(p, cs, cl, "ushr64") or pool_str_eq_lit(p, cs, cl, "popcnt64") or pool_str_eq_lit(p, cs, cl, "ptr_read_u8") or pool_str_eq_lit(p, cs, cl, "ptr_read_i64") or pool_str_eq_lit(p, cs, cl, "ptr_write_u8") or pool_str_eq_lit(p, cs, cl, "ptr_write_i64") or pool_str_eq_lit(p, cs, cl, "ptr_read_f32") or pool_str_eq_lit(p, cs, cl, "ptr_write_f32") or pool_str_eq_lit(p, cs, cl, "ptr_read_f64") or pool_str_eq_lit(p, cs, cl, "ptr_write_f64") or pool_str_eq_lit(p, cs, cl, "sqrt_f64")
         if not pure_bi { return false }
         aoff := ast_get(cg.nodes, nid, 3); acnt := ast_get(cg.nodes, nid, 4)
         mut i := 0
@@ -5156,6 +5322,10 @@ fn scan_ast_has_f64_ax(cg: CodegenCtx, nid: i64) -> bool {
     if k == nk_if() { return scan_ast_has_f64_ax(cg, ast_get(cg.nodes, nid, 1)) or scan_ast_has_f64_ax(cg, ast_get(cg.nodes, nid, 2)) }
     if k == nk_binary() { return scan_ast_has_f64_ax(cg, ast_get(cg.nodes, nid, 2)) or scan_ast_has_f64_ax(cg, ast_get(cg.nodes, nid, 3)) }
     if k == nk_unary() { return scan_ast_has_f64_ax(cg, ast_get(cg.nodes, nid, 2)) }
+    if k == nk_call() {
+        cs := ast_get(cg.nodes, nid, 1); cl := ast_get(cg.nodes, nid, 2)
+        if pool_str_eq_lit(cg.pool, cs, cl, "ptr_read_f64") or pool_str_eq_lit(cg.pool, cs, cl, "ptr_write_f64") or pool_str_eq_lit(cg.pool, cs, cl, "sqrt_f64") { return true }
+    }
     return false
 }
 
@@ -5248,8 +5418,165 @@ fn find_deep_f64_cmp_const_ax(cg: CodegenCtx, vars: IntBuf, nid: i64) -> i64 {
     return 0
 }
 
+// Auto-vectorizes 4-wide AVX2 FMA `f64` AXPY loops (`while j < n { cv := ptr_read_f64(c, o1+j); bv := ptr_read_f64(b, o2+j); ptr_write_f64(c, o1+j, cv + s * bv); j += 1 }`)
+fn try_emit_avx2_f64_axpy_while_ax(cg: CodegenCtx, vars: IntBuf, snid: i64) -> bool {
+    if ibuf_get(cg.state, 17) == 0 or (ibuf_get(cg.state, 18) & fnflag_nan_guard()) != 0 { return false }
+    cond := ast_get(cg.nodes, snid, 1)
+    bnid := ast_get(cg.nodes, snid, 2)
+    if cond <= 0 or bnid <= 0 or ast_kind(cg.nodes, cond) != nk_binary() or ast_get(cg.nodes, cond, 1) != op_lt() { return false }
+    if ast_kind(cg.nodes, bnid) != nk_block() or ast_get(cg.nodes, bnid, 2) != 4 { return false }
+    j_nid := ast_get(cg.nodes, cond, 2); n_nid := ast_get(cg.nodes, cond, 3)
+    j_slot := local_scalar_slot_ax(cg, vars, j_nid)
+    if j_slot <= 0 or immut_local_const_int_node(cg, vars, j_nid) > 0 { return false }
+    j_soff := ast_get(cg.nodes, j_nid, 1); j_slen := ast_get(cg.nodes, j_nid, 2)
+    n_is_imm := is_folded_const_int_ax(cg, vars, n_nid)
+    mut n_imm := 0
+    mut n_slot := 0
+    if n_is_imm { n_imm = eval_folded_const_int_ax(cg, vars, n_nid) }
+    else { n_slot = local_scalar_slot_ax(cg, vars, n_nid); if n_slot <= 0 { return false } }
+
+    boff := ast_get(cg.nodes, bnid, 1)
+    s0 := ibuf_get(cg.extra, boff); s1 := ibuf_get(cg.extra, boff + 1)
+    s2 := ibuf_get(cg.extra, boff + 2); s3 := ibuf_get(cg.extra, boff + 3)
+    if ast_kind(cg.nodes, s0) != nk_var_decl() or ast_kind(cg.nodes, s1) != nk_var_decl() or ast_kind(cg.nodes, s2) != nk_expr_stmt() or ast_kind(cg.nodes, s3) != nk_assign() { return false }
+    if ast_get(cg.nodes, s3, 1) != aop_add() or not ast_is_ident_lit(cg, ast_get(cg.nodes, s3, 2), j_soff, j_slen) { return false }
+    inc_n := ast_get(cg.nodes, s3, 3)
+    if inc_n <= 0 or ast_kind(cg.nodes, inc_n) != nk_int() or ast_get(cg.nodes, inc_n, 1) != 1 { return false }
+
+    // s0: `cv := ptr_read_f64(c, o1 + j)`, s1: `bv := ptr_read_f64(b, o2 + j)`
+    e0 := ast_get(cg.nodes, s0, 5); e1 := ast_get(cg.nodes, s1, 5); e2 := ast_get(cg.nodes, s2, 1)
+    if e0 <= 0 or e1 <= 0 or e2 <= 0 or ast_kind(cg.nodes, e0) != nk_call() or ast_kind(cg.nodes, e1) != nk_call() or ast_kind(cg.nodes, e2) != nk_call() { return false }
+    if ast_get(cg.nodes, e0, 4) != 2 or ast_get(cg.nodes, e1, 4) != 2 or ast_get(cg.nodes, e2, 4) != 3 { return false }
+    if not pool_str_eq_lit(cg.pool, ast_get(cg.nodes, e0, 1), ast_get(cg.nodes, e0, 2), "ptr_read_f64") { return false }
+    if not pool_str_eq_lit(cg.pool, ast_get(cg.nodes, e1, 1), ast_get(cg.nodes, e1, 2), "ptr_read_f64") { return false }
+    if not pool_str_eq_lit(cg.pool, ast_get(cg.nodes, e2, 1), ast_get(cg.nodes, e2, 2), "ptr_write_f64") { return false }
+
+    c_slot := local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, ibuf_get(cg.extra, ast_get(cg.nodes, e0, 3)), 4))
+    b_slot := local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, ibuf_get(cg.extra, ast_get(cg.nodes, e1, 3)), 4))
+    wc_slot := local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, ibuf_get(cg.extra, ast_get(cg.nodes, e2, 3)), 4))
+    if c_slot <= 0 or b_slot <= 0 or wc_slot != c_slot { return false }
+
+    ci_n := ast_get(cg.nodes, ibuf_get(cg.extra, ast_get(cg.nodes, e0, 3) + 1), 4)
+    bi_n := ast_get(cg.nodes, ibuf_get(cg.extra, ast_get(cg.nodes, e1, 3) + 1), 4)
+    wi_n := ast_get(cg.nodes, ibuf_get(cg.extra, ast_get(cg.nodes, e2, 3) + 1), 4)
+    if ast_kind(cg.nodes, ci_n) != nk_binary() or ast_kind(cg.nodes, bi_n) != nk_binary() or ast_kind(cg.nodes, wi_n) != nk_binary() { return false }
+    if ast_get(cg.nodes, ci_n, 1) != op_add() or ast_get(cg.nodes, bi_n, 1) != op_add() or ast_get(cg.nodes, wi_n, 1) != op_add() { return false }
+    if not ast_is_ident_lit(cg, ast_get(cg.nodes, ci_n, 3), j_soff, j_slen) or not ast_is_ident_lit(cg, ast_get(cg.nodes, bi_n, 3), j_soff, j_slen) or not ast_is_ident_lit(cg, ast_get(cg.nodes, wi_n, 3), j_soff, j_slen) { return false }
+    o1_slot := local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, ci_n, 2))
+    o2_slot := local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, bi_n, 2))
+    wo1_slot := local_scalar_slot_ax(cg, vars, ast_get(cg.nodes, wi_n, 2))
+    if o1_slot <= 0 or o2_slot <= 0 or wo1_slot != o1_slot { return false }
+
+    // s2 val: `cv + aik * bv`
+    val_n := ast_get(cg.nodes, ibuf_get(cg.extra, ast_get(cg.nodes, e2, 3) + 2), 4)
+    if val_n <= 0 or ast_kind(cg.nodes, val_n) != nk_binary() or ast_get(cg.nodes, val_n, 1) != op_add() { return false }
+    cv_s := ast_get(cg.nodes, s0, 1); cv_l := ast_get(cg.nodes, s0, 2)
+    bv_s := ast_get(cg.nodes, s1, 1); bv_l := ast_get(cg.nodes, s1, 2)
+    if not ast_is_ident_lit(cg, ast_get(cg.nodes, val_n, 2), cv_s, cv_l) { return false }
+    mul_n := ast_get(cg.nodes, val_n, 3)
+    if mul_n <= 0 or ast_kind(cg.nodes, mul_n) != nk_binary() or ast_get(cg.nodes, mul_n, 1) != op_mul() { return false }
+    if not ast_is_ident_lit(cg, ast_get(cg.nodes, mul_n, 3), bv_s, bv_l) { return false }
+    s_slot := local_f64_slot_ax(cg, vars, ast_get(cg.nodes, mul_n, 2))
+    if s_slot <= 0 { return false }
+
+    // Emit runtime CPUID guard (`g_simd_tier >= 1`): if 0, fall back cleanly to scalar loop!
+    c := cg.code
+    cg_mov_rax_data(cg, data_off_simd_tier())
+    mc_b3(c, 0x48, 0x85, 0xC0)
+    jz_scalar := mc_jcc32(c, 0x84)
+
+    // Setup: R8 = c_ptr + o1*8, R9 = b_ptr + o2*8, RCX = j, R10 = n, YMM2 = broadcast(s)
+    pr_c := cg_slot_reg(cg, c_slot); pr_o1 := cg_slot_reg(cg, o1_slot)
+    if pr_c > 0 { mc_mov_r8_gpreg(c, pr_c) } else { mc_load_r8(c, c_slot, 0) }
+    if pr_o1 > 0 { mc_mov_rax_gpreg(c, pr_o1) } else { mc_load_rax(c, o1_slot, 0) }
+    mc_b4(c, 0x4D, 0x8D, 0x04, 0xC0) // LEA R8, [R8 + RAX*8]
+
+    pr_b := cg_slot_reg(cg, b_slot); pr_o2 := cg_slot_reg(cg, o2_slot)
+    if pr_b > 0 { mc_mov_r9_gpreg(c, pr_b) } else { mc_load_r9(c, b_slot, 0) }
+    if pr_o2 > 0 { mc_mov_rax_gpreg(c, pr_o2) } else { mc_load_rax(c, o2_slot, 0) }
+    mc_b4(c, 0x4D, 0x8D, 0x0C, 0xC1) // LEA R9, [R9 + RAX*8]
+
+    pr_j := cg_slot_reg(cg, j_slot)
+    if pr_j > 0 { mc_mov_rcx_gpreg(c, pr_j) } else { mc_load_rcx(c, j_slot, 0) }
+    if n_is_imm {
+        mc_mov_rax_imm(c, n_imm)
+        mc_b3(c, 0x49, 0x89, 0xC2) // MOV R10, RAX
+    } else {
+        pr_n := cg_slot_reg(cg, n_slot)
+        if pr_n > 0 { mc_mov_rax_gpreg(c, pr_n) } else { mc_load_rax(c, n_slot, 0) }
+        mc_b3(c, 0x49, 0x89, 0xC2) // MOV R10, RAX
+    }
+
+    fr_s := cg_slot_freg(cg, s_slot)
+    if fr_s > 0 { mc_vex_movaps_rr(c, 0, 5 + fr_s) } else { mc_sse_xmm0_slot(c, 0xF2, 0x10, s_slot, 0) }
+    mc_vex3(c, 0, 0, 0, 2, 0, 0, 1, 1, 0x19); mc_b1(c, 0xD0) // VBROADCASTSD YMM2, XMM0
+
+    mc_b4(c, 0x4D, 0x8D, 0x5A, 0xFC) // LEA R11, [R10 - 4]
+    mc_b3(c, 0x4C, 0x39, 0xD9)       // CMP RCX, R11
+    jg_tail := mc_jcc8(c, 0x7F)
+    while (buf_len(c) & 15) != 0 { buf_push(c, 0x90) }
+    lp4 := buf_len(c)
+    mc_vex3(c, 0, 0, 1, 1, 0, 0, 1, 1, 0x10); mc_b2(c, 0x04, 0xC8) // VMOVUPD YMM0, [R8 + RCX*8]
+    mc_vex3(c, 0, 0, 1, 2, 1, 2, 1, 1, 0xB8); mc_b2(c, 0x04, 0xC9) // VFMADD231PD YMM0, YMM2, [R9 + RCX*8]
+    mc_vex3(c, 0, 0, 1, 1, 0, 0, 1, 1, 0x11); mc_b2(c, 0x04, 0xC8) // VMOVUPD [R8 + RCX*8], YMM0
+    mc_b4(c, 0x48, 0x83, 0xC1, 0x04)                               // ADD RCX, 4
+    mc_b3(c, 0x4C, 0x39, 0xD9)                                     // CMP RCX, R11
+    jle_lp4 := mc_jcc8(c, 0x7E)
+    mc_patch_jcc8(c, jle_lp4, lp4)
+
+    mc_patch_jcc8(c, jg_tail, buf_len(c))
+    mc_b3(c, 0x4C, 0x39, 0xD1) // CMP RCX, R10
+    jge_done := mc_jcc8(c, 0x7D)
+    lp1 := buf_len(c)
+    mc_vex3(c, 0, 0, 1, 1, 0, 0, 0, 3, 0x10); mc_b2(c, 0x04, 0xC8) // VMOVSD XMM0, [R8 + RCX*8]
+    mc_vex3(c, 0, 0, 1, 2, 1, 2, 0, 1, 0xB9); mc_b2(c, 0x04, 0xC9) // VFMADD231SD XMM0, XMM2, [R9 + RCX*8]
+    mc_vex3(c, 0, 0, 1, 1, 0, 0, 0, 3, 0x11); mc_b2(c, 0x04, 0xC8) // VMOVSD [R8 + RCX*8], XMM0
+    mc_b3(c, 0x48, 0xFF, 0xC1)                                     // INC RCX
+    mc_b3(c, 0x4C, 0x39, 0xD1)                                     // CMP RCX, R10
+    jl_lp1 := mc_jcc8(c, 0x7C)
+    mc_patch_jcc8(c, jl_lp1, lp1)
+
+    mc_patch_jcc8(c, jge_done, buf_len(c))
+    mc_b3(c, 0xC5, 0xF8, 0x77) // VZEROUPPER
+    if pr_j > 0 { mc_b3(c, 0x48 | gpreg_hi(pr_j), 0x89, 0xC8 | gpreg_hw(pr_j)) } // MOV pr_j, RCX
+    else { mc_b3(c, 0x48, 0x89, 0xC8); mc_store_rax(c, j_slot, 0) }
+    jmp_end := mc_jmp32(c)
+    mc_patch_rel32(c, jz_scalar, buf_len(c))
+    // Scalar fallback (`--simd=scalar` or pre-AVX2 CPU)
+    if pr_c > 0 { mc_mov_r8_gpreg(c, pr_c) } else { mc_load_r8(c, c_slot, 0) }
+    if pr_o1 > 0 { mc_mov_rax_gpreg(c, pr_o1) } else { mc_load_rax(c, o1_slot, 0) }
+    mc_b4(c, 0x4D, 0x8D, 0x04, 0xC0)
+    if pr_b > 0 { mc_mov_r9_gpreg(c, pr_b) } else { mc_load_r9(c, b_slot, 0) }
+    if pr_o2 > 0 { mc_mov_rax_gpreg(c, pr_o2) } else { mc_load_rax(c, o2_slot, 0) }
+    mc_b4(c, 0x4D, 0x8D, 0x0C, 0xC1)
+    if pr_j > 0 { mc_mov_rcx_gpreg(c, pr_j) } else { mc_load_rcx(c, j_slot, 0) }
+    if n_is_imm { mc_mov_rax_imm(c, n_imm); mc_b3(c, 0x49, 0x89, 0xC2) }
+    else { pr_n := cg_slot_reg(cg, n_slot); if pr_n > 0 { mc_mov_rax_gpreg(c, pr_n) } else { mc_load_rax(c, n_slot, 0) }; mc_b3(c, 0x49, 0x89, 0xC2) }
+    if fr_s > 0 { mc_mov_xmm0_freg(c, fr_s) } else { mc_sse_xmm0_slot(c, 0xF2, 0x10, s_slot, 0) }
+    mc_b3(c, 0x0F, 0x28, 0xD0) // MOVAPS XMM2, XMM0
+    mc_b3(c, 0x4C, 0x39, 0xD1)
+    jge_sd := mc_jcc8(c, 0x7D)
+    lps := buf_len(c)
+    mc_b4(c, 0xF2, 0x41, 0x0F, 0x10); mc_b2(c, 0x04, 0xC9) // MOVSD XMM0, [R9 + RCX*8]
+    mc_b4(c, 0xF2, 0x0F, 0x59, 0xC2)                       // MULSD XMM0, XMM2
+    mc_b4(c, 0xF2, 0x41, 0x0F, 0x58); mc_b2(c, 0x04, 0xC8) // ADDSD XMM0, [R8 + RCX*8]
+    mc_b4(c, 0xF2, 0x41, 0x0F, 0x11); mc_b2(c, 0x04, 0xC8) // MOVSD [R8 + RCX*8], XMM0
+    mc_b3(c, 0x48, 0xFF, 0xC1)
+    mc_b3(c, 0x4C, 0x39, 0xD1)
+    jl_lps := mc_jcc8(c, 0x7C)
+    mc_patch_jcc8(c, jl_lps, lps)
+    mc_patch_jcc8(c, jge_sd, buf_len(c))
+    if pr_j > 0 { mc_b3(c, 0x48 | gpreg_hi(pr_j), 0x89, 0xC8 | gpreg_hw(pr_j)) }
+    else { mc_b3(c, 0x48, 0x89, 0xC8); mc_store_rax(c, j_slot, 0) }
+    mc_patch_rel32(c, jmp_end, buf_len(c))
+    return true
+}
+
 fn emit_while_core_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBuf, snid: i64) {
     c := cg.code
+    if try_emit_avx2_f64_axpy_while_ax(cg, vars, snid) {
+        return
+    }
     if try_emit_unrolled4_while_ax(cg, vars, drops, breaks, snid) {
         return
     }
@@ -5471,7 +5798,7 @@ fn try_emit_unrolled4_while_ax(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, brea
     if cond <= 0 or bnid <= 0 or ast_kind(cg.nodes, cond) != nk_binary() or ast_get(cg.nodes, cond, 1) != op_lt() { return false }
     if ast_kind(cg.nodes, bnid) != nk_block() { return false }
     cnt := ast_get(cg.nodes, bnid, 2)
-    if cnt < 2 or cnt > 8 { return false }
+    if cnt < 2 or cnt > 16 { return false }
     lhs := ast_get(cg.nodes, cond, 2)
     rhs := ast_get(cg.nodes, cond, 3)
     if lhs <= 0 or (ast_kind(cg.nodes, lhs) != nk_ident() and ast_kind(cg.nodes, lhs) != nk_move_ident()) { return false }
