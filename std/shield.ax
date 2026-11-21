@@ -1,0 +1,214 @@
+// Axon Standard Library: Expert Anti-Crack, 2-Adic Hensel MBA Vault & Integrity Mesh (`std/shield.ax`)
+// 100% Pure Axon: Zero External Dependencies, Zero-GC (@no_alloc hot paths).
+// Combines compile-time `@whitebox` / `--shield` protection with runtime anti-crack primitives:
+//   1. 2-Adic Hensel Newton-Raphson Inverse + Mixed Boolean-Arithmetic (MBA) Memory Vault
+//      (Zero static inverse key in `.rdata`; stops Cheat Engine / memory scanners / static IDA sigs)
+//   2. 3-Share Orthogonal Split-Key Reconstruction (secret key never exists in 1 memory slot at rest)
+//   3. Rolling Memory Integrity Mesh Watchdog (`ShieldMesh`) for anti-tamper & anti-freeze
+//   4. Detour / Software Breakpoint Scanner (`0xCC` INT3, `0xE9` JMP rel32, `0xFF 0x25` indirect JMP)
+
+use std::os
+
+// --- 1. 2-Adic Hensel Multiplicative Inverse & Non-Linear MBA Primitives ---
+
+// Computes the exact multiplicative inverse of any odd 64-bit integer `m` modulo 2^64
+// using 5 Hensel lifting steps: `m *% shield_hensel_inv64(m) == 1`.
+// Eliminates static decryption constants from binary disassembly!
+@no_alloc
+fn shield_hensel_inv64(m_in: i64) -> i64 {
+    m := m_in | 1
+    mut inv := m
+    inv = inv *% (2 -% m *% inv)
+    inv = inv *% (2 -% m *% inv)
+    inv = inv *% (2 -% m *% inv)
+    inv = inv *% (2 -% m *% inv)
+    inv = inv *% (2 -% m *% inv)
+    return inv
+}
+
+// Non-linear MBA addition identity: `(x ^ y) + 2*(x & y) == x + y (mod 2^64)`
+@no_alloc
+fn shield_mba_add(x: i64, y: i64) -> i64 {
+    return (x ^ y) +% ((x & y) *% 2)
+}
+
+// Non-linear MBA subtraction identity: `(x ^ y) - 2*(~x & y) == x - y (mod 2^64)`
+@no_alloc
+fn shield_mba_sub(x: i64, y: i64) -> i64 {
+    not_x := x ^ -1
+    return (x ^ y) -% ((not_x & y) *% 2)
+}
+
+// Seals a 64-bit sensitive value (license flag, balance, pointer, key) into an obfuscated MBA token
+@whitebox
+@no_alloc
+fn shield_mba_seal(plain: i64, dynamic_salt: i64) -> i64 {
+    k0 := shield_mba_add(dynamic_salt, 0x7319A5C39E3779B9)
+    odd_m := (k0 ^ 0xBF58476D1CE4E5B9) | 1
+    mut v := shield_mba_add(plain, k0)
+    v = v ^ ushr64(v, 32)
+    v = v *% odd_m
+    v = v ^ ushr64(v, 32)
+    return v ^ (k0 *% 0x94D049BB133111EB)
+}
+
+// Unseals an MBA token back to the original 64-bit value using on-the-fly 2-adic Hensel inversion
+@whitebox
+@no_alloc
+fn shield_mba_unseal(sealed: i64, dynamic_salt: i64) -> i64 {
+    k0 := shield_mba_add(dynamic_salt, 0x7319A5C39E3779B9)
+    odd_m := (k0 ^ 0xBF58476D1CE4E5B9) | 1
+    inv_m := shield_hensel_inv64(odd_m)
+    mut v := sealed ^ (k0 *% 0x94D049BB133111EB)
+    v = v ^ ushr64(v, 32)
+    v = v *% inv_m
+    v = v ^ ushr64(v, 32)
+    return shield_mba_sub(v, k0)
+}
+
+// Constant-time MBA equality check without exposing plaintext comparison in flags
+@no_alloc
+fn shield_mba_verify_eq(sealed_a: i64, salt_a: i64, expected_plain: i64) -> bool {
+    resealed := shield_mba_seal(expected_plain, salt_a)
+    diff := sealed_a ^ resealed
+    folded := diff | (0 -% diff)
+    return ushr64(folded, 63) == 0
+}
+
+// --- 2. 3-Share Orthogonal Split-Key Vault ---
+
+// Splits `secret` into 3 MBA-entangled shares stored in `out_shares[0..2]`
+@no_alloc
+fn shield_split_key3(secret: i64, nonce: i64, out_shares: IntBuf) -> bool {
+    if ibuf_len(out_shares) < 3 { return false }
+    s0 := (nonce ^ 0x243F6A8885A308D3) *% 0x9E3779B97F4A7C15
+    s1 := (nonce ^ 0x13198A2E03707344) *% 0xBF58476D1CE4E5B9
+    mixed := shield_mba_add(secret ^ s0, s1)
+    s2 := mixed *% ((nonce ^ 0x6A09E667F3BCC909) | 1)
+    ibuf_set(out_shares, 0, s0)
+    ibuf_set(out_shares, 1, s1)
+    ibuf_set(out_shares, 2, s2)
+    return true
+}
+
+// Reconstructs the 64-bit secret from 3 shares in `shares[0..2]` using Hensel 2-adic inversion
+@no_alloc
+fn shield_reconstruct_key3(nonce: i64, shares: IntBuf) -> i64 {
+    if ibuf_len(shares) < 3 { return 0 }
+    s0 := ibuf_get(shares, 0)
+    s1 := ibuf_get(shares, 1)
+    s2 := ibuf_get(shares, 2)
+    inv_m := shield_hensel_inv64((nonce ^ 0x6A09E667F3BCC909) | 1)
+    mixed := s2 *% inv_m
+    unadded := shield_mba_sub(mixed, s1)
+    return unadded ^ s0
+}
+
+// --- 3. Rolling Memory Integrity Mesh Watchdog (`ShieldMesh`) ---
+// Protects registered memory blocks `(base_ptr, word_count, expected_mac)` against runtime patching
+
+struct ShieldMesh {
+    table: IntBuf
+    count: i64
+    cap: i64
+    key: i64
+}
+
+fn shield_mesh_new(max_regions: i64, secret_seed: i64) -> ShieldMesh {
+    mut c := max_regions
+    if c < 8 { c = 8 }
+    tb := ibuf_new(c * 3)
+    return ShieldMesh(table = tb, count = 0, cap = c, key = secret_seed ^ 0x7319A5C39E3779B9)
+}
+
+fn shield_mesh_free(move m: ShieldMesh) {
+    buf_free(move m.table)
+}
+
+@no_alloc
+fn shield_region_mac(base_ptr: i64, word_count: i64, key: i64) -> i64 {
+    unsafe {
+    if base_ptr == 0 or word_count <= 0 { return 0 }
+    mut acc := key ^ (word_count *% 0x9E3779B97F4A7C15)
+    mut i := 0
+    while i < word_count {
+        w := ptr_read_i64(base_ptr, i)
+        acc = shield_mba_add(acc ^ w, 0xBF58476D1CE4E5B9)
+        acc = (acc ^ ushr64(acc, 29)) *% 0x94D049BB133111EB
+        i += 1
+    }
+    return acc ^ ushr64(acc, 32)
+    }
+}
+
+fn shield_mesh_register(mut m: ShieldMesh, base_ptr: i64, word_count: i64) -> i64 {
+    if base_ptr == 0 or word_count <= 0 or m.count >= m.cap { return -1 }
+    tag := shield_region_mac(base_ptr, word_count, m.key)
+    idx := m.count
+    ibuf_push(m.table, base_ptr)
+    ibuf_push(m.table, word_count)
+    ibuf_push(m.table, tag)
+    m.count = idx + 1
+    return idx
+}
+
+// Re-computes and updates the integrity tag after an authorized state update
+@no_alloc
+fn shield_mesh_reseal(m: ShieldMesh, region_idx: i64) -> bool {
+    if region_idx < 0 or region_idx >= m.count { return false }
+    base := region_idx * 3
+    ptr := ibuf_get(m.table, base)
+    cnt := ibuf_get(m.table, base + 1)
+    ibuf_set(m.table, base + 2, shield_region_mac(ptr, cnt, m.key))
+    return true
+}
+
+// Verifies all registered regions in constant-style accumulation; returns -1 if clean, or tampered index
+@no_alloc
+fn shield_mesh_verify_all(m: ShieldMesh) -> i64 {
+    mut i := 0
+    while i < m.count {
+        base := i * 3
+        ptr := ibuf_get(m.table, base)
+        cnt := ibuf_get(m.table, base + 1)
+        exp_tag := ibuf_get(m.table, base + 2)
+        cur_tag := shield_region_mac(ptr, cnt, m.key)
+        if cur_tag != exp_tag {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// --- 4. Detour / Breakpoint Patch Scanner & RDTSC Timing Window Guard ---
+
+// Scans a byte buffer or code slice for software breakpoints (`0xCC` INT3) or 5-byte JMP detours (`0xE9`)
+@no_alloc
+fn shield_detect_hook_bytes(code_buf: ByteBuf, check_len: i64) -> bool {
+    mut n := buf_len(code_buf)
+    if check_len < n { n = check_len }
+    if n <= 0 { return false }
+    b0 := buf_get(code_buf, 0)
+    // Immediate INT3 (0xCC), JMP rel32 (0xE9), JMP rel8 (0xEB), or RET patch (0xC3) at entry
+    if b0 == 0xCC or b0 == 0xE9 or b0 == 0xEB or b0 == 0xC3 { return true }
+    if n >= 2 and b0 == 0xFF and buf_get(code_buf, 1) == 0x25 { return true } // JMP [RIP+disp32]
+    mut i := 1
+    while i < n {
+        if buf_get(code_buf, i) == 0xCC { return true }
+        i += 1
+    }
+    return false
+}
+
+@no_alloc
+fn shield_timing_begin() -> i64 {
+    return cpu_rdtsc()
+}
+
+@no_alloc
+fn shield_timing_verify(start_tsc: i64, max_cycles: i64 = 500000000) -> bool {
+    now := cpu_rdtsc()
+    delta := now -% start_tsc
+    return delta >= 0 and delta <= max_cycles
+}

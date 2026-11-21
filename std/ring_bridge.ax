@@ -1,0 +1,303 @@
+// Axon Standard Library: Ring 0 <-> Ring 3 High-Speed Shared-Memory & IOCTL Bridge (`std/ring_bridge.ax`)
+// 100% Pure Axon: Zero CRT, Zero External Dependencies, Zero-GC (@no_alloc hot paths).
+// Provides smooth, zero-copy communication between Ring 3 (User Mode) and Ring 0 (Kernel / Drivers):
+//   1. Cross-OS Kernel Control Codes: Windows NT `CTL_CODE` & Linux `_IOC` (`_IO/_IOR/_IOW/_IOWR`)
+//   2. Confused-Deputy Protection: `ring0_probe_user_range` canonical Ring-3 pointer verification
+//   3. Dual Cache-Line Isolated Shared-Memory Queues (`IoRingBridge`: Submission SQ + Completion CQ)
+//   4. Zero-Syscall Doorbell & Batch Kernel Dispatcher (`ring3_submit_sqe`, `ring0_process_batch`, `ring3_reap_cqe`)
+
+use std::os
+
+// --- 1. Windows NT `CTL_CODE` & Linux `_IOC` Kernel IOCTL Builders ---
+
+@no_alloc
+fn method_buffered() -> i64   { return 0 }
+@no_alloc
+fn method_in_direct() -> i64  { return 1 }
+@no_alloc
+fn method_out_direct() -> i64 { return 2 }
+@no_alloc
+fn method_neither() -> i64    { return 3 }
+
+@no_alloc
+fn file_any_access() -> i64   { return 0 }
+@no_alloc
+fn file_read_access() -> i64  { return 1 }
+@no_alloc
+fn file_write_access() -> i64 { return 2 }
+
+// Windows NT `CTL_CODE(DeviceType, Function, Method, Access)`
+// Layout: [31:16] DeviceType | [15:14] Access | [13:2] Function | [1:0] Method
+@no_alloc
+fn ring_ctl_code_win32(dev_type: i64, func: i64, method: i64, access: i64) -> i64 {
+    return ((dev_type & 0xFFFF) << 16) | ((access & 0x03) << 14) | ((func & 0xFFF) << 2) | (method & 0x03)
+}
+
+@no_alloc
+fn ring_ctl_device_type(code: i64) -> i64 { return (ushr64(code, 16)) & 0xFFFF }
+@no_alloc
+fn ring_ctl_access(code: i64) -> i64      { return (ushr64(code, 14)) & 0x03 }
+@no_alloc
+fn ring_ctl_function(code: i64) -> i64    { return (ushr64(code, 2)) & 0xFFF }
+@no_alloc
+fn ring_ctl_method(code: i64) -> i64      { return code & 0x03 }
+
+// Linux Kernel `_IOC(dir, type, nr, size)` (`0`=NONE, `1`=WRITE, `2`=READ, `3`=READ|WRITE)
+// Layout: [31:30] dir | [29:16] size | [15:8] type | [7:0] nr
+@no_alloc
+fn ring_ioctl_code_linux(dir: i64, ty: i64, nr: i64, size: i64) -> i64 {
+    return ((dir & 0x03) << 30) | ((size & 0x3FFF) << 16) | ((ty & 0xFF) << 8) | (nr & 0xFF)
+}
+
+// --- 2. Ring 0 / Ring 3 Canonical User-Space Address Verification ---
+
+// Validates that `[user_addr, user_addr + byte_len)` lies strictly within canonical Ring-3 User Space
+// (`0x0000000000010000 .. 0x00007FFFFFFFFFFF`) with zero wrap-around, blocking kernel overwrite attacks.
+@no_alloc
+fn ring0_probe_user_range(user_addr: i64, byte_len: i64) -> bool {
+    if user_addr < 65536 or byte_len < 0 { return false }
+    max_user := 0x00007FFFFFFFFFFF
+    if user_addr > max_user or byte_len > max_user { return false }
+    if user_addr > max_user - byte_len { return false }
+    return true
+}
+
+// --- 3. Standard Ring-0 / Ring-3 Bridge Opcodes ---
+
+@no_alloc
+fn ring_op_nop() -> i64         { return 0 }
+@no_alloc
+fn ring_op_ping() -> i64        { return 1 } // Echoes `arg0 ^ 0xA5A55A5A`
+@no_alloc
+fn ring_op_mmio_read64() -> i64 { return 2 } // Reads 64-bit value at `[arg0 + arg1 * 8]`
+@no_alloc
+fn ring_op_mmio_write64() -> i64{ return 3 } // Writes `arg1` to `[arg0]`
+@no_alloc
+fn ring_op_dma_sum_i64() -> i64 { return 4 } // Sums `arg1` i64 words starting at `arg0`
+@no_alloc
+fn ring_op_crypto_mac() -> i64  { return 5 } // Computes kernel keyed FNV/Sip mix of `(arg0, arg1)`
+
+// --- 4. Dual Cache-Line Isolated Shared-Memory Ring Bridge (`IoRingBridge`) ---
+// Shared Memory Header Layout (32 i64 slots = 256 bytes = cuatro 64-byte cache lines):
+//   Cache Line 0 (offset 0):  SQ Head (Ring 3 Producer index)
+//   Cache Line 1 (offset 8):  SQ Tail (Ring 0 Consumer index)
+//   Cache Line 2 (offset 16): CQ Head (Ring 0 Producer index)
+//   Cache Line 3 (offset 24): CQ Tail (Ring 3 Consumer index), [25] = Doorbell counter, [26] = Completed total
+// Followed by:
+//   SQ Descriptors: `cap * 4` i64 slots (`[opcode, tag, arg0, arg1]`)
+//   CQ Descriptors: `cap * 4` i64 slots (`[tag, status, res0, res1]`)
+
+struct IoRingBridge {
+    shm_ptr: i64
+    cap: i64
+    mask: i64
+    sq_base: i64
+    cq_base: i64
+}
+
+fn ring_bridge_new(pow2_entries: i64) -> IoRingBridge {
+    unsafe {
+    mut c := 16
+    while c < pow2_entries and c < 65536 {
+        c = c * 2
+    }
+    sq_off := 32
+    cq_off := 32 + c * 4
+    total_i64 := 32 + c * 8
+    ptr := mem_alloc_aligned(total_i64 * 8 + 64)
+    if ptr == 0 {
+        return IoRingBridge(shm_ptr = 0, cap = 0, mask = 0, sq_base = 0, cq_base = 0)
+    }
+    mut i := 0
+    while i < 32 {
+        ptr_write_i64(ptr, i, 0)
+        i += 1
+    }
+    return IoRingBridge(shm_ptr = ptr, cap = c, mask = c - 1, sq_base = sq_off, cq_base = cq_off)
+    }
+}
+
+fn ring_bridge_free(move b: IoRingBridge) {
+    unsafe {
+    if b.shm_ptr != 0 {
+        mem_free_aligned(b.shm_ptr)
+    }
+    }
+}
+
+@no_alloc
+fn ring_bridge_sq_pending(b: IoRingBridge) -> i64 {
+    if b.shm_ptr == 0 { return 0 }
+    h := atomic_load_i64(b.shm_ptr, 0)
+    t := atomic_load_i64(b.shm_ptr, 8)
+    return h - t
+}
+
+@no_alloc
+fn ring_bridge_cq_ready(b: IoRingBridge) -> i64 {
+    if b.shm_ptr == 0 { return 0 }
+    h := atomic_load_i64(b.shm_ptr, 16)
+    t := atomic_load_i64(b.shm_ptr, 24)
+    return h - t
+}
+
+@no_alloc
+fn ring_bridge_doorbell_ring(b: IoRingBridge) -> i64 {
+    if b.shm_ptr == 0 { return 0 }
+    return atomic_add_i64(b.shm_ptr, 25, 1)
+}
+
+@no_alloc
+fn ring_bridge_doorbell_count(b: IoRingBridge) -> i64 {
+    if b.shm_ptr == 0 { return 0 }
+    return atomic_load_i64(b.shm_ptr, 25)
+}
+
+// Ring 3 Producer: Enqueues a 32-byte Submission Queue Entry (SQE) without a system call
+@no_alloc
+fn ring3_submit_sqe(b: IoRingBridge, opcode: i64, tag: i64, arg0: i64, arg1: i64) -> bool {
+    unsafe {
+    if b.shm_ptr == 0 { return false }
+    h := atomic_load_i64(b.shm_ptr, 0)
+    t := atomic_load_i64(b.shm_ptr, 8)
+    if (h - t) >= b.cap { return false }
+    slot := b.sq_base + (h & b.mask) * 4
+    ptr_write_i64(b.shm_ptr, slot, opcode)
+    ptr_write_i64(b.shm_ptr, slot + 1, tag)
+    ptr_write_i64(b.shm_ptr, slot + 2, arg0)
+    ptr_write_i64(b.shm_ptr, slot + 3, arg1)
+    atomic_store_rel_i64(b.shm_ptr, 0, h + 1)
+    return true
+    }
+}
+
+// Ring 0 Consumer: Pops next SQE into `out_sqe[0..3]` (`[opcode, tag, arg0, arg1]`)
+@no_alloc
+fn ring0_consume_sqe(b: IoRingBridge, out_sqe: IntBuf) -> bool {
+    unsafe {
+    if b.shm_ptr == 0 or ibuf_len(out_sqe) < 4 { return false }
+    t := atomic_load_i64(b.shm_ptr, 8)
+    h := atomic_load_i64(b.shm_ptr, 0)
+    if t == h { return false }
+    slot := b.sq_base + (t & b.mask) * 4
+    ibuf_set(out_sqe, 0, ptr_read_i64(b.shm_ptr, slot))
+    ibuf_set(out_sqe, 1, ptr_read_i64(b.shm_ptr, slot + 1))
+    ibuf_set(out_sqe, 2, ptr_read_i64(b.shm_ptr, slot + 2))
+    ibuf_set(out_sqe, 3, ptr_read_i64(b.shm_ptr, slot + 3))
+    atomic_store_rel_i64(b.shm_ptr, 8, t + 1)
+    return true
+    }
+}
+
+// Ring 0 Producer: Posts a 32-byte Completion Queue Entry (CQE) back to Ring 3
+@no_alloc
+fn ring0_post_cqe(b: IoRingBridge, tag: i64, status: i64, res0: i64, res1: i64) -> bool {
+    unsafe {
+    if b.shm_ptr == 0 { return false }
+    h := atomic_load_i64(b.shm_ptr, 16)
+    t := atomic_load_i64(b.shm_ptr, 24)
+    if (h - t) >= b.cap { return false }
+    slot := b.cq_base + (h & b.mask) * 4
+    ptr_write_i64(b.shm_ptr, slot, tag)
+    ptr_write_i64(b.shm_ptr, slot + 1, status)
+    ptr_write_i64(b.shm_ptr, slot + 2, res0)
+    ptr_write_i64(b.shm_ptr, slot + 3, res1)
+    atomic_store_rel_i64(b.shm_ptr, 16, h + 1)
+    return true
+    }
+}
+
+// Ring 3 Consumer: Reaps next CQE into `out_cqe[0..3]` (`[tag, status, res0, res1]`)
+@no_alloc
+fn ring3_reap_cqe(b: IoRingBridge, out_cqe: IntBuf) -> bool {
+    unsafe {
+    if b.shm_ptr == 0 or ibuf_len(out_cqe) < 4 { return false }
+    t := atomic_load_i64(b.shm_ptr, 24)
+    h := atomic_load_i64(b.shm_ptr, 16)
+    if t == h { return false }
+    slot := b.cq_base + (t & b.mask) * 4
+    ibuf_set(out_cqe, 0, ptr_read_i64(b.shm_ptr, slot))
+    ibuf_set(out_cqe, 1, ptr_read_i64(b.shm_ptr, slot + 1))
+    ibuf_set(out_cqe, 2, ptr_read_i64(b.shm_ptr, slot + 2))
+    ibuf_set(out_cqe, 3, ptr_read_i64(b.shm_ptr, slot + 3))
+    atomic_store_rel_i64(b.shm_ptr, 24, t + 1)
+    return true
+    }
+}
+
+// Ring 0 High-Throughput Polling Batch Dispatcher:
+// Drains up to `max_batch` SQEs in a single Ring-0 pass and posts CQEs with zero context switches!
+@no_alloc
+fn ring0_process_batch(b: IoRingBridge, max_batch: i64) -> i64 {
+    unsafe {
+    if b.shm_ptr == 0 or max_batch <= 0 { return 0 }
+    mut processed := 0
+    while processed < max_batch {
+        t := atomic_load_i64(b.shm_ptr, 8)
+        h := atomic_load_i64(b.shm_ptr, 0)
+        if t == h { break }
+        cq_h := atomic_load_i64(b.shm_ptr, 16)
+        cq_t := atomic_load_i64(b.shm_ptr, 24)
+        if (cq_h - cq_t) >= b.cap { break }
+
+        sq_slot := b.sq_base + (t & b.mask) * 4
+        op := ptr_read_i64(b.shm_ptr, sq_slot)
+        tag := ptr_read_i64(b.shm_ptr, sq_slot + 1)
+        a0 := ptr_read_i64(b.shm_ptr, sq_slot + 2)
+        a1 := ptr_read_i64(b.shm_ptr, sq_slot + 3)
+        atomic_store_rel_i64(b.shm_ptr, 8, t + 1)
+
+        mut status := 0
+        mut res0 := 0
+        mut res1 := 0
+        if op == 1 {
+            // RING_OP_PING
+            res0 = a0 ^ 0xA5A55A5A
+            res1 = a1 + 1
+        } else if op == 2 {
+            // RING_OP_MMIO_READ64 (with canonical Ring-3 range probe)
+            if ring0_probe_user_range(a0, (a1 + 1) * 8) and a1 >= 0 {
+                res0 = ptr_read_i64(a0, a1)
+            } else {
+                status = -14 // -EFAULT
+            }
+        } else if op == 3 {
+            // RING_OP_MMIO_WRITE64 (with canonical Ring-3 range probe)
+            if ring0_probe_user_range(a0, 8) {
+                ptr_write_i64(a0, 0, a1)
+                res0 = a1
+            } else {
+                status = -14 // -EFAULT
+            }
+        } else if op == 4 {
+            // RING_OP_DMA_SUM_I64
+            if a1 > 0 and ring0_probe_user_range(a0, a1 * 8) {
+                mut sum := 0
+                mut k := 0
+                while k < a1 {
+                    sum = sum +% ptr_read_i64(a0, k)
+                    k += 1
+                }
+                res0 = sum
+                res1 = a1
+            } else {
+                status = -14
+            }
+        } else if op == 5 {
+            // RING_OP_CRYPTO_MAC
+            mut mac := (a0 ^ 0x7319A5C39E3779B9) *% 0xBF58476D1CE4E5B9
+            mac = (mac ^ a1 ^ ushr64(mac, 29)) *% 0x94D049BB133111EB
+            res0 = mac ^ ushr64(mac, 31)
+        }
+
+        cq_slot := b.cq_base + (cq_h & b.mask) * 4
+        ptr_write_i64(b.shm_ptr, cq_slot, tag)
+        ptr_write_i64(b.shm_ptr, cq_slot + 1, status)
+        ptr_write_i64(b.shm_ptr, cq_slot + 2, res0)
+        ptr_write_i64(b.shm_ptr, cq_slot + 3, res1)
+        atomic_store_rel_i64(b.shm_ptr, 16, cq_h + 1)
+        processed += 1
+    }
+    return processed
+    }
+}
