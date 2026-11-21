@@ -308,7 +308,7 @@ fn grpc_frame_decode(frame_data: ByteBuf) -> ByteBuf ! i64 {
     n := buf_len(frame_data)
     if n < 5 { return err(-500) }
     mlen := (buf_get(frame_data, 1) << 24) | (buf_get(frame_data, 2) << 16) | (buf_get(frame_data, 3) << 8) | buf_get(frame_data, 4)
-    if 5 + mlen > n { return err(-501) }
+    if mlen < 0 or mlen > n - 5 { return err(-501) }
     out := buf_new(mlen + 4)
     mut i := 0
     while i < mlen { buf_push(out, buf_get(frame_data, 5 + i)); i += 1 }
@@ -371,7 +371,9 @@ fn grpc_unary_call(mut ch: GrpcChannel, service_method: str, req_pb: ByteBuf) ->
     buf_free(move df)
     if rd < 0 { return err(-513) }
 
-    resp_raw := buf_new(1024)
+    max_grpc_msg := 4194304 // 4 MB gRPC message cap (prevents 1KB trap DoS & remote OOM)
+    mut resp_cap := 4096
+    mut resp_raw := buf_new(resp_cap)
     mut st_code := 0
     mut st_msg := ""
     mut guard := 0
@@ -395,8 +397,22 @@ fn grpc_unary_call(mut ch: GrpcChannel, service_method: str, req_pb: ByteBuf) ->
                 break
             }
         } else if fr.ftype == h2_frame_data() and fr.stream_id == sid {
+            pl := buf_len(fr.payload)
+            cur_l := buf_len(resp_raw)
+            if cur_l + pl > max_grpc_msg { buf_free(move fr.payload); break }
+            if cur_l + pl > resp_cap {
+                mut nc := resp_cap * 2
+                while nc < cur_l + pl { nc = nc * 2 }
+                if nc > max_grpc_msg { nc = max_grpc_msg }
+                nb := buf_new(nc)
+                mut ci := 0
+                while ci < cur_l { buf_push(nb, buf_get(resp_raw, ci)); ci += 1 }
+                buf_free(move resp_raw)
+                resp_raw = nb
+                resp_cap = nc
+            }
             mut i := 0
-            while i < buf_len(fr.payload) { buf_push(resp_raw, buf_get(fr.payload, i)); i += 1 }
+            while i < pl { buf_push(resp_raw, buf_get(fr.payload, i)); i += 1 }
             if (fr.flags & h2_flag_end_stream()) != 0 {
                 buf_free(move fr.payload)
                 break
@@ -421,11 +437,12 @@ fn grpc_listen(bind_ip: str, port: i64) -> GrpcServer ! i64 {
 fn grpc_server_accept_unary(srv: GrpcServer) -> GrpcIncoming ! i64 {
     sock := tcp_accept(srv.listener) or return
     _ := tcp_set_nodelay(sock, true)
-    // Read 24-byte HTTP/2 client preface
+    // Read & verify 24-byte HTTP/2 client preface
     pref := tcp_recv_exact(sock, 24) or buf_new(0)
     plen := buf_len(pref)
+    pref_ok := plen == 24 and str_eq(buf_slice_str(pref, 0, 24), h2_client_preface())
     buf_free(move pref)
-    if plen != 24 { tcp_close(sock); return err(-520) }
+    if not pref_ok { tcp_close(sock); return err(-520) }
     // Send server SETTINGS
     em := buf_new(0)
     sf := h2_encode_frame(h2_frame_settings(), 0, 0, em)
@@ -435,7 +452,9 @@ fn grpc_server_accept_unary(srv: GrpcServer) -> GrpcIncoming ! i64 {
 
     mut req_sid := 1
     mut mpath := ""
-    req_raw := buf_new(1024)
+    max_req_msg := 4194304 // 4 MB gRPC request cap
+    mut req_cap := 4096
+    mut req_raw := buf_new(req_cap)
     mut guard := 0
     while guard < 128 {
         guard += 1
@@ -453,8 +472,22 @@ fn grpc_server_accept_unary(srv: GrpcServer) -> GrpcIncoming ! i64 {
             if str_len(mp) > 0 { mpath = mp }
             if (fr.flags & h2_flag_end_stream()) != 0 { buf_free(move fr.payload); break }
         } else if fr.ftype == h2_frame_data() {
+            pl := buf_len(fr.payload)
+            cur_l := buf_len(req_raw)
+            if cur_l + pl > max_req_msg { buf_free(move fr.payload); break }
+            if cur_l + pl > req_cap {
+                mut nc := req_cap * 2
+                while nc < cur_l + pl { nc = nc * 2 }
+                if nc > max_req_msg { nc = max_req_msg }
+                nb := buf_new(nc)
+                mut ci := 0
+                while ci < cur_l { buf_push(nb, buf_get(req_raw, ci)); ci += 1 }
+                buf_free(move req_raw)
+                req_raw = nb
+                req_cap = nc
+            }
             mut i := 0
-            while i < buf_len(fr.payload) { buf_push(req_raw, buf_get(fr.payload, i)); i += 1 }
+            while i < pl { buf_push(req_raw, buf_get(fr.payload, i)); i += 1 }
             if (fr.flags & h2_flag_end_stream()) != 0 { buf_free(move fr.payload); break }
         }
         buf_free(move fr.payload)
