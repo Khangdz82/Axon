@@ -1747,8 +1747,28 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
         poly_seed := ibuf_get(cg.state, 15)
         mc_align16(c)
         s_sv := buf_len(c)
-        mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+        mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA) // ENDBR64 (also verified inline by every `@shield` fn!)
         mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
+        mut jne_peb_dbg := 0
+        mut jnz_ntgf := 0
+        if osm <= 1 {
+            // Layer 1: Zero-API Kernel PEB Anti-Debug (immune to `IsDebuggerPresent` IAT hooks!)
+            // MOV RAX, GS:[0x60] (PEB)
+            mc_b4(c, 0x65, 0x48, 0x8B, 0x04); mc_b1(c, 0x25); mc_u32(c, 0x60)
+            // CMP BYTE PTR [RAX + 0x02], 0 (`PEB.BeingDebugged`)
+            mc_b4(c, 0x80, 0x78, 0x02, 0x00)
+            jne_peb_dbg = mc_jcc32(c, 0x85)
+            // TEST DWORD PTR [RAX + 0xBC], 0x70 (`PEB.NtGlobalFlag` heap debug flags)
+            mc_b2(c, 0xF7, 0x80); mc_u32(c, 0xBC); mc_u32(c, 0x70)
+            jnz_ntgf = mc_jcc32(c, 0x85)
+        }
+        // Layer 2: RDTSC Anti-Single-Step Start Timestamp -> R11
+        mc_b2(c, 0x0F, 0x31)             // RDTSC
+        mc_b4(c, 0x48, 0xC1, 0xE2, 0x20) // SHL RDX, 32
+        mc_b3(c, 0x48, 0x09, 0xD0)       // OR  RAX, RDX
+        mc_b3(c, 0x49, 0x89, 0xC3)       // MOV R11, RAX
+
+        // Layer 3: Polymorphic `.text` Code Integrity MAC (`0 .. s_sv`)
         mc_b3(c, 0x48, 0x8D, 0x0D)
         disp0 := 0 - (buf_len(c) + 4)
         mc_u32(c, disp0)
@@ -1772,6 +1792,17 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
         jnz_p := mc_jcc8(c, 0x75)
         mc_patch_jcc8(c, jnz_p, ltop)
 
+        // RDTSC End Timestamp & Single-Step Check (preserves computed MAC in RAX via PUSH/POP!)
+        mc_b1(c, 0x50)                   // PUSH RAX
+        mc_b2(c, 0x0F, 0x31)             // RDTSC
+        mc_b4(c, 0x48, 0xC1, 0xE2, 0x20) // SHL RDX, 32
+        mc_b3(c, 0x48, 0x09, 0xD0)       // OR  RAX, RDX
+        mc_b3(c, 0x4C, 0x29, 0xD8)       // SUB RAX, R11
+        mc_b2(c, 0x41, 0xBB); mc_u32(c, 0x7FFFFFFF) // MOV R11D, 0x7FFFFFFF (~2.1B cycles)
+        mc_b3(c, 0x4C, 0x39, 0xD8)       // CMP RAX, R11
+        mc_b1(c, 0x58)                   // POP RAX (does not modify flags!)
+        ja_rdtsc := mc_jcc32(c, 0x87)
+
         mc_b3(c, 0x48, 0x8D, 0x0D)
         dp := buf_len(c)
         mc_u32(c, 0)
@@ -1783,9 +1814,14 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
         jne_trap := mc_jcc8(c, 0x75)
         mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
         mc_b1(c, 0xC3)
-        mc_patch_jcc8(c, jne_trap, buf_len(c))
+
+        trap_pos := buf_len(c)
+        if jne_peb_dbg > 0 { mc_patch_rel32(c, jne_peb_dbg, trap_pos) }
+        if jnz_ntgf > 0 { mc_patch_rel32(c, jnz_ntgf, trap_pos) }
+        mc_patch_rel32(c, ja_rdtsc, trap_pos)
+        mc_patch_jcc8(c, jne_trap, trap_pos)
         cg_call_fn(cg, h_shield_trap())
-        mc_b1(c, 0xCC)
+        mc_b2(c, 0x0F, 0x0B) // UD2 (un-hookable hardware kill!)
         cg_reg_helper(cg, h_shield_verify(), s_sv, buf_len(c))
     }
 
@@ -2087,6 +2123,8 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
         mc_u32(c, str_len(shd_msg))
         cg_call_fn(cg, h_print_bytes())
         cg_emit_exit_imm(cg, 255)
+        mc_b2(c, 0x0F, 0x0B) // UD2 fallback if ExitProcess is hooked!
+        mc_b1(c, 0xCC)
         cg_reg_helper(cg, h_shield_trap(), s_t2, buf_len(c))
     }
 
