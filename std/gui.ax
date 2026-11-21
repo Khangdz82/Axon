@@ -125,10 +125,14 @@ fn _gui_win32_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64
         if dwm != 0 {
             f_dwm := ffi_sym(dwm, "DwmSetWindowAttribute")
             if f_dwm != 0 {
-                dark_box := ffi_alloc(8)
+                dark_box := ffi_alloc(16)
                 ffi_write_u32_le(dark_box, 0, 1)
                 _ := ffi_call4(f_dwm, hwnd, 20, dark_box, 4)
                 _ := ffi_call4(f_dwm, hwnd, 19, dark_box, 4)
+                ffi_write_u32_le(dark_box, 4, 0x00110E0E) // DWMWA_CAPTION_COLOR = #0E0E11
+                _ := ffi_call4(f_dwm, hwnd, 35, dark_box + 4, 4)
+                ffi_write_u32_le(dark_box, 8, 0x001F1B1B) // DWMWA_BORDER_COLOR = #1B1B1F
+                _ := ffi_call4(f_dwm, hwnd, 34, dark_box + 8, 4)
                 ffi_free(dark_box)
             }
         }
@@ -350,6 +354,70 @@ fn gui_close(mut win: GuiWindow) {
     win.is_open = false
 }
 
+// Win32 HFONT cache. GDI font creation costs ~40-80us per call; caching by
+// (size, weight) keeps steady-state frames free of object churn.
+struct GuiFontCache {
+    entries: IntBuf // triples: [size, weight, hfont]
+    count: i64
+}
+
+fn gui_font_cache_new() -> GuiFontCache {
+    return GuiFontCache(entries = ibuf_new(24), count = 0)
+}
+
+fn _gui_font_index(c: GuiFontCache, size: i64, weight: i64) -> i64 {
+    mut i := 0
+    while i < c.count {
+        if ibuf_get(c.entries, i * 3) == size and ibuf_get(c.entries, i * 3 + 1) == weight { return i }
+        i += 1
+    }
+    return -1
+}
+
+fn _gui_create_font(gdi: i64, face: str, size: i64, weight: i64) -> i64 {
+    f_cfont := ffi_sym(gdi, "CreateFontA")
+    if f_cfont == 0 { return 0 }
+    c_face := ffi_cstr(face)
+    args := ibuf_new(16)
+    ibuf_push(args, 0 - size); ibuf_push(args, 0); ibuf_push(args, 0); ibuf_push(args, 0)
+    ibuf_push(args, weight); ibuf_push(args, 0); ibuf_push(args, 0); ibuf_push(args, 0)
+    ibuf_push(args, 1); ibuf_push(args, 0); ibuf_push(args, 0); ibuf_push(args, 5) // CLEARTYPE_QUALITY
+    ibuf_push(args, 0); ibuf_push(args, c_face)
+    h := ffi_call_arr(f_cfont, 14, args)
+    buf_free(move args)
+    ffi_free(c_face)
+    return h
+}
+
+fn gui_font_cache_get(mut c: GuiFontCache, gdi: i64, face: str, size: i64, weight: i64) -> i64 {
+    mut sz := size
+    if sz < 8 { sz = 8 }
+    if sz > 96 { sz = 96 }
+    mut w := weight
+    if w < 100 or w > 900 { w = 400 }
+    idx := _gui_font_index(c, sz, w)
+    if idx >= 0 { return ibuf_get(c.entries, idx * 3 + 2) }
+    h := _gui_create_font(gdi, face, sz, w)
+    if h == 0 { return 0 }
+    ibuf_push(c.entries, sz)
+    ibuf_push(c.entries, w)
+    ibuf_push(c.entries, h)
+    c.count += 1
+    return h
+}
+
+fn gui_font_cache_free(move c: GuiFontCache, gdi: i64) {
+    f_delo := ffi_sym(gdi, "DeleteObject")
+    if f_delo != 0 {
+        mut i := 0
+        while i < c.count {
+            _ := ffi_call1(f_delo, ibuf_get(c.entries, i * 3 + 2))
+            i += 1
+        }
+    }
+    buf_free(move c.entries)
+}
+
 fn _gui_color_to_colorref(argb: i64) -> i64 {
     r := (argb >> 16) & 0xFF
     g := (argb >> 8) & 0xFF
@@ -357,8 +425,17 @@ fn _gui_color_to_colorref(argb: i64) -> i64 {
     return r | (g << 8) | (b << 16)
 }
 
-// Axon PhotonUI Native Engine: Pure Zero-Browser Double-Buffered ERMS Cards + Win32 ClearType Segoe UI Text (~200 KB exe, 0 disk churn!)
+// Axon PhotonUI Native Engine: Pure Zero-Browser Double-Buffered ERMS Cards + Win32 ClearType text
+// (~200 KB exe, 0 disk churn!) Font handles come from a caller-owned cache so steady-state
+// frames allocate no GDI objects.
 fn gui_present_photon_ui(win: GuiWindow, mut app: UiApp) -> bool {
+    mut fonts := gui_font_cache_new()
+    ok_present := gui_present_photon_ui_cached(win, mut app, mut fonts)
+    gui_font_cache_free(move fonts, win.gdi32)
+    return ok_present
+}
+
+fn gui_present_photon_ui_cached(win: GuiWindow, mut app: UiApp, mut fonts: GuiFontCache) -> bool {
     if not win.is_open { return false }
     if not app.is_ready {
         parsed := html_parse(app.html_src) or dom_tree_new(app.html_src)
@@ -393,7 +470,6 @@ fn gui_present_photon_ui(win: GuiWindow, mut app: UiApp) -> bool {
     f_deldc := ffi_sym(win.gdi32, "DeleteDC")
     f_sdib  := ffi_sym(win.gdi32, "StretchDIBits")
     f_bkit  := ffi_sym(win.gdi32, "BitBlt")
-    f_cfont := ffi_sym(win.gdi32, "CreateFontA")
     f_bk    := ffi_sym(win.gdi32, "SetBkMode")
     f_tcol  := ffi_sym(win.gdi32, "SetTextColor")
 
@@ -424,20 +500,10 @@ fn gui_present_photon_ui(win: GuiWindow, mut app: UiApp) -> bool {
     buf_free(move args)
     ffi_free(bmi)
 
-    // Create 3 crisp ClearType Segoe UI fonts: Regular (14px), Semibold (14px), Title Bold (21px)
-    c_face := ffi_cstr("Segoe UI")
-    fargs := ibuf_new(16)
-    ibuf_push(fargs, -14); ibuf_push(fargs, 0); ibuf_push(fargs, 0); ibuf_push(fargs, 0)
-    ibuf_push(fargs, 400); ibuf_push(fargs, 0); ibuf_push(fargs, 0); ibuf_push(fargs, 0)
-    ibuf_push(fargs, 1); ibuf_push(fargs, 0); ibuf_push(fargs, 0); ibuf_push(fargs, 5)
-    ibuf_push(fargs, 0); ibuf_push(fargs, c_face)
-    hfont_reg := ffi_call_arr(f_cfont, 14, fargs)
-    ibuf_set(fargs, 4, 600)
-    hfont_semi := ffi_call_arr(f_cfont, 14, fargs)
-    ibuf_set(fargs, 0, -21); ibuf_set(fargs, 4, 700)
-    hfont_h1 := ffi_call_arr(f_cfont, 14, fargs)
-    buf_free(move fargs)
-    ffi_free(c_face)
+    // GDI negative logical height already tracks the window DPI, so CSS px stays
+    // comparable to a browser's CSS px without double scaling.
+    face := "Segoe UI"
+    hfont_reg := gui_font_cache_get(mut fonts, win.gdi32, face, 14, 400)
 
     _ := ffi_call2(f_bk, mem_dc, 1) // TRANSPARENT
     old_font := ffi_call2(f_sel, mem_dc, hfont_reg)
@@ -454,14 +520,15 @@ fn gui_present_photon_ui(win: GuiWindow, mut app: UiApp) -> bool {
             tlen := str_len(txt)
             if tlen > 0 {
                 style := css_compute_node_style(app.tree, i, app.sheet)
-                tag := dom_get_tag(app.tree, i)
-                is_btn := str_eq_ignore_case(tag, "button")
-                is_h1 := str_eq_ignore_case(tag, "h1")
-                is_h2 := str_eq_ignore_case(tag, "h2") or str_eq_ignore_case(tag, "strong")
 
-                if is_h1 { _ := ffi_call2(f_sel, mem_dc, hfont_h1) }
-                else if is_btn or is_h2 { _ := ffi_call2(f_sel, mem_dc, hfont_semi) }
-                else { _ := ffi_call2(f_sel, mem_dc, hfont_reg) }
+                // CSS font-size wins; otherwise derive from semantic tag.
+                mut logical := style.font_size
+                if logical <= 0 { logical = 14 }
+                mut weight := style.font_weight
+                if weight <= 0 { weight = 400 }
+                mut fh := gui_font_cache_get(mut fonts, win.gdi32, face, logical, weight)
+                if fh == 0 { fh = hfont_reg }
+                _ := ffi_call2(f_sel, mem_dc, fh)
 
                 _ := ffi_call2(f_tcol, mem_dc, _gui_color_to_colorref(style.text_color))
 
@@ -472,18 +539,14 @@ fn gui_present_photon_ui(win: GuiWindow, mut app: UiApp) -> bool {
                 ffi_write_u32_le(rc_box, 8, bx + bw - pad_x)
                 ffi_write_u32_le(rc_box, 12, by + bh - pad_y)
 
-                // DT_NOPREFIX (0x800) + centered single-line for buttons / headings, word-break for body text
+                // DT_NOPREFIX (0x800) + word-break for body text; alignment from CSS
                 mut dflags := 0x0810 // DT_WORDBREAK | DT_NOPREFIX
-                if is_btn {
-                    ffi_write_u32_le(rc_box, 0, bx + 4)
-                    ffi_write_u32_le(rc_box, 4, by)
-                    ffi_write_u32_le(rc_box, 8, bx + bw - 4)
-                    ffi_write_u32_le(rc_box, 12, by + bh)
-                    dflags = 0x0825 // DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX
-                } else if is_h1 or is_h2 or style.display == 2 {
+                if style.text_align == 1 { dflags = dflags | 0x0001 }        // DT_CENTER
+                else if style.text_align == 2 { dflags = dflags | 0x0002 }   // DT_RIGHT
+                if weight >= 600 or style.font_size > 18 or style.text_align == 1 {
                     ffi_write_u32_le(rc_box, 4, by)
                     ffi_write_u32_le(rc_box, 12, by + bh)
-                    dflags = 0x0824 // DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX
+                    dflags = dflags | 0x0004 | 0x0020 // DT_VCENTER | DT_SINGLELINE
                 }
 
                 ctxt := ffi_cstr(txt)
@@ -513,9 +576,6 @@ fn gui_present_photon_ui(win: GuiWindow, mut app: UiApp) -> bool {
 
     ffi_free(rc_box)
     _ := ffi_call2(f_sel, mem_dc, old_font)
-    _ := ffi_call1(f_delo, hfont_reg)
-    _ := ffi_call1(f_delo, hfont_semi)
-    _ := ffi_call1(f_delo, hfont_h1)
     _ := ffi_call2(f_sel, mem_dc, old_bm)
     _ := ffi_call1(f_delo, hbm)
     _ := ffi_call1(f_deldc, mem_dc)
