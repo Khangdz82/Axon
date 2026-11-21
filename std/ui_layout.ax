@@ -71,8 +71,22 @@ fn layout_shift_subtree(tree: DomTree, lt: LayoutTree, node_idx: i64, dx: i64, d
 fn layout_estimate_text_width(text: str, font_size: i64 = 14) -> i64 {
     n := str_len(text)
     if n == 0 { return 0 }
-    char_w := (font_size * 6) / 10 // ~0.6 aspect ratio
+    char_w := (font_size * 62) / 100
     return n * char_w
+}
+
+// Estimates total width of an inline node including its <span>/<strong> inline children
+fn layout_estimate_inline_tree_w(tree: DomTree, sheet: Stylesheet, node_idx: i64, font_size: i64 = 14) -> i64 {
+    mut w := layout_estimate_text_width(dom_get_text(tree, node_idx), font_size)
+    mut ch := dom_first_child(tree, node_idx)
+    while ch >= 0 {
+        cs := css_compute_node_style(tree, ch, sheet)
+        if cs.display == 2 {
+            w += layout_estimate_text_width(dom_get_text(tree, ch), 14) + 6
+        }
+        ch = dom_next_sibling(tree, ch)
+    }
+    return w
 }
 
 // Solves layout recursively using pre-computed style (avoids redundant CSS/Tailwind parsing per child!)
@@ -105,12 +119,14 @@ fn layout_solve_node_styled(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, no
     }
 
     txt := dom_get_text(tree, node_idx)
+    node_tag := dom_get_tag(tree, node_idx)
+    txt_scale := if str_eq_ignore_case(node_tag, "h1") { 2 } else { 1 }
+    txt_line_h := if txt_scale == 2 { 34 } else { 22 }
     if box_h < 0 and str_len(txt) > 0 {
-        c_tag := dom_get_tag(tree, node_idx)
-        if str_eq_ignore_case(c_tag, "button") or str_eq_ignore_case(c_tag, "input") or str_eq_ignore_case(c_tag, "h1") {
-            box_h = 36 + pad_h
-        } else if str_eq_ignore_case(c_tag, "h2") {
-            box_h = 28 + pad_h
+        if str_eq_ignore_case(node_tag, "button") or str_eq_ignore_case(node_tag, "input") or str_eq_ignore_case(node_tag, "h1") {
+            box_h = 34 + pad_h
+        } else if str_eq_ignore_case(node_tag, "h2") {
+            box_h = 22 + pad_h
         } else {
             box_h = 24 + pad_h
         }
@@ -124,27 +140,43 @@ fn layout_solve_node_styled(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, no
         if content_w < 0 { content_w = 0 }
 
         // Block containers and flex-direction: column stack vertically; flex-row / inline lay out horizontally
-        is_col := (style.display == 0) or (style.display == 1 and style.flex_direction == 1)
+        first_c_style := css_compute_node_style(tree, fc, sheet)
+        has_inline_flow := first_c_style.display == 2
+        is_col := (not has_inline_flow) and ((style.display == 0) or (style.display == 1 and style.flex_direction == 1))
         gap := style.gap
 
-        // Pre-pass for flex-row: measure fixed/auto children so `flex-1` (`width == -2`) and containers get exact remaining width!
+        // Pre-pass for flex-row: measure fixed, percentage (`<= -1000`), and auto children
         mut flex_grow_count := 0
         mut fixed_row_w := 0
+        mut pct_total := 0
         mut row_vis := 0
         if not is_col {
             mut rc := fc
             while rc >= 0 {
                 rs := css_compute_node_style(tree, rc, sheet)
                 if rs.display != 3 {
-                    if rs.width == -2 {
+                    if rs.width <= -1000 {
+                        pct_total += (0 - rs.width - 1000)
+                        fixed_row_w += rs.margin_x
+                    } else if rs.width == -2 {
                         flex_grow_count += 1
                     } else if rs.width > 0 {
                         fixed_row_w += rs.width + rs.margin_x
-                    } else if dom_first_child(tree, rc) >= 0 {
-                        flex_grow_count += 1
+                    } else if rs.display != 2 and dom_first_child(tree, rc) >= 0 {
+                        rfc := dom_first_child(tree, rc)
+                        rfc_s := css_compute_node_style(tree, rfc, sheet)
+                        if rfc_s.display == 2 {
+                            rtag := dom_get_tag(tree, rc)
+                            rfz := if str_eq_ignore_case(rtag, "h1") { 20 } else { 14 }
+                            mut est_i := layout_estimate_inline_tree_w(tree, sheet, rc, rfz) + rs.padding_x + 16
+                            if est_i > content_w { est_i = content_w }
+                            fixed_row_w += est_i + rs.margin_x
+                        } else {
+                            flex_grow_count += 1
+                        }
                     } else {
                         rt := dom_get_text(tree, rc)
-                        mut est := if str_len(rt) > 0 { layout_estimate_text_width(rt) + rs.padding_x + 16 } else { 100 }
+                        mut est := if str_len(rt) > 0 { layout_estimate_text_width(rt) + rs.padding_x + 16 } else { 80 }
                         if est > content_w { est = content_w }
                         fixed_row_w += est + rs.margin_x
                     }
@@ -154,7 +186,9 @@ fn layout_solve_node_styled(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, no
                 rc = dom_next_sibling(tree, rc)
             }
         }
-        mut rem_row_w := content_w - fixed_row_w
+        mut pct_base_w := content_w - fixed_row_w
+        if pct_base_w < 0 { pct_base_w = 0 }
+        mut rem_row_w := pct_base_w - (pct_base_w * pct_total) / 100
         if rem_row_w < 0 { rem_row_w = 0 }
         mut flex_each_w := if flex_grow_count > 0 { rem_row_w / flex_grow_count } else { content_w }
         if flex_each_w < 80 and content_w >= 80 { flex_each_w = 80 }
@@ -162,6 +196,13 @@ fn layout_solve_node_styled(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, no
         mut cur_child := fc
         mut cursor_x := content_x
         mut cursor_y := content_y
+        if str_len(txt) > 0 {
+            if has_inline_flow {
+                cursor_x += layout_estimate_text_width(txt, if txt_scale == 2 { 18 } else { 13 }) + 4
+            } else {
+                cursor_y += txt_line_h
+            }
+        }
         mut total_main := 0
         mut max_child_w := 0
         mut max_child_h := 0
@@ -179,21 +220,38 @@ fn layout_solve_node_styled(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, no
             mut ch := c_style.height
             c_tag := dom_get_tag(tree, cur_child)
             if ch < 0 and dom_first_child(tree, cur_child) < 0 {
-                if str_eq_ignore_case(c_tag, "button") or str_eq_ignore_case(c_tag, "input") { ch = 36 + c_style.padding_y }
-                else if str_eq_ignore_case(c_tag, "h1") { ch = 36 + c_style.padding_y }
-                else if str_eq_ignore_case(c_tag, "h2") { ch = 28 + c_style.padding_y }
-                else { ch = 24 + c_style.padding_y }
+                if str_eq_ignore_case(c_tag, "button") or str_eq_ignore_case(c_tag, "input") { ch = 32 + c_style.padding_y }
+                else if str_eq_ignore_case(c_tag, "h1") { ch = 34 + c_style.padding_y }
+                else if str_eq_ignore_case(c_tag, "h2") { ch = 22 + c_style.padding_y }
+                else if c_style.display == 2 { ch = txt_line_h }
+                else { ch = 22 + c_style.padding_y }
             }
-            if cw < 0 {
+            if cw <= -1000 {
+                pct := 0 - cw - 1000
+                cw = (pct_base_w * pct) / 100
+                if cw < 60 and content_w >= 60 { cw = 60 }
+            } else if cw < 0 {
                 c_txt := dom_get_text(tree, cur_child)
                 if not is_col {
-                    if cw == -2 or dom_first_child(tree, cur_child) >= 0 {
+                    if c_style.display == 2 {
+                        cw = layout_estimate_text_width(c_txt) + c_style.padding_x + 4
+                    } else if cw == -2 {
                         cw = flex_each_w - c_style.margin_x
                         if cw < 0 { cw = 0 }
+                    } else if dom_first_child(tree, cur_child) >= 0 {
+                        cfc := dom_first_child(tree, cur_child)
+                        cfc_s := css_compute_node_style(tree, cfc, sheet)
+                        if cfc_s.display == 2 {
+                            cfz := if str_eq_ignore_case(c_tag, "h1") { 20 } else { 14 }
+                            cw = layout_estimate_inline_tree_w(tree, sheet, cur_child, cfz) + c_style.padding_x + 16
+                        } else {
+                            cw = flex_each_w - c_style.margin_x
+                            if cw < 0 { cw = 0 }
+                        }
                     } else if str_len(c_txt) > 0 {
                         cw = layout_estimate_text_width(c_txt) + c_style.padding_x + 16
                     } else {
-                        cw = 100
+                        cw = 80
                     }
                 } else if str_eq_ignore_case(c_tag, "button") and str_len(c_txt) > 0 {
                     cw = layout_estimate_text_width(c_txt) + c_style.padding_x + 16
