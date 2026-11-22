@@ -17,7 +17,7 @@ The entire compiler (`compiler_ax/` — `18` pure Axon modules, `37,137` lines) 
   - **Medium (`B11..B20`):** `31.18 ms` vs `276.24 ms` (**8.86x faster**) — Zero-VDOM reactive signals (`34.99x`), 100k-row virtual list (`27.79x`), AVX2+FMA3 RMSNorm+RoPE (`10.15x`).
   - **Extreme (`B21..B30`):** `43.56 ms` vs `827.56 ms` (**19.00x faster**) — PagedKV FlashAttention-2 (`52.71x`), Binary-Heap A* (`46.09x`), 64-dim L2 Vector Search (`39.81x`), ChaCha20 ARX (`15.82x`).
 - **Self-Hosted Deterministic Toolchain:** Prebuilt binaries verified by 3-stage deterministic bootstrap (`SHA256(Stage 2) == SHA256(Stage 3)`): Windows x64 (`bin/axc.exe`, `1,843,712 B`), Linux x64 (`bin/axc-linux-x64`, `1,799,088 B`), and macOS Apple Silicon (`bin/axc-macos-arm64`, `1,278,016 B`).
-- **Hardened Security & Verification (`70/70` pass, `34/34` fail_compile):** Compile-time capability attenuation (`E0501`), `tainted[str]` SQLi/CMDi blocking (`E0502`), strict `unsafe` boundary (`E0503`) covering raw pointer/FFI/atomic/SIMD intrinsics, Ring 0 <-> Ring 3 bridge (`std/ring_bridge.ax`), Shield v5 (`std/shield.ax`), PIE-safe runtime stack backtraces (`exit 101`), and static advisor `axc advise <file.ax> [--json]`.
+- **Hardened Security & Verification (`71/71` pass, `34/34` fail_compile):** Compile-time capability attenuation (`E0501`), `tainted[str]` SQLi/CMDi blocking (`E0502`), strict `unsafe` boundary (`E0503`) covering raw pointer/FFI/atomic/SIMD intrinsics, Ring 0 <-> Ring 3 bridge (`std/ring_bridge.ax`), Shield v5 (`std/shield.ax`), PIE-safe runtime stack backtraces (`exit 101`), and static advisor `axc advise <file.ax> [--json]`.
 
 ---
 
@@ -150,7 +150,7 @@ Open [`playground/index.html`](playground/index.html) directly in Chrome/Edge/Fi
 
 - **Compile-Time Safety Gates (`34/34` verified in `tests/fail_compile/`):**
   Second-class reference isolation (`E0101`–`E0102`), Perceus linear ownership / move-in-loop / `par_for` race detection (`E0201`–`E0204`), immutability (`E0301`), capability attenuation (`E0501`), unsanitized `tainted[str]` SQL/shell sinks (`E0502`), **strict `unsafe` boundary (`E0503`)** blocking all unguarded raw pointer, FFI, SIMD pointer, and atomic intrinsics, `@no_alloc` verification (`E0601`), symbolic tensor shapes (`E0602`), `comptime_assert` (`E0604`), and parser recursion cap (`E0020`, depth limit `256`).
-- **Fail-Closed Runtime Protection (`70/70` `tests/pass/*.ax` + `6/6` runtime traps -> `exit 101`):**
+- **Fail-Closed Runtime Protection (`71/71` `tests/pass/*.ax` + `6/6` runtime traps -> `exit 101`):**
   Hardware/runtime traps with PIE-safe stack backtraces (`#0 fn -> #1 caller -> #2 main`) for integer `/ 0`, `% 0`, `INT64_MIN / -1`, checked `--shield` signed overflow, and `ByteBuf` / `str_byte` out-of-bounds accesses; CWE-158 `NUL`-byte rejection across FS/OS/SQLite/PostgreSQL/MySQL; TLS 1.2+ with fail-closed hostname verification; HTTP/2 4 MB frame caps & strict HPACK/gRPC framing; UNC NTLM leak prevention in native image loaders; bounds-hardened vLLM/GGUF/CUDA/KvStore/FFI/SafeTensors/ONNX modules.
 
 ---
