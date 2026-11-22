@@ -1,0 +1,106 @@
+// Axon AI Agent & Evaluation Harness Suite (`tests/pass/44_ai_harness.ax`)
+// Verifies: AgentContext compaction, ToolRegistry + OpenAI JSON builder, ToolCall parser (JSON & XML),
+// Jailed HarnessSandbox (path traversal, read-only, step budget, secret leak guard), and EvalSuite metrics.
+
+use std::ai_harness
+use std::tls
+
+@test
+fn test_agent_context_and_budget_compaction() {
+    mut ctx := agent_ctx_new(40)
+    assert(agent_ctx_push(mut ctx, 0, "You are an Axon coding agent."))
+    assert(agent_ctx_push(mut ctx, 1, "Turn 1: read main.ax and inspect the architecture carefully."))
+    assert(agent_ctx_push(mut ctx, 2, "Turn 1 reply: I inspected main.ax and found 3 modules."))
+    assert(agent_ctx_push(mut ctx, 1, "Turn 2: now fix the bug in parser.ax."))
+    assert(agent_ctx_push(mut ctx, 2, "Turn 2 reply: fixed!"))
+
+    // Prune to budget: must keep system prompt (idx 0) and most recent turn(s), dropping middle turns
+    dropped := agent_ctx_prune_to_budget(mut ctx)
+    assert(dropped >= 1)
+    assert(agent_ctx_msg_role(ctx, 0) == 0)
+    assert(str_contains(agent_ctx_msg_text(ctx, ctx.msg_count - 1), "Turn 2"))
+    agent_ctx_free(move ctx)
+}
+
+@test
+fn test_tool_registry_json_and_tool_call_parser() {
+    mut ctx := agent_ctx_new(4096)
+    _ := agent_ctx_push(mut ctx, 0, "System \"quoted\"")
+    _ := agent_ctx_push(mut ctx, 1, "Check file")
+
+    mut reg := tool_reg_new()
+    assert(tool_reg_add(mut reg, "read_file", "Read a file", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}"))
+    assert(tool_reg_exists(reg, "read_file"))
+    assert(not tool_reg_exists(reg, "rm_rf"))
+
+    req := agent_ctx_build_chat_json(ctx, reg, "gpt-4o", 512)
+    assert(str_contains(req, "\"model\":\"gpt-4o\""))
+    assert(str_contains(req, "\\\"quoted\\\""))
+    assert(str_contains(req, "\"tools\":[{\"type\":\"function\""))
+
+    // 1. OpenAI tool_calls JSON parsing
+    oa := "{\"choices\":[{\"message\":{\"tool_calls\":[{\"id\":\"call_42\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.ax\\\"}\"}}]}}]}"
+    tc1 := harness_parse_tool_call(oa)
+    assert(tc1.found and str_eq(tc1.id, "call_42") and str_eq(tc1.name, "read_file"))
+
+    // 2. Lightweight XML <tool name="...">...</tool> parsing
+    xml := "Thinking...\n<tool name=\"read_file\">{\"path\":\"b.ax\"}</tool>"
+    tc2 := harness_parse_tool_call(xml)
+    assert(tc2.found and str_eq(tc2.name, "read_file") and str_contains(tc2.args_json, "b.ax"))
+
+    tool_reg_free(move reg)
+    agent_ctx_free(move ctx)
+}
+
+@test
+fn test_harness_sandbox_and_secret_guard() {
+    mut sb := harness_sandbox_new("tests", false, 3, 256)
+    // Traversal escape blocked (403)
+    bad := harness_tool_read_file(mut sb, "../README.md") or "BLOCKED"
+    assert(str_eq(bad, "BLOCKED"))
+
+    // Valid jailed write & read
+    wr := harness_tool_write_file(mut sb, "_tmp_harness_test.txt", "hello axon harness") or -1
+    assert(wr == 18)
+    rd := harness_tool_read_file(mut sb, "_tmp_harness_test.txt") or ""
+    assert(str_eq(rd, "hello axon harness"))
+
+    // Step budget exhausted (max_steps = 3 used above -> 4th call blocked with 429)
+    over := harness_tool_read_file(mut sb, "_tmp_harness_test.txt") or "LIMIT"
+    assert(str_eq(over, "LIMIT"))
+
+    // Read-only sandbox blocks writes
+    mut ro := harness_sandbox_new("tests", true, 5, 256)
+    assert((harness_tool_write_file(mut ro, "_tmp_harness_test.txt", "x") or -9) == -9)
+
+    // Secret leak scanner & multi-header TLS guard
+    assert(harness_contains_secret("token=sk-proj-abc123456"))
+    assert(harness_contains_secret("ghp_1234567890"))
+    assert(not harness_contains_secret("normal output text"))
+    assert(tls_is_safe_http_headers("Content-Type: application/json\r\nAuthorization: Bearer tok"))
+    assert(not tls_is_safe_http_headers("A: 1\r\n\r\nSMUGGLED"))
+
+    _ := sys_fs_remove("tests/_tmp_harness_test.txt")
+}
+
+@test
+fn test_eval_suite_metrics() {
+    mut ev := eval_suite_new("AxonSWE-Bench")
+    eval_record(mut ev, true, 12000, 500, 120, 3, 250)
+    eval_record(mut ev, true, 28000, 800, 200, 5, 450)
+    eval_record(mut ev, false, 20000, 600, 100, 4, 300)
+    assert(eval_pass_rate_pct(ev) == 66)
+    assert(eval_avg_latency_ms(ev) == 20)
+    rep := eval_format_report(ev)
+    assert(str_contains(rep, "pass=2/3 (66%)"))
+    assert(str_contains(rep, "avg_latency=20ms"))
+}
+
+fn main() -> i32 {
+    test_agent_context_and_budget_compaction()
+    test_tool_registry_json_and_tool_call_parser()
+    test_harness_sandbox_and_secret_guard()
+    test_eval_suite_metrics()
+    println("[PASS] 44_ai_harness: Context compaction, ToolRegistry/Parser, Sandbox, SecretGuard & EvalSuite verified!")
+    return 0
+}
