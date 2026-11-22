@@ -1,0 +1,148 @@
+// Deep Security Wave 2 Regression Test (`tests/pass/45_deep_security_wave2.ax`)
+// Verifies bounds, overflow, null-deref, and DoS hardening across:
+//   - std::vllm (PagedAttention OOB write, alloc overflow, ltp_cap reset after free)
+//   - std::data (KvStore power-of-2 shift cap, arena_cap bounds, malformed AXKV1 reject)
+//   - std::ai_serve (AiModelRouter null meta_ptr & cost/token overflow safety)
+//   - std::cuda (empty/invalid context null-safety, negative device ordinal, alloc overflow)
+//   - std::ai_gguf (direct dequantizer OOB/overflow rejection without crashing)
+
+use std::os
+use std::str
+use std::vllm
+use std::data
+use std::ai_serve
+use std::cuda
+use std::ai_gguf
+use std::ai_harness
+
+@test
+fn test_vllm_bounds_and_ltp_reset() {
+    // 1. Overflowing block table dimensions fail closed cleanly without crashing
+    bt_bad := vllm_block_table_new(65536, 4096, 16384)
+    assert(bt_bad.max_blocks == 0)
+    assert(bt_bad.pool_k_ptr == 0)
+    buf_free(move bt_bad.free_list_buf)
+
+    // 2. Normal engine + OOB paged_kv_write silently ignored (no heap corruption)
+    mut eng := vllm_engine_new(4, 32)
+    unsafe {
+        kv := mem_alloc_aligned(64 * 4)
+        mut i := 0
+        while i < 64 { ptr_write_f32(kv, i, 1.5); i += 1 }
+
+        // Out-of-bounds physical block & token indices must not corrupt memory
+        vllm_paged_kv_write(eng.block_table, -1, 0, kv, kv)
+        vllm_paged_kv_write(eng.block_table, 9999, 0, kv, kv)
+        vllm_paged_kv_write(eng.block_table, 0, -5, kv, kv)
+        vllm_paged_kv_write(eng.block_table, 0, 999, kv, kv)
+        vllm_paged_kv_write(eng.block_table, 0, 0, 0, kv)
+
+        // 3. Freeing request blocks must reset ltp_cap = 16 so reuse past 16 blocks grows safely
+        mut req := vllm_request_new(1, 0, 400)
+        assert(vllm_request_append_token(mut eng, mut req, kv, kv))
+        vllm_request_free_blocks(mut eng, mut req)
+        assert(req.ltp_cap == 16)
+        req.tokens_generated = 0
+        // Push 18 logical blocks worth of tokens (18 * 16 = 288 tokens) to force ltp growth from 16 -> 32
+        mut t := 0
+        while t < 280 {
+            ok_app := vllm_request_append_token(mut eng, mut req, kv, kv)
+            assert(ok_app)
+            t += 1
+        }
+        assert(req.ltp_cap >= 32)
+        vllm_request_free_blocks(mut eng, mut req)
+        buf_free(move req.logical_to_physical)
+        mem_free_aligned(kv)
+    }
+    vllm_engine_free(move eng)
+}
+
+@test
+fn test_kvstore_dos_and_arena_cap() {
+    // 1. Huge cap_hint must not infinite-loop shift or OOM
+    kv_huge := kv_new(9223372036854775800, 4096)
+    assert(ibuf_get(kv_huge.meta, 2) <= 1048576)
+    kv_free(move kv_huge)
+
+    // 2. Arena capacity strictly enforced (returns false instead of OOB trap)
+    kv := kv_new(16, 4096)
+    mut big := buf_new(3000)
+    mut i := 0
+    while i < 2500 { buf_push(big, 65); i += 1 }
+    big_s := buf_to_owned_str(move big)
+    assert(kv_set(kv, "k1", big_s))
+    // Second 2500B insert exceeds 4096B arena -> must return false cleanly
+    assert(not kv_set(kv, "k2", big_s))
+    v1 := kv_get(kv, "k1") or ""
+    assert(str_len(v1) == 2500)
+    kv_free(move kv)
+}
+
+@test
+fn test_ai_router_null_and_overflow_safety() {
+    // Uninitialized/null meta_ptr router must never deref null
+    bad_r := AiModelRouter(endpoints = ibuf_new(8), max_endpoints = 1, meta_ptr = 0)
+    assert(ai_router_select(bad_r, 100, 100, 50, true, 1000) == -1)
+    assert(ai_router_total_spend_micros(bad_r) == 0)
+    ai_router_record_success(bad_r, 0, 10, 10, 5)
+    ai_router_record_failure(bad_r, 0)
+    ai_router_free(move bad_r)
+
+    // Huge token counts clamped without signed overflow
+    r := ai_router_new(4)
+    ep := ai_router_add_endpoint(r, 1, 5000000, 15000000, 2000000000, 10, 20)
+    assert(ep == 0)
+    sel := ai_router_select(r, 9000000000000, 9000000000000, 50, false, 9000000000000000)
+    assert(sel == 0 or sel == -1)
+    ai_router_free(move r)
+}
+
+@test
+fn test_cuda_empty_ctx_and_gguf_dequant_bounds() {
+    // 1. CUDA calls on empty context or negative ordinal must fail closed without crashing
+    mut empty := CudaCtx(dll = 0, cu_ctx = 0, cu_mod = 0, tbl = 0, argv = 0, pbox = 0, dev_name = "")
+    assert(not cuda_ready(empty))
+    assert(cuda_sync(empty) == -1)
+    assert(cuda_alloc(empty, 64) == 0)
+    assert(cuda_alloc_f32(empty, -10) == 0)
+    assert(cuda_alloc_f32(empty, 4611686018427387903) == 0)
+    assert(cuda_h2d(empty, 0, 0, 64) == -1)
+    assert(cuda_d2h(empty, 0, 0, 64) == -1)
+    assert(cuda_d2d(empty, 0, 0, 64) == -1)
+    assert(cuda_gemv_f32(empty, 0, 0, 0, 8, 8) == -1)
+    assert(cuda_timer_stop_ms(empty) == 0.0)
+    cuda_timer_start(empty)
+    cuda_free(mut empty)
+
+    mut neg_dev := cuda_init(-1)
+    assert(not cuda_ready(neg_dev))
+    cuda_free(mut neg_dev)
+
+    // 2. Direct GGUF dequantizer calls with truncated buffer must return safely without OOB trap
+    tiny := buf_new(8)
+    buf_push(tiny, 0); buf_push(tiny, 0)
+    unsafe {
+        out := mem_alloc_aligned(1024)
+        gguf_dequant_f16(tiny, 0, 100, out)
+        gguf_dequant_q8_0(tiny, 0, 64, out)
+        gguf_dequant_q4_k(tiny, 0, 256, out)
+        mem_free_aligned(out)
+    }
+    buf_free(move tiny)
+
+    // 3. AI Harness secret redaction must mask Bearer tokens and JWTs
+    red1 := harness_redact_secrets("Authorization: Bearer sk-1234567890abcdef12345678")
+    assert(str_eq(red1, "Authorization: Bearer [REDACTED]"))
+    red2 := harness_redact_secrets("tok=eyJhbGciOiJIUzI1NiJ9.payload.sig end")
+    assert(str_eq(red2, "tok=[REDACTED] end"))
+}
+
+fn main() -> i32 {
+    test_vllm_bounds_and_ltp_reset()
+    test_kvstore_dos_and_arena_cap()
+    test_ai_router_null_and_overflow_safety()
+    test_cuda_empty_ctx_and_gguf_dequant_bounds()
+    println("DEEP_SECURITY_WAVE2_OK")
+    return 0
+}

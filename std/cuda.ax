@@ -48,6 +48,7 @@ fn _cuda_cstr_alloc(s: str) -> i64 {
     unsafe {
     n := str_len(s)
     buf := mem_alloc_aligned(n + 8)
+    if buf == 0 { return 0 }
     mut i := 0
     while i < n {
         ptr_write_u8(buf, i, str_byte(s, i))
@@ -73,6 +74,7 @@ fn _ptx_append(buf: i64, pos: i64, s: str) -> i64 {
 fn _cuda_build_kernels_ptx() -> i64 {
     unsafe {
     b := mem_alloc_aligned(32768)
+    if b == 0 { return 0 }
     mut p := 0
     p = _ptx_append(b, p, ".version 6.4\n.target sm_52\n.address_size 64\n\n")
 
@@ -408,32 +410,50 @@ fn cuda_init(device_ord: i64 = 0) -> CudaCtx {
     f_attr := dll_sym(dll, "cuDeviceGetAttribute")
     f_vram := _cuda_sym2(dll, "cuDeviceTotalMem_v2", "cuDeviceTotalMem")
     f_ctx_cr := _cuda_sym2(dll, "cuCtxCreate_v2", "cuCtxCreate")
-    if f_init == 0 or f_ctx_cr == 0 { dll_close(dll); return empty }
+    if f_init == 0 or f_cnt == 0 or f_dev == 0 or f_ctx_cr == 0 or device_ord < 0 { dll_close(dll); return empty }
 
     tbl := mem_alloc_aligned(256)
     argv := mem_alloc_aligned(128)
     pbox := mem_alloc_aligned(256)
     tmp := mem_alloc_aligned(128)
+    if tbl == 0 or argv == 0 or pbox == 0 or tmp == 0 {
+        if tbl != 0 { mem_free_aligned(tbl) }
+        if argv != 0 { mem_free_aligned(argv) }
+        if pbox != 0 { mem_free_aligned(pbox) }
+        if tmp != 0 { mem_free_aligned(tmp) }
+        dll_close(dll)
+        return empty
+    }
 
     ptr_write_i64(argv, 0, 0)
     if c_call_v(f_init, 1, argv) != 0 {
         mem_free_aligned(tbl); mem_free_aligned(argv); mem_free_aligned(pbox); mem_free_aligned(tmp); dll_close(dll); return empty
     }
     ptr_write_i64(argv, 0, tmp)
-    c_call_v(f_cnt, 1, argv)
+    if c_call_v(f_cnt, 1, argv) != 0 {
+        mem_free_aligned(tbl); mem_free_aligned(argv); mem_free_aligned(pbox); mem_free_aligned(tmp); dll_close(dll); return empty
+    }
     cnt := ptr_read_i64(tmp, 0) & 0xFFFFFFFF
-    if device_ord >= cnt {
+    if device_ord < 0 or device_ord >= cnt {
         mem_free_aligned(tbl); mem_free_aligned(argv); mem_free_aligned(pbox); mem_free_aligned(tmp); dll_close(dll); return empty
     }
     ptr_write_i64(argv, 0, tmp)
     ptr_write_i64(argv, 1, device_ord)
-    c_call_v(f_dev, 2, argv)
+    if c_call_v(f_dev, 2, argv) != 0 {
+        mem_free_aligned(tbl); mem_free_aligned(argv); mem_free_aligned(pbox); mem_free_aligned(tmp); dll_close(dll); return empty
+    }
     dev := ptr_read_i64(tmp, 0) & 0xFFFFFFFF
 
     nbuf := mem_alloc_aligned(128)
-    ptr_write_i64(argv, 0, nbuf); ptr_write_i64(argv, 1, 128); ptr_write_i64(argv, 2, dev)
-    c_call_v(f_name, 3, argv)
-    dname := str_from_cstr(nbuf)
+    mut dname := ""
+    if nbuf != 0 and f_name != 0 {
+        ptr_write_u8(nbuf, 0, 0)
+        ptr_write_i64(argv, 0, nbuf); ptr_write_i64(argv, 1, 128); ptr_write_i64(argv, 2, dev)
+        if c_call_v(f_name, 3, argv) == 0 {
+            ptr_write_u8(nbuf, 127, 0)
+            dname = str_from_cstr(nbuf)
+        }
+    }
 
     mut sms := 0
     if f_attr != 0 {
@@ -450,6 +470,7 @@ fn cuda_init(device_ord: i64 = 0) -> CudaCtx {
     rc_ctx := c_call_v(f_ctx_cr, 3, argv)
     cu_ctx := if rc_ctx == 0 { ptr_read_i64(tmp, 0) } else { 0 }
     if cu_ctx == 0 {
+        if nbuf != 0 { mem_free_aligned(nbuf) }
         mem_free_aligned(tbl); mem_free_aligned(argv); mem_free_aligned(pbox); mem_free_aligned(tmp); dll_close(dll); return empty
     }
 
@@ -457,11 +478,17 @@ fn cuda_init(device_ord: i64 = 0) -> CudaCtx {
     f_mod_get_fn := dll_sym(dll, "cuModuleGetFunction")
     f_ev_cr := dll_sym(dll, "cuEventCreate")
 
-    ptx_ptr := _cuda_build_kernels_ptx()
-    ptr_write_i64(argv, 0, tmp); ptr_write_i64(argv, 1, ptx_ptr)
-    rc_mod := c_call_v(f_mod_load, 2, argv)
-    mem_free_aligned(ptx_ptr)
-    cu_mod := if rc_mod == 0 { ptr_read_i64(tmp, 0) } else { 0 }
+    mut rc_mod := -1
+    mut cu_mod := 0
+    if f_mod_load != 0 {
+        ptx_ptr := _cuda_build_kernels_ptx()
+        if ptx_ptr != 0 {
+            ptr_write_i64(argv, 0, tmp); ptr_write_i64(argv, 1, ptx_ptr)
+            rc_mod = c_call_v(f_mod_load, 2, argv)
+            mem_free_aligned(ptx_ptr)
+            if rc_mod == 0 { cu_mod = ptr_read_i64(tmp, 0) }
+        }
+    }
 
     mut ev0 := 0
     mut ev1 := 0
@@ -534,6 +561,7 @@ fn cuda_sm_count(ctx: CudaCtx) -> i64 { unsafe { return if ctx.tbl == 0 { 0 } el
 
 fn cuda_sync(ctx: CudaCtx) -> i64 {
     unsafe {
+    if ctx.tbl == 0 or ctx.argv == 0 { return -1 }
     f := ptr_read_i64(ctx.tbl, 0)
     if f == 0 { return -1 }
     return c_call_v(f, 0, ctx.argv)
@@ -542,8 +570,9 @@ fn cuda_sync(ctx: CudaCtx) -> i64 {
 
 fn cuda_alloc(ctx: CudaCtx, bytes: i64) -> i64 {
     unsafe {
+    if ctx.tbl == 0 or ctx.argv == 0 or ctx.pbox == 0 or bytes <= 0 { return 0 }
     f := ptr_read_i64(ctx.tbl, 2)
-    if f == 0 or bytes <= 0 { return 0 }
+    if f == 0 { return 0 }
     ptr_write_i64(ctx.pbox, 0, 0)
     ptr_write_i64(ctx.argv, 0, ctx.pbox)
     ptr_write_i64(ctx.argv, 1, bytes)
@@ -554,12 +583,13 @@ fn cuda_alloc(ctx: CudaCtx, bytes: i64) -> i64 {
 }
 
 fn cuda_alloc_f32(ctx: CudaCtx, count: i64) -> i64 {
+    if count <= 0 or count > 2305843009213693951 { return 0 }
     return cuda_alloc(ctx, count * 4)
 }
 
 fn cuda_mem_free(ctx: CudaCtx, dptr: i64) {
     unsafe {
-    if dptr == 0 or ctx.tbl == 0 { return }
+    if dptr == 0 or ctx.tbl == 0 or ctx.argv == 0 { return }
     f := ptr_read_i64(ctx.tbl, 3)
     if f == 0 { return }
     ptr_write_i64(ctx.argv, 0, dptr)
@@ -569,6 +599,7 @@ fn cuda_mem_free(ctx: CudaCtx, dptr: i64) {
 
 fn cuda_h2d(ctx: CudaCtx, dptr: i64, host_ptr: i64, bytes: i64) -> i64 {
     unsafe {
+    if ctx.tbl == 0 or ctx.argv == 0 or dptr == 0 or host_ptr == 0 or bytes <= 0 { return -1 }
     f := ptr_read_i64(ctx.tbl, 4)
     if f == 0 { return -1 }
     ptr_write_i64(ctx.argv, 0, dptr)
@@ -580,6 +611,7 @@ fn cuda_h2d(ctx: CudaCtx, dptr: i64, host_ptr: i64, bytes: i64) -> i64 {
 
 fn cuda_d2h(ctx: CudaCtx, host_ptr: i64, dptr: i64, bytes: i64) -> i64 {
     unsafe {
+    if ctx.tbl == 0 or ctx.argv == 0 or host_ptr == 0 or dptr == 0 or bytes <= 0 { return -1 }
     f := ptr_read_i64(ctx.tbl, 5)
     if f == 0 { return -1 }
     ptr_write_i64(ctx.argv, 0, host_ptr)
@@ -591,6 +623,7 @@ fn cuda_d2h(ctx: CudaCtx, host_ptr: i64, dptr: i64, bytes: i64) -> i64 {
 
 fn cuda_d2d(ctx: CudaCtx, dst_dptr: i64, src_dptr: i64, bytes: i64) -> i64 {
     unsafe {
+    if ctx.tbl == 0 or ctx.argv == 0 or dst_dptr == 0 or src_dptr == 0 or bytes <= 0 { return -1 }
     f := ptr_read_i64(ctx.tbl, 6)
     if f == 0 { return -1 }
     ptr_write_i64(ctx.argv, 0, dst_dptr)
@@ -602,9 +635,11 @@ fn cuda_d2d(ctx: CudaCtx, dst_dptr: i64, src_dptr: i64, bytes: i64) -> i64 {
 
 fn cuda_load_ptx(ctx: CudaCtx, ptx_src: str) -> i64 {
     unsafe {
+    if ctx.tbl == 0 or ctx.argv == 0 or ctx.pbox == 0 { return 0 }
     f := ptr_read_i64(ctx.tbl, 7)
     if f == 0 { return 0 }
     cp := _cuda_cstr_alloc(ptx_src)
+    if cp == 0 { return 0 }
     ptr_write_i64(ctx.pbox, 0, 0)
     ptr_write_i64(ctx.argv, 0, ctx.pbox)
     ptr_write_i64(ctx.argv, 1, cp)
@@ -617,8 +652,9 @@ fn cuda_load_ptx(ctx: CudaCtx, ptx_src: str) -> i64 {
 
 fn cuda_get_fn(ctx: CudaCtx, hmod: i64, name: str) -> i64 {
     unsafe {
+    if ctx.tbl == 0 or ctx.argv == 0 or hmod == 0 { return 0 }
     f := ptr_read_i64(ctx.tbl, 9)
-    if f == 0 or hmod == 0 { return 0 }
+    if f == 0 { return 0 }
     return _cuda_get_fn(f, ctx.argv, hmod, name)
     }
 }
@@ -626,8 +662,10 @@ fn cuda_get_fn(ctx: CudaCtx, hmod: i64, name: str) -> i64 {
 // Launch using pre-populated `params_ptr_array` (`void**`).
 fn cuda_launch_raw(ctx: CudaCtx, kfn: i64, gx: i64, gy: i64, gz: i64, bx: i64, by: i64, bz: i64, shmem: i64, params: i64) -> i64 {
     unsafe {
+    if ctx.tbl == 0 or ctx.argv == 0 or kfn == 0 { return -1 }
+    if gx <= 0 or gy <= 0 or gz <= 0 or bx <= 0 or by <= 0 or bz <= 0 or shmem < 0 { return -1 }
     f := ptr_read_i64(ctx.tbl, 10)
-    if kfn == 0 or f == 0 { return -1 }
+    if f == 0 { return -1 }
     ptr_write_i64(ctx.argv, 0, kfn)
     ptr_write_i64(ctx.argv, 1, gx)
     ptr_write_i64(ctx.argv, 2, gy)
@@ -662,7 +700,7 @@ fn _cuda_pack5_u64x3_u32x2(pbox: i64, a0: i64, a1: i64, a2: i64, a3: i64, a4: i6
 
 fn cuda_gemv_f32(ctx: CudaCtx, d_w: i64, d_x: i64, d_out: i64, rows: i64, cols: i64) -> i64 {
     unsafe {
-    if rows <= 0 or cols <= 0 { return 0 }
+    if ctx.tbl == 0 or ctx.pbox == 0 or rows <= 0 or cols <= 0 { return -1 }
     params := _cuda_pack5_u64x3_u32x2(ctx.pbox, d_w, d_x, d_out, rows, cols)
     gx := (rows + 7) / 8
     return cuda_launch_raw(ctx, ptr_read_i64(ctx.tbl, 16), gx, 1, 1, 256, 1, 1, 0, params)
@@ -671,7 +709,7 @@ fn cuda_gemv_f32(ctx: CudaCtx, d_w: i64, d_x: i64, d_out: i64, rows: i64, cols: 
 
 fn cuda_gemm_f32(ctx: CudaCtx, d_a: i64, d_b: i64, d_c: i64, m: i64, k: i64, n: i64) -> i64 {
     unsafe {
-    if m <= 0 or k <= 0 or n <= 0 { return 0 }
+    if ctx.tbl == 0 or ctx.pbox == 0 or m <= 0 or k <= 0 or n <= 0 { return -1 }
     vals := ctx.pbox + 64
     ptr_write_i64(vals, 0, d_a)
     ptr_write_i64(vals, 1, d_b)
@@ -689,7 +727,7 @@ fn cuda_gemm_f32(ctx: CudaCtx, d_a: i64, d_b: i64, d_c: i64, m: i64, k: i64, n: 
 
 fn cuda_gemv_q8_0(ctx: CudaCtx, d_act: i64, d_q8: i64, d_out: i64, rows: i64, nblk: i64) -> i64 {
     unsafe {
-    if rows <= 0 or nblk <= 0 { return 0 }
+    if ctx.tbl == 0 or ctx.pbox == 0 or rows <= 0 or nblk <= 0 { return -1 }
     params := _cuda_pack5_u64x3_u32x2(ctx.pbox, d_act, d_q8, d_out, rows, nblk)
     gx := (rows + 7) / 8
     return cuda_launch_raw(ctx, ptr_read_i64(ctx.tbl, 18), gx, 1, 1, 256, 1, 1, 0, params)
@@ -698,7 +736,7 @@ fn cuda_gemv_q8_0(ctx: CudaCtx, d_act: i64, d_q8: i64, d_out: i64, rows: i64, nb
 
 fn cuda_gemv_q4_0(ctx: CudaCtx, d_act: i64, d_q4: i64, d_out: i64, rows: i64, nblk: i64) -> i64 {
     unsafe {
-    if rows <= 0 or nblk <= 0 { return 0 }
+    if ctx.tbl == 0 or ctx.pbox == 0 or rows <= 0 or nblk <= 0 { return -1 }
     params := _cuda_pack5_u64x3_u32x2(ctx.pbox, d_act, d_q4, d_out, rows, nblk)
     gx := (rows + 7) / 8
     return cuda_launch_raw(ctx, ptr_read_i64(ctx.tbl, 19), gx, 1, 1, 256, 1, 1, 0, params)
@@ -707,7 +745,7 @@ fn cuda_gemv_q4_0(ctx: CudaCtx, d_act: i64, d_q4: i64, d_out: i64, rows: i64, nb
 
 fn cuda_l2_batch_f32(ctx: CudaCtx, d_db: i64, d_q: i64, d_out: i64, n_vecs: i64, dim: i64) -> i64 {
     unsafe {
-    if n_vecs <= 0 or dim <= 0 { return 0 }
+    if ctx.tbl == 0 or ctx.pbox == 0 or n_vecs <= 0 or dim <= 0 { return -1 }
     params := _cuda_pack5_u64x3_u32x2(ctx.pbox, d_db, d_q, d_out, n_vecs, dim)
     gx := (n_vecs + 7) / 8
     return cuda_launch_raw(ctx, ptr_read_i64(ctx.tbl, 20), gx, 1, 1, 256, 1, 1, 0, params)
@@ -716,7 +754,7 @@ fn cuda_l2_batch_f32(ctx: CudaCtx, d_db: i64, d_q: i64, d_out: i64, n_vecs: i64,
 
 fn cuda_rmsnorm_batch_f32(ctx: CudaCtx, d_x: i64, d_w: i64, d_out: i64, rows: i64, dim: i64, eps: f64) -> i64 {
     unsafe {
-    if rows <= 0 or dim <= 0 { return 0 }
+    if ctx.tbl == 0 or ctx.pbox == 0 or rows <= 0 or dim <= 0 { return -1 }
     vals := ctx.pbox + 64
     ptr_write_i64(vals, 0, d_x)
     ptr_write_i64(vals, 1, d_w)
@@ -735,7 +773,7 @@ fn cuda_rmsnorm_f32(ctx: CudaCtx, d_x: i64, d_w: i64, d_out: i64, dim: i64, eps:
 
 fn cuda_swiglu_f32(ctx: CudaCtx, d_gate: i64, d_up: i64, d_out: i64, dim: i64) -> i64 {
     unsafe {
-    if dim <= 0 { return 0 }
+    if ctx.tbl == 0 or ctx.pbox == 0 or dim <= 0 { return -1 }
     vals := ctx.pbox + 64
     ptr_write_i64(vals, 0, d_gate)
     ptr_write_i64(vals, 1, d_up)
@@ -750,7 +788,7 @@ fn cuda_swiglu_f32(ctx: CudaCtx, d_gate: i64, d_up: i64, d_out: i64, dim: i64) -
 
 fn cuda_scale_add_f32(ctx: CudaCtx, d_a: i64, d_b: i64, d_out: i64, n: i64, alpha: f64) -> i64 {
     unsafe {
-    if n <= 0 { return 0 }
+    if ctx.tbl == 0 or ctx.pbox == 0 or n <= 0 { return -1 }
     vals := ctx.pbox + 64
     ptr_write_i64(vals, 0, d_a)
     ptr_write_i64(vals, 1, d_b)
@@ -766,6 +804,7 @@ fn cuda_scale_add_f32(ctx: CudaCtx, d_a: i64, d_b: i64, d_out: i64, n: i64, alph
 
 fn cuda_timer_start(ctx: CudaCtx) {
     unsafe {
+    if ctx.tbl == 0 or ctx.argv == 0 { return }
     ev0 := ptr_read_i64(ctx.tbl, 24)
     f := ptr_read_i64(ctx.tbl, 13)
     if ev0 == 0 or f == 0 { return }
@@ -777,12 +816,13 @@ fn cuda_timer_start(ctx: CudaCtx) {
 
 fn cuda_timer_stop_ms(ctx: CudaCtx) -> f64 {
     unsafe {
+    if ctx.tbl == 0 or ctx.argv == 0 or ctx.pbox == 0 { return 0.0 }
     ev0 := ptr_read_i64(ctx.tbl, 24)
     ev1 := ptr_read_i64(ctx.tbl, 25)
     f_rec := ptr_read_i64(ctx.tbl, 13)
     f_sync := ptr_read_i64(ctx.tbl, 14)
     f_elap := ptr_read_i64(ctx.tbl, 15)
-    if ev0 == 0 or ev1 == 0 or f_rec == 0 { return 0.0 }
+    if ev0 == 0 or ev1 == 0 or f_rec == 0 or f_sync == 0 or f_elap == 0 { return 0.0 }
     ptr_write_i64(ctx.argv, 0, ev1)
     ptr_write_i64(ctx.argv, 1, 0)
     c_call_v(f_rec, 2, ctx.argv)
