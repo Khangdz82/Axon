@@ -291,8 +291,9 @@ fn gui_poll_events(mut win: GuiWindow) -> bool {
             } else if mcode == 0x0102 { // WM_CHAR
                 ch := ffi_read_i64(buf, 2) & 0xFFFF
                 if ch > 0 { win.last_char = ch }
-            } else if mcode == 0x020A { // WM_MOUSEWHEEL
-                delta := ffi_sext32((ffi_read_i64(buf, 2) >> 16) & 0xFFFF)
+            } else if mcode == 0x020A { // WM_MOUSEWHEEL (signed 16-bit HIWORD)
+                raw_d := (ffi_read_i64(buf, 2) >> 16) & 0xFFFF
+                delta := if raw_d >= 32768 { raw_d - 65536 } else { raw_d }
                 win.scroll_delta += delta
             }
             _ := ffi_call1(f_tr, buf)
@@ -499,6 +500,7 @@ struct PhotonD2D {
     out_box: i64
     wbuf: i64
     wcap: i64
+    dpi: i64
 }
 
 fn _p2d_vt(obj: i64, idx: i64) -> i64 {
@@ -575,7 +577,8 @@ fn photon_d2d_init(win: GuiWindow) -> PhotonD2D {
         scratch = ffi_alloc(384),
         out_box = ffi_alloc(16),
         wbuf = ffi_alloc(16384),
-        wcap = 8188
+        wcap = 8188,
+        dpi = gui_get_dpi(win)
     )
     if win.backend != 1 { return d2d }
     lib_d2d := ffi_open_one("d2d1.dll")
@@ -606,15 +609,17 @@ fn photon_d2d_init(win: GuiWindow) -> PhotonD2D {
     ffi_write_u32_le(props, 0, 0)
     ffi_write_u32_le(props, 4, 87) // DXGI_FORMAT_B8G8R8A8_UNORM
     ffi_write_u32_le(props, 8, 3)  // D2D1_ALPHA_MODE_IGNORE
-    ffi_write_u32_le(props, 12, _p2d_f32(96))
-    ffi_write_u32_le(props, 16, _p2d_f32(96))
+    // Native Per-Monitor DPI (96 / 120 / 144 / 192): Direct2D + DirectWrite render at full physical resolution (0 blur!)
+    ffi_write_u32_le(props, 12, _p2d_f32(d2d.dpi))
+    ffi_write_u32_le(props, 16, _p2d_f32(d2d.dpi))
     ffi_write_u32_le(props, 20, 0)
     ffi_write_u32_le(props, 24, 0)
     hr3 := ffi_call3(_p2d_vt(d2d.d2d_fac, 16), d2d.d2d_fac, props, d2d.out_box) & 0xFFFFFFFF
     d2d.rt = ffi_read_i64(d2d.out_box, 0)
     if hr3 != 0 or d2d.rt == 0 { return d2d }
 
-    _ := ffi_call2(_p2d_vt(d2d.rt, 34), d2d.rt, 2) // D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+    // D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE (1): 3x horizontal LCD subpixel sharpness identical to Chrome/Edge!
+    _ := ffi_call2(_p2d_vt(d2d.rt, 34), d2d.rt, 1)
 
     _p2d_write_color(d2d.scratch, 0xFFFFFFFF)
     hr4 := ffi_call4(_p2d_vt(d2d.rt, 8), d2d.rt, d2d.scratch, 0, d2d.out_box) & 0xFFFFFFFF
@@ -708,6 +713,8 @@ fn _p2d_get_text_format(mut d2d: PhotonD2D, sz_in: i64, weight_in: i64, h_align:
 
 fn _p2d_fill_rrect(d2d: PhotonD2D, x: i64, y: i64, w: i64, h: i64, rad: i64, argb: i64) {
     if w <= 0 or h <= 0 or ((argb >> 24) & 0xFF) == 0 { return }
+    // Sharp aliased edges for 0-radius 1px hairlines, per-primitive AA for rounded corners (0 blur!)
+    _ := ffi_call2(_p2d_vt(d2d.rt, 32), d2d.rt, if rad == 0 { 1 } else { 0 })
     _p2d_write_color(d2d.scratch, argb)
     _ := ffi_call2(_p2d_vt(d2d.brush, 8), d2d.brush, d2d.scratch)
     rr := d2d.scratch + 32
@@ -770,15 +777,17 @@ fn photon_d2d_present(win: GuiWindow, mut app: UiApp, mut d2d: PhotonD2D, hovere
     _p2d_write_color(d2d.scratch, 0xFF09090B)
     _ := ffi_call2(_p2d_vt(d2d.rt, 47), d2d.rt, d2d.scratch)
 
+    dip_h := (h * 96) / d2d.dpi
     mut i := 0
     while i < app.tree.count {
         bx := layout_get_x(app.layout, i)
-        by := layout_get_y(app.layout, i)
+        raw_by := layout_get_y(app.layout, i)
         bw := layout_get_w(app.layout, i)
         bh := layout_get_h(app.layout, i)
         if bw > 0 and bh > 0 {
             style := css_compute_node_style_state(app.tree, i, app.sheet, i == hovered_node)
-            if style.display != 3 and style.opacity > 0 {
+            by := if style.position == 2 { raw_by } else { raw_by - app.scroll_y }
+            if style.display != 3 and style.opacity > 0 and by + bh >= 0 and by <= dip_h {
                 mut rad := style.border_radius
                 if rad > bw / 2 { rad = bw / 2 }
                 if rad > bh / 2 { rad = bh / 2 }
@@ -791,14 +800,16 @@ fn photon_d2d_present(win: GuiWindow, mut app: UiApp, mut d2d: PhotonD2D, hovere
                     _p2d_fill_rrect(d2d, bx, by + sh, bw, bh + sh / 2 + 1, rad + 1, 0x26000000)
                 }
 
-                // 2. Border + Background / Linear Gradient (zero half-pixel blur!)
-                has_bd := style.border_width > 0 and style.border_color != 0
+                // 2. Border + Background / Linear Gradient + Focus Ring (zero half-pixel blur!)
+                is_focused := (i == app.focused_idx)
+                has_bd := (style.border_width > 0 and style.border_color != 0) or is_focused
                 has_grad := style.grad_dir > 0 and (style.grad_from != 0 or style.grad_to != 0)
                 has_bg := style.bg_color != 0
-                bd_w := if has_bd { style.border_width } else { 0 }
+                bd_w := if is_focused { 2 } else { (if has_bd { style.border_width } else { 0 }) }
+                eff_bd_col := if is_focused { 0xFF3B82F6 } else { style.border_color }
 
                 if has_bd and (has_grad or has_bg) {
-                    bd_col := _p2d_apply_opacity(style.border_color, style.opacity)
+                    bd_col := _p2d_apply_opacity(eff_bd_col, style.opacity)
                     _p2d_fill_rrect(d2d, bx, by, bw, bh, rad, bd_col)
                 }
 
@@ -818,15 +829,16 @@ fn photon_d2d_present(win: GuiWindow, mut app: UiApp, mut d2d: PhotonD2D, hovere
                     _p2d_fill_rrect(d2d, ix, iy, iw, ih, irad, bg_col)
                 } else if has_bd {
                     // True transparent-interior border over ANY parent background or gradient
-                    bd_col := _p2d_apply_opacity(style.border_color, style.opacity)
+                    bd_col := _p2d_apply_opacity(eff_bd_col, style.opacity)
                     _p2d_fill_rrect(d2d, bx, by, bw, bd_w, 0, bd_col)
                     _p2d_fill_rrect(d2d, bx, by + bh - bd_w, bw, bd_w, 0, bd_col)
                     _p2d_fill_rrect(d2d, bx, by, bd_w, bh, 0, bd_col)
                     _p2d_fill_rrect(d2d, bx + bw - bd_w, by, bd_w, bh, 0, bd_col)
                 }
 
-                // 3. DirectWrite Crisp Grayscale Typography (Full Vietnamese Unicode!)
-                txt := dom_get_text(app.tree, i)
+                // 3. DirectWrite Crisp ClearType Typography (Full Vietnamese Unicode!)
+                raw_txt := dom_get_text(app.tree, i)
+                txt := if is_focused { raw_txt + "|" } else { raw_txt }
                 tlen := str_len(txt)
                 if tlen > 0 and d2d.f_mb2w != 0 {
                     mut fz := style.font_size
@@ -1074,25 +1086,41 @@ fn gui_run_ui_app(mut app: UiApp, max_frames: i64 = 0, visible: bool = true) -> 
     while gui_poll_events(mut win) {
         if win.needs_redraw { dirty = true }
 
-        // Live responsive Flexbox reflow on window resize
-        if win.width > 100 and win.height > 100 and (win.width != app.width or win.height != app.height) {
-            app.width = win.width
-            app.height = win.height
+        dpi := if d2d.ok and d2d.dpi > 0 { d2d.dpi } else { 96 }
+        dip_w := (win.width * 96) / dpi
+        dip_h := (win.height * 96) / dpi
+        mx := (win.mouse_x * 96) / dpi
+        my := (win.mouse_y * 96) / dpi
+
+        // Live responsive Flexbox/Grid reflow on window resize in CSS DIPs
+        if dip_w > 100 and dip_h > 100 and (dip_w != app.width or dip_h != app.height) {
+            app.width = dip_w
+            app.height = dip_h
             if app.is_ready {
                 app.layout = layout_compute(app.tree, app.sheet, app.width, app.height)
             }
             dirty = true
         }
 
+        // Smooth mouse-wheel scrolling
+        if win.scroll_delta != 0 {
+            if ui_scroll(mut app, 0 - (win.scroll_delta / 3)) { dirty = true }
+        }
+
+        // Live Unicode / Vietnamese keyboard input into focused <input>/<textarea>
+        if win.last_char != 0 {
+            if ui_handle_char(mut app, win.last_char) { dirty = true }
+        }
+
         // Hover-node dirty check (zero redraws when cursor moves within same element!)
-        hovered := if app.is_ready { ui_hit_test(app, win.mouse_x, win.mouse_y) } else { -1 }
+        hovered := if app.is_ready { ui_hit_test(app, mx, my) } else { -1 }
         if hovered != prev_hover {
             prev_hover = hovered
             dirty = true
         }
 
         if win.mouse_down and not prev_down {
-            _ := ui_click(mut app, win.mouse_x, win.mouse_y)
+            _ := ui_click(mut app, mx, my)
             dirty = true
         }
         prev_down = win.mouse_down

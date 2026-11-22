@@ -26,6 +26,8 @@ struct UiApp {
     clicked_id: str
     state: JsStateStore
     signals: SignalGraph
+    scroll_y: i64
+    focused_idx: i64
     is_ready: bool
 }
 
@@ -51,6 +53,8 @@ fn ui_app_new(title: str, w: i64, h: i64) -> UiApp {
         clicked_id = "",
         state = st,
         signals = sig,
+        scroll_y = 0,
+        focused_idx = -1,
         is_ready = false
     )
 }
@@ -118,7 +122,7 @@ fn ui_render(mut app: UiApp) -> Canvas {
     return app.canvas
 }
 
-// Hit-testing: returns topmost DOM node index under coordinates (x, y)
+// Hit-testing: returns topmost DOM node index under coordinates (x, y) accounting for scroll_y
 fn ui_hit_test(app: UiApp, px: i64, py: i64) -> i64 {
     mut hit := -1
     mut i := 0
@@ -127,9 +131,12 @@ fn ui_hit_test(app: UiApp, px: i64, py: i64) -> i64 {
         by := layout_get_y(app.layout, i)
         bw := layout_get_w(app.layout, i)
         bh := layout_get_h(app.layout, i)
-
-        if px >= bx and px < bx + bw and py >= by and py < by + bh {
-            hit = i
+        if bw > 0 and bh > 0 {
+            st := css_compute_node_style(app.tree, i, app.sheet)
+            eff_y := if st.position == 2 { by } else { by - app.scroll_y }
+            if px >= bx and px < bx + bw and py >= eff_y and py < eff_y + bh {
+                hit = i
+            }
         }
         i += 1
     }
@@ -142,10 +149,19 @@ fn ui_hit_test_id(app: UiApp, px: i64, py: i64) -> str {
     return dom_get_id(app.tree, node_idx)
 }
 
-// Dispatches mouse click event with standard DOM bubbling, executes inline JS onclick actions, and reflows layout
+// Dispatches mouse click event with standard DOM bubbling, focus management for <input>/<textarea>, and JS onclick
 fn ui_dispatch_click(mut app: UiApp, px: i64, py: i64) -> str {
     node_idx := ui_hit_test(app, px, py)
-    if node_idx < 0 { return "" }
+    if node_idx < 0 {
+        app.focused_idx = -1
+        return ""
+    }
+    tag := dom_get_tag(app.tree, node_idx)
+    if str_eq_ignore_case(tag, "input") or str_eq_ignore_case(tag, "textarea") {
+        app.focused_idx = node_idx
+    } else {
+        app.focused_idx = -1
+    }
     mut id := dom_get_id(app.tree, node_idx)
 
     // Bubble up DOM ancestors until finding an `onclick` handler (and id if target leaf had none)
@@ -175,6 +191,61 @@ fn ui_dispatch_click(mut app: UiApp, px: i64, py: i64) -> str {
     }
 
     return id
+}
+
+// Scroll document viewport vertically (`delta_y > 0` scrolls down), clamped to content height
+fn ui_scroll(mut app: UiApp, delta_y: i64) -> bool {
+    if not app.is_ready or delta_y == 0 { return false }
+    mut max_bot := app.height
+    mut i := 0
+    while i < app.tree.count {
+        bot := layout_get_y(app.layout, i) + layout_get_h(app.layout, i)
+        if bot > max_bot { max_bot = bot }
+        i += 1
+    }
+    max_scroll := max_bot - app.height
+    mut next_y := app.scroll_y + delta_y
+    if next_y < 0 { next_y = 0 }
+    if next_y > max_scroll { next_y = max_scroll }
+    if next_y == app.scroll_y { return false }
+    app.scroll_y = next_y
+    return true
+}
+
+// Handles live Unicode keyboard input (including Vietnamese UTF-8 & Backspace) into focused <input>/<textarea>
+fn ui_handle_char(mut app: UiApp, cp: i64) -> bool {
+    if app.focused_idx < 0 or app.focused_idx >= app.tree.count { return false }
+    cur := dom_get_text(app.tree, app.focused_idx)
+    n := str_len(cur)
+    if cp == 8 { // Backspace (UTF-8 aware: strip trailing continuation bytes 0x80..0xBF + lead byte)
+        if n == 0 { return false }
+        mut cut := n - 1
+        while cut > 0 and (str_byte(cur, cut) & 0xC0) == 0x80 {
+            cut -= 1
+        }
+        dom_set_text(mut app.tree, app.focused_idx, str_slice(cur, 0, cut))
+        return true
+    }
+    if cp < 32 or cp == 127 or n >= 4096 { return false }
+    out := buf_new(n + 8)
+    buf_push_str(out, cur)
+    if cp < 0x80 {
+        buf_push(out, cp)
+    } else if cp < 0x800 {
+        buf_push(out, 0xC0 | (cp >> 6))
+        buf_push(out, 0x80 | (cp & 0x3F))
+    } else if cp < 0x10000 {
+        buf_push(out, 0xE0 | (cp >> 12))
+        buf_push(out, 0x80 | ((cp >> 6) & 0x3F))
+        buf_push(out, 0x80 | (cp & 0x3F))
+    } else {
+        buf_push(out, 0xF0 | (cp >> 18))
+        buf_push(out, 0x80 | ((cp >> 12) & 0x3F))
+        buf_push(out, 0x80 | ((cp >> 6) & 0x3F))
+        buf_push(out, 0x80 | (cp & 0x3F))
+    }
+    dom_set_text(mut app.tree, app.focused_idx, buf_to_owned_str(move out))
+    return true
 }
 
 // Reactive DOM updates from code
