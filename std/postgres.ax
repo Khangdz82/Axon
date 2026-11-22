@@ -95,8 +95,8 @@ fn pg_encode_password(pw: str) -> ByteBuf {
 // Build Parameterized Extended Query (`Parse` + `Bind` + `Describe` + `Execute` + `Sync`)
 // `params_csv`: NUL-separated or newline-separated parameter values (`param_vals` / `param_offs` / `param_lens`)
 fn pg_encode_extended_query(sql: str, param_buf: ByteBuf, param_offs: IntBuf, param_lens: IntBuf) -> ByteBuf {
-    pkt := buf_new(str_len(sql) + buf_len(param_buf) + 128)
     pcnt := ibuf_len(param_offs)
+    pkt := buf_new(str_len(sql) + buf_len(param_buf) + pcnt * 8 + 128)
 
     // 1. Parse ('P'): stmt="", sql, 0 param oids
     buf_push(pkt, 80) // 'P'
@@ -158,6 +158,7 @@ fn _pg_read_msg(sock: TcpStream, out_type: IntBuf) -> ByteBuf ! i64 {
 fn pg_connect(host: str, port: i64, user: str, password: str, database: str) -> PgConn ! i64 {
     sock := tcp_connect(host, port) or return
     _ := tcp_set_nodelay(sock, true)
+    _ := tcp_set_timeout_ms(sock, 30000)
     st := pg_encode_startup(user, database)
     sr := tcp_send_bytes(sock, st) or -1
     buf_free(move st)
@@ -178,6 +179,10 @@ fn pg_connect(host: str, port: i64, user: str, password: str, database: str) -> 
         }
         mt := ibuf_get(mtype_box, 0)
         if mt == 82 { // 'R' Authentication
+            if buf_len(payload) < 4 {
+                buf_free(move payload); buf_free(move mtype_box); tcp_close(sock)
+                return err(-303)
+            }
             auth_kind := _pg_read_be32(payload, 0)
             if auth_kind == 0 {
                 authed = true
@@ -218,6 +223,7 @@ fn _pg_read_query_result(sock: TcpStream) -> PgResult ! i64 {
     col_offs := ibuf_new(64)
     col_lens := ibuf_new(64)
     mtype_box := ibuf_new(4)
+    ibuf_push(mtype_box, 0)
     mut ncols := 0
     mut nrows := 0
     mut ok_f := true
@@ -238,37 +244,49 @@ fn _pg_read_query_result(sock: TcpStream) -> PgResult ! i64 {
         if mt == 84 { // 'T' RowDescription
             if plen >= 2 {
                 ncols = _pg_read_be16(payload, 0)
+                if ncols > 64 { ncols = 64 }
                 mut pos := 2
                 mut ci := 0
-                while ci < ncols and pos < plen {
+                while ci < ncols and pos < plen and ibuf_len(col_offs) < 64 {
                     ns := pos
                     while pos < plen and buf_get(payload, pos) != 0 { pos += 1 }
+                    mut nlen := pos - ns
+                    rem_cn := 512 - buf_len(col_names)
+                    if nlen > rem_cn { nlen = rem_cn }
                     ibuf_push(col_offs, buf_len(col_names))
-                    ibuf_push(col_lens, pos - ns)
-                    mut k := ns
-                    while k < pos { buf_push(col_names, buf_get(payload, k)); k += 1 }
+                    ibuf_push(col_lens, nlen)
+                    mut k := 0
+                    while k < nlen { buf_push(col_names, buf_get(payload, ns + k)); k += 1 }
                     pos += 1 + 18 // NUL + 18 bytes column metadata
                     ci += 1
                 }
+                ncols = ibuf_len(col_offs)
             }
         } else if mt == 68 { // 'D' DataRow
             if plen >= 2 {
-                fcnt := _pg_read_be16(payload, 0)
+                mut fcnt := _pg_read_be16(payload, 0)
+                if ncols > 0 and fcnt > ncols { fcnt = ncols }
                 mut pos := 2
                 mut ci := 0
-                while ci < fcnt and pos + 4 <= plen {
+                while ci < fcnt and pos + 4 <= plen and ibuf_len(cell_offs) < 256 {
                     flen := ffi_sext32(_pg_read_be32(payload, pos))
                     pos += 4
                     ibuf_push(cell_offs, buf_len(cell_data))
-                    if flen < 0 {
+                    if flen <= 0 {
                         ibuf_push(cell_lens, 0)
                     } else {
-                        ibuf_push(cell_lens, flen)
+                        mut avail := plen - pos
+                        if flen < avail { avail = flen }
+                        rem_cd := 4096 - buf_len(cell_data)
+                        mut copy_n := avail
+                        if copy_n > rem_cd { copy_n = rem_cd }
+                        ibuf_push(cell_lens, copy_n)
                         mut k := 0
-                        while k < flen and pos < plen {
-                            buf_push(cell_data, buf_get(payload, pos))
-                            pos += 1; k += 1
+                        while k < copy_n {
+                            buf_push(cell_data, buf_get(payload, pos + k))
+                            k += 1
                         }
+                        pos += avail
                     }
                     ci += 1
                 }
@@ -318,15 +336,18 @@ fn pg_query(conn: PgConn, sql: str) -> PgResult ! i64 {
 fn pg_result_get(res: PgResult, row: i64, col: i64) -> str {
     if row < 0 or row >= res.row_count or col < 0 or col >= res.col_count { return "" }
     idx := row * res.col_count + col
+    if idx < 0 or idx >= ibuf_len(res.cell_offs) { return "" }
     off := ibuf_get(res.cell_offs, idx)
     ln := ibuf_get(res.cell_lens, idx)
+    if off < 0 or ln < 0 or off + ln > buf_len(res.cell_data) { return "" }
     return buf_slice_str(res.cell_data, off, off + ln)
 }
 
 fn pg_result_col_name(res: PgResult, col: i64) -> str {
-    if col < 0 or col >= res.col_count { return "" }
+    if col < 0 or col >= res.col_count or col >= ibuf_len(res.col_offs) { return "" }
     off := ibuf_get(res.col_offs, col)
     ln := ibuf_get(res.col_lens, col)
+    if off < 0 or ln < 0 or off + ln > buf_len(res.col_names) { return "" }
     return buf_slice_str(res.col_names, off, off + ln)
 }
 

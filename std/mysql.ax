@@ -193,6 +193,7 @@ fn _my_read_lenenc(b: ByteBuf, pos_box: IntBuf) -> i64 {
 fn mysql_connect(host: str, port: i64, user: str, password: str, database: str) -> MysqlConn ! i64 {
     sock := tcp_connect(host, port) or return
     _ := tcp_set_nodelay(sock, true)
+    _ := tcp_set_timeout_ms(sock, 30000)
 
     // 1. Read Initial Handshake v10 packet
     hs := _my_recv_pkt(sock) or buf_new(0)
@@ -289,10 +290,14 @@ fn mysql_query(conn: MysqlConn, sql: str) -> MysqlResult ! i64 {
         ))
     }
     if tag == 0xFF { // ERR Packet
-        ec := buf_get(first, 1) | (buf_get(first, 2) << 8)
+        mut ec := 0
+        if flen >= 3 {
+            ec = buf_get(first, 1) | (buf_get(first, 2) << 8)
+        }
         mut ms := 3
         if flen > 9 and buf_get(first, 3) == 35 { ms = 9 } // skip #SQLSTATE
-        em := buf_slice_str(first, ms, flen)
+        mut em := ""
+        if flen > ms { em = buf_slice_str(first, ms, flen) }
         buf_free(move first)
         return ok(MysqlResult(
             col_count = 0, row_count = 0, affected_rows = 0, last_insert_id = 0,
@@ -301,16 +306,25 @@ fn mysql_query(conn: MysqlConn, sql: str) -> MysqlResult ! i64 {
         ))
     }
 
-    // ResultSet: first packet = column count
+    // ResultSet: first packet = column count (bounded against malicious server DoS)
     pbox := ibuf_new(2); ibuf_push(pbox, 0)
     ncols := _my_read_lenenc(first, pbox)
     buf_free(move first)
+    if ncols <= 0 or ncols > 4096 {
+        buf_free(move pbox)
+        buf_free(move cell_data); buf_free(move cell_offs); buf_free(move cell_lens)
+        return err(-413)
+    }
 
     // Read `ncols` ColumnDefinition41 packets + intermediate EOF packet
     mut ci := 0
     while ci < ncols {
         cd := _my_recv_pkt(conn.sock) or buf_new(0)
-        if buf_len(cd) == 0 { buf_free(move cd); buf_free(move pbox); return err(-412) }
+        if buf_len(cd) == 0 {
+            buf_free(move cd); buf_free(move pbox)
+            buf_free(move cell_data); buf_free(move cell_offs); buf_free(move cell_lens)
+            return err(-412)
+        }
         buf_free(move cd)
         ci += 1
     }
@@ -330,20 +344,26 @@ fn mysql_query(conn: MysqlConn, sql: str) -> MysqlResult ! i64 {
         }
         ibuf_set(pbox, 0, 0)
         mut c := 0
-        while c < ncols {
+        while c < ncols and ibuf_len(cell_offs) < 256 {
             clen := _my_read_lenenc(rp, pbox)
             ibuf_push(cell_offs, buf_len(cell_data))
-            if clen < 0 {
+            if clen <= 0 {
                 ibuf_push(cell_lens, 0)
             } else {
-                ibuf_push(cell_lens, clen)
                 cur := ibuf_get(pbox, 0)
+                mut avail := rlen - cur
+                if avail < 0 { avail = 0 }
+                if clen < avail { avail = clen }
+                rem_cd := 4096 - buf_len(cell_data)
+                mut copy_n := avail
+                if copy_n > rem_cd { copy_n = rem_cd }
+                ibuf_push(cell_lens, copy_n)
                 mut k := 0
-                while k < clen and cur + k < rlen {
+                while k < copy_n {
                     buf_push(cell_data, buf_get(rp, cur + k))
                     k += 1
                 }
-                ibuf_set(pbox, 0, cur + clen)
+                ibuf_set(pbox, 0, cur + avail)
             }
             c += 1
         }
@@ -361,8 +381,10 @@ fn mysql_query(conn: MysqlConn, sql: str) -> MysqlResult ! i64 {
 fn mysql_result_get(res: MysqlResult, row: i64, col: i64) -> str {
     if row < 0 or row >= res.row_count or col < 0 or col >= res.col_count { return "" }
     idx := row * res.col_count + col
+    if idx < 0 or idx >= ibuf_len(res.cell_offs) { return "" }
     off := ibuf_get(res.cell_offs, idx)
     ln := ibuf_get(res.cell_lens, idx)
+    if off < 0 or ln < 0 or off + ln > buf_len(res.cell_data) { return "" }
     return buf_slice_str(res.cell_data, off, off + ln)
 }
 

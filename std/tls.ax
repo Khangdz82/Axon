@@ -19,6 +19,7 @@ struct OpenSslApi {
     fn_ctx_use_cert: i64
     fn_ctx_use_key: i64
     fn_ctx_set_alpn: i64
+    fn_ctx_ctrl: i64
     fn_ssl_new: i64
     fn_ssl_free: i64
     fn_ssl_set_fd: i64
@@ -67,6 +68,7 @@ fn tls_load_openssl() -> OpenSslApi ! i64 {
         fn_ctx_use_cert = ffi_sym(lib, "SSL_CTX_use_certificate_file"),
         fn_ctx_use_key = ffi_sym(lib, "SSL_CTX_use_PrivateKey_file"),
         fn_ctx_set_alpn = ffi_sym(lib, "SSL_CTX_set_alpn_protos"),
+        fn_ctx_ctrl = ffi_sym(lib, "SSL_CTX_ctrl"),
         fn_ssl_new = ffi_sym(lib, "SSL_new"),
         fn_ssl_free = ffi_sym(lib, "SSL_free"),
         fn_ssl_set_fd = ffi_sym(lib, "SSL_set_fd"),
@@ -94,7 +96,11 @@ fn tls_ctx_client() -> TlsCtx ! i64 {
     if meth == 0 { return err(-102) }
     ctx := ffi_call1(api.fn_ctx_new, meth)
     if ctx == 0 { return err(-103) }
-    // Secure-by-default (CWE-295): enforce peer certificate verification + system CA trust store
+    // Secure-by-default (CWE-295 / CWE-327): enforce TLS 1.2+ minimum, peer cert verification & system CA store
+    if api.fn_ctx_ctrl != 0 {
+        // SSL_CTRL_SET_MIN_PROTO_VERSION = 123, TLS1_2_VERSION = 0x0303
+        _ := ffi_call4(api.fn_ctx_ctrl, ctx, 123, 0x0303, 0)
+    }
     if api.fn_ctx_set_verify != 0 {
         _ := ffi_call3(api.fn_ctx_set_verify, ctx, 1, 0) // SSL_VERIFY_PEER = 1
     }
@@ -117,6 +123,10 @@ fn tls_ctx_server(cert_pem_path: str, key_pem_path: str) -> TlsCtx ! i64 {
     if meth == 0 { return err(-104) }
     ctx := ffi_call1(api.fn_ctx_new, meth)
     if ctx == 0 { return err(-105) }
+    if api.fn_ctx_ctrl != 0 {
+        // Enforce TLS 1.2+ minimum on server contexts (CWE-327)
+        _ := ffi_call4(api.fn_ctx_ctrl, ctx, 123, 0x0303, 0)
+    }
     cc := ffi_cstr(cert_pem_path)
     ck := ffi_cstr(key_pem_path)
     rc1 := ffi_sext32(ffi_call3(api.fn_ctx_use_cert, ctx, cc, 1)) // SSL_FILETYPE_PEM = 1
@@ -165,8 +175,13 @@ fn tls_wrap_client(ctx: TlsCtx, sock: TcpStream, sni_host: str) -> TlsStream ! i
             _ := ffi_call4(ctx.api.fn_ssl_ctrl, ssl, 55, 0, sh)
         }
         if ctx.api.fn_ssl_set1_host != 0 {
-            // CWE-297: bind peer certificate hostname verification to SNI host
-            _ := ffi_call2(ctx.api.fn_ssl_set1_host, ssl, sh)
+            // CWE-297: bind peer certificate hostname verification to SNI host; fail closed if rejected
+            hr := ffi_sext32(ffi_call2(ctx.api.fn_ssl_set1_host, ssl, sh))
+            if hr != 1 {
+                ffi_free(sh)
+                _ := ffi_call1(ctx.api.fn_ssl_free, ssl)
+                return err(-114)
+            }
         }
         ffi_free(sh)
     }
@@ -256,13 +271,13 @@ fn tls_winhttp_available() -> bool {
     return h != 0
 }
 
-// Rejects CR, LF, NUL, and control chars to block HTTP Request Smuggling / CRLF Injection (CWE-113)
+// Rejects CR, LF, NUL, whitespace, and control chars to block HTTP Request-Line / CRLF Injection (CWE-113)
 fn tls_is_safe_http_token(s: str) -> bool {
     n := str_len(s)
     mut i := 0
     while i < n {
         b := str_byte(s, i)
-        if b <= 31 or b == 127 { return false }
+        if b <= 32 or b >= 127 { return false }
         i += 1
     }
     return n > 0
@@ -322,8 +337,14 @@ fn https_request(method: str, host: str, port: i64, path: str, headers: str = ""
         }
         h_con := ffi_call4(f_conn, h_ses, w_host, port, 0)
         // WINHTTP_FLAG_SECURE = 0x00800000
-        h_rq := ffi_call7(f_req, h_con, w_meth, w_path, 0, 0, 0, 0x00800000)
-        ok_s := (ffi_call7(f_send, h_rq, w_hdrs, hlen, bptr, blen, blen, 0) & 0xFFFFFFFF) != 0
+        mut h_rq := 0
+        if h_con != 0 {
+            h_rq = ffi_call7(f_req, h_con, w_meth, w_path, 0, 0, 0, 0x00800000)
+        }
+        mut ok_s := false
+        if h_rq != 0 {
+            ok_s = (ffi_call7(f_send, h_rq, w_hdrs, hlen, bptr, blen, blen, 0) & 0xFFFFFFFF) != 0
+        }
         mut ok_r := false
         if ok_s { ok_r = (ffi_call2(f_recv, h_rq, 0) & 0xFFFFFFFF) != 0 }
 
@@ -387,8 +408,9 @@ fn https_request(method: str, host: str, port: i64, path: str, headers: str = ""
     // OpenSSL fallback for Linux / macOS
     ctx := tls_ctx_client() or return
     sock := tcp_connect(host, port) or return
+    _ := tcp_set_timeout_ms(sock, 30000)
     ts := tls_wrap_client(ctx, sock, host) or return
-    req := buf_new(str_len(path) + str_len(headers) + str_len(body) + 256)
+    req := buf_new(str_len(method) + str_len(host) + str_len(path) + str_len(headers) + str_len(body) + 256)
     buf_push_str(req, f"{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n")
     if str_len(headers) > 0 { buf_push_str(req, headers); buf_push_str(req, "\r\n") }
     if str_len(body) > 0 { buf_push_str(req, f"Content-Length: {str_len(body)}\r\n") }

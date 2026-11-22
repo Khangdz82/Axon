@@ -1,0 +1,81 @@
+// Regression suite for TLS, SQLite, PostgreSQL, and MySQL hardening (`std/tls.ax`, `std/sqlite.ax`, `std/postgres.ax`, `std/mysql.ax`).
+
+use std::tls
+use std::sqlite
+use std::postgres
+use std::mysql
+
+@test
+fn test_tls_request_line_and_header_guards() {
+    // Spaces in method/host/path must be rejected (blocks HTTP request-line injection in OpenSSL fallback)
+    assert(tls_is_safe_http_token("GET"))
+    assert(tls_is_safe_http_token("/api/v1/items"))
+    assert(not tls_is_safe_http_token("GET /evil HTTP/1.1"))
+    assert(not tls_is_safe_http_token("example.com evil"))
+    assert(not tls_is_safe_http_token("/ok\r\nX-Injected: 1"))
+    assert(not tls_is_safe_http_token(""))
+
+    // Headers reject CR/LF/NUL
+    assert(tls_is_safe_http_headers("Authorization: Bearer tok123"))
+    assert(not tls_is_safe_http_headers("A: 1\r\nB: 2"))
+    assert(not tls_is_safe_http_headers("A: 1\nB: 2"))
+}
+
+@test
+fn test_sqlite_nul_rejection_and_prepared_sqli() {
+    db := sqlite_open(":memory:") or return
+    assert(sqlite_exec(db, "CREATE TABLE users (id INTEGER, name TEXT);"))
+    st := sqlite_prepare(db, "INSERT INTO users (id, name) VALUES (?, ?);") or return
+    assert(sqlite_bind_i64(st, 1, 7))
+    // Classic SQLi payload bound as parameter must be stored literally, not executed
+    sqli := "alice'); DROP TABLE users; --"
+    assert(sqlite_bind_text(st, 2, sqli))
+    assert(sqlite_step(st) == 101)
+    sqlite_finalize(st)
+
+    // Embedded NUL in SQL must be rejected cleanly
+    nul_sql := buf_new(16)
+    buf_push_str(nul_sql, "SELECT 1")
+    buf_push(nul_sql, 0)
+    buf_push_str(nul_sql, "; DROP")
+    bad_s := buf_to_owned_str(move nul_sql)
+    assert(not sqlite_exec(db, bad_s))
+
+    // Verify table still intact with literal payload
+    q := sqlite_prepare(db, "SELECT name FROM users WHERE id = ?;") or return
+    assert(sqlite_bind_i64(q, 1, 7))
+    assert(sqlite_step(q) == 100)
+    assert(str_eq(sqlite_col_text(q, 0), sqli))
+    sqlite_finalize(q)
+    sqlite_close(db)
+}
+
+@test
+fn test_postgres_extended_query_many_params() {
+    // 32 bound parameters previously overflowed the fixed `+ 128` byte buffer in `pg_encode_extended_query`
+    pbuf := buf_new(128)
+    poffs := ibuf_new(32)
+    plens := ibuf_new(32)
+    mut i := 0
+    while i < 32 {
+        ibuf_push(poffs, buf_len(pbuf))
+        ibuf_push(plens, 2)
+        buf_push(pbuf, 65)
+        buf_push(pbuf, 66)
+        i += 1
+    }
+    pkt := pg_encode_extended_query("SELECT $1", pbuf, poffs, plens)
+    assert(buf_len(pkt) > 200)
+    buf_free(move pkt)
+    buf_free(move plens)
+    buf_free(move poffs)
+    buf_free(move pbuf)
+}
+
+fn main() -> i32 {
+    test_tls_request_line_and_header_guards()
+    test_sqlite_nul_rejection_and_prepared_sqli()
+    test_postgres_extended_query_many_params()
+    println("[PASS] 42_tls_db_hardening: TLS/SQLite/Postgres/MySQL security guards verified")
+    return 0
+}

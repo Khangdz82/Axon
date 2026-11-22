@@ -219,6 +219,8 @@ fn h2_recv_frame(sock: TcpStream) -> H2Frame ! i64 {
     fl := buf_get(hdr, 4)
     sid := ((buf_get(hdr, 5) & 0x7F) << 24) | (buf_get(hdr, 6) << 16) | (buf_get(hdr, 7) << 8) | buf_get(hdr, 8)
     buf_free(move hdr)
+    // CWE-770: a 24-bit length lets a peer force a 16 MB allocation per frame; cap at the gRPC message cap (RFC 9113 FRAME_SIZE_ERROR)
+    if plen > 4194304 { return err(-514) }
     if plen == 0 {
         return ok(H2Frame(ftype = ft, flags = fl, stream_id = sid, payload = buf_new(0)))
     }
@@ -245,7 +247,7 @@ fn _hpack_push_hdr(b: ByteBuf, name: str, val: str) {
 }
 
 fn hpack_encode_grpc_request(authority: str, service_method: str) -> ByteBuf {
-    b := buf_new(256)
+    b := buf_new(str_len(authority) + str_len(service_method) + 256)
     buf_push(b, 0x83) // Static index 3: `:method: POST`
     buf_push(b, 0x86) // Static index 6: `:scheme: http`
     _hpack_push_hdr(b, ":path", service_method)
@@ -256,7 +258,7 @@ fn hpack_encode_grpc_request(authority: str, service_method: str) -> ByteBuf {
 }
 
 fn hpack_encode_grpc_response(grpc_status: i64, grpc_msg: str) -> ByteBuf {
-    b := buf_new(128)
+    b := buf_new(str_len(grpc_msg) + 128)
     buf_push(b, 0x88) // Static index 8: `:status: 200`
     _hpack_push_hdr(b, "content-type", "application/grpc")
     _hpack_push_hdr(b, "grpc-status", f"{grpc_status}")
@@ -264,29 +266,87 @@ fn hpack_encode_grpc_response(grpc_status: i64, grpc_msg: str) -> ByteBuf {
     return b
 }
 
-fn hpack_find_header(block: ByteBuf, target_name: str) -> str {
+// HPACK prefixed integer (RFC 7541 §5.1). Returns -1 on truncation/overflow; advances `pos[0]`.
+fn _hpack_int(block: ByteBuf, pos: IntBuf, mask: i64) -> i64 {
     n := buf_len(block)
-    mut p := 0
-    while p < n {
-        b0 := buf_get(block, p)
-        if (b0 & 0x80) != 0 {
-            p += 1 // indexed static header
-        } else if b0 == 0x00 or b0 == 0x10 or b0 == 0x40 {
+    mut p := ibuf_get(pos, 0)
+    if p >= n { return -1 }
+    mut v := buf_get(block, p) & mask
+    p += 1
+    if v == mask {
+        mut shift := 0
+        while true {
+            if p >= n or shift > 28 { return -1 }
+            b := buf_get(block, p)
             p += 1
-            if p >= n { break }
-            nlen := buf_get(block, p) & 0x7F; p += 1
-            if p + nlen > n { break }
-            nm := buf_slice_str(block, p, p + nlen); p += nlen
-            if p >= n { break }
-            vlen := buf_get(block, p) & 0x7F; p += 1
-            if p + vlen > n { break }
-            vl := buf_slice_str(block, p, p + vlen); p += vlen
-            if str_eq(nm, target_name) { return vl }
-        } else {
-            p += 1
+            v = v + ((b & 0x7F) << shift)
+            if (b & 0x80) == 0 { break }
+            shift += 7
         }
     }
-    return ""
+    ibuf_set(pos, 0, p)
+    return v
+}
+
+// Reads one HPACK string literal; returns "" for Huffman-coded strings (unsupported: never mis-decode them as raw bytes).
+// `ok_box[0]` = 1 on success, 0 on malformed input.
+fn _hpack_str(block: ByteBuf, pos: IntBuf, ok_box: IntBuf) -> str {
+    n := buf_len(block)
+    p0 := ibuf_get(pos, 0)
+    if p0 >= n { ibuf_set(ok_box, 0, 0); return "" }
+    huff := (buf_get(block, p0) & 0x80) != 0
+    slen := _hpack_int(block, pos, 0x7F)
+    p1 := ibuf_get(pos, 0)
+    if slen < 0 or slen > n - p1 { ibuf_set(ok_box, 0, 0); return "" }
+    ibuf_set(pos, 0, p1 + slen)
+    if huff { return "" }
+    return buf_slice_str(block, p1, p1 + slen)
+}
+
+// Finds a literal header by name. Handles multi-byte lengths, indexed-name literals, table-size updates
+// and Huffman strings without desynchronising (CWE-130 / header-smuggling via mis-parsed length prefixes).
+fn hpack_find_header(block: ByteBuf, target_name: str) -> str {
+    n := buf_len(block)
+    pos := ibuf_new(2)
+    ibuf_push(pos, 0)
+    okb := ibuf_new(2)
+    ibuf_push(okb, 1)
+    mut result := ""
+    while ibuf_get(pos, 0) < n {
+        b0 := buf_get(block, ibuf_get(pos, 0))
+        if (b0 & 0x80) != 0 {
+            if _hpack_int(block, pos, 0x7F) < 0 { break }
+        } else if (b0 & 0xE0) == 0x20 {
+            if _hpack_int(block, pos, 0x1F) < 0 { break }
+        } else {
+            mask := if (b0 & 0xC0) == 0x40 { 0x3F } else { 0x0F }
+            idx := _hpack_int(block, pos, mask)
+            if idx < 0 { break }
+            mut nm := ""
+            if idx == 0 { nm = _hpack_str(block, pos, okb) }
+            vl := _hpack_str(block, pos, okb)
+            if ibuf_get(okb, 0) == 0 { break }
+            if idx == 0 and str_len(nm) > 0 and str_eq(nm, target_name) { result = vl; break }
+        }
+    }
+    buf_free(move okb)
+    buf_free(move pos)
+    return result
+}
+
+// Validates an incoming `:path` before it reaches application dispatch (CWE-20 / log & route injection).
+fn grpc_is_safe_method_path(p: str) -> bool {
+    n := str_len(p)
+    if n < 2 or n > 512 { return false }
+    if str_byte(p, 0) != 47 { return false }
+    mut i := 0
+    while i < n {
+        b := str_byte(p, i)
+        if b <= 32 or b >= 127 { return false }
+        if b == 46 and i + 1 < n and str_byte(p, i + 1) == 46 { return false }
+        i += 1
+    }
+    return true
 }
 
 // ==================== 3. gRPC LENGTH-PREFIXED MESSAGE & LIVE RPC ====================
@@ -307,8 +367,11 @@ fn grpc_frame_encode(pb_payload: ByteBuf, compressed: bool = false) -> ByteBuf {
 fn grpc_frame_decode(frame_data: ByteBuf) -> ByteBuf ! i64 {
     n := buf_len(frame_data)
     if n < 5 { return err(-500) }
+    // Compressed flag set but no `grpc-encoding` is negotiated/implemented: reject instead of parsing ciphertext-like bytes as protobuf
+    if buf_get(frame_data, 0) != 0 { return err(-502) }
     mlen := (buf_get(frame_data, 1) << 24) | (buf_get(frame_data, 2) << 16) | (buf_get(frame_data, 3) << 8) | buf_get(frame_data, 4)
-    if mlen < 0 or mlen > n - 5 { return err(-501) }
+    // Unary RPC carries exactly one message: trailing bytes are a framing violation, not ignorable padding
+    if mlen < 0 or mlen != n - 5 { return err(-501) }
     out := buf_new(mlen + 4)
     mut i := 0
     while i < mlen { buf_push(out, buf_get(frame_data, 5 + i)); i += 1 }
@@ -341,6 +404,7 @@ struct GrpcIncoming {
 fn grpc_connect(host: str, port: i64) -> GrpcChannel ! i64 {
     sock := tcp_connect(host, port) or return
     _ := tcp_set_nodelay(sock, true)
+    _ := tcp_set_timeout_ms(sock, 30000)
     // Send HTTP/2 client connection preface + empty SETTINGS frame
     r0 := tcp_send_str(sock, h2_client_preface()) or -1
     if r0 < 0 { tcp_close(sock); return err(-510) }
@@ -354,6 +418,8 @@ fn grpc_connect(host: str, port: i64) -> GrpcChannel ! i64 {
 }
 
 fn grpc_unary_call(mut ch: GrpcChannel, service_method: str, req_pb: ByteBuf) -> GrpcResponse ! i64 {
+    if buf_len(req_pb) > 4194304 { return err(-514) }
+    if not grpc_is_safe_method_path(service_method) { return err(-515) }
     sid := ch.next_stream_id
     ch.next_stream_id += 2
 
@@ -437,6 +503,8 @@ fn grpc_listen(bind_ip: str, port: i64) -> GrpcServer ! i64 {
 fn grpc_server_accept_unary(srv: GrpcServer) -> GrpcIncoming ! i64 {
     sock := tcp_accept(srv.listener) or return
     _ := tcp_set_nodelay(sock, true)
+    // CWE-400: bound how long one silent peer can hold the (serial) accept loop
+    _ := tcp_set_timeout_ms(sock, 30000)
     // Read & verify 24-byte HTTP/2 client preface
     pref := tcp_recv_exact(sock, 24) or buf_new(0)
     plen := buf_len(pref)
@@ -467,11 +535,13 @@ fn grpc_server_accept_unary(srv: GrpcServer) -> GrpcIncoming ! i64 {
             _ := tcp_send_bytes(sock, ack) or 0
             buf_free(move ack)
         } else if fr.ftype == h2_frame_headers() {
+            // Client-initiated streams are odd & non-zero (RFC 9113 §5.1.1); only the first stream is served
+            if fr.stream_id == 0 or (fr.stream_id & 1) == 0 { buf_free(move fr.payload); break }
             req_sid = fr.stream_id
             mp := hpack_find_header(fr.payload, ":path")
             if str_len(mp) > 0 { mpath = mp }
             if (fr.flags & h2_flag_end_stream()) != 0 { buf_free(move fr.payload); break }
-        } else if fr.ftype == h2_frame_data() {
+        } else if fr.ftype == h2_frame_data() and fr.stream_id == req_sid {
             pl := buf_len(fr.payload)
             cur_l := buf_len(req_raw)
             if cur_l + pl > max_req_msg { buf_free(move fr.payload); break }
@@ -494,10 +564,22 @@ fn grpc_server_accept_unary(srv: GrpcServer) -> GrpcIncoming ! i64 {
     }
     pb_in := grpc_frame_decode(req_raw) or buf_new(0)
     buf_free(move req_raw)
+    if not grpc_is_safe_method_path(mpath) {
+        buf_free(move pb_in)
+        tcp_close(sock)
+        return err(-521)
+    }
     return ok(GrpcIncoming(sock = sock, stream_id = req_sid, method_path = mpath, payload = pb_in))
 }
 
 fn grpc_server_reply(inc: GrpcIncoming, resp_pb: ByteBuf, grpc_status: i64 = 0, grpc_msg: str = "") -> bool {
+    // CWE-190: an H2 frame length is 24-bit; larger payloads would wrap and desynchronise the stream
+    if buf_len(resp_pb) > 4194304 {
+        eb := buf_new(0)
+        _ := grpc_server_reply(inc, eb, 8, "response too large")
+        buf_free(move eb)
+        return false
+    }
     hblk := hpack_encode_grpc_response(grpc_status, grpc_msg)
     hf := h2_encode_frame(h2_frame_headers(), h2_flag_end_headers(), inc.stream_id, hblk)
     buf_free(move hblk)

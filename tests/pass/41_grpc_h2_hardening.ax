@@ -1,0 +1,92 @@
+// Regression suite for gRPC / HTTP2 / HPACK / socket-timeout hardening (`std/grpc.ax`, `std/net.ax`).
+
+use std::grpc
+use std::net
+
+@test
+fn test_hpack_long_values_and_malformed() {
+    // 1. Values >= 127 bytes need a multi-byte HPACK length; the old 7-bit parser desynchronised here
+    mut long_path := "/"
+    mut i := 0
+    while i < 200 { long_path = long_path + "a"; i += 1 }
+    b := hpack_encode_grpc_request("host:1", long_path)
+    assert(str_eq(hpack_find_header(b, ":path"), long_path))
+    assert(str_eq(hpack_find_header(b, "content-type"), "application/grpc"))
+    buf_free(move b)
+
+    // 2. Huffman-coded value (H bit set) must not be mis-decoded as raw bytes
+    h := buf_new(32)
+    buf_push(h, 0x00)
+    buf_push(h, 5); buf_push_str(h, ":path")
+    buf_push(h, 0x83); buf_push(h, 1); buf_push(h, 2); buf_push(h, 3)
+    assert(str_len(hpack_find_header(h, ":path")) == 0)
+    buf_free(move h)
+
+    // 3. Truncated literal (declared length beyond block) is rejected, never read OOB
+    t := buf_new(16)
+    buf_push(t, 0x00)
+    buf_push(t, 5); buf_push_str(t, ":path")
+    buf_push(t, 120); buf_push_str(t, "/x")
+    assert(str_len(hpack_find_header(t, ":path")) == 0)
+    buf_free(move t)
+}
+
+@test
+fn test_grpc_frame_strictness_and_paths() {
+    // compressed flag set -> rejected (no grpc-encoding implemented)
+    c := buf_new(8)
+    buf_push(c, 1); buf_push(c, 0); buf_push(c, 0); buf_push(c, 0); buf_push(c, 1); buf_push(c, 65)
+    assert(buf_len(grpc_frame_decode(c) or buf_new(0)) == 0)
+    buf_free(move c)
+
+    // trailing bytes after the single unary message -> rejected
+    tr := buf_new(8)
+    buf_push(tr, 0); buf_push(tr, 0); buf_push(tr, 0); buf_push(tr, 0); buf_push(tr, 1); buf_push(tr, 65); buf_push(tr, 66)
+    assert(buf_len(grpc_frame_decode(tr) or buf_new(0)) == 0)
+    buf_free(move tr)
+
+    // exact frame -> accepted
+    ok_f := buf_new(8)
+    buf_push(ok_f, 0); buf_push(ok_f, 0); buf_push(ok_f, 0); buf_push(ok_f, 0); buf_push(ok_f, 1); buf_push(ok_f, 65)
+    d := grpc_frame_decode(ok_f) or buf_new(0)
+    assert(buf_len(d) == 1)
+    buf_free(move d)
+    buf_free(move ok_f)
+
+    assert(grpc_is_safe_method_path("/axon.Greeter/SayHello"))
+    assert(not grpc_is_safe_method_path(""))
+    assert(not grpc_is_safe_method_path("no-slash"))
+    assert(not grpc_is_safe_method_path("/a/../b"))
+    assert(not grpc_is_safe_method_path("/a\r\nX: y"))
+}
+
+@test
+fn test_h2_oversize_frame_rejected_and_timeout() {
+    ln := tcp_listen("127.0.0.1", 49177, 4) or return
+    cli := tcp_connect("127.0.0.1", 49177) or return
+    srv := tcp_accept(ln) or return
+    // Frame header claiming a 16 MB payload (0xFFFFFF) must be refused before allocating it
+    hdr := buf_new(16)
+    buf_push(hdr, 0xFF); buf_push(hdr, 0xFF); buf_push(hdr, 0xFF)
+    buf_push(hdr, 0); buf_push(hdr, 0)
+    buf_push(hdr, 0); buf_push(hdr, 0); buf_push(hdr, 0); buf_push(hdr, 1)
+    _ := tcp_send_bytes(cli, hdr) or -1
+    buf_free(move hdr)
+    mut rejected := false
+    fr := h2_recv_frame(srv) or H2Frame(ftype = -1, flags = 0, stream_id = 0, payload = buf_new(0))
+    if fr.ftype == -1 { rejected = true }
+    buf_free(move fr.payload)
+    assert(rejected)
+
+    assert(tcp_set_timeout_ms(srv, 500))
+    assert(not tcp_set_timeout_ms(srv, 0))
+    tcp_close(srv); tcp_close(cli); tcp_listener_close(ln)
+}
+
+fn main() -> i32 {
+    test_hpack_long_values_and_malformed()
+    test_grpc_frame_strictness_and_paths()
+    test_h2_oversize_frame_rejected_and_timeout()
+    println("[PASS] 41_grpc_h2_hardening: HPACK / gRPC framing / H2 frame cap / timeout verified")
+    return 0
+}
