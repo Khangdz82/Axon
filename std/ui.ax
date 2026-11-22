@@ -27,6 +27,7 @@ struct UiApp {
     state: JsStateStore
     signals: SignalGraph
     scroll_y: i64
+    node_scrolls: IntBuf
     focused_idx: i64
     is_ready: bool
 }
@@ -54,6 +55,7 @@ fn ui_app_new(title: str, w: i64, h: i64) -> UiApp {
         state = st,
         signals = sig,
         scroll_y = 0,
+        node_scrolls = map_new(64),
         focused_idx = -1,
         is_ready = false
     )
@@ -122,25 +124,58 @@ fn ui_render(mut app: UiApp) -> Canvas {
     return app.canvas
 }
 
-// Hit-testing: returns topmost DOM node index under coordinates (x, y) accounting for scroll_y
-fn ui_hit_test(app: UiApp, px: i64, py: i64) -> i64 {
-    mut hit := -1
-    mut i := 0
-    while i < app.tree.count {
-        bx := layout_get_x(app.layout, i)
-        by := layout_get_y(app.layout, i)
-        bw := layout_get_w(app.layout, i)
-        bh := layout_get_h(app.layout, i)
-        if bw > 0 and bh > 0 {
-            st := css_compute_node_style(app.tree, i, app.sheet)
-            eff_y := if st.position == 2 { by } else { by - app.scroll_y }
-            if px >= bx and px < bx + bw and py >= eff_y and py < eff_y + bh {
-                hit = i
-            }
-        }
-        i += 1
+fn ui_node_scroll_y(app: UiApp, node_idx: i64) -> i64 {
+    if node_idx < 0 { return 0 }
+    return map_get(app.node_scrolls, node_idx + 1, 0)
+}
+
+fn ui_node_content_height(app: UiApp, node_idx: i64) -> i64 {
+    if node_idx < 0 or node_idx >= app.tree.count { return 0 }
+    top_y := layout_get_y(app.layout, node_idx)
+    mut max_bot := top_y
+    mut ch := dom_first_child(app.tree, node_idx)
+    while ch >= 0 {
+        bot := layout_get_y(app.layout, ch) + layout_get_h(app.layout, ch)
+        if bot > max_bot { max_bot = bot }
+        ch = dom_next_sibling(app.tree, ch)
+    }
+    return max_bot - top_y
+}
+
+fn _ui_hit_test_rec(app: UiApp, node_idx: i64, px: i64, py: i64, acc_scroll_y: i64) -> i64 {
+    if node_idx < 0 or node_idx >= app.tree.count { return -1 }
+    bx := layout_get_x(app.layout, node_idx)
+    by := layout_get_y(app.layout, node_idx)
+    bw := layout_get_w(app.layout, node_idx)
+    bh := layout_get_h(app.layout, node_idx)
+    st := css_compute_node_style(app.tree, node_idx, app.sheet)
+    if st.display == 3 { return -1 }
+
+    eff_y := if st.position == 2 { by } else { by - acc_scroll_y }
+    inside := bw > 0 and bh > 0 and px >= bx and px < bx + bw and py >= eff_y and py < eff_y + bh
+
+    // If container clips overflow and point is outside, skip its subtree
+    if (st.overflow_hidden or st.overflow_scroll) and not inside {
+        return -1
+    }
+
+    mut hit := if inside { node_idx } else { -1 }
+    own_scroll := if st.overflow_scroll { ui_node_scroll_y(app, node_idx) } else { 0 }
+    child_scroll := if st.position == 2 { own_scroll } else { acc_scroll_y + own_scroll }
+
+    mut ch := dom_first_child(app.tree, node_idx)
+    while ch >= 0 {
+        sub := _ui_hit_test_rec(app, ch, px, py, child_scroll)
+        if sub >= 0 { hit = sub }
+        ch = dom_next_sibling(app.tree, ch)
     }
     return hit
+}
+
+// Hit-testing: returns topmost DOM node index under (px, py) respecting nested overflow clips & scroll offsets
+fn ui_hit_test(app: UiApp, px: i64, py: i64) -> i64 {
+    if app.tree.root_idx < 0 { return -1 }
+    return _ui_hit_test_rec(app, app.tree.root_idx, px, py, app.scroll_y)
 }
 
 fn ui_hit_test_id(app: UiApp, px: i64, py: i64) -> str {
@@ -210,6 +245,35 @@ fn ui_scroll(mut app: UiApp, delta_y: i64) -> bool {
     if next_y == app.scroll_y { return false }
     app.scroll_y = next_y
     return true
+}
+
+// Scroll innermost scrollable container under (px, py), or fall back to viewport scroll
+fn ui_scroll_at(mut app: UiApp, px: i64, py: i64, delta_y: i64) -> bool {
+    if not app.is_ready or delta_y == 0 { return false }
+    mut cur := ui_hit_test(app, px, py)
+    mut depth := 0
+    while cur >= 0 and depth < 64 {
+        st := css_compute_node_style(app.tree, cur, app.sheet)
+        if st.overflow_scroll {
+            bh := layout_get_h(app.layout, cur)
+            ch := ui_node_content_height(app, cur)
+            if ch > bh and bh > 0 {
+                max_s := ch - bh
+                cur_s := ui_node_scroll_y(app, cur)
+                mut next_s := cur_s + delta_y
+                if next_s < 0 { next_s = 0 }
+                if next_s > max_s { next_s = max_s }
+                if next_s != cur_s {
+                    map_put(app.node_scrolls, cur + 1, next_s)
+                    return true
+                }
+                return false
+            }
+        }
+        cur = dom_parent(app.tree, cur)
+        depth += 1
+    }
+    return ui_scroll(mut app, delta_y)
 }
 
 // Handles live Unicode keyboard input (including Vietnamese UTF-8 & Backspace) into focused <input>/<textarea>

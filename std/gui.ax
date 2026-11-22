@@ -501,6 +501,10 @@ struct PhotonD2D {
     wbuf: i64
     wcap: i64
     dpi: i64
+    gdiplus: i64
+    gdip_tok: i64
+    img_entries: IntBuf
+    img_count: i64
 }
 
 fn _p2d_vt(obj: i64, idx: i64) -> i64 {
@@ -578,7 +582,11 @@ fn photon_d2d_init(win: GuiWindow) -> PhotonD2D {
         out_box = ffi_alloc(16),
         wbuf = ffi_alloc(16384),
         wcap = 8188,
-        dpi = gui_get_dpi(win)
+        dpi = gui_get_dpi(win),
+        gdiplus = 0,
+        gdip_tok = 0,
+        img_entries = ibuf_new(128),
+        img_count = 0
     )
     if win.backend != 1 { return d2d }
     lib_d2d := ffi_open_one("d2d1.dll")
@@ -643,6 +651,17 @@ fn photon_d2d_free(move d2d: PhotonD2D) {
         i += 1
     }
     buf_free(move d2d.tf_entries)
+    i = 0
+    while i < d2d.img_count {
+        bmp := ibuf_get(d2d.img_entries, i * 4 + 1)
+        if bmp != 0 { _ := ffi_call1(_p2d_vt(bmp, 2), bmp) }
+        i += 1
+    }
+    buf_free(move d2d.img_entries)
+    if d2d.gdip_tok != 0 and d2d.gdiplus != 0 {
+        f_sd := ffi_sym(d2d.gdiplus, "GdiplusShutdown")
+        if f_sd != 0 { _ := ffi_call1(f_sd, d2d.gdip_tok) }
+    }
     if d2d.brush != 0 { _ := ffi_call1(_p2d_vt(d2d.brush, 2), d2d.brush) }
     if d2d.rt != 0 { _ := ffi_call1(_p2d_vt(d2d.rt, 2), d2d.rt) }
     if d2d.dw_fac != 0 { _ := ffi_call1(_p2d_vt(d2d.dw_fac, 2), d2d.dw_fac) }
@@ -751,6 +770,272 @@ fn _p2d_fill_grad_rrect(d2d: PhotonD2D, x: i64, y: i64, w: i64, h: i64, rad: i64
     _ := ffi_call1(_p2d_vt(gb, 2), gb)
 }
 
+// Native PNG/JPG/BMP/GIF/ICO image loader via Windows `gdiplus.dll` -> cached `ID2D1Bitmap` (0 external deps!)
+fn _p2d_find_or_load_img(mut d2d: PhotonD2D, path: str) -> i64 {
+    if str_len(path) == 0 or not d2d.ok { return -1 }
+    ph := fnv1a_64(path)
+    mut i := 0
+    while i < d2d.img_count {
+        if ibuf_get(d2d.img_entries, i * 4) == ph { return i }
+        i += 1
+    }
+    if d2d.img_count >= 32 { return -1 }
+
+    if d2d.gdiplus == 0 {
+        d2d.gdiplus = ffi_open_one("gdiplus.dll")
+        if d2d.gdiplus == 0 { return -1 }
+        f_st := ffi_sym(d2d.gdiplus, "GdiplusStartup")
+        if f_st == 0 { return -1 }
+        si := ffi_alloc(32)
+        ffi_write_u32_le(si, 0, 1) // GdiplusVersion = 1
+        tok_box := ffi_alloc(16)
+        st := ffi_call3(f_st, tok_box, si, 0) & 0xFFFFFFFF
+        d2d.gdip_tok = ffi_read_i64(tok_box, 0)
+        ffi_free(tok_box); ffi_free(si)
+        if st != 0 { return -1 }
+    }
+
+    f_load := ffi_sym(d2d.gdiplus, "GdipCreateBitmapFromFile")
+    f_gw   := ffi_sym(d2d.gdiplus, "GdipGetImageWidth")
+    f_gh   := ffi_sym(d2d.gdiplus, "GdipGetImageHeight")
+    f_lock := ffi_sym(d2d.gdiplus, "GdipBitmapLockBits")
+    f_unlk := ffi_sym(d2d.gdiplus, "GdipBitmapUnlockBits")
+    f_disp := ffi_sym(d2d.gdiplus, "GdipDisposeImage")
+    if f_load == 0 or f_lock == 0 or f_disp == 0 { return -1 }
+
+    wpath := _gui_utf8_to_utf16(d2d.k32, path)
+    gp_box := ffi_alloc(16)
+    st_l := ffi_call2(f_load, wpath, gp_box) & 0xFFFFFFFF
+    gp_bmp := ffi_read_i64(gp_box, 0)
+    ffi_free(gp_box); ffi_free(wpath)
+    if st_l != 0 or gp_bmp == 0 { return -1 }
+
+    wh_box := ffi_alloc(16)
+    _ := ffi_call2(f_gw, gp_bmp, wh_box)
+    _ := ffi_call2(f_gh, gp_bmp, wh_box + 8)
+    iw := ffi_read_u32_le(wh_box, 0)
+    ih := ffi_read_u32_le(wh_box, 8)
+    ffi_free(wh_box)
+    if iw <= 0 or ih <= 0 or iw > 8192 or ih > 8192 {
+        _ := ffi_call1(f_disp, gp_bmp)
+        return -1
+    }
+
+    // Lock into 32bpp Premultiplied ARGB (`0x000E200B`) matching Direct2D `B8G8R8A8_UNORM` + `PREMULTIPLIED`
+    rc := ffi_alloc(16)
+    ffi_write_u32_le(rc, 0, 0); ffi_write_u32_le(rc, 4, 0)
+    ffi_write_u32_le(rc, 8, iw); ffi_write_u32_le(rc, 12, ih)
+    bdata := ffi_alloc(48) // sizeof(BitmapData) = 32 on x64: [0]=W, [4]=H, [8]=Stride, [12]=PixelFormat, [16]=Scan0
+    st_lk := ffi_call5(f_lock, gp_bmp, rc, 1, 0x000E200B, bdata) & 0xFFFFFFFF
+    ffi_free(rc)
+    mut d2d_bmp := 0
+    if st_lk == 0 {
+        stride := ffi_sext32(ffi_read_u32_le(bdata, 8))
+        scan0  := ffi_read_i64(bdata, 2) // offset 16
+        if scan0 != 0 and stride > 0 {
+            bprops := d2d.scratch + 280
+            ffi_write_u32_le(bprops, 0, 87) // DXGI_FORMAT_B8G8R8A8_UNORM
+            ffi_write_u32_le(bprops, 4, 1)  // D2D1_ALPHA_MODE_PREMULTIPLIED
+            ffi_write_u32_le(bprops, 8, _p2d_f32(96))
+            ffi_write_u32_le(bprops, 12, _p2d_f32(96))
+            sz_u := (iw & 0xFFFFFFFF) | ((ih & 0xFFFFFFFF) << 32)
+            hr_b := ffi_call6(_p2d_vt(d2d.rt, 4), d2d.rt, sz_u, scan0, stride, bprops, d2d.out_box) & 0xFFFFFFFF
+            if hr_b == 0 { d2d_bmp = ffi_read_i64(d2d.out_box, 0) }
+        }
+        _ := ffi_call2(f_unlk, gp_bmp, bdata)
+    }
+    ffi_free(bdata)
+    _ := ffi_call1(f_disp, gp_bmp)
+    if d2d_bmp == 0 { return -1 }
+
+    slot := d2d.img_count
+    ibuf_push(d2d.img_entries, ph)
+    ibuf_push(d2d.img_entries, d2d_bmp)
+    ibuf_push(d2d.img_entries, iw)
+    ibuf_push(d2d.img_entries, ih)
+    d2d.img_count += 1
+    return slot
+}
+
+fn _p2d_draw_img_rrect(mut d2d: PhotonD2D, path: str, x: i64, y: i64, w: i64, h: i64, rad: i64) {
+    if w <= 0 or h <= 0 { return }
+    slot := _p2d_find_or_load_img(mut d2d, path)
+    if slot < 0 { return }
+    bmp := ibuf_get(d2d.img_entries, slot * 4 + 1)
+    iw  := ibuf_get(d2d.img_entries, slot * 4 + 2)
+    ih  := ibuf_get(d2d.img_entries, slot * 4 + 3)
+    if bmp == 0 or iw <= 0 or ih <= 0 { return }
+
+    // CreateBitmapBrush (vtable slot 11): 100% pointer ABI + supports rounded corners (`rounded-full` avatars!)
+    hr_bb := ffi_call5(_p2d_vt(d2d.rt, 11), d2d.rt, bmp, 0, 0, d2d.out_box) & 0xFFFFFFFF
+    if hr_bb != 0 { return }
+    bbrush := ffi_read_i64(d2d.out_box, 0)
+    if bbrush == 0 { return }
+
+    // D2D1_MATRIX_3X2_F: [sx, 0, 0, sy, tx, ty] -> maps image (0..iw, 0..ih) to (x..x+w, y..y+h)
+    mat := d2d.scratch + 240
+    ffi_write_u32_le(mat, 0, _p2d_f32_ratio(w, iw))
+    ffi_write_u32_le(mat, 4, 0)
+    ffi_write_u32_le(mat, 8, 0)
+    ffi_write_u32_le(mat, 12, _p2d_f32_ratio(h, ih))
+    ffi_write_u32_le(mat, 16, _p2d_f32(x))
+    ffi_write_u32_le(mat, 20, _p2d_f32(y))
+    _ := ffi_call2(_p2d_vt(bbrush, 4), bbrush, mat) // ID2D1Brush::SetTransform
+
+    _ := ffi_call2(_p2d_vt(d2d.rt, 32), d2d.rt, if rad == 0 { 1 } else { 0 })
+    rr := d2d.scratch + 32
+    _p2d_write_rrect(rr, x, y, w, h, rad)
+    _ := ffi_call3(_p2d_vt(d2d.rt, 19), d2d.rt, rr, bbrush)
+    _ := ffi_call1(_p2d_vt(bbrush, 2), bbrush)
+}
+
+fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: i64, acc_scroll_y: i64, dip_h: i64) {
+    if node_idx < 0 or node_idx >= app.tree.count { return }
+    bx := layout_get_x(app.layout, node_idx)
+    raw_by := layout_get_y(app.layout, node_idx)
+    bw := layout_get_w(app.layout, node_idx)
+    bh := layout_get_h(app.layout, node_idx)
+    style := css_compute_node_style_state(app.tree, node_idx, app.sheet, node_idx == hovered_node)
+    if style.display == 3 or style.opacity <= 0 { return }
+
+    by := if style.position == 2 { raw_by } else { raw_by - acc_scroll_y }
+    vis := bw > 0 and bh > 0 and by + bh >= 0 and by <= dip_h
+    tag := dom_get_tag(app.tree, node_idx)
+
+    if vis {
+        mut rad := style.border_radius
+        if rad > bw / 2 { rad = bw / 2 }
+        if rad > bh / 2 { rad = bh / 2 }
+        if rad < 0 { rad = 0 }
+
+        // 1. Soft multi-layer Drop Shadow (`shadow-sm..2xl`, CSS `box-shadow`)
+        if style.shadow > 0 and (style.bg_color != 0 or style.grad_dir > 0) {
+            sh := style.shadow
+            _p2d_fill_rrect(d2d, bx - sh, by + sh * 2, bw + sh * 2, bh + sh, rad + sh, 0x16000000)
+            _p2d_fill_rrect(d2d, bx, by + sh, bw, bh + sh / 2 + 1, rad + 1, 0x26000000)
+        }
+
+        // 2. Border + Background / Linear Gradient + Focus Ring (zero half-pixel blur!)
+        is_focused := (node_idx == app.focused_idx)
+        has_bd := (style.border_width > 0 and style.border_color != 0) or is_focused
+        has_grad := style.grad_dir > 0 and (style.grad_from != 0 or style.grad_to != 0)
+        has_bg := style.bg_color != 0
+        bd_w := if is_focused { 2 } else { (if has_bd { style.border_width } else { 0 }) }
+        eff_bd_col := if is_focused { 0xFF3B82F6 } else { style.border_color }
+
+        if has_bd and (has_grad or has_bg) {
+            bd_col := _p2d_apply_opacity(eff_bd_col, style.opacity)
+            _p2d_fill_rrect(d2d, bx, by, bw, bh, rad, bd_col)
+        }
+
+        ix := bx + bd_w
+        iy := by + bd_w
+        iw := bw - bd_w * 2
+        ih := bh - bd_w * 2
+        mut irad := rad - bd_w
+        if irad < 0 { irad = 0 }
+
+        if has_grad {
+            cf := _p2d_apply_opacity(if style.grad_from != 0 { style.grad_from } else { style.bg_color }, style.opacity)
+            ct := _p2d_apply_opacity(if style.grad_to != 0 { style.grad_to } else { cf }, style.opacity)
+            _p2d_fill_grad_rrect(d2d, ix, iy, iw, ih, irad, style.grad_dir, cf, ct)
+        } else if has_bg {
+            bg_col := _p2d_apply_opacity(style.bg_color, style.opacity)
+            _p2d_fill_rrect(d2d, ix, iy, iw, ih, irad, bg_col)
+        } else if has_bd {
+            bd_col := _p2d_apply_opacity(eff_bd_col, style.opacity)
+            _p2d_fill_rrect(d2d, bx, by, bw, bd_w, 0, bd_col)
+            _p2d_fill_rrect(d2d, bx, by + bh - bd_w, bw, bd_w, 0, bd_col)
+            _p2d_fill_rrect(d2d, bx, by, bd_w, bh, 0, bd_col)
+            _p2d_fill_rrect(d2d, bx + bw - bd_w, by, bd_w, bh, 0, bd_col)
+        }
+
+        // 3. Native `<img src="...">` Bitmap Rendering OR DirectWrite ClearType Typography
+        if str_eq_ignore_case(tag, "img") {
+            src_path := dom_get_text(app.tree, node_idx)
+            if str_len(src_path) > 0 {
+                _p2d_draw_img_rrect(mut d2d, src_path, ix, iy, iw, ih, irad)
+            }
+        } else {
+            raw_txt := dom_get_text(app.tree, node_idx)
+            txt := if is_focused { raw_txt + "|" } else { raw_txt }
+            tlen := str_len(txt)
+            if tlen > 0 and d2d.f_mb2w != 0 {
+                mut fz := style.font_size
+                if fz <= 0 { fz = 14 }
+                mut fw := style.font_weight
+                if fw <= 0 { fw = 400 }
+
+                mut ha := 0
+                if style.text_align == 1 { ha = 2 }
+                else if style.text_align == 2 { ha = 1 }
+
+                is_single := str_eq_ignore_case(tag, "button") or str_eq_ignore_case(tag, "input")
+                va := if is_single { 2 } else { 0 }
+                wrap := if is_single { 1 } else { 0 }
+
+                tf := _p2d_get_text_format(mut d2d, fz, fw, ha, va, wrap, style.font_mono)
+                if tf != 0 {
+                    ctxt := ffi_cstr(txt)
+                    wlen := ffi_sext32(ffi_call6(d2d.f_mb2w, 65001, 0, ctxt, tlen, d2d.wbuf, d2d.wcap))
+                    ffi_free(ctxt)
+                    if wlen > 0 {
+                        pad_x := if style.padding_x > 0 { style.padding_x / 2 } else { (if style.display == 2 { 2 } else { 0 }) }
+                        pad_y := if is_single { 0 } else { style.padding_y / 2 }
+                        tx := bx + pad_x
+                        ty := by + pad_y
+                        mut tw := bw - pad_x * 2
+                        mut th := bh - pad_y * 2
+                        if tw < 4 { tw = bw }
+                        if th < 4 { th = bh }
+
+                        tc := _p2d_apply_opacity(style.text_color, style.opacity)
+                        _p2d_write_color(d2d.scratch, tc)
+                        _ := ffi_call2(_p2d_vt(d2d.brush, 8), d2d.brush, d2d.scratch)
+                        rc := d2d.scratch + 32
+                        _p2d_write_rect(rc, tx, ty, tw, th)
+                        _ := ffi_call8(_p2d_vt(d2d.rt, 27), d2d.rt, d2d.wbuf, wlen, tf, rc, d2d.brush, 6, 0)
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Recursively paint children with hardware Direct2D clip & per-container scroll offset
+    fc := dom_first_child(app.tree, node_idx)
+    if fc >= 0 {
+        do_clip := (style.overflow_hidden or style.overflow_scroll) and bw > 0 and bh > 0
+        if do_clip {
+            crc := d2d.scratch + 64
+            _p2d_write_rect(crc, bx, by, bw, bh)
+            _ := ffi_call3(_p2d_vt(d2d.rt, 45), d2d.rt, crc, 1) // PushAxisAlignedClip (ALIASED)
+        }
+        own_scroll := if style.overflow_scroll { ui_node_scroll_y(app, node_idx) } else { 0 }
+        child_scroll := if style.position == 2 { own_scroll } else { acc_scroll_y + own_scroll }
+
+        mut ch := fc
+        while ch >= 0 {
+            _p2d_paint_node(mut d2d, app, ch, hovered_node, child_scroll, dip_h)
+            ch = dom_next_sibling(app.tree, ch)
+        }
+
+        // Sleek 4px native scrollbar thumb when scrollable content overflows container
+        if style.overflow_scroll and vis {
+            content_h := ui_node_content_height(app, node_idx)
+            if content_h > bh and bh > 20 {
+                mut thumb_h := (bh * bh) / content_h
+                if thumb_h < 20 { thumb_h = 20 }
+                max_s := content_h - bh
+                thumb_y := by + ((bh - thumb_h) * own_scroll) / max_s
+                _p2d_fill_rrect(d2d, bx + bw - 6, thumb_y, 4, thumb_h, 2, 0x8871717A)
+            }
+        }
+        if do_clip {
+            _ := ffi_call1(_p2d_vt(d2d.rt, 46), d2d.rt) // PopAxisAlignedClip
+        }
+    }
+}
+
 // Hardware Direct2D + DirectWrite Presenter for ALL `std::ui` HTML5/CSS3/Tailwind/JS apps!
 fn photon_d2d_present(win: GuiWindow, mut app: UiApp, mut d2d: PhotonD2D, hovered_node: i64 = -1) -> bool {
     if not win.is_open or not d2d.ok { return false }
@@ -778,111 +1063,8 @@ fn photon_d2d_present(win: GuiWindow, mut app: UiApp, mut d2d: PhotonD2D, hovere
     _ := ffi_call2(_p2d_vt(d2d.rt, 47), d2d.rt, d2d.scratch)
 
     dip_h := (h * 96) / d2d.dpi
-    mut i := 0
-    while i < app.tree.count {
-        bx := layout_get_x(app.layout, i)
-        raw_by := layout_get_y(app.layout, i)
-        bw := layout_get_w(app.layout, i)
-        bh := layout_get_h(app.layout, i)
-        if bw > 0 and bh > 0 {
-            style := css_compute_node_style_state(app.tree, i, app.sheet, i == hovered_node)
-            by := if style.position == 2 { raw_by } else { raw_by - app.scroll_y }
-            if style.display != 3 and style.opacity > 0 and by + bh >= 0 and by <= dip_h {
-                mut rad := style.border_radius
-                if rad > bw / 2 { rad = bw / 2 }
-                if rad > bh / 2 { rad = bh / 2 }
-                if rad < 0 { rad = 0 }
-
-                // 1. Soft multi-layer Drop Shadow (`shadow-sm..2xl`, CSS `box-shadow`)
-                if style.shadow > 0 and (style.bg_color != 0 or style.grad_dir > 0) {
-                    sh := style.shadow
-                    _p2d_fill_rrect(d2d, bx - sh, by + sh * 2, bw + sh * 2, bh + sh, rad + sh, 0x16000000)
-                    _p2d_fill_rrect(d2d, bx, by + sh, bw, bh + sh / 2 + 1, rad + 1, 0x26000000)
-                }
-
-                // 2. Border + Background / Linear Gradient + Focus Ring (zero half-pixel blur!)
-                is_focused := (i == app.focused_idx)
-                has_bd := (style.border_width > 0 and style.border_color != 0) or is_focused
-                has_grad := style.grad_dir > 0 and (style.grad_from != 0 or style.grad_to != 0)
-                has_bg := style.bg_color != 0
-                bd_w := if is_focused { 2 } else { (if has_bd { style.border_width } else { 0 }) }
-                eff_bd_col := if is_focused { 0xFF3B82F6 } else { style.border_color }
-
-                if has_bd and (has_grad or has_bg) {
-                    bd_col := _p2d_apply_opacity(eff_bd_col, style.opacity)
-                    _p2d_fill_rrect(d2d, bx, by, bw, bh, rad, bd_col)
-                }
-
-                ix := bx + bd_w
-                iy := by + bd_w
-                iw := bw - bd_w * 2
-                ih := bh - bd_w * 2
-                mut irad := rad - bd_w
-                if irad < 0 { irad = 0 }
-
-                if has_grad {
-                    cf := _p2d_apply_opacity(if style.grad_from != 0 { style.grad_from } else { style.bg_color }, style.opacity)
-                    ct := _p2d_apply_opacity(if style.grad_to != 0 { style.grad_to } else { cf }, style.opacity)
-                    _p2d_fill_grad_rrect(d2d, ix, iy, iw, ih, irad, style.grad_dir, cf, ct)
-                } else if has_bg {
-                    bg_col := _p2d_apply_opacity(style.bg_color, style.opacity)
-                    _p2d_fill_rrect(d2d, ix, iy, iw, ih, irad, bg_col)
-                } else if has_bd {
-                    // True transparent-interior border over ANY parent background or gradient
-                    bd_col := _p2d_apply_opacity(eff_bd_col, style.opacity)
-                    _p2d_fill_rrect(d2d, bx, by, bw, bd_w, 0, bd_col)
-                    _p2d_fill_rrect(d2d, bx, by + bh - bd_w, bw, bd_w, 0, bd_col)
-                    _p2d_fill_rrect(d2d, bx, by, bd_w, bh, 0, bd_col)
-                    _p2d_fill_rrect(d2d, bx + bw - bd_w, by, bd_w, bh, 0, bd_col)
-                }
-
-                // 3. DirectWrite Crisp ClearType Typography (Full Vietnamese Unicode!)
-                raw_txt := dom_get_text(app.tree, i)
-                txt := if is_focused { raw_txt + "|" } else { raw_txt }
-                tlen := str_len(txt)
-                if tlen > 0 and d2d.f_mb2w != 0 {
-                    mut fz := style.font_size
-                    if fz <= 0 { fz = 14 }
-                    mut fw := style.font_weight
-                    if fw <= 0 { fw = 400 }
-
-                    // DirectWrite alignment: 0=LEADING, 1=TRAILING, 2=CENTER
-                    mut ha := 0
-                    if style.text_align == 1 { ha = 2 }
-                    else if style.text_align == 2 { ha = 1 }
-
-                    tag := dom_get_tag(app.tree, i)
-                    is_single := str_eq_ignore_case(tag, "button") or str_eq_ignore_case(tag, "input")
-                    va := if is_single { 2 } else { 0 }
-                    wrap := if is_single { 1 } else { 0 }
-
-                    tf := _p2d_get_text_format(mut d2d, fz, fw, ha, va, wrap, style.font_mono)
-                    if tf != 0 {
-                        ctxt := ffi_cstr(txt)
-                        wlen := ffi_sext32(ffi_call6(d2d.f_mb2w, 65001, 0, ctxt, tlen, d2d.wbuf, d2d.wcap))
-                        ffi_free(ctxt)
-                        if wlen > 0 {
-                            pad_x := if style.padding_x > 0 { style.padding_x / 2 } else { (if style.display == 2 { 2 } else { 0 }) }
-                            pad_y := if is_single { 0 } else { style.padding_y / 2 }
-                            tx := bx + pad_x
-                            ty := by + pad_y
-                            mut tw := bw - pad_x * 2
-                            mut th := bh - pad_y * 2
-                            if tw < 4 { tw = bw }
-                            if th < 4 { th = bh }
-
-                            tc := _p2d_apply_opacity(style.text_color, style.opacity)
-                            _p2d_write_color(d2d.scratch, tc)
-                            _ := ffi_call2(_p2d_vt(d2d.brush, 8), d2d.brush, d2d.scratch)
-                            rc := d2d.scratch + 32
-                            _p2d_write_rect(rc, tx, ty, tw, th)
-                            _ := ffi_call8(_p2d_vt(d2d.rt, 27), d2d.rt, d2d.wbuf, wlen, tf, rc, d2d.brush, 6, 0)
-                        }
-                    }
-                }
-            }
-        }
-        i += 1
+    if app.tree.root_idx >= 0 {
+        _p2d_paint_node(mut d2d, app, app.tree.root_idx, hovered_node, app.scroll_y, dip_h)
     }
 
     _ := ffi_call3(_p2d_vt(d2d.rt, 49), d2d.rt, 0, 0) // EndDraw
@@ -1102,9 +1284,9 @@ fn gui_run_ui_app(mut app: UiApp, max_frames: i64 = 0, visible: bool = true) -> 
             dirty = true
         }
 
-        // Smooth mouse-wheel scrolling
+        // Smooth per-container (or viewport) mouse-wheel scrolling
         if win.scroll_delta != 0 {
-            if ui_scroll(mut app, 0 - (win.scroll_delta / 3)) { dirty = true }
+            if ui_scroll_at(mut app, mx, my, 0 - (win.scroll_delta / 3)) { dirty = true }
         }
 
         // Live Unicode / Vietnamese keyboard input into focused <input>/<textarea>
