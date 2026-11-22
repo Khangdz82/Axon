@@ -112,13 +112,55 @@ fn document_set_style(mut tree: DomTree, id: str, style_str: str) -> bool {
     return true
 }
 
-// 2. Reactive State Store (backed by fast FNV-1a Map)
+// 2. Reactive State Store & Script Function Registry (backed by fast FNV-1a Map)
 struct JsStateStore {
     map: IntBuf
+    fn_names: ByteBuf
+    fn_bodies: ByteBuf
+    fn_meta: IntBuf  // 4 ints per fn: [name_off, name_len, body_off, body_len]
+    fn_count: i64
 }
 
 fn js_state_new() -> JsStateStore {
-    return JsStateStore(map = map_new(64))
+    return JsStateStore(
+        map = map_new(64),
+        fn_names = buf_new(1024),
+        fn_bodies = buf_new(8192),
+        fn_meta = ibuf_new(256),
+        fn_count = 0
+    )
+}
+
+fn js_register_fn(mut store: JsStateStore, name: str, body: str) {
+    nl := str_len(name)
+    bl := str_len(body)
+    if nl <= 0 or bl <= 0 or store.fn_count >= 64 { return }
+    if buf_len(store.fn_names) + nl >= 1020 or buf_len(store.fn_bodies) + bl >= 8180 { return }
+    no := buf_len(store.fn_names)
+    bo := buf_len(store.fn_bodies)
+    buf_push_str(store.fn_names, name)
+    buf_push_str(store.fn_bodies, body)
+    ibuf_push(store.fn_meta, no); ibuf_push(store.fn_meta, nl)
+    ibuf_push(store.fn_meta, bo); ibuf_push(store.fn_meta, bl)
+    store.fn_count += 1
+}
+
+fn js_find_fn_body(store: JsStateStore, name: str) -> str {
+    nl := str_len(name)
+    mut i := store.fn_count - 1
+    while i >= 0 {
+        b := i * 4
+        if ibuf_get(store.fn_meta, b + 1) == nl {
+            no := ibuf_get(store.fn_meta, b)
+            if str_eq(buf_slice_str(store.fn_names, no, no + nl), name) {
+                bo := ibuf_get(store.fn_meta, b + 2)
+                bl := ibuf_get(store.fn_meta, b + 3)
+                return buf_slice_str(store.fn_bodies, bo, bo + bl)
+            }
+        }
+        i -= 1
+    }
+    return ""
 }
 
 fn js_state_set(store: JsStateStore, key: str, val: i64) {
@@ -162,14 +204,50 @@ fn _js_extract_quoted(s: str, start: i64) -> str {
     return str_slice(s, q1 + 1, q2)
 }
 
-fn _js_apply_member_op(mut tree: DomTree, elem_id: str, act: str, from_pos: i64) -> bool {
+// Evaluates a JS string/concat expression like `'Count: ' + count` or `'Hello'`
+fn _js_eval_str_expr(store: JsStateStore, raw_expr: str) -> str {
+    e := str_trim(raw_expr)
+    n := str_len(e)
+    if n == 0 { return "" }
+    out := buf_new(n + 64)
+    mut i := 0
+    while i < n {
+        while i < n and (str_byte(e, i) == 32 or str_byte(e, i) == 9 or str_byte(e, i) == 43) { i += 1 }
+        if i >= n { break }
+        b := str_byte(e, i)
+        if b == 39 or b == 34 {
+            q2 := str_find_byte(e, b, i + 1)
+            if q2 > i {
+                buf_push_str(out, str_slice(e, i + 1, q2))
+                i = q2 + 1
+            } else { break }
+        } else {
+            mut j := i
+            while j < n and str_byte(e, j) != 43 and str_byte(e, j) != 32 and str_byte(e, j) != 9 and str_byte(e, j) != 59 { j += 1 }
+            tok := str_slice(e, i, j)
+            c0 := str_byte(tok, 0)
+            if (c0 >= 48 and c0 <= 57) or c0 == 45 {
+                buf_push_str(out, tok)
+            } else {
+                v := js_state_get(store, tok, 0)
+                buf_push_str(out, f"{v}")
+            }
+            i = j
+        }
+    }
+    return buf_to_owned_str(move out)
+}
+
+fn _js_apply_member_op(mut tree: DomTree, store: JsStateStore, elem_id: str, act: str, from_pos: i64) -> bool {
     p_it := str_find(act, "innerText", from_pos)
     p_tc := str_find(act, "textContent", from_pos)
-    p_txt := if p_it >= 0 { p_it } else { p_tc }
+    p_vl := str_find(act, ".value", from_pos)
+    mut p_txt := if p_it >= 0 { p_it } else { p_tc }
+    if p_txt < 0 { p_txt = p_vl }
     if p_txt >= 0 {
         eq := str_find_byte(act, 61, p_txt)
         if eq >= 0 {
-            val := _js_extract_quoted(act, eq)
+            val := _js_eval_str_expr(store, str_slice(act, eq + 1, str_len(act)))
             return document_set_inner_text(mut tree, elem_id, val)
         }
     }
@@ -211,7 +289,8 @@ fn _js_apply_member_op(mut tree: DomTree, elem_id: str, act: str, from_pos: i64)
     return false
 }
 
-fn _js_eval_single(mut tree: DomTree, store: JsStateStore, action_str: str) -> bool {
+fn _js_eval_single(mut tree: DomTree, store: JsStateStore, action_str: str, depth: i64 = 0) -> bool {
+    if depth >= 16 { return false }
     act := str_trim(action_str)
     n := str_len(act)
     if n == 0 { return false }
@@ -227,7 +306,7 @@ fn _js_eval_single(mut tree: DomTree, store: JsStateStore, action_str: str) -> b
         }
         rp := str_find_byte(act, 41, base_p)
         if str_len(elem_id) > 0 and rp > base_p {
-            return _js_apply_member_op(mut tree, elem_id, act, rp)
+            return _js_apply_member_op(mut tree, store, elem_id, act, rp)
         }
     }
 
@@ -236,7 +315,57 @@ fn _js_eval_single(mut tree: DomTree, store: JsStateStore, action_str: str) -> b
         dot := str_find_byte(act, 46, 1) // '.'
         if dot > 1 {
             elem_id := str_slice(act, 1, dot)
-            return _js_apply_member_op(mut tree, elem_id, act, dot)
+            return _js_apply_member_op(mut tree, store, elem_id, act, dot)
+        }
+    }
+
+    // --- JS Variables & Arithmetic: `let x = 0`, `const x = 5`, `x++`, `x--`, `x += 2`, `x -= 1`, `x = 10` ---
+    mut vsrc := act
+    if str_starts_with(vsrc, "let ") or str_starts_with(vsrc, "var ") {
+        vsrc = str_trim(str_slice(vsrc, 4, str_len(vsrc)))
+    } else if str_starts_with(vsrc, "const ") {
+        vsrc = str_trim(str_slice(vsrc, 6, str_len(vsrc)))
+    }
+    vn := str_len(vsrc)
+    if vn > 2 and str_ends_with(vsrc, "++") {
+        vname := str_trim(str_slice(vsrc, 0, vn - 2))
+        _ := js_state_inc(store, vname, 1)
+        return true
+    }
+    if vn > 2 and str_ends_with(vsrc, "--") {
+        vname := str_trim(str_slice(vsrc, 0, vn - 2))
+        _ := js_state_inc(store, vname, -1)
+        return true
+    }
+    p_peq := str_find(vsrc, "+=", 0)
+    if p_peq > 0 {
+        vname := str_trim(str_slice(vsrc, 0, p_peq))
+        rhs := parse_i64(str_trim(str_slice(vsrc, p_peq + 2, vn))) or 0
+        _ := js_state_inc(store, vname, rhs)
+        return true
+    }
+    p_meq := str_find(vsrc, "-=", 0)
+    if p_meq > 0 {
+        vname := str_trim(str_slice(vsrc, 0, p_meq))
+        rhs := parse_i64(str_trim(str_slice(vsrc, p_meq + 2, vn))) or 0
+        _ := js_state_inc(store, vname, 0 - rhs)
+        return true
+    }
+    p_eq := str_find_byte(vsrc, 61, 0)
+    if p_eq > 0 and str_find_byte(vsrc, 40, 0) < 0 and str_find_byte(vsrc, 46, 0) < 0 {
+        vname := str_trim(str_slice(vsrc, 0, p_eq))
+        rhs := parse_i64(str_trim(str_slice(vsrc, p_eq + 1, vn))) or 0
+        js_state_set(store, vname, rhs)
+        return true
+    }
+
+    // --- JS Function Call: `myFunc()` ---
+    lp := str_find_byte(act, 40, 0)
+    if lp > 0 and str_ends_with(act, ")") and str_find_byte(act, 46, 0) < 0 {
+        fname := str_trim(str_slice(act, 0, lp))
+        body := js_find_fn_body(store, fname)
+        if str_len(body) > 0 {
+            return _js_eval_stmts(mut tree, store, body, depth + 1)
         }
     }
 
@@ -291,10 +420,10 @@ fn _js_eval_single(mut tree: DomTree, store: JsStateStore, action_str: str) -> b
     return false
 }
 
-// Executes one or more semicolon-separated DOM JS statements (quote-aware)
-fn js_eval_action(mut tree: DomTree, store: JsStateStore, action_str: str) -> bool {
+// Executes one or more semicolon/newline-separated DOM JS statements (quote-aware)
+fn _js_eval_stmts(mut tree: DomTree, store: JsStateStore, action_str: str, depth: i64) -> bool {
     n := str_len(action_str)
-    if n == 0 { return false }
+    if n == 0 or depth >= 16 { return false }
     mut any_mut := false
     mut start := 0
     mut i := 0
@@ -307,19 +436,77 @@ fn js_eval_action(mut tree: DomTree, store: JsStateStore, action_str: str) -> bo
                 in_q = b
             } else if in_q != 0 and b == in_q {
                 in_q = 0
-            } else if in_q == 0 and b == 59 { // ';'
+            } else if in_q == 0 and (b == 59 or b == 10) { // ';' or '\n'
                 is_sep = true
             }
         }
         if is_sep {
             if i > start {
-                if _js_eval_single(mut tree, store, str_slice(action_str, start, i)) {
+                if _js_eval_single(mut tree, store, str_slice(action_str, start, i), depth) {
                     any_mut = true
                 }
             }
             start = i + 1
         }
         i += 1
+    }
+    return any_mut
+}
+
+fn js_eval_action(mut tree: DomTree, store: JsStateStore, action_str: str) -> bool {
+    return _js_eval_stmts(mut tree, store, action_str, 0)
+}
+
+// Parses `<script>` blocks: registers `function name() { ... }` and executes top-level JS statements
+fn js_eval_script(mut tree: DomTree, mut store: JsStateStore, script: str) -> bool {
+    n := str_len(script)
+    if n == 0 { return false }
+    mut any_mut := false
+    mut p := 0
+    while p < n {
+        // Skip whitespace & line comments `// ...`
+        while p < n and (str_byte(script, p) == 32 or str_byte(script, p) == 9 or str_byte(script, p) == 10 or str_byte(script, p) == 13) { p += 1 }
+        if p >= n { break }
+        if p + 1 < n and str_byte(script, p) == 47 and str_byte(script, p + 1) == 47 {
+            nl := str_find_byte(script, 10, p + 2)
+            p = if nl >= 0 { nl + 1 } else { n }
+            continue
+        }
+        if str_starts_with(str_slice(script, p, n), "function ") {
+            lp := str_find_byte(script, 40, p + 9)
+            lb := if lp > 0 { str_find_byte(script, 123, lp) } else { -1 }
+            if lb > lp {
+                fname := str_trim(str_slice(script, p + 9, lp))
+                mut depth := 1
+                mut j := lb + 1
+                while j < n and depth > 0 {
+                    ch := str_byte(script, j)
+                    if ch == 123 { depth += 1 }
+                    else if ch == 125 { depth -= 1 }
+                    j += 1
+                }
+                fbody := str_slice(script, lb + 1, j - 1)
+                js_register_fn(mut store, fname, fbody)
+                p = j
+                continue
+            }
+        }
+        // Single top-level statement up to `;` or `\n`
+        mut st_end := p
+        mut in_q := 0
+        while st_end < n {
+            ch := str_byte(script, st_end)
+            if in_q == 0 and (ch == 39 or ch == 34) { in_q = ch }
+            else if in_q != 0 and ch == in_q { in_q = 0 }
+            else if in_q == 0 and (ch == 59 or ch == 10) { break }
+            st_end += 1
+        }
+        if st_end > p {
+            if _js_eval_single(mut tree, store, str_slice(script, p, st_end), 0) {
+                any_mut = true
+            }
+        }
+        p = st_end + 1
     }
     return any_mut
 }

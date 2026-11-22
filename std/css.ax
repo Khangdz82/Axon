@@ -47,6 +47,7 @@ struct ComputedStyle {
     pos_left: i64       // -999999 = unset
     pos_right: i64      // -999999 = unset
     pos_bottom: i64     // -999999 = unset
+    text_transform: i64 // 0: none, 1: uppercase, 2: lowercase
 }
 
 fn style_default() -> ComputedStyle {
@@ -90,7 +91,8 @@ fn style_default() -> ComputedStyle {
         pos_top = -999999,
         pos_left = -999999,
         pos_right = -999999,
-        pos_bottom = -999999
+        pos_bottom = -999999,
+        text_transform = 0
     )
 }
 
@@ -417,6 +419,10 @@ fn css_apply_property(mut style: ComputedStyle, prop_name: str, prop_val: str) {
         if str_eq(v, "center") { style.text_align = 1 }
         else if str_eq(v, "right") or str_eq(v, "end") { style.text_align = 2 }
         else { style.text_align = 0 }
+    } else if str_eq(p, "text-transform") {
+        if str_eq(v, "uppercase") { style.text_transform = 1 }
+        else if str_eq(v, "lowercase") { style.text_transform = 2 }
+        else { style.text_transform = 0 }
     }
 }
 
@@ -464,13 +470,62 @@ struct Stylesheet {
     css_text: str
     rules: IntBuf
     rule_count: i64
+    vars: IntBuf       // 4 ints per CSS custom property: [name_st, name_len, val_st, val_len]
+    var_count: i64
+}
+
+fn css_resolve_var(sheet: Stylesheet, raw_val: str) -> str {
+    v := str_trim(raw_val)
+    if not str_starts_with(v, "var(") { return raw_val }
+    rp := str_find_byte(v, 41, 4)
+    if rp <= 4 { return raw_val }
+    inner := str_slice(v, 4, rp)
+    comma := str_find_byte(inner, 44, 0)
+    vname := str_trim(if comma >= 0 { str_slice(inner, 0, comma) } else { inner })
+    fallback := if comma >= 0 { str_trim(str_slice(inner, comma + 1, str_len(inner))) } else { "" }
+
+    mut i := sheet.var_count - 1
+    while i >= 0 {
+        b := i * 4
+        ns := ibuf_get(sheet.vars, b)
+        nl := ibuf_get(sheet.vars, b + 1)
+        if nl == str_len(vname) and str_eq(str_slice(sheet.css_text, ns, ns + nl), vname) {
+            vs := ibuf_get(sheet.vars, b + 2)
+            vl := ibuf_get(sheet.vars, b + 3)
+            return str_trim(str_slice(sheet.css_text, vs, vs + vl))
+        }
+        i -= 1
+    }
+    if str_len(fallback) > 0 { return fallback }
+    return raw_val
+}
+
+fn css_parse_inline_with_vars(mut style: ComputedStyle, inline_str: str, sheet: Stylesheet) {
+    clean := css_strip_comments(inline_str)
+    n := str_len(clean)
+    if n == 0 { return }
+    mut cur := 0
+    while cur < n {
+        mut semi := str_find_byte(clean, 59, cur)
+        if semi < 0 { semi = n }
+        decl := str_slice(clean, cur, semi)
+        colon := str_find_byte(decl, 58, 0)
+        if colon >= 0 {
+            prop := str_slice(decl, 0, colon)
+            val := css_resolve_var(sheet, str_slice(decl, colon + 1, str_len(decl)))
+            css_apply_property(mut style, prop, val)
+        }
+        cur = semi + 1
+    }
 }
 
 fn css_parse_stylesheet(css: str) -> Stylesheet {
     clean := css_strip_comments(css)
     n := str_len(clean)
     rb := ibuf_new(2048)
+    vb := ibuf_new(512)
     mut count := 0
+    mut vcount := 0
     mut p := 0
 
     while p < n and count < 512 {
@@ -485,6 +540,33 @@ fn css_parse_stylesheet(css: str) -> Stylesheet {
         body_st := brace_open + 1
         body_l := brace_close - body_st
 
+        // Extract CSS custom properties (`--name: value;`) from `:root` or any rule block
+        mut vp := body_st
+        body_end := brace_close
+        while vp < body_end and vcount < 128 {
+            mut semi := str_find_byte(clean, 59, vp)
+            if semi < 0 or semi > body_end { semi = body_end }
+            mut ks := vp
+            while ks < semi and (str_byte(clean, ks) == 32 or str_byte(clean, ks) == 9 or str_byte(clean, ks) == 10 or str_byte(clean, ks) == 13) { ks += 1 }
+            if ks + 2 < semi and str_byte(clean, ks) == 45 and str_byte(clean, ks + 1) == 45 {
+                col := str_find_byte(clean, 58, ks)
+                if col > ks and col < semi {
+                    mut ke := col
+                    while ke > ks and (str_byte(clean, ke - 1) == 32 or str_byte(clean, ke - 1) == 9) { ke -= 1 }
+                    mut vs := col + 1
+                    while vs < semi and (str_byte(clean, vs) == 32 or str_byte(clean, vs) == 9) { vs += 1 }
+                    mut ve := semi
+                    while ve > vs and (str_byte(clean, ve - 1) == 32 or str_byte(clean, ve - 1) == 9 or str_byte(clean, ve - 1) == 10 or str_byte(clean, ve - 1) == 13) { ve -= 1 }
+                    if ke > ks and ve > vs {
+                        ibuf_push(vb, ks); ibuf_push(vb, ke - ks)
+                        ibuf_push(vb, vs); ibuf_push(vb, ve - vs)
+                        vcount += 1
+                    }
+                }
+            }
+            vp = semi + 1
+        }
+
         ibuf_push(rb, sel_st)
         ibuf_push(rb, sel_l)
         ibuf_push(rb, body_st)
@@ -494,7 +576,7 @@ fn css_parse_stylesheet(css: str) -> Stylesheet {
         p = brace_close + 1
     }
 
-    return Stylesheet(css_text = clean, rules = rb, rule_count = count)
+    return Stylesheet(css_text = clean, rules = rb, rule_count = count, vars = vb, var_count = vcount)
 }
 
 fn css_has_class_token(cls_list: str, target_cls: str) -> bool {
@@ -645,6 +727,8 @@ fn css_compute_node_style_state(tree: DomTree, node_idx: i64, sheet: Stylesheet,
     } else if str_eq_ignore_case(tag, "h3") or str_eq_ignore_case(tag, "strong") or str_eq_ignore_case(tag, "b") {
         style.font_size = 15
         style.font_weight = 600
+    } else if str_eq_ignore_case(tag, "circle") {
+        style.border_radius = 9999
     }
 
     // 2. Apply Tailwind & Bootstrap utilities from class attribute
@@ -667,12 +751,12 @@ fn css_compute_node_style_state(tree: DomTree, node_idx: i64, sheet: Stylesheet,
                 base_sel := str_slice(sel_str, 0, str_len(sel_str) - 6)
                 if css_selector_matches(tree, node_idx, base_sel) {
                     body_str := str_slice(sheet.css_text, body_st, body_st + body_l)
-                    css_parse_inline(mut style, body_str)
+                    css_parse_inline_with_vars(mut style, body_str, sheet)
                 }
             }
         } else if css_selector_matches(tree, node_idx, sel_str) {
             body_str := str_slice(sheet.css_text, body_st, body_st + body_l)
-            css_parse_inline(mut style, body_str)
+            css_parse_inline_with_vars(mut style, body_str, sheet)
         }
         r += 1
     }
@@ -686,7 +770,7 @@ fn css_compute_node_style_state(tree: DomTree, node_idx: i64, sheet: Stylesheet,
 
     inline_s := dom_get_style(tree, node_idx)
     if str_len(inline_s) > 0 {
-        css_parse_inline(mut style, inline_s)
+        css_parse_inline_with_vars(mut style, inline_s, sheet)
     }
 
     return style
