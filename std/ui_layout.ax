@@ -161,12 +161,63 @@ fn layout_solve_node_styled(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, no
         content_y := pos_y + pad_h / 2
         mut content_w := box_w - pad_w
         if content_w < 0 { content_w = 0 }
+        gap := style.gap
+
+        // --- Native CSS Grid (`display: grid` / Tailwind `grid grid-cols-N`) ---
+        if style.display == 4 {
+            mut cols := style.grid_cols
+            if cols <= 0 { cols = 1 }
+            mut cell_w := (content_w - gap * (cols - 1)) / cols
+            if cell_w < 1 { cell_w = 1 }
+
+            mut cur_y := content_y
+            mut col_i := 0
+            mut row_h := 0
+            mut row_start_node := fc
+            mut cur_g := fc
+            while cur_g >= 0 {
+                gs := css_compute_node_style(tree, cur_g, sheet)
+                if gs.display == 3 {
+                    layout_set_box(lt, cur_g, 0, 0, 0, 0)
+                    cur_g = dom_next_sibling(tree, cur_g)
+                    continue
+                }
+                cx := content_x + col_i * (cell_w + gap)
+                layout_solve_node_styled(tree, sheet, lt, cur_g, gs, cx, cur_y, cell_w, avail_h)
+                gh := layout_get_h(lt, cur_g) + gs.margin_y
+                if gh > row_h { row_h = gh }
+                col_i += 1
+                nxt_g := dom_next_sibling(tree, cur_g)
+                if col_i >= cols or nxt_g < 0 {
+                    // Equalize row item heights (CSS Grid default `align-items: stretch`)
+                    mut eq := row_start_node
+                    while eq >= 0 {
+                        if layout_get_w(lt, eq) > 0 and layout_get_h(lt, eq) < row_h {
+                            layout_set_box(lt, eq, layout_get_x(lt, eq), layout_get_y(lt, eq), layout_get_w(lt, eq), row_h)
+                        }
+                        if eq == cur_g { break }
+                        eq = dom_next_sibling(tree, eq)
+                    }
+                    cur_y += row_h
+                    if nxt_g >= 0 { cur_y += gap }
+                    col_i = 0
+                    row_h = 0
+                    row_start_node = nxt_g
+                }
+                cur_g = nxt_g
+            }
+            if box_h < 0 {
+                box_h = (cur_y - content_y) + pad_h
+                if box_h < 32 + pad_h { box_h = 32 + pad_h }
+            }
+            layout_set_box(lt, node_idx, pos_x, pos_y, box_w, box_h)
+            return
+        }
 
         // Block containers and flex-direction: column stack vertically; flex-row / inline lay out horizontally
         first_c_style := css_compute_node_style(tree, fc, sheet)
         has_inline_flow := first_c_style.display == 2
         is_col := (not has_inline_flow) and ((style.display == 0) or (style.display == 1 and style.flex_direction == 1))
-        gap := style.gap
 
         // Pre-pass for flex-row: measure fixed, percentage (`<= -1000`), and auto children
         mut flex_grow_count := 0
@@ -234,6 +285,9 @@ fn layout_solve_node_styled(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, no
         mut max_child_w := 0
         mut max_child_h := 0
         mut vis_count := 0
+        mut line_item_count := 0
+        mut line_max_h := 0
+        mut wrapped_total_h := 0
 
         while cur_child >= 0 {
             c_style := css_compute_node_style(tree, cur_child, sheet)
@@ -257,7 +311,7 @@ fn layout_solve_node_styled(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, no
                 if not is_col {
                     if c_style.display == 2 {
                         cw = layout_estimate_text_width(c_txt, c_fz) + c_style.padding_x + 10
-                    } else if cw == -2 {
+                    } else if cw == -2 and not style.flex_wrap {
                         cw = flex_each_w - c_style.margin_x
                         if cw < 0 { cw = 0 }
                     } else if dom_first_child(tree, cur_child) >= 0 {
@@ -300,17 +354,31 @@ fn layout_solve_node_styled(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, no
                     if clines < 1 { clines = 1 }
                     ch = c_lh * clines + c_style.padding_y
                 }
-            } else if not is_col and style.display == 1 and style.align_items == 0 and box_h > 0 and ch < 0 {
+            } else if not is_col and style.display == 1 and style.align_items == 0 and box_h > 0 and ch < 0 and not style.flex_wrap {
                 // CSS Flexbox default `align-items: stretch` on fixed/h-screen flex-row containers!
                 ch = box_h - pad_h - c_style.margin_y
                 if ch < 0 { ch = 0 }
             }
 
-            if vis_count > 0 {
-                if is_col {
+            // Flexbox `flex-wrap: wrap` line break when next item overflows content_w
+            if not is_col and style.flex_wrap and line_item_count > 0 {
+                need_w := gap + cw + c_style.margin_x
+                if cursor_x + need_w > content_x + content_w {
+                    wrapped_total_h += line_max_h + gap
+                    cursor_y += line_max_h + gap
+                    cursor_x = content_x
+                    line_max_h = 0
+                    line_item_count = 0
+                }
+            }
+
+            if is_col {
+                if vis_count > 0 {
                     cursor_y += gap
                     total_main += gap
-                } else {
+                }
+            } else {
+                if line_item_count > 0 {
                     cursor_x += gap
                     total_main += gap
                 }
@@ -319,7 +387,7 @@ fn layout_solve_node_styled(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, no
             child_avail_w := cw + c_style.margin_x
             child_avail_h := if ch >= 0 { ch + c_style.margin_y } else { avail_h }
             layout_solve_node_styled(tree, sheet, lt, cur_child, c_style, cursor_x, cursor_y, child_avail_w, child_avail_h)
-            if not is_col and style.display == 1 and style.align_items == 0 and box_h > 0 and c_style.height < 0 {
+            if not is_col and style.display == 1 and style.align_items == 0 and box_h > 0 and c_style.height < 0 and not style.flex_wrap {
                 stretch_h := box_h - pad_h - c_style.margin_y
                 if stretch_h > layout_get_h(lt, cur_child) {
                     layout_set_box(lt, cur_child, layout_get_x(lt, cur_child), layout_get_y(lt, cur_child), layout_get_w(lt, cur_child), stretch_h)
@@ -330,6 +398,7 @@ fn layout_solve_node_styled(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, no
             actual_h := layout_get_h(lt, cur_child)
             if actual_w + c_style.margin_x > max_child_w { max_child_w = actual_w + c_style.margin_x }
             if actual_h + c_style.margin_y > max_child_h { max_child_h = actual_h + c_style.margin_y }
+            if actual_h + c_style.margin_y > line_max_h { line_max_h = actual_h + c_style.margin_y }
 
             if is_col {
                 step := actual_h + c_style.margin_y
@@ -339,9 +408,44 @@ fn layout_solve_node_styled(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, no
                 step := actual_w + c_style.margin_x
                 cursor_x += step
                 total_main += step
+                line_item_count += 1
             }
             vis_count += 1
             cur_child = dom_next_sibling(tree, cur_child)
+        }
+
+        // Vertical `flex-1` / `flex-grow` distribution inside fixed-height `flex-col` containers!
+        if is_col and style.display == 1 and box_h > 0 and vis_count > 0 {
+            col_content_h := box_h - pad_h
+            extra_v := col_content_h - total_main
+            if extra_v > 0 {
+                mut grow_cnt := 0
+                mut gc := fc
+                while gc >= 0 {
+                    gs := css_compute_node_style(tree, gc, sheet)
+                    if gs.display != 3 and gs.flex_grow > 0 { grow_cnt += 1 }
+                    gc = dom_next_sibling(tree, gc)
+                }
+                if grow_cnt > 0 {
+                    add_each := extra_v / grow_cnt
+                    mut cum_dy := 0
+                    gc = fc
+                    while gc >= 0 {
+                        gs := css_compute_node_style(tree, gc, sheet)
+                        if gs.display != 3 {
+                            if cum_dy > 0 {
+                                layout_shift_subtree(tree, lt, gc, 0, cum_dy)
+                            }
+                            if gs.flex_grow > 0 {
+                                layout_set_box(lt, gc, layout_get_x(lt, gc), layout_get_y(lt, gc), layout_get_w(lt, gc), layout_get_h(lt, gc) + add_each)
+                                cum_dy += add_each
+                            }
+                        }
+                        gc = dom_next_sibling(tree, gc)
+                    }
+                    total_main = col_content_h
+                }
+            }
         }
 
         if box_h < 0 {
@@ -349,6 +453,8 @@ fn layout_solve_node_styled(tree: DomTree, sheet: Stylesheet, lt: LayoutTree, no
                 box_h = 32 + pad_h
             } else if is_col {
                 box_h = total_main + pad_h
+            } else if style.flex_wrap {
+                box_h = wrapped_total_h + line_max_h + pad_h
             } else {
                 box_h = max_child_h + pad_h
             }
