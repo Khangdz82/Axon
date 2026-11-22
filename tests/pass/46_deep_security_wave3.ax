@@ -1,0 +1,157 @@
+// Deep Security Wave 3 Regression Test (`tests/pass/46_deep_security_wave3.ax`)
+// Verifies overflow, OOB, null-deref, div-by-zero, and DoS hardening across:
+//   - std::numpy (np_zeros/eye/arange overflow & null safety, overflow-proof np_reshape)
+//   - std::faiss (IndexFlat alloc overflow, OOB vec_idx, null query/vectors)
+//   - std::torch (optimizer OOB param_offset, shape mismatch backward, zero-dim linear/loss)
+//   - std::ai_local (tokenizer shift DoS cap, vocab cap enforcement, batcher/session null safety)
+//   - std::ai_quant / std::ai_lora / std::quant / std::transformers / std::sklearn
+
+use std::os
+use std::numpy
+use std::faiss
+use std::torch
+use std::ai_local
+use std::ai_quant
+use std::ai_lora
+use std::quant
+use std::transformers
+use std::sklearn
+
+@test
+fn test_numpy_and_faiss_hardening() {
+    // 1. NumPy overflow & negative dimension fail-closed
+    a_bad := np_zeros(1000000, 1000000)
+    assert(a_bad.data_ptr == 0 and a_bad.size == 0)
+    a_neg := np_zeros(-5, 4)
+    assert(a_neg.data_ptr == 0)
+    e_bad := np_eye(0)
+    assert(e_bad.data_ptr == 0)
+    r_bad := np_arange(10.0, 0.0, 1.0)
+    assert(r_bad.data_ptr == 0)
+    // Null NdArray ops must not crash
+    assert(np_get(a_bad, 0, 0) == 0.0)
+    assert(np_sum(a_bad) == 0.0)
+    assert(np_argmax(a_bad) == -1)
+    assert(np_dot(a_bad, a_bad) == 0.0)
+    mm_bad := np_matmul(a_bad, a_bad)
+    assert(mm_bad.data_ptr == 0)
+    // Overflow-proof reshape
+    mut ok_arr := np_ones(2, 3)
+    assert(not np_reshape(mut ok_arr, 4611686018427387904, 2))
+    assert(np_reshape(mut ok_arr, 3, 2))
+    np_free(move ok_arr)
+
+    // 2. FAISS overflow, OOB vec_idx, and null pointer guards
+    mut f_bad := faiss_index_flat_new(0, 0, 64)
+    assert(f_bad.vectors_ptr == 0 and f_bad.capacity == 0)
+    assert(not faiss_index_flat_add(mut f_bad, 0))
+    assert(faiss_compute_distance(f_bad, 0, -1) == 0.0)
+    sr_bad := faiss_search_flat(f_bad, 0, 5)
+    assert(ibuf_len(sr_bad.indices) == 0)
+    buf_free(move sr_bad.indices)
+    np_free(move sr_bad.distances)
+
+    mut idx := faiss_index_flat_new(4, 0, 64)
+    assert(idx.vectors_ptr != 0)
+    q := np_ones(4, 1)
+    assert(faiss_index_flat_add(mut idx, q.data_ptr))
+    // Out-of-bounds vector indices return 0.0 safely
+    assert(faiss_compute_distance(idx, q.data_ptr, -1) == 0.0)
+    assert(faiss_compute_distance(idx, q.data_ptr, 999) == 0.0)
+    np_free(move q)
+    faiss_index_flat_free(move idx)
+}
+
+@test
+fn test_torch_optimizer_bounds_and_losses() {
+    // 1. Optimizer allocation overflow & OOB param_offset blocked
+    sgd_bad := optim_sgd_new(-10)
+    assert(sgd_bad.velocity_ptr == 0 and sgd_bad.total_params == 0)
+    mut adam_bad := optim_adamw_new(9999999999)
+    assert(adam_bad.m_ptr == 0 and adam_bad.total_params == 0)
+
+    p := tensor_new(4, 1, true)
+    sgd := optim_sgd_new(4, 0.01, 0.9, 0.0)
+    // Out-of-bounds offsets must be ignored safely (no heap corruption)
+    optim_sgd_step(sgd, p, -1)
+    optim_sgd_step(sgd, p, 2) // 2 + 4 > 4 -> OOB blocked
+    optim_sgd_step(sgd, p, 0) // valid
+    optim_sgd_free(move sgd)
+
+    mut adam := optim_adamw_new(4, 0.01, 0.9, 0.999, 0.01)
+    optim_adamw_step(mut adam, p, -5)
+    optim_adamw_step(mut adam, p, 1) // 1 + 4 > 4 -> OOB blocked
+    assert(adam.step_count == 0)     // step_count not incremented on rejected OOB call
+    optim_adamw_step(mut adam, p, 0)
+    assert(adam.step_count == 1)
+    optim_adamw_free(move adam)
+
+    // 2. Zero/mismatched tensor backward & loss guards
+    mut empty_loss := tensor_new(1, 1, false)
+    small_target := tensor_new(2, 1, false)
+    assert(nn_mse_loss(p, small_target, mut empty_loss) == 0.0)
+    assert(nn_cross_entropy_loss(p, 999, mut empty_loss) == 0.0)
+    tensor_backward_step_relu(0, 0, 0, 10)
+    tensor_backward_step_add(0, 0, 0, 10)
+    tensor_backward_step_matmul(0, 0, 0, 0, 0, 2, 2, 2)
+
+    // 3. Zero-dim linear layer does not divide by zero
+    lin := torch_linear_new(0, 0)
+    assert(lin.in_features == 1 and lin.out_features == 1)
+    tensor_free(move lin.weight)
+    tensor_free(move lin.bias)
+    tensor_free(move p)
+    tensor_free(move small_target)
+    tensor_free(move empty_loss)
+}
+
+@test
+fn test_ai_local_quant_lora_transformers_sklearn() {
+    // 1. Tokenizer power-of-2 shift cap & vocab overflow guard
+    tk := ai_tokenizer_new(16) // clamped to 64
+    mut added := 0
+    mut i := 0
+    while i < 80 {
+        tid := ai_tokenizer_add_token(tk, "a")
+        if tid >= 0 { added += 1 }
+        i += 1
+    }
+    assert(added == 64)
+    ai_tokenizer_free(move tk)
+
+    // 2. Batcher null & bounds guard
+    b_bad := ContinuousBatcher(slots = ibuf_new(5), max_slots = 1, meta_ptr = 0)
+    assert(batcher_enqueue(b_bad, 1, 10, 5) == -1)
+    assert(batcher_step_all(b_bad) == 0)
+    batcher_free(move b_bad)
+
+    // 3. QuantTensor overflow & null checks
+    qt_bad := quant_tensor_alloc(1000000, 1000000, quant_dtype_q4())
+    assert(qt_bad.data_ptr == 0 and qt_bad.rows == 0)
+    quant_tensor_free(move qt_bad)
+    assert(quant_f32_to_bits(0, 1.0) == 0)
+    assert(quant_bits_to_f32(0, 0x3F800000) == 0.0)
+    assert(gemv_q8_0(0, 0, 10) == 0.0)
+    assert(gemv_q4_0(0, 0, 10) == 0.0)
+
+    // 4. CausalLM zero num_heads no div-by-zero
+    cfg := TransformerConfig(vocab_size = 8, hidden_size = 8, num_layers = 1, num_heads = 0, num_kv_heads = 1, intermediate_size = 16, max_seq_len = 8)
+    lm := causal_lm_new(cfg)
+    assert(lm.token_embeddings.rows == 8)
+    causal_lm_free(move lm)
+
+    // 5. KMeans invalid k guard
+    mut km := sklearn_kmeans_new(0, 2)
+    x_empty := np_zeros(0, 2)
+    sklearn_kmeans_fit(mut km, x_empty, 5)
+    sklearn_kmeans_free(move km)
+    np_free(move x_empty)
+}
+
+fn main() -> i32 {
+    test_numpy_and_faiss_hardening()
+    test_torch_optimizer_bounds_and_losses()
+    test_ai_local_quant_lora_transformers_sklearn()
+    println("DEEP_SECURITY_WAVE3_OK")
+    return 0
+}

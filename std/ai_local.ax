@@ -75,11 +75,16 @@ struct AxmArchiveBuilder {
 
 fn axm_builder_new(init_payload_bytes: i64 = 65536) -> AxmArchiveBuilder {
     unsafe {
+    mut cap := init_payload_bytes
+    if cap < 4096 { cap = 4096 }
+    if cap > 67108864 { cap = 67108864 }
     cp := mem_alloc_aligned(64)
-    ptr_write_i64(cp, 0, 0)
+    if cp != 0 {
+        ptr_write_i64(cp, 0, 0)
+    }
     return AxmArchiveBuilder(
         dir_buf = ibuf_new(512),
-        payload = buf_new(init_payload_bytes),
+        payload = buf_new(cap),
         tensor_count_ptr = cp
     )
     }
@@ -95,6 +100,7 @@ fn axm_builder_free(move b: AxmArchiveBuilder) {
 
 fn axm_builder_add_raw(b: AxmArchiveBuilder, name: str, dtype: i64, rows: i64, cols: i64, raw_ptr: i64, byte_len: i64) {
     unsafe {
+    if b.tensor_count_ptr == 0 or raw_ptr == 0 or byte_len < 0 or rows <= 0 or cols <= 0 { return }
     // Pad payload to 16-byte alignment for SIMD reads
     while (buf_len(b.payload) & 15) != 0 {
         buf_push(b.payload, 0)
@@ -116,6 +122,7 @@ fn axm_builder_add_raw(b: AxmArchiveBuilder, name: str, dtype: i64, rows: i64, c
 
 fn axm_builder_save(b: AxmArchiveBuilder, path: str) -> i64 ! i64 {
     unsafe {
+    if b.tensor_count_ptr == 0 { return err(500) }
     cnt := ptr_read_i64(b.tensor_count_ptr, 0)
     plen := buf_len(b.payload)
     out := buf_new(32 + cnt * 40 + plen)
@@ -139,7 +146,9 @@ fn axm_builder_save(b: AxmArchiveBuilder, path: str) -> i64 ! i64 {
         buf_push(out, buf_get(b.payload, i))
         i += 1
     }
-    return fs_write_file(path, out)
+    res := fs_write_file(path, out)
+    buf_free(move out)
+    return res
     }
 }
 
@@ -189,14 +198,20 @@ fn axm_load_into_arena(path: str) -> AxmLoadedModel ! i64 {
         while ((off - payload_start) & 15) != 0 and off < total {
             off += 1
         }
-        if blen < 0 or rows <= 0 or cols <= 0 or blen > total - off {
+        if blen < 0 or blen > 0x3FFFFFF0 or rows <= 0 or cols <= 0 or blen > total - off {
             buf_free(move raw)
             vram_arena_free(move arena)
             buf_free(move tbl)
             return err(422)
         }
         n_floats := (blen + 3) / 4
-        dst_ptr := vram_arena_alloc_f32(arena, n_floats)
+        dst_ptr := if n_floats > 0 { vram_arena_alloc_f32(arena, n_floats) } else { 0 }
+        if blen > 0 and dst_ptr == 0 {
+            buf_free(move raw)
+            vram_arena_free(move arena)
+            buf_free(move tbl)
+            return err(507)
+        }
         mut k := 0
         while k < blen {
             ptr_write_u8(dst_ptr, k, buf_get(raw, off + k))
@@ -248,8 +263,11 @@ struct AiTokenizer {
 
 fn ai_tokenizer_new(vocab_cap: i64 = 1024) -> AiTokenizer {
     unsafe {
+    mut vcap := vocab_cap
+    if vcap < 64 { vcap = 64 }
+    if vcap > 262144 { vcap = 262144 }
     mut hm_cap := 256
-    while hm_cap < vocab_cap * 2 {
+    while hm_cap < vcap * 2 and hm_cap < 524288 {
         hm_cap = hm_cap << 1
     }
     hm := ibuf_new(hm_cap * 2)
@@ -259,12 +277,16 @@ fn ai_tokenizer_new(vocab_cap: i64 = 1024) -> AiTokenizer {
         i += 1
     }
     vp := mem_alloc_aligned(64)
-    ptr_write_i64(vp, 0, 0)
-    ptr_write_i64(vp, 1, 1) // [1] = max_tok_len
+    if vp != 0 {
+        ptr_write_i64(vp, 0, 0)
+        ptr_write_i64(vp, 1, 1) // [1] = max_tok_len
+        ptr_write_i64(vp, 2, vcap) // [2] = vocab_cap
+        ptr_write_i64(vp, 3, vcap * 8) // [3] = vocab_bytes_cap
+    }
     return AiTokenizer(
-        vocab_bytes = buf_new(vocab_cap * 8),
-        tok_offs = ibuf_new(vocab_cap),
-        tok_lens = ibuf_new(vocab_cap),
+        vocab_bytes = buf_new(vcap * 8),
+        tok_offs = ibuf_new(vcap),
+        tok_lens = ibuf_new(vcap),
         hash_map = hm,
         mask = hm_cap - 1,
         max_tok_len = 32,
@@ -285,9 +307,15 @@ fn ai_tokenizer_free(move tk: AiTokenizer) {
 
 fn ai_tokenizer_add_token(tk: AiTokenizer, piece: str) -> i64 {
     unsafe {
+    if tk.vocab_size_ptr == 0 { return -1 }
     tid := ptr_read_i64(tk.vocab_size_ptr, 0)
+    vcap := ptr_read_i64(tk.vocab_size_ptr, 2)
+    bcap := ptr_read_i64(tk.vocab_size_ptr, 3)
     off := buf_len(tk.vocab_bytes)
     plen := str_len(piece)
+    if tid >= vcap or plen < 0 or off > bcap or plen > bcap - off {
+        return -1
+    }
     buf_push_str(tk.vocab_bytes, piece)
     ibuf_push(tk.tok_offs, off)
     ibuf_push(tk.tok_lens, plen)
@@ -366,6 +394,7 @@ fn tok_lookup_slice(tk: AiTokenizer, text: str, start: i64, end_pos: i64) -> i64
 // Greedy longest-match subword encoder with O(1) hash lookup and guaranteed byte-level fallback.
 fn ai_tokenizer_encode(tk: AiTokenizer, text: str, out_ids: IntBuf) -> i64 {
     unsafe {
+    if tk.vocab_size_ptr == 0 { return 0 }
     n := str_len(text)
     max_len := ptr_read_i64(tk.vocab_size_ptr, 1)
     mut i := 0
@@ -398,6 +427,7 @@ fn ai_tokenizer_encode(tk: AiTokenizer, text: str, out_ids: IntBuf) -> i64 {
 
 fn ai_tokenizer_decode(tk: AiTokenizer, ids: IntBuf, out: ByteBuf) {
     unsafe {
+    if tk.vocab_size_ptr == 0 { return }
     n := ibuf_len(ids)
     vsz := ptr_read_i64(tk.vocab_size_ptr, 0)
     mut i := 0
@@ -430,16 +460,27 @@ struct LocalLlmSession {
 
 fn local_session_new(scratch_bytes: i64, max_kv_blocks: i64, block_tokens: i64, kv_dim: i64) -> LocalLlmSession {
     unsafe {
+    mut mb := max_kv_blocks
+    if mb < 1 { mb = 1 }
+    if mb > 65536 { mb = 65536 }
+    mut bt := block_tokens
+    if bt < 1 { bt = 1 }
+    if bt > 4096 { bt = 4096 }
+    mut max_toks := mb * bt
+    if max_toks > 1048576 { max_toks = 1048576 }
     st := mem_alloc_aligned(64)
-    ptr_write_i64(st, 0, 0)
-    ptr_write_i64(st, 1, 0)
-    ptr_write_i64(st, 2, 0)
-    ptr_write_i64(st, 3, 0)
+    if st != 0 {
+        ptr_write_i64(st, 0, 0)
+        ptr_write_i64(st, 1, 0)
+        ptr_write_i64(st, 2, 0)
+        ptr_write_i64(st, 3, 0)
+        ptr_write_i64(st, 4, max_toks)
+    }
     return LocalLlmSession(
         scratch = vram_arena_new(scratch_bytes),
-        k_cache = paged_kv_new(max_kv_blocks, block_tokens, kv_dim),
-        v_cache = paged_kv_new(max_kv_blocks, block_tokens, kv_dim),
-        cached_tokens = ibuf_new(max_kv_blocks * block_tokens),
+        k_cache = paged_kv_new(mb, bt, kv_dim),
+        v_cache = paged_kv_new(mb, bt, kv_dim),
+        cached_tokens = ibuf_new(max_toks),
         state_ptr = st
     )
     }
@@ -460,8 +501,13 @@ fn local_session_free(move s: LocalLlmSession) {
 @no_alloc
 fn local_session_reuse_prefix(s: LocalLlmSession, prompt_ids: IntBuf) -> i64 {
     unsafe {
+    if s.state_ptr == 0 or s.k_cache.meta_ptr == 0 or s.v_cache.meta_ptr == 0 or s.k_cache.block_tokens <= 0 {
+        return 0
+    }
     old_len := ibuf_len(s.cached_tokens)
-    new_len := ibuf_len(prompt_ids)
+    max_toks := ptr_read_i64(s.state_ptr, 4)
+    mut new_len := ibuf_len(prompt_ids)
+    if new_len > max_toks { new_len = max_toks }
     kv_len := paged_kv_num_tokens(s.k_cache)
     mut lim := old_len
     if new_len < lim { lim = new_len }
@@ -505,16 +551,21 @@ struct ContinuousBatcher {
 
 fn batcher_new(max_slots: i64) -> ContinuousBatcher {
     unsafe {
-    sb := ibuf_new(max_slots * 5)
+    mut ms := max_slots
+    if ms < 1 { ms = 1 }
+    if ms > 65536 { ms = 65536 }
+    sb := ibuf_new(ms * 5)
     mut i := 0
-    while i < max_slots * 5 {
+    while i < ms * 5 {
         ibuf_push(sb, 0)
         i += 1
     }
     mp := mem_alloc_aligned(64)
-    ptr_write_i64(mp, 0, 0)
-    ptr_write_i64(mp, 1, 0)
-    return ContinuousBatcher(slots = sb, max_slots = max_slots, meta_ptr = mp)
+    if mp != 0 {
+        ptr_write_i64(mp, 0, 0)
+        ptr_write_i64(mp, 1, 0)
+    }
+    return ContinuousBatcher(slots = sb, max_slots = ms, meta_ptr = mp)
     }
 }
 
@@ -528,6 +579,7 @@ fn batcher_free(move b: ContinuousBatcher) {
 @no_alloc
 fn batcher_enqueue(b: ContinuousBatcher, req_id: i64, prompt_len: i64, max_gen: i64) -> i64 {
     unsafe {
+    if b.meta_ptr == 0 { return -1 }
     mut i := 0
     while i < b.max_slots {
         base := i * 5
@@ -550,6 +602,7 @@ fn batcher_enqueue(b: ContinuousBatcher, req_id: i64, prompt_len: i64, max_gen: 
 @no_alloc
 fn batcher_step_all(b: ContinuousBatcher) -> i64 {
     unsafe {
+    if b.meta_ptr == 0 { return 0 }
     mut stepped := 0
     mut i := 0
     while i < b.max_slots {
