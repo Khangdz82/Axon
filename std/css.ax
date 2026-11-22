@@ -472,6 +472,7 @@ struct Stylesheet {
     rule_count: i64
     vars: IntBuf       // 4 ints per CSS custom property: [name_st, name_len, val_st, val_len]
     var_count: i64
+    viewport_w: i64
 }
 
 fn css_resolve_var(sheet: Stylesheet, raw_val: str) -> str {
@@ -519,16 +520,78 @@ fn css_parse_inline_with_vars(mut style: ComputedStyle, inline_str: str, sheet: 
     }
 }
 
+fn _css_parse_media_bound(header: str, key: str) -> i64 {
+    idx := str_find(header, key, 0)
+    if idx < 0 { return -1 }
+    col := str_find_byte(header, 58, idx) // ':'
+    if col < 0 { return -1 }
+    mut p := col + 1
+    hn := str_len(header)
+    while p < hn and (str_byte(header, p) == 32 or str_byte(header, p) == 9) { p += 1 }
+    mut end := p
+    while end < hn and str_byte(header, end) != 41 and str_byte(header, end) != 32 and str_byte(header, end) != 123 { end += 1 }
+    val_str := str_slice(header, p, end)
+    px := css_parse_px(val_str)
+    return px
+}
+
 fn css_parse_stylesheet(css: str) -> Stylesheet {
     clean := css_strip_comments(css)
     n := str_len(clean)
-    rb := ibuf_new(2048)
+    rb := ibuf_new(3072)
     vb := ibuf_new(512)
     mut count := 0
     mut vcount := 0
     mut p := 0
 
     while p < n and count < 512 {
+        while p < n and (str_byte(clean, p) == 32 or str_byte(clean, p) == 9 or str_byte(clean, p) == 10 or str_byte(clean, p) == 13) { p += 1 }
+        if p >= n { break }
+
+        // --- Responsive CSS @media queries: @media (min-width: Xpx) / (max-width: Ypx) ---
+        if p + 6 < n and str_starts_with(str_slice(clean, p, n), "@media") {
+            media_open := str_find_byte(clean, 123, p) // '{'
+            if media_open < 0 { break }
+            media_header := str_slice(clean, p, media_open)
+            mut min_w := _css_parse_media_bound(media_header, "min-width")
+            if min_w < 0 { min_w = 0 }
+            mut max_w := _css_parse_media_bound(media_header, "max-width")
+            if max_w < 0 { max_w = 999999 }
+
+            // Find matching closing brace for the outer @media block
+            mut depth := 1
+            mut k := media_open + 1
+            while k < n and depth > 0 {
+                b := str_byte(clean, k)
+                if b == 123 { depth += 1 }
+                else if b == 125 { depth -= 1 }
+                k += 1
+            }
+            media_close := k - 1
+
+            // Parse inner rules inside @media block
+            mut mp := media_open + 1
+            while mp < media_close and count < 512 {
+                while mp < media_close and (str_byte(clean, mp) == 32 or str_byte(clean, mp) == 9 or str_byte(clean, mp) == 10 or str_byte(clean, mp) == 13) { mp += 1 }
+                if mp >= media_close { break }
+                in_open := str_find_byte(clean, 123, mp)
+                if in_open < 0 or in_open >= media_close { break }
+                in_close := str_find_byte(clean, 125, in_open + 1)
+                if in_close < 0 or in_close > media_close { break }
+
+                ibuf_push(rb, mp)
+                ibuf_push(rb, in_open - mp)
+                ibuf_push(rb, in_open + 1)
+                ibuf_push(rb, in_close - in_open - 1)
+                ibuf_push(rb, min_w)
+                ibuf_push(rb, max_w)
+                count += 1
+                mp = in_close + 1
+            }
+            p = media_close + 1
+            continue
+        }
+
         brace_open := str_find_byte(clean, 123, p)
         if brace_open < 0 { break }
 
@@ -571,12 +634,14 @@ fn css_parse_stylesheet(css: str) -> Stylesheet {
         ibuf_push(rb, sel_l)
         ibuf_push(rb, body_st)
         ibuf_push(rb, body_l)
+        ibuf_push(rb, 0)
+        ibuf_push(rb, 999999)
         count += 1
 
         p = brace_close + 1
     }
 
-    return Stylesheet(css_text = clean, rules = rb, rule_count = count, vars = vb, var_count = vcount)
+    return Stylesheet(css_text = clean, rules = rb, rule_count = count, vars = vb, var_count = vcount, viewport_w = 1280)
 }
 
 fn css_has_class_token(cls_list: str, target_cls: str) -> bool {
@@ -731,19 +796,28 @@ fn css_compute_node_style_state(tree: DomTree, node_idx: i64, sheet: Stylesheet,
         style.border_radius = 9999
     }
 
-    // 2. Apply Tailwind & Bootstrap utilities from class attribute
+    // 2. Apply Tailwind & Bootstrap utilities from class attribute (responsive with viewport_w)
     cls_str := dom_get_class(tree, node_idx)
     if str_len(cls_str) > 0 {
-        tw_apply_classes(mut style, cls_str)
+        tw_apply_classes(mut style, cls_str, sheet.viewport_w)
     }
 
-    // 3. Apply Stylesheet rules (including `:hover` rules when `is_hovered` is true!)
+    // 3. Apply Stylesheet rules (including responsive @media boundaries and :hover!)
     mut r := 0
     while r < sheet.rule_count {
-        sel_st := ibuf_get(sheet.rules, r * 4)
-        sel_l := ibuf_get(sheet.rules, r * 4 + 1)
-        body_st := ibuf_get(sheet.rules, r * 4 + 2)
-        body_l := ibuf_get(sheet.rules, r * 4 + 3)
+        sel_st := ibuf_get(sheet.rules, r * 6)
+        sel_l := ibuf_get(sheet.rules, r * 6 + 1)
+        body_st := ibuf_get(sheet.rules, r * 6 + 2)
+        body_l := ibuf_get(sheet.rules, r * 6 + 3)
+        min_w := ibuf_get(sheet.rules, r * 6 + 4)
+        max_w := ibuf_get(sheet.rules, r * 6 + 5)
+
+        if sheet.viewport_w > 0 {
+            if sheet.viewport_w < min_w or sheet.viewport_w > max_w {
+                r += 1
+                continue
+            }
+        }
 
         sel_str := str_trim(str_slice(sheet.css_text, sel_st, sel_st + sel_l))
         if str_ends_with(sel_str, ":hover") {
