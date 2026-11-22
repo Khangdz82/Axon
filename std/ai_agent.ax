@@ -1,0 +1,527 @@
+// Axon Production Autonomous AI Agent Runtime (`std/ai_agent.ax`)
+// 100% Pure Axon, Zero-GC, Zero External Dependencies:
+//   1. Episodic & Keyword Agent Memory (`AgentMemory`) with Integrity-Checked `.axmem` Persistence
+//   2. Task Plan & Dependency Scratchpad (`AgentPlan`) with Markdown Prompt Renderer
+//   3. Structured JSON Output Extractor & Required-Key Validator (`harness_extract_json_block`)
+//   4. Multi-Agent Swarm Handoff Bus (`AgentBus`) with Max-Hop Loop Prevention
+//   5. Per-Model Micro-Dollar Cost Estimator & Hard Budget Guard (`HarnessBudget`)
+//   6. ReAct Turn Controller, Identical-Call Stuck-Loop Detector & JSONL Trajectory Tracer (`AgentLoopState`)
+
+use std::str
+use std::json
+use std::path
+use std::ai_harness
+
+// ==================== 1. EPISODIC & KEYWORD AGENT MEMORY (`.axmem`) ====================
+
+struct AgentMemory {
+    blob: ByteBuf
+    blob_cap: i64
+    meta: IntBuf // 6 ints per entry: [key_off, key_len, tag_off, tag_len, val_off, val_len]
+    count: i64
+    max_entries: i64
+}
+
+fn agent_mem_new(max_entries: i64 = 256, blob_bytes: i64 = 65536) -> AgentMemory {
+    mut me := max_entries
+    if me < 16 { me = 16 }
+    if me > 4096 { me = 4096 }
+    mut bb := blob_bytes
+    if bb < 4096 { bb = 4096 }
+    if bb > 16777216 { bb = 16777216 }
+    return AgentMemory(
+        blob = buf_new(bb),
+        blob_cap = bb,
+        meta = ibuf_new(me * 6 + 16),
+        count = 0,
+        max_entries = me
+    )
+}
+
+fn agent_mem_free(move m: AgentMemory) {
+    buf_free(move m.blob)
+    buf_free(move m.meta)
+}
+
+fn _agent_mem_ensure(mut m: AgentMemory, add_len: i64) -> bool {
+    cur := buf_len(m.blob)
+    if cur + add_len + 16 <= m.blob_cap { return true }
+    mut nc := m.blob_cap * 2
+    while nc < cur + add_len + 32 and nc < 16777216 { nc = nc * 2 }
+    if nc > 16777216 { nc = 16777216 }
+    if cur + add_len + 16 > nc { return false }
+    nb := buf_new(nc)
+    mut i := 0
+    while i < cur { buf_push(nb, buf_get(m.blob, i)); i += 1 }
+    buf_free(move m.blob)
+    m.blob = nb
+    m.blob_cap = nc
+    return true
+}
+
+fn agent_mem_put(mut m: AgentMemory, key: str, tag: str, val: str) -> bool {
+    kl := str_len(key)
+    tl := str_len(tag)
+    vl := str_len(val)
+    if kl <= 0 or m.count >= m.max_entries { return false }
+    if not _agent_mem_ensure(mut m, kl + tl + vl) { return false }
+    ko := buf_len(m.blob); buf_push_str(m.blob, key)
+    to := buf_len(m.blob); buf_push_str(m.blob, tag)
+    vo := buf_len(m.blob); buf_push_str(m.blob, val)
+    ibuf_push(m.meta, ko); ibuf_push(m.meta, kl)
+    ibuf_push(m.meta, to); ibuf_push(m.meta, tl)
+    ibuf_push(m.meta, vo); ibuf_push(m.meta, vl)
+    m.count += 1
+    return true
+}
+
+// Returns most recent value for exact `key`
+fn agent_mem_get(m: AgentMemory, key: str) -> str ! i64 {
+    kl := str_len(key)
+    mut i := m.count - 1
+    while i >= 0 {
+        b := i * 6
+        if ibuf_get(m.meta, b + 1) == kl {
+            ko := ibuf_get(m.meta, b)
+            if str_eq(buf_slice_str(m.blob, ko, ko + kl), key) {
+                vo := ibuf_get(m.meta, b + 4)
+                vl := ibuf_get(m.meta, b + 5)
+                return ok(buf_slice_str(m.blob, vo, vo + vl))
+            }
+        }
+        i -= 1
+    }
+    return err(404)
+}
+
+// Keyword search across key, tag, and value (most-recent first), returns formatted recall block for prompts
+fn agent_mem_search(m: AgentMemory, query: str, max_hits: i64 = 5) -> str {
+    if str_len(query) == 0 or max_hits <= 0 { return "" }
+    qlow := str_to_lower(query)
+    out := buf_new(8192)
+    mut hits := 0
+    mut i := m.count - 1
+    while i >= 0 and hits < max_hits {
+        b := i * 6
+        ks := buf_slice_str(m.blob, ibuf_get(m.meta, b), ibuf_get(m.meta, b) + ibuf_get(m.meta, b + 1))
+        ts := buf_slice_str(m.blob, ibuf_get(m.meta, b + 2), ibuf_get(m.meta, b + 2) + ibuf_get(m.meta, b + 3))
+        vs := buf_slice_str(m.blob, ibuf_get(m.meta, b + 4), ibuf_get(m.meta, b + 4) + ibuf_get(m.meta, b + 5))
+        if str_contains(str_to_lower(ks), qlow) or str_contains(str_to_lower(ts), qlow) or str_contains(str_to_lower(vs), qlow) {
+            entry := f"- [{ts}] {ks}: {vs}\n"
+            if buf_len(out) + str_len(entry) < 8100 {
+                buf_push_str(out, entry)
+                hits += 1
+            }
+        }
+        i -= 1
+    }
+    return buf_to_owned_str(move out)
+}
+
+fn _mem_fnv64(b: ByteBuf, start: i64, end_pos: i64) -> i64 {
+    mut h := -3750763034362895579
+    mut i := start
+    while i < end_pos {
+        h = (h ^ (buf_get(b, i) & 255)) *% 1099511628211
+        i += 1
+    }
+    return h
+}
+
+fn _mem_read_u32(b: ByteBuf, off: i64) -> i64 {
+    return buf_get(b, off) | (buf_get(b, off + 1) << 8) | (buf_get(b, off + 2) << 16) | (buf_get(b, off + 3) << 24)
+}
+
+fn _mem_read_u64(b: ByteBuf, off: i64) -> i64 {
+    return _mem_read_u32(b, off) | (_mem_read_u32(b, off + 4) << 32)
+}
+
+// Integrity-protected `.axmem` binary save: `[magic "AXMM":4][ver=1:4][count:4][blob_len:4][checksum:8][entries...]`
+fn agent_mem_save(m: AgentMemory, path: str) -> i64 ! i64 {
+    est := 32 + m.count * 12 + buf_len(m.blob) + 64
+    out := buf_new(est)
+    buf_push_u32(out, 0x4D4D5841) // "AXMM"
+    buf_push_u32(out, 1)
+    buf_push_u32(out, m.count)
+    buf_push_u32(out, buf_len(m.blob))
+    buf_push_u64(out, 0) // checksum placeholder at offset 16
+    mut i := 0
+    while i < m.count {
+        b := i * 6
+        ko := ibuf_get(m.meta, b); kl := ibuf_get(m.meta, b + 1)
+        to := ibuf_get(m.meta, b + 2); tl := ibuf_get(m.meta, b + 3)
+        vo := ibuf_get(m.meta, b + 4); vl := ibuf_get(m.meta, b + 5)
+        buf_push_u32(out, kl); buf_push_u32(out, tl); buf_push_u32(out, vl)
+        buf_push_str(out, buf_slice_str(m.blob, ko, ko + kl))
+        buf_push_str(out, buf_slice_str(m.blob, to, to + tl))
+        buf_push_str(out, buf_slice_str(m.blob, vo, vo + vl))
+        i += 1
+    }
+    chk := _mem_fnv64(out, 24, buf_len(out))
+    buf_put_u64(out, 16, chk)
+    wr := fs_write_file(path, out) or -1
+    buf_free(move out)
+    if wr < 0 { return err(500) }
+    return ok(wr)
+}
+
+// Strict integrity-checked `.axmem` binary loader (rejects tampered checksums, bad magic, or OOB lengths)
+fn agent_mem_load(path: str) -> AgentMemory ! i64 {
+    raw := fs_read_file(path) or return err(404)
+    n := buf_len(raw)
+    if n < 24 { buf_free(move raw); return err(422) }
+    if _mem_read_u32(raw, 0) != 0x4D4D5841 or _mem_read_u32(raw, 4) != 1 {
+        buf_free(move raw); return err(422)
+    }
+    cnt := _mem_read_u32(raw, 8)
+    exp_chk := _mem_read_u64(raw, 16)
+    if cnt < 0 or cnt > 4096 { buf_free(move raw); return err(422) }
+    if _mem_fnv64(raw, 24, n) != exp_chk { buf_free(move raw); return err(422) }
+
+    mut mem := agent_mem_new(if cnt > 256 { cnt } else { 256 }, n + 4096)
+    mut pos := 24
+    mut i := 0
+    while i < cnt {
+        if pos > n - 12 { agent_mem_free(move mem); buf_free(move raw); return err(422) }
+        kl := _mem_read_u32(raw, pos)
+        tl := _mem_read_u32(raw, pos + 4)
+        vl := _mem_read_u32(raw, pos + 8)
+        pos += 12
+        if kl < 0 or tl < 0 or vl < 0 or kl > n - pos or tl > n - pos - kl or vl > n - pos - kl - tl {
+            agent_mem_free(move mem); buf_free(move raw); return err(422)
+        }
+        ks := buf_slice_str(raw, pos, pos + kl); pos += kl
+        ts := buf_slice_str(raw, pos, pos + tl); pos += tl
+        vs := buf_slice_str(raw, pos, pos + vl); pos += vl
+        _ := agent_mem_put(mut mem, ks, ts, vs)
+        i += 1
+    }
+    buf_free(move raw)
+    return ok(mem)
+}
+
+// ==================== 2. TASK PLAN & SCRATCHPAD (`AgentPlan`) ====================
+
+// Step statuses: 0 = pending, 1 = in_progress, 2 = done, 3 = failed
+struct AgentPlan {
+    titles: ByteBuf
+    meta: IntBuf // 4 ints per step: [off, len, status, depends_on (-1 if none)]
+    count: i64
+}
+
+fn agent_plan_new() -> AgentPlan {
+    return AgentPlan(titles = buf_new(4096), meta = ibuf_new(256), count = 0)
+}
+
+fn agent_plan_free(move p: AgentPlan) {
+    buf_free(move p.titles)
+    buf_free(move p.meta)
+}
+
+fn agent_plan_add(mut p: AgentPlan, title: str, depends_on: i64 = -1) -> i64 {
+    if p.count >= 64 { return -1 }
+    tl := str_len(title)
+    if tl <= 0 or buf_len(p.titles) + tl + 8 > 4096 { return -1 }
+    off := buf_len(p.titles)
+    buf_push_str(p.titles, title)
+    ibuf_push(p.meta, off)
+    ibuf_push(p.meta, tl)
+    ibuf_push(p.meta, 0)
+    ibuf_push(p.meta, depends_on)
+    idx := p.count
+    p.count += 1
+    return idx
+}
+
+fn agent_plan_set_status(p: AgentPlan, idx: i64, status: i64) -> bool {
+    if idx < 0 or idx >= p.count or status < 0 or status > 3 { return false }
+    ibuf_set(p.meta, idx * 4 + 2, status)
+    return true
+}
+
+// Returns next runnable pending step index whose dependency is `done` (or `-1` if none)
+fn agent_plan_next_ready(p: AgentPlan) -> i64 {
+    mut i := 0
+    while i < p.count {
+        st := ibuf_get(p.meta, i * 4 + 2)
+        dep := ibuf_get(p.meta, i * 4 + 3)
+        if st == 0 {
+            if dep < 0 or (dep < p.count and ibuf_get(p.meta, dep * 4 + 2) == 2) {
+                return i
+            }
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn agent_plan_progress_pct(p: AgentPlan) -> i64 {
+    if p.count <= 0 { return 100 }
+    mut done := 0
+    mut i := 0
+    while i < p.count {
+        if ibuf_get(p.meta, i * 4 + 2) == 2 { done += 1 }
+        i += 1
+    }
+    return (done * 100) / p.count
+}
+
+fn agent_plan_to_markdown(p: AgentPlan) -> str {
+    out := buf_new(4096)
+    mut i := 0
+    while i < p.count {
+        b := i * 4
+        st := ibuf_get(p.meta, b + 2)
+        mut mark := "[ ]"
+        if st == 2 { mark = "[x]" }
+        else if st == 1 { mark = "[/]" }
+        else if st == 3 { mark = "[!]" }
+        title := buf_slice_str(p.titles, ibuf_get(p.meta, b), ibuf_get(p.meta, b) + ibuf_get(p.meta, b + 1))
+        line := f"- {mark} {title}\n"
+        if buf_len(out) + str_len(line) < 4080 { buf_push_str(out, line) }
+        i += 1
+    }
+    return buf_to_owned_str(move out)
+}
+
+// ==================== 3. STRUCTURED JSON OUTPUT EXTRACTOR & VALIDATOR ====================
+
+// Strips markdown ```json ... ``` fences and extracts the first balanced `{...}` object
+fn harness_extract_json_block(text: str) -> str ! i64 {
+    n := str_len(text)
+    mut start := 0
+    p_fence := str_find(text, "```json", 0)
+    if p_fence >= 0 {
+        start = p_fence + 7
+    } else {
+        p_f2 := str_find(text, "```", 0)
+        if p_f2 >= 0 { start = p_f2 + 3 }
+    }
+    lb := str_find_byte(text, 123, start)
+    if lb < 0 { return err(422) }
+    mut depth := 0
+    mut in_q := false
+    mut i := lb
+    while i < n {
+        b := str_byte(text, i)
+        if b == 92 and in_q { i += 2; continue }
+        if b == 34 { in_q = not in_q }
+        else if not in_q {
+            if b == 123 { depth += 1 }
+            else if b == 125 {
+                depth -= 1
+                if depth == 0 { return ok(str_slice(text, lb, i + 1)) }
+            }
+        }
+        i += 1
+    }
+    return err(422)
+}
+
+// Validates that a comma-separated list of required keys (`"summary,status,files"`) all exist in `json_str`
+fn harness_validate_json_keys(json_str: str, required_csv: str) -> bool {
+    n := str_len(required_csv)
+    mut p := 0
+    while p < n {
+        mut c := str_find_byte(required_csv, 44, p)
+        if c < 0 { c = n }
+        key := str_trim(str_slice(required_csv, p, c))
+        if str_len(key) > 0 {
+            if json_locate_key_val(json_str, key) < 0 { return false }
+        }
+        p = c + 1
+    }
+    return true
+}
+
+// ==================== 4. MULTI-AGENT SWARM HANDOFF BUS (`AgentBus`) ====================
+
+struct AgentMessage {
+    found: bool
+    from_agent: str
+    to_agent: str
+    payload: str
+    hop: i64
+}
+
+struct AgentBus {
+    blob: ByteBuf
+    meta: IntBuf // 8 ints per msg: [from_o, from_l, to_o, to_l, pay_o, pay_l, hop, consumed]
+    count: i64
+    max_hops: i64
+}
+
+fn agent_bus_new(max_hops: i64 = 12) -> AgentBus {
+    return AgentBus(
+        blob = buf_new(32768),
+        meta = ibuf_new(512),
+        count = 0,
+        max_hops = if max_hops > 0 { max_hops } else { 12 }
+    )
+}
+
+fn agent_bus_free(move bus: AgentBus) {
+    buf_free(move bus.blob)
+    buf_free(move bus.meta)
+}
+
+fn agent_bus_send(mut bus: AgentBus, from_agent: str, to_agent: str, payload: str, hop: i64 = 0) -> bool {
+    if bus.count >= 64 or hop >= bus.max_hops { return false }
+    fl := str_len(from_agent); tl := str_len(to_agent); pl := str_len(payload)
+    if fl <= 0 or tl <= 0 or buf_len(bus.blob) + fl + tl + pl + 16 > 32768 { return false }
+    fo := buf_len(bus.blob); buf_push_str(bus.blob, from_agent)
+    to := buf_len(bus.blob); buf_push_str(bus.blob, to_agent)
+    po := buf_len(bus.blob); buf_push_str(bus.blob, payload)
+    ibuf_push(bus.meta, fo); ibuf_push(bus.meta, fl)
+    ibuf_push(bus.meta, to); ibuf_push(bus.meta, tl)
+    ibuf_push(bus.meta, po); ibuf_push(bus.meta, pl)
+    ibuf_push(bus.meta, hop); ibuf_push(bus.meta, 0)
+    bus.count += 1
+    return true
+}
+
+fn agent_bus_recv(bus: AgentBus, recipient: str) -> AgentMessage {
+    rl := str_len(recipient)
+    mut i := 0
+    while i < bus.count {
+        b := i * 8
+        if ibuf_get(bus.meta, b + 7) == 0 and ibuf_get(bus.meta, b + 3) == rl {
+            to := ibuf_get(bus.meta, b + 2)
+            if str_eq(buf_slice_str(bus.blob, to, to + rl), recipient) {
+                ibuf_set(bus.meta, b + 7, 1)
+                fo := ibuf_get(bus.meta, b); fl := ibuf_get(bus.meta, b + 1)
+                po := ibuf_get(bus.meta, b + 4); pl := ibuf_get(bus.meta, b + 5)
+                return AgentMessage(
+                    found = true,
+                    from_agent = buf_slice_str(bus.blob, fo, fo + fl),
+                    to_agent = recipient,
+                    payload = buf_slice_str(bus.blob, po, po + pl),
+                    hop = ibuf_get(bus.meta, b + 6)
+                )
+            }
+        }
+        i += 1
+    }
+    return AgentMessage(found = false, from_agent = "", to_agent = "", payload = "", hop = 0)
+}
+
+// ==================== 5. PER-MODEL COST ESTIMATOR & BUDGET GUARD ====================
+
+// Returns estimated cost in micro-dollars (1 USD = 1,000,000 micros)
+fn harness_estimate_cost_micros(model: str, in_tokens: i64, out_tokens: i64) -> i64 {
+    if in_tokens <= 0 and out_tokens <= 0 { return 0 }
+    m := str_to_lower(model)
+    mut in_per_1m := 2500000    // default $2.50 / 1M in
+    mut out_per_1m := 10000000  // default $10.00 / 1M out
+    if str_contains(m, "local") or str_contains(m, "ollama") or str_contains(m, "llama") {
+        in_per_1m = 0; out_per_1m = 0
+    } else if str_contains(m, "mini") or str_contains(m, "flash") or str_contains(m, "haiku") {
+        in_per_1m = 150000; out_per_1m = 600000
+    } else if str_contains(m, "deepseek") {
+        in_per_1m = 270000; out_per_1m = 1100000
+    } else if str_contains(m, "claude") or str_contains(m, "sonnet") {
+        in_per_1m = 3000000; out_per_1m = 15000000
+    }
+    mut it := if in_tokens > 0 { in_tokens } else { 0 }
+    mut ot := if out_tokens > 0 { out_tokens } else { 0 }
+    if it > 100000000 { it = 100000000 }
+    if ot > 100000000 { ot = 100000000 }
+    return (it * in_per_1m + ot * out_per_1m) / 1000000
+}
+
+struct HarnessBudget {
+    max_micros: i64
+    spent_micros: i64
+    max_tokens: i64
+    used_tokens: i64
+}
+
+fn harness_budget_new(max_usd_cents: i64, max_tokens: i64 = 500000) -> HarnessBudget {
+    return HarnessBudget(
+        max_micros = max_usd_cents * 10000,
+        spent_micros = 0,
+        max_tokens = max_tokens,
+        used_tokens = 0
+    )
+}
+
+fn harness_budget_can_spend(b: HarnessBudget, est_micros: i64, est_tokens: i64) -> bool {
+    if b.max_micros > 0 and b.spent_micros + est_micros > b.max_micros { return false }
+    if b.max_tokens > 0 and b.used_tokens + est_tokens > b.max_tokens { return false }
+    return true
+}
+
+fn harness_budget_charge(mut b: HarnessBudget, micros: i64, tokens: i64) -> bool {
+    if not harness_budget_can_spend(b, micros, tokens) { return false }
+    b.spent_micros += micros
+    b.used_tokens += tokens
+    return true
+}
+
+// ==================== 6. REACT TURN CONTROLLER, STUCK-LOOP DETECTOR & TRACE ====================
+
+struct AgentLoopState {
+    turn: i64
+    max_turns: i64
+    consecutive_errors: i64
+    max_consecutive_errors: i64
+    last_call_hash: i64
+    repeat_call_count: i64
+    trace_jsonl: ByteBuf
+    trace_cap: i64
+}
+
+fn agent_loop_new(max_turns: i64 = 20, max_consecutive_errors: i64 = 3) -> AgentLoopState {
+    return AgentLoopState(
+        turn = 0,
+        max_turns = if max_turns > 0 { max_turns } else { 20 },
+        consecutive_errors = 0,
+        max_consecutive_errors = if max_consecutive_errors > 0 { max_consecutive_errors } else { 3 },
+        last_call_hash = 0,
+        repeat_call_count = 0,
+        trace_jsonl = buf_new(16384),
+        trace_cap = 16384
+    )
+}
+
+fn agent_loop_free(move st: AgentLoopState) {
+    buf_free(move st.trace_jsonl)
+}
+
+fn agent_loop_can_continue(st: AgentLoopState) -> bool {
+    if st.turn >= st.max_turns { return false }
+    if st.consecutive_errors >= st.max_consecutive_errors { return false }
+    if st.repeat_call_count >= 3 { return false }
+    return true
+}
+
+// Records a tool invocation, detects identical stuck loops (`repeat_call_count >= 3`), and appends JSONL trace
+fn agent_loop_record_step(mut st: AgentLoopState, tool_name: str, args_json: str, ok_flag: bool, latency_us: i64) -> bool {
+    st.turn += 1
+    if ok_flag { st.consecutive_errors = 0 } else { st.consecutive_errors += 1 }
+    ch := fnv1a_64(tool_name + "|" + args_json)
+    if ch == st.last_call_hash {
+        st.repeat_call_count += 1
+    } else {
+        st.last_call_hash = ch
+        st.repeat_call_count = 1
+    }
+    // Append JSONL trace entry if room permits (`* 2` accounts for worst-case JSON escaping)
+    est := str_len(tool_name) * 2 + 128
+    if buf_len(st.trace_jsonl) + est < st.trace_cap {
+        buf_push_str(st.trace_jsonl, "{\"turn\":")
+        buf_push_str(st.trace_jsonl, f"{st.turn}")
+        buf_push_str(st.trace_jsonl, ",\"tool\":\"")
+        harness_push_json_escaped(st.trace_jsonl, tool_name)
+        buf_push_str(st.trace_jsonl, "\",\"ok\":")
+        buf_push_str(st.trace_jsonl, if ok_flag { "true" } else { "false" })
+        buf_push_str(st.trace_jsonl, ",\"latency_us\":")
+        buf_push_str(st.trace_jsonl, f"{latency_us}")
+        buf_push_str(st.trace_jsonl, "}\n")
+    }
+    return agent_loop_can_continue(st)
+}
+
+fn agent_loop_get_trace(st: AgentLoopState) -> str {
+    return buf_slice_str(st.trace_jsonl, 0, buf_len(st.trace_jsonl))
+}

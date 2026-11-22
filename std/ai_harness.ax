@@ -1,16 +1,18 @@
-// Axon Production AI Agent & Evaluation Harness Library (`std/ai_harness.ax`)
+// Axon Production AI Agent & Evaluation Harness Core (`std/ai_harness.ax`)
 // 100% Pure Axon, Zero-GC, Zero Python/Node.js:
 //   1. Multi-Turn Context & Token-Budget Compaction (`AgentContext`)
-//   2. Tool Registry, OpenAI Tool-Call JSON Builder & Parser (`ToolRegistry`, `ToolCall`)
-//   3. Jailed Workspace Sandbox with Path-Traversal/Secret-Leak/Budget Guards (`HarnessSandbox`)
-//   4. OpenAI / DeepSeek / OpenRouter / Ollama-Compatible HTTPS/HTTP Caller (`harness_llm_call`)
-//   5. Deterministic Agent Evaluation & Benchmark Reporter (`EvalSuite`)
+//   2. Multi-Provider Chat Builders & Callers (OpenAI, Anthropic, Gemini, Local Ollama/vLLM)
+//   3. Multi-Tool Registry, Schema Generator & Parallel Tool-Call Parser (`ToolRegistry`, `ToolCallBatch`)
+//   4. Jailed Workspace Sandbox (read/write/edit/grep/safe-cmd), Secret Redactor & Prompt-Injection Guard
+//   5. Exponential Backoff Retry Policy & Circuit Breaker (`HarnessRetryPolicy`, `HarnessCircuitBreaker`)
+//   6. Deterministic Eval Suite Summary (`EvalSuite`)
 
 use std::str
 use std::json
 use std::path
 use std::sys
 use std::tls
+use std::http
 use std::ai_serve
 
 // ==================== 1. JSON ESCAPING & MULTI-TURN CONTEXT ====================
@@ -51,11 +53,12 @@ struct AgentContext {
 fn agent_ctx_new(max_tokens: i64 = 16384) -> AgentContext {
     mut mt := max_tokens
     if mt < 16 { mt = 16 }
+    if mt > 2097152 { mt = 2097152 }
     return AgentContext(
         text_buf = buf_new(16384),
         text_cap = 16384,
-        meta = ibuf_new(512),
-        meta_cap = 128,
+        meta = ibuf_new(1024),
+        meta_cap = 256,
         msg_count = 0,
         total_tokens = 0,
         max_tokens = mt
@@ -71,8 +74,9 @@ fn _agent_ctx_ensure_text(mut ctx: AgentContext, add_len: i64) {
     cur := buf_len(ctx.text_buf)
     if cur + add_len + 8 <= ctx.text_cap { return }
     mut nc := ctx.text_cap * 2
-    while nc < cur + add_len + 16 { nc = nc * 2 }
-    if nc > 16777216 { return }
+    while nc < cur + add_len + 16 and nc < 16777216 { nc = nc * 2 }
+    if nc > 16777216 { nc = 16777216 }
+    if cur + add_len + 8 > nc { return }
     nb := buf_new(nc)
     mut i := 0
     while i < cur { buf_push(nb, buf_get(ctx.text_buf, i)); i += 1 }
@@ -84,6 +88,7 @@ fn _agent_ctx_ensure_text(mut ctx: AgentContext, add_len: i64) {
 fn agent_ctx_push(mut ctx: AgentContext, role: i64, content: str) -> bool {
     if ctx.msg_count >= ctx.meta_cap { return false }
     clen := str_len(content)
+    if clen > 4194304 { return false }
     _agent_ctx_ensure_text(mut ctx, clen)
     if buf_len(ctx.text_buf) + clen + 4 > ctx.text_cap { return false }
     off := buf_len(ctx.text_buf)
@@ -107,11 +112,11 @@ fn agent_ctx_msg_text(ctx: AgentContext, idx: i64) -> str {
     if idx < 0 or idx >= ctx.msg_count { return "" }
     off := ibuf_get(ctx.meta, idx * 4 + 1)
     ln  := ibuf_get(ctx.meta, idx * 4 + 2)
+    if off < 0 or ln < 0 or off + ln > buf_len(ctx.text_buf) { return "" }
     return buf_slice_str(ctx.text_buf, off, off + ln)
 }
 
 // Deterministic sliding-window compaction: preserves system prompt (idx 0) & most recent turns within `max_tokens`.
-// Returns number of dropped middle messages.
 fn agent_ctx_prune_to_budget(mut ctx: AgentContext) -> i64 {
     if ctx.total_tokens <= ctx.max_tokens or ctx.msg_count <= 2 { return 0 }
     has_sys := ibuf_get(ctx.meta, 0) == 0
@@ -156,16 +161,17 @@ fn agent_ctx_prune_to_budget(mut ctx: AgentContext) -> i64 {
     return dropped
 }
 
-// ==================== 2. TOOL REGISTRY & TOOL-CALL PARSER ====================
+// ==================== 2. TOOL REGISTRY & MULTI-PROVIDER BUILDERS ====================
 
 struct ToolRegistry {
     data: ByteBuf
+    data_cap: i64
     meta: IntBuf // 6 ints per tool: [name_off, name_len, desc_off, desc_len, schema_off, schema_len]
     count: i64
 }
 
 fn tool_reg_new() -> ToolRegistry {
-    return ToolRegistry(data = buf_new(8192), meta = ibuf_new(192), count = 0)
+    return ToolRegistry(data = buf_new(16384), data_cap = 16384, meta = ibuf_new(384), count = 0)
 }
 
 fn tool_reg_free(move reg: ToolRegistry) {
@@ -174,9 +180,9 @@ fn tool_reg_free(move reg: ToolRegistry) {
 }
 
 fn tool_reg_add(mut reg: ToolRegistry, name: str, desc: str, params_schema_json: str) -> bool {
-    if reg.count >= 32 { return false }
+    if reg.count >= 64 or str_len(name) == 0 { return false }
     need := str_len(name) + str_len(desc) + str_len(params_schema_json)
-    if buf_len(reg.data) + need + 8 > 8192 { return false }
+    if buf_len(reg.data) + need + 16 > reg.data_cap { return false }
     no := buf_len(reg.data); nl := str_len(name); buf_push_str(reg.data, name)
     do := buf_len(reg.data); dl := str_len(desc); buf_push_str(reg.data, desc)
     so := buf_len(reg.data); sl := str_len(params_schema_json); buf_push_str(reg.data, params_schema_json)
@@ -201,9 +207,18 @@ fn tool_reg_exists(reg: ToolRegistry, name: str) -> bool {
     return false
 }
 
-// Builds complete OpenAI-compatible Chat Completions JSON body with messages & optional tools array
+// Registers the standard coding-agent toolset (`read_file`, `write_file`, `edit_file`, `grep`, `run_check`)
+fn tool_reg_add_coding_defaults(mut reg: ToolRegistry) {
+    _ := tool_reg_add(mut reg, "read_file", "Read a file inside workspace", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"start_line\":{\"type\":\"integer\"},\"end_line\":{\"type\":\"integer\"}},\"required\":[\"path\"]}")
+    _ := tool_reg_add(mut reg, "write_file", "Write a file inside workspace", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}")
+    _ := tool_reg_add(mut reg, "edit_file", "Exact search-and-replace inside workspace file", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"target\":{\"type\":\"string\"},\"replacement\":{\"type\":\"string\"}},\"required\":[\"path\",\"target\",\"replacement\"]}")
+    _ := tool_reg_add(mut reg, "grep", "Search substring in workspace file", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"query\":{\"type\":\"string\"}},\"required\":[\"path\",\"query\"]}")
+    _ := tool_reg_add(mut reg, "run_safe_cmd", "Run allowlisted check/test/git command", "{\"type\":\"object\",\"properties\":{\"cmd\":{\"type\":\"string\"}},\"required\":[\"cmd\"]}")
+}
+
+// 2a. OpenAI / DeepSeek / Groq / OpenRouter / Ollama Chat Completions JSON
 fn agent_ctx_build_chat_json(ctx: AgentContext, reg: ToolRegistry, model: str, max_out_tokens: i64 = 1024) -> str {
-    est := buf_len(ctx.text_buf) * 2 + buf_len(reg.data) * 2 + 1024
+    est := buf_len(ctx.text_buf) * 2 + buf_len(reg.data) * 2 + ctx.msg_count * 64 + reg.count * 128 + 2048
     out := buf_new(est)
     buf_push_str(out, "{\"model\":\"")
     harness_push_json_escaped(out, model)
@@ -245,6 +260,120 @@ fn agent_ctx_build_chat_json(ctx: AgentContext, reg: ToolRegistry, model: str, m
     return buf_to_owned_str(move out)
 }
 
+// 2b. Anthropic Messages API JSON (`system` top-level + `messages` + `tools` with `input_schema`)
+fn agent_ctx_build_anthropic_json(ctx: AgentContext, reg: ToolRegistry, model: str, max_out_tokens: i64 = 1024) -> str {
+    est := buf_len(ctx.text_buf) * 2 + buf_len(reg.data) * 2 + ctx.msg_count * 64 + reg.count * 128 + 2048
+    out := buf_new(est)
+    buf_push_str(out, "{\"model\":\"")
+    harness_push_json_escaped(out, model)
+    buf_push_str(out, "\",\"max_tokens\":")
+    buf_push_str(out, f"{max_out_tokens}")
+    if ctx.msg_count > 0 and agent_ctx_msg_role(ctx, 0) == 0 {
+        buf_push_str(out, ",\"system\":\"")
+        harness_push_json_escaped(out, agent_ctx_msg_text(ctx, 0))
+        buf_push(out, 34)
+    }
+    buf_push_str(out, ",\"messages\":[")
+    mut i := 0
+    mut first_m := true
+    while i < ctx.msg_count {
+        r := agent_ctx_msg_role(ctx, i)
+        if r != 0 {
+            if not first_m { buf_push(out, 44) }
+            first_m = false
+            arole := if r == 2 { "assistant" } else { "user" }
+            buf_push_str(out, "{\"role\":\"")
+            buf_push_str(out, arole)
+            buf_push_str(out, "\",\"content\":\"")
+            harness_push_json_escaped(out, agent_ctx_msg_text(ctx, i))
+            buf_push_str(out, "\"}")
+        }
+        i += 1
+    }
+    buf_push(out, 93)
+    if reg.count > 0 {
+        buf_push_str(out, ",\"tools\":[")
+        mut ti := 0
+        while ti < reg.count {
+            if ti > 0 { buf_push(out, 44) }
+            b := ti * 6
+            tn := buf_slice_str(reg.data, ibuf_get(reg.meta, b), ibuf_get(reg.meta, b) + ibuf_get(reg.meta, b + 1))
+            td := buf_slice_str(reg.data, ibuf_get(reg.meta, b + 2), ibuf_get(reg.meta, b + 2) + ibuf_get(reg.meta, b + 3))
+            ts := buf_slice_str(reg.data, ibuf_get(reg.meta, b + 4), ibuf_get(reg.meta, b + 4) + ibuf_get(reg.meta, b + 5))
+            buf_push_str(out, "{\"name\":\"")
+            harness_push_json_escaped(out, tn)
+            buf_push_str(out, "\",\"description\":\"")
+            harness_push_json_escaped(out, td)
+            buf_push_str(out, "\",\"input_schema\":")
+            buf_push_str(out, if str_len(ts) > 0 { ts } else { "{\"type\":\"object\",\"properties\":{}}" })
+            buf_push(out, 125)
+            ti += 1
+        }
+        buf_push(out, 93)
+    }
+    buf_push(out, 125)
+    return buf_to_owned_str(move out)
+}
+
+// 2c. Google Gemini `generateContent` JSON (`systemInstruction` + `contents` + `tools.functionDeclarations`)
+fn agent_ctx_build_gemini_json(ctx: AgentContext, reg: ToolRegistry, max_out_tokens: i64 = 1024) -> str {
+    est := buf_len(ctx.text_buf) * 2 + buf_len(reg.data) * 2 + ctx.msg_count * 80 + reg.count * 128 + 2048
+    out := buf_new(est)
+    buf_push(out, 123) // '{'
+    mut need_comma := false
+    if ctx.msg_count > 0 and agent_ctx_msg_role(ctx, 0) == 0 {
+        buf_push_str(out, "\"systemInstruction\":{\"parts\":[{\"text\":\"")
+        harness_push_json_escaped(out, agent_ctx_msg_text(ctx, 0))
+        buf_push_str(out, "\"}]}")
+        need_comma = true
+    }
+    if need_comma { buf_push(out, 44) }
+    buf_push_str(out, "\"contents\":[")
+    mut i := 0
+    mut first_c := true
+    while i < ctx.msg_count {
+        r := agent_ctx_msg_role(ctx, i)
+        if r != 0 {
+            if not first_c { buf_push(out, 44) }
+            first_c = false
+            grole := if r == 2 { "model" } else { "user" }
+            buf_push_str(out, "{\"role\":\"")
+            buf_push_str(out, grole)
+            buf_push_str(out, "\",\"parts\":[{\"text\":\"")
+            harness_push_json_escaped(out, agent_ctx_msg_text(ctx, i))
+            buf_push_str(out, "\"}]}")
+        }
+        i += 1
+    }
+    buf_push_str(out, "],\"generationConfig\":{\"maxOutputTokens\":")
+    buf_push_str(out, f"{max_out_tokens}")
+    buf_push(out, 125)
+    if reg.count > 0 {
+        buf_push_str(out, ",\"tools\":[{\"functionDeclarations\":[")
+        mut ti := 0
+        while ti < reg.count {
+            if ti > 0 { buf_push(out, 44) }
+            b := ti * 6
+            tn := buf_slice_str(reg.data, ibuf_get(reg.meta, b), ibuf_get(reg.meta, b) + ibuf_get(reg.meta, b + 1))
+            td := buf_slice_str(reg.data, ibuf_get(reg.meta, b + 2), ibuf_get(reg.meta, b + 2) + ibuf_get(reg.meta, b + 3))
+            ts := buf_slice_str(reg.data, ibuf_get(reg.meta, b + 4), ibuf_get(reg.meta, b + 4) + ibuf_get(reg.meta, b + 5))
+            buf_push_str(out, "{\"name\":\"")
+            harness_push_json_escaped(out, tn)
+            buf_push_str(out, "\",\"description\":\"")
+            harness_push_json_escaped(out, td)
+            buf_push_str(out, "\",\"parameters\":")
+            buf_push_str(out, if str_len(ts) > 0 { ts } else { "{\"type\":\"object\",\"properties\":{}}" })
+            buf_push(out, 125)
+            ti += 1
+        }
+        buf_push_str(out, "]}]")
+    }
+    buf_push(out, 125)
+    return buf_to_owned_str(move out)
+}
+
+// ==================== 3. PARALLEL TOOL-CALL PARSER (OPENAI / ANTHROPIC / GEMINI / XML) ====================
+
 struct ToolCall {
     found: bool
     id: str
@@ -252,8 +381,33 @@ struct ToolCall {
     args_json: str
 }
 
-// Parses either OpenAI `"tool_calls"` JSON OR lightweight `<tool name="...">...</tool>` tags
+// Extracts balanced `{...}` object starting at `pos` (quote-aware)
+fn _harness_extract_balanced_obj(s: str, start_pos: i64) -> str {
+    n := str_len(s)
+    lb := str_find_byte(s, 123, start_pos)
+    if lb < 0 { return "{}" }
+    mut depth := 0
+    mut in_q := false
+    mut i := lb
+    while i < n {
+        b := str_byte(s, i)
+        if b == 92 and in_q { i += 2; continue }
+        if b == 34 { in_q = not in_q }
+        else if not in_q {
+            if b == 123 { depth += 1 }
+            else if b == 125 {
+                depth -= 1
+                if depth == 0 { return str_slice(s, lb, i + 1) }
+            }
+        }
+        i += 1
+    }
+    return "{}"
+}
+
+// Parses OpenAI `tool_calls`, Anthropic `tool_use`, Gemini `functionCall`, or `<tool name="...">...</tool>`
 fn harness_parse_tool_call(resp: str) -> ToolCall {
+    // 1. OpenAI `"tool_calls"`
     p_tc := str_find(resp, "\"tool_calls\"", 0)
     if p_tc >= 0 {
         sub := str_slice(resp, p_tc, str_len(resp))
@@ -264,6 +418,30 @@ fn harness_parse_tool_call(resp: str) -> ToolCall {
             return ToolCall(found = true, id = cid, name = nm, args_json = arg)
         }
     }
+    // 2. Anthropic `"type":"tool_use"`
+    p_tu := str_find(resp, "\"tool_use\"", 0)
+    if p_tu >= 0 {
+        sub := str_slice(resp, p_tu, str_len(resp))
+        cid := json_get_str(sub, "id") or "toolu_0"
+        nm  := json_get_str(sub, "name") or ""
+        p_in := str_find(sub, "\"input\"", 0)
+        arg := if p_in >= 0 { _harness_extract_balanced_obj(sub, p_in + 7) } else { "{}" }
+        if str_len(nm) > 0 {
+            return ToolCall(found = true, id = cid, name = nm, args_json = arg)
+        }
+    }
+    // 3. Gemini `"functionCall"`
+    p_fc := str_find(resp, "\"functionCall\"", 0)
+    if p_fc >= 0 {
+        sub := str_slice(resp, p_fc, str_len(resp))
+        nm  := json_get_str(sub, "name") or ""
+        p_ar := str_find(sub, "\"args\"", 0)
+        arg := if p_ar >= 0 { _harness_extract_balanced_obj(sub, p_ar + 6) } else { "{}" }
+        if str_len(nm) > 0 {
+            return ToolCall(found = true, id = "gem_0", name = nm, args_json = arg)
+        }
+    }
+    // 4. Lightweight XML `<tool name="...">...</tool>`
     p_tag := str_find(resp, "<tool ", 0)
     if p_tag >= 0 {
         gt := str_find_byte(resp, 62, p_tag)
@@ -287,7 +465,98 @@ fn harness_parse_tool_call(resp: str) -> ToolCall {
     return ToolCall(found = false, id = "", name = "", args_json = "")
 }
 
-// ==================== 3. JAILED WORKSPACE SANDBOX & SECRET GUARD ====================
+// Batch parallel tool-call extractor (extracts up to 16 `<tool>` or OpenAI `function` calls in one turn)
+struct ToolCallBatch {
+    buf: ByteBuf
+    meta: IntBuf // 6 ints per call: [id_off, id_len, name_off, name_len, args_off, args_len]
+    count: i64
+}
+
+fn tool_batch_free(move b: ToolCallBatch) {
+    buf_free(move b.buf)
+    buf_free(move b.meta)
+}
+
+fn tool_batch_get(batch: ToolCallBatch, idx: i64) -> ToolCall {
+    if idx < 0 or idx >= batch.count {
+        return ToolCall(found = false, id = "", name = "", args_json = "")
+    }
+    b := idx * 6
+    io := ibuf_get(batch.meta, b); il := ibuf_get(batch.meta, b + 1)
+    no := ibuf_get(batch.meta, b + 2); nl := ibuf_get(batch.meta, b + 3)
+    ao := ibuf_get(batch.meta, b + 4); al := ibuf_get(batch.meta, b + 5)
+    return ToolCall(
+        found = true,
+        id = buf_slice_str(batch.buf, io, io + il),
+        name = buf_slice_str(batch.buf, no, no + nl),
+        args_json = buf_slice_str(batch.buf, ao, ao + al)
+    )
+}
+
+fn _tool_batch_push(buf: ByteBuf, meta: IntBuf, count: i64, id: str, name: str, args: str) -> i64 {
+    if count >= 16 { return count }
+    need := str_len(id) + str_len(name) + str_len(args)
+    if buf_len(buf) + need + 16 > 32768 { return count }
+    io := buf_len(buf); il := str_len(id); buf_push_str(buf, id)
+    no := buf_len(buf); nl := str_len(name); buf_push_str(buf, name)
+    ao := buf_len(buf); al := str_len(args); buf_push_str(buf, args)
+    ibuf_push(meta, io); ibuf_push(meta, il)
+    ibuf_push(meta, no); ibuf_push(meta, nl)
+    ibuf_push(meta, ao); ibuf_push(meta, al)
+    return count + 1
+}
+
+fn harness_parse_tool_calls_all(resp: str) -> ToolCallBatch {
+    buf := buf_new(32768)
+    meta := ibuf_new(96)
+    mut cnt := 0
+    n := str_len(resp)
+
+    // 1. Scan all XML `<tool name="...">...</tool>` tags
+    mut pos := 0
+    while pos < n and cnt < 16 {
+        p_tag := str_find(resp, "<tool ", pos)
+        if p_tag < 0 { break }
+        gt := str_find_byte(resp, 62, p_tag)
+        end_t := if gt > p_tag { str_find(resp, "</tool>", gt + 1) } else { -1 }
+        if gt < 0 or end_t < 0 { break }
+        tc := harness_parse_tool_call(str_slice(resp, p_tag, end_t + 7))
+        if tc.found {
+            cnt = _tool_batch_push(buf, meta, cnt, f"xml_{cnt}", tc.name, tc.args_json)
+        }
+        pos = end_t + 7
+    }
+
+    // 2. Scan all OpenAI `"function":{"name":...,"arguments":...}` objects
+    if cnt == 0 {
+        p_tc := str_find(resp, "\"tool_calls\"", 0)
+        if p_tc >= 0 {
+            mut fpos := p_tc
+            while fpos < n and cnt < 16 {
+                pf := str_find(resp, "\"function\"", fpos)
+                if pf < 0 { break }
+                sub := str_slice(resp, pf, n)
+                nm := json_get_str(sub, "name") or ""
+                arg := json_get_str(sub, "arguments") or "{}"
+                if str_len(nm) > 0 {
+                    cnt = _tool_batch_push(buf, meta, cnt, f"call_{cnt}", nm, arg)
+                }
+                fpos = pf + 10
+            }
+        }
+    }
+
+    // 3. Fallback to single-call parser (Anthropic / Gemini)
+    if cnt == 0 {
+        tc := harness_parse_tool_call(resp)
+        if tc.found {
+            cnt = _tool_batch_push(buf, meta, cnt, tc.id, tc.name, tc.args_json)
+        }
+    }
+    return ToolCallBatch(buf = buf, meta = meta, count = cnt)
+}
+
+// ==================== 4. JAILED WORKSPACE SANDBOX, REDACTOR & INJECTION GUARD ====================
 
 struct HarnessSandbox {
     workspace_root: str
@@ -298,12 +567,15 @@ struct HarnessSandbox {
 }
 
 fn harness_sandbox_new(workspace_root: str, read_only: bool = false, max_steps: i64 = 24, max_tool_bytes: i64 = 16384) -> HarnessSandbox {
+    mut mtb := max_tool_bytes
+    if mtb < 256 { mtb = 256 }
+    if mtb > 1048576 { mtb = 1048576 }
     return HarnessSandbox(
         workspace_root = workspace_root,
         read_only = read_only,
         max_steps = max_steps,
         steps_used = 0,
-        max_tool_bytes = max_tool_bytes
+        max_tool_bytes = mtb
     )
 }
 
@@ -313,10 +585,58 @@ fn harness_sandbox_consume_step(mut sb: HarnessSandbox) -> bool {
     return true
 }
 
-// Scans tool/model text for leaked API keys (`sk-`, `ghp_`, `AIza`, `AKIA`) before returning to external LLMs
+// Scans tool/model text for leaked API keys (`sk-`, `ghp_`, `AIza`, `AKIA`)
 fn harness_contains_secret(text: str) -> bool {
-    if str_contains(text, "sk-proj-") or str_contains(text, "sk-ant-") { return true }
-    if str_contains(text, "ghp_") or str_contains(text, "AIzaSy") or str_contains(text, "AKIA") { return true }
+    if str_contains(text, "sk-proj-") or str_contains(text, "sk-ant-") or str_contains(text, "sk-live-") { return true }
+    if str_contains(text, "ghp_") or str_contains(text, "gho_") or str_contains(text, "AIzaSy") or str_contains(text, "AKIA") { return true }
+    return false
+}
+
+fn _harness_is_token_ch(b: i64) -> bool {
+    if b >= 48 and b <= 57 { return true }
+    if b >= 65 and b <= 90 { return true }
+    if b >= 97 and b <= 122 { return true }
+    return b == 45 or b == 95
+}
+
+// Actively redacts secret tokens (`sk-proj-*`, `sk-ant-*`, `ghp_*`, `AIzaSy*`, `AKIA*`) -> `[REDACTED]`
+fn harness_redact_secrets(text: str) -> str {
+    if not harness_contains_secret(text) { return text }
+    n := str_len(text)
+    // Worst-case expansion: 4-byte `"AKIA"` -> 10-byte `"[REDACTED]"` (2.5x), so `n * 3 + 64` is mathematically overflow-proof
+    out := buf_new(n * 3 + 64)
+    mut i := 0
+    while i < n {
+        rem := str_slice(text, i, n)
+        mut match_len := 0
+        if str_starts_with(rem, "sk-proj-") { match_len = 8 }
+        else if str_starts_with(rem, "sk-ant-") { match_len = 7 }
+        else if str_starts_with(rem, "sk-live-") { match_len = 8 }
+        else if str_starts_with(rem, "ghp_") or str_starts_with(rem, "gho_") or str_starts_with(rem, "AKIA") { match_len = 4 }
+        else if str_starts_with(rem, "AIzaSy") { match_len = 6 }
+
+        if match_len > 0 {
+            mut j := i + match_len
+            while j < n and _harness_is_token_ch(str_byte(text, j)) { j += 1 }
+            buf_push_str(out, "[REDACTED]")
+            i = j
+        } else {
+            buf_push(out, str_byte(text, i))
+            i += 1
+        }
+    }
+    return buf_to_owned_str(move out)
+}
+
+// Detects common indirect prompt-injection attempts inside untrusted tool/web outputs (case-insensitive)
+fn harness_detect_prompt_injection(text: str) -> bool {
+    low := str_to_lower(text)
+    if str_contains(low, "ignore previous instructions") { return true }
+    if str_contains(low, "ignore all previous") { return true }
+    if str_contains(low, "disregard prior instructions") { return true }
+    if str_contains(low, "<|im_start|>system") { return true }
+    if str_contains(low, "begin system prompt") { return true }
+    if str_contains(low, "you are now in developer mode") { return true }
     return false
 }
 
@@ -327,10 +647,33 @@ fn harness_tool_read_file(mut sb: HarnessSandbox, rel_path: str) -> str ! i64 {
     raw := fs_read_file(full) or return err(404)
     n := buf_len(raw)
     lim := if n > sb.max_tool_bytes { sb.max_tool_bytes } else { n }
-    out := buf_slice_str(raw, 0, lim)
-    s := "" + out
+    out := "" + buf_slice_str(raw, 0, lim)
     buf_free(move raw)
-    return ok(s)
+    return ok(out)
+}
+
+// Jailed line-range file reader (`1-based` inclusive `start_line..end_line`, with line numbers!)
+fn harness_tool_read_lines(mut sb: HarnessSandbox, rel_path: str, start_line: i64, end_line: i64) -> str ! i64 {
+    if start_line < 1 or end_line < start_line { return err(400) }
+    content := harness_tool_read_file(mut sb, rel_path) or return
+    n := str_len(content)
+    out := buf_new(sb.max_tool_bytes + 128)
+    mut line_no := 1
+    mut i := 0
+    while i < n and line_no <= end_line {
+        mut nl := str_find_byte(content, 10, i)
+        if nl < 0 { nl = n }
+        if line_no >= start_line {
+            mut line_end := nl
+            if line_end > i and str_byte(content, line_end - 1) == 13 { line_end -= 1 }
+            lstr := f"{line_no}: " + str_slice(content, i, line_end) + "\n"
+            if buf_len(out) + str_len(lstr) > sb.max_tool_bytes { break }
+            buf_push_str(out, lstr)
+        }
+        line_no += 1
+        i = nl + 1
+    }
+    return ok(buf_to_owned_str(move out))
 }
 
 // Jailed workspace file write (enforces `read_only` mode + `path_join_safe`)
@@ -346,7 +689,152 @@ fn harness_tool_write_file(mut sb: HarnessSandbox, rel_path: str, content: str) 
     return ok(wr)
 }
 
-// ==================== 4. LIVE OPENAI-COMPATIBLE HTTPS CALLER ====================
+// Jailed exact search-and-replace patch (like coding agent `edit_file`)
+fn harness_tool_edit_file(mut sb: HarnessSandbox, rel_path: str, target: str, replacement: str) -> bool ! i64 {
+    if sb.read_only { return err(403) }
+    if str_len(target) == 0 { return err(400) }
+    if not harness_sandbox_consume_step(mut sb) { return err(429) }
+    full := path_join_safe(sb.workspace_root, rel_path) or return err(403)
+    raw := fs_read_file(full) or return err(404)
+    if buf_len(raw) > 4194304 { buf_free(move raw); return err(413) }
+    src := buf_to_owned_str(move raw)
+    pos := str_find(src, target, 0)
+    if pos < 0 { return ok(false) }
+    out := buf_new(str_len(src) + str_len(replacement) + 16)
+    buf_push_str(out, str_slice(src, 0, pos))
+    buf_push_str(out, replacement)
+    buf_push_str(out, str_slice(src, pos + str_len(target), str_len(src)))
+    wr := fs_write_file(full, out) or -1
+    buf_free(move out)
+    if wr < 0 { return err(500) }
+    return ok(true)
+}
+
+// Jailed substring grep over a workspace file -> returns `line_no: line` matches
+fn harness_tool_grep(mut sb: HarnessSandbox, rel_path: str, query: str, max_matches: i64 = 50) -> str ! i64 {
+    if str_len(query) == 0 { return err(400) }
+    content := harness_tool_read_file(mut sb, rel_path) or return
+    n := str_len(content)
+    out := buf_new(sb.max_tool_bytes + 128)
+    mut line_no := 1
+    mut matches := 0
+    mut i := 0
+    while i < n and matches < max_matches {
+        mut nl := str_find_byte(content, 10, i)
+        if nl < 0 { nl = n }
+        mut line_end := nl
+        if line_end > i and str_byte(content, line_end - 1) == 13 { line_end -= 1 }
+        line := str_slice(content, i, line_end)
+        if str_contains(line, query) {
+            entry := f"{line_no}: {line}\n"
+            if buf_len(out) + str_len(entry) > sb.max_tool_bytes { break }
+            buf_push_str(out, entry)
+            matches += 1
+        }
+        line_no += 1
+        i = nl + 1
+    }
+    return ok(buf_to_owned_str(move out))
+}
+
+// Strict allowlist validator for agent shell commands (CWE-78): blocks ALL shell metachars & unknown binaries
+fn harness_is_safe_cmd(cmd: str) -> bool {
+    c := str_trim(cmd)
+    n := str_len(c)
+    if n == 0 or n > 256 { return false }
+    // Allowlist prefixes ONLY: read-only / compiler verification commands (block git arg-injection flags too, CWE-88)
+    ok_pref := str_starts_with(c, "git status") or str_starts_with(c, "git diff") or str_starts_with(c, "git log") or str_starts_with(c, "bin/axc.exe check ") or str_starts_with(c, "bin/axc.exe test ")
+    if not ok_pref { return false }
+    if str_contains(c, "--output") or str_contains(c, "--ext-diff") or str_contains(c, " -c ") or str_contains(c, "--exec") { return false }
+    // Strict character whitelist: [a-zA-Z0-9 _./:-] — ZERO `;|&><$`'"\n\r`
+    mut i := 0
+    while i < n {
+        b := str_byte(c, i)
+        alnum := (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
+        safe_p := b == 32 or b == 95 or b == 46 or b == 47 or b == 45
+        if not alnum and not safe_p { return false }
+        if b == 46 and i + 1 < n and str_byte(c, i + 1) == 46 { return false } // block `..`
+        i += 1
+    }
+    return true
+}
+
+fn harness_tool_run_safe_cmd(mut sb: HarnessSandbox, cmd: str) -> str ! i64 {
+    if not harness_is_safe_cmd(cmd) { return err(403) }
+    if not harness_sandbox_consume_step(mut sb) { return err(429) }
+    raw := sys_exec_capture(cmd)
+    n := str_len(raw)
+    trimmed := if n > sb.max_tool_bytes { str_slice(raw, 0, sb.max_tool_bytes) } else { raw }
+    return ok(harness_redact_secrets(trimmed))
+}
+
+// ==================== 5. RETRY POLICY, CIRCUIT BREAKER & MULTI-PROVIDER CALLERS ====================
+
+struct HarnessRetryPolicy {
+    max_retries: i64
+    base_delay_ms: i64
+    max_delay_ms: i64
+}
+
+fn harness_retry_default() -> HarnessRetryPolicy {
+    return HarnessRetryPolicy(max_retries = 3, base_delay_ms = 250, max_delay_ms = 4000)
+}
+
+fn harness_is_retryable_status(status: i64) -> bool {
+    return status == 0 or status == 429 or status == 500 or status == 502 or status == 503 or status == 504
+}
+
+fn harness_retry_delay_ms(pol: HarnessRetryPolicy, attempt: i64) -> i64 {
+    mut d := pol.base_delay_ms
+    mut i := 0
+    while i < attempt and d < pol.max_delay_ms {
+        d = d * 2
+        i += 1
+    }
+    if d > pol.max_delay_ms { d = pol.max_delay_ms }
+    return d
+}
+
+struct HarnessCircuitBreaker {
+    fail_threshold: i64
+    consecutive_fails: i64
+    cooldown_ns: i64
+    opened_at_ns: i64
+    is_open: bool
+}
+
+fn harness_cb_new(fail_threshold: i64 = 5, cooldown_ms: i64 = 30000) -> HarnessCircuitBreaker {
+    return HarnessCircuitBreaker(
+        fail_threshold = if fail_threshold > 0 { fail_threshold } else { 5 },
+        consecutive_fails = 0,
+        cooldown_ns = cooldown_ms * 1000000,
+        opened_at_ns = 0,
+        is_open = false
+    )
+}
+
+fn harness_cb_allow(mut cb: HarnessCircuitBreaker) -> bool {
+    if not cb.is_open { return true }
+    if clock_ns() - cb.opened_at_ns >= cb.cooldown_ns {
+        cb.is_open = false
+        cb.consecutive_fails = 0
+        return true
+    }
+    return false
+}
+
+fn harness_cb_record_ok(mut cb: HarnessCircuitBreaker) {
+    cb.consecutive_fails = 0
+    cb.is_open = false
+}
+
+fn harness_cb_record_fail(mut cb: HarnessCircuitBreaker) {
+    cb.consecutive_fails += 1
+    if cb.consecutive_fails >= cb.fail_threshold {
+        cb.is_open = true
+        cb.opened_at_ns = clock_ns()
+    }
+}
 
 struct HarnessLlmResult {
     ok_flag: bool
@@ -381,7 +869,43 @@ fn harness_llm_call(host: str, port: i64, api_path: str, api_key: str, json_body
     )
 }
 
-// ==================== 5. DETERMINISTIC AGENT EVAL & BENCHMARK SUITE ====================
+// Anthropic Messages HTTPS caller (`x-api-key` + `anthropic-version: 2023-06-01`)
+fn harness_llm_call_anthropic(api_key: str, json_body: str) -> HarnessLlmResult {
+    t0 := clock_ns()
+    hdr := "Content-Type: application/json\r\nanthropic-version: 2023-06-01\r\nx-api-key: " + api_key
+    resp := https_request("POST", "api.anthropic.com", 443, "/v1/messages", hdr, json_body) or HttpsResponse(status = 0, body = "")
+    el_us := (clock_ns() - t0) / 1000
+    if resp.status < 200 or resp.status >= 300 {
+        return HarnessLlmResult(ok_flag = false, status = resp.status, latency_us = el_us, raw_body = resp.body, content = "", tool_call = ToolCall(found = false, id = "", name = "", args_json = ""))
+    }
+    tc := harness_parse_tool_call(resp.body)
+    txt := json_get_str(resp.body, "text") or ""
+    return HarnessLlmResult(ok_flag = true, status = resp.status, latency_us = el_us, raw_body = resp.body, content = txt, tool_call = tc)
+}
+
+// Resilient caller with automatic exponential backoff & circuit breaker
+fn harness_llm_call_resilient(host: str, port: i64, api_path: str, api_key: str, json_body: str, pol: HarnessRetryPolicy, mut cb: HarnessCircuitBreaker) -> HarnessLlmResult {
+    if not harness_cb_allow(mut cb) {
+        return HarnessLlmResult(ok_flag = false, status = 503, latency_us = 0, raw_body = "circuit_open", content = "", tool_call = ToolCall(found = false, id = "", name = "", args_json = ""))
+    }
+    mut attempt := 0
+    while attempt <= pol.max_retries {
+        res := harness_llm_call(host, port, api_path, api_key, json_body)
+        if res.ok_flag {
+            harness_cb_record_ok(mut cb)
+            return res
+        }
+        harness_cb_record_fail(mut cb)
+        if not harness_is_retryable_status(res.status) or attempt == pol.max_retries {
+            return res
+        }
+        sleep_ms(harness_retry_delay_ms(pol, attempt))
+        attempt += 1
+    }
+    return HarnessLlmResult(ok_flag = false, status = 0, latency_us = 0, raw_body = "", content = "", tool_call = ToolCall(found = false, id = "", name = "", args_json = ""))
+}
+
+// ==================== 6. DETERMINISTIC EVAL SUITE SUMMARY ====================
 
 struct EvalSuite {
     name: str
