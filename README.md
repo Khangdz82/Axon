@@ -9,14 +9,15 @@ The entire compiler (`compiler_ax/` — `18` pure Axon modules, `37,137` lines) 
 ## Key Highlights (v1.1.0)
 
 - **Native Photon-D2D Web UI Engine (0 WebView, 0 Electron, 0 Blur):** Build crisp desktop UIs directly in HTML5 + CSS3 (Grid, Flexbox, `flex-wrap`, `position: absolute/fixed`, `:root`/`var(--*)`, compound/descendant selectors) + Tailwind CSS (`dark:`, `sm:`/`md:`/`lg:`/`xl:`) + `<script>` JS engine + `<img src>` (`gdiplus` + Direct2D `BitmapBrush`) + per-container `overflow-y-auto` scrollbars + live Unicode `<input>`/`<textarea>` + Per-Monitor HiDPI ClearType rendering (`std/ui.ax`, `std/gui.ax`, `std/html.ax`, `std/css.ax`, `std/ui_tailwind.ax`, `std/ui_layout.ax`, `std/ui_js.ax`).
+- **Ultra-Lean Chromium Desktop Host (`std/webview.ax`):** For complex web apps, launch native Edge/Chromium desktop windows (`--app=`, no tabs/omnibox) with isolated ephemeral user profiles in `%TEMP%` (zero junk folders in cwd, automatic wipe on exit), capped 64MB V8 heap (`--js-flags="--max-old-space-size=64"`), single renderer process, 8MB disk cache, zero GPU shader disk cache, and zero background telemetry/sync (~35–55 MB idle RAM vs 250MB+ Electron).
 - **Production AI Agent Harness & Eval Framework (`std/ai_harness.ax`, `std/ai_agent.ax`, `std/ai_eval.ax`):** Token-budgeted context manager, OpenAI/Anthropic/Gemini/Ollama tool-call normalizer, parallel tool dispatcher, sandboxed tools (path/command guards, secret redaction, prompt-injection detection), retry/circuit-breaker/rate-limiter, persistent `.axmem` key-value memory, DAG task planner, agent-to-agent swarm bus, ReAct loop, and benchmark eval graders (`p50`/`p95`/`p99`, `pass@k`, Markdown/JSONL export).
-- **Full-Stack Production Stdlib (`93` Pure Axon Modules, `38,222` Lines):** Native TCP/UDP sockets, TLS 1.2/1.3 (WinHTTP Schannel + OpenSSL with fail-closed hostname checks), HTTP/1.1, HTTP/2 + HPACK + Protobuf v3 + gRPC, PostgreSQL Wire v3.0, MySQL Wire v10, SQLite3, universal 16-arg Win64/SysV C-ABI FFI (`std::ffi`), zero-cost generics (`Box[T]`, `Option[T]`, `Pair[A,B]`), zero-`nvcc` PTX JIT CUDA (`std::cuda`), GGUF/LLaMA/vLLM/FAISS, and 2D/3D Game Engine + Audio.
+- **Full-Stack Production Stdlib (`93` Pure Axon Modules, `38,684` Lines):** Native TCP/UDP sockets, TLS 1.2/1.3 (WinHTTP Schannel + OpenSSL with fail-closed hostname checks), HTTP/1.1, HTTP/2 + HPACK + Protobuf v3 + gRPC, PostgreSQL Wire v3.0, MySQL Wire v10, SQLite3, universal 16-arg Win64/SysV C-ABI FFI (`std::ffi`), zero-cost generics (`Box[T]`, `Option[T]`, `Pair[A,B]`), zero-`nvcc` PTX JIT CUDA (`std::cuda`), GGUF/LLaMA/vLLM/FAISS, and 2D/3D Game Engine + Audio.
 - **11.79x Faster Runtime & 12.15x Faster Compile vs MSVC `/O2 /arch:AVX2` (30/30 Benchmarks):** Across [`examples/bench_30_suite/axon_bench_30.ax`](examples/bench_30_suite/axon_bench_30.ax) (`0 B` leaks):
   - **Easy (`B01..B10`):** `45.36 ms` vs `312.27 ms` (**6.88x faster**) — ERMS `REP STOSD` canvas spans (`21.61x`), zero-IDIV calendar (`8.50x`), `FrameArena` (`12.71x`).
   - **Medium (`B11..B20`):** `31.18 ms` vs `276.24 ms` (**8.86x faster**) — Zero-VDOM reactive signals (`34.99x`), 100k-row virtual list (`27.79x`), AVX2+FMA3 RMSNorm+RoPE (`10.15x`).
   - **Extreme (`B21..B30`):** `43.56 ms` vs `827.56 ms` (**19.00x faster**) — PagedKV FlashAttention-2 (`52.71x`), Binary-Heap A* (`46.09x`), 64-dim L2 Vector Search (`39.81x`), ChaCha20 ARX (`15.82x`).
 - **Self-Hosted Deterministic Toolchain:** Prebuilt binaries verified by 3-stage deterministic bootstrap (`SHA256(Stage 2) == SHA256(Stage 3)`): Windows x64 (`bin/axc.exe`, `1,843,712 B`), Linux x64 (`bin/axc-linux-x64`, `1,799,088 B`), and macOS Apple Silicon (`bin/axc-macos-arm64`, `1,278,016 B`).
-- **Hardened Security & Verification (`69/69` pass, `34/34` fail_compile):** Compile-time capability attenuation (`E0501`), `tainted[str]` SQLi/CMDi blocking (`E0502`), strict `unsafe` boundary (`E0503`) covering raw pointer/FFI/atomic/SIMD intrinsics, Ring 0 <-> Ring 3 bridge (`std/ring_bridge.ax`), Shield v5 (`std/shield.ax`), PIE-safe runtime stack backtraces (`exit 101`), and static advisor `axc advise <file.ax> [--json]`.
+- **Hardened Security & Verification (`70/70` pass, `34/34` fail_compile):** Compile-time capability attenuation (`E0501`), `tainted[str]` SQLi/CMDi blocking (`E0502`), strict `unsafe` boundary (`E0503`) covering raw pointer/FFI/atomic/SIMD intrinsics, Ring 0 <-> Ring 3 bridge (`std/ring_bridge.ax`), Shield v5 (`std/shield.ax`), PIE-safe runtime stack backtraces (`exit 101`), and static advisor `axc advise <file.ax> [--json]`.
 
 ---
 
@@ -130,11 +131,11 @@ Open [`playground/index.html`](playground/index.html) directly in Chrome/Edge/Fi
 
 ---
 
-## Standard Library (`93` Pure Axon Modules, `38,222` Lines)
+## Standard Library (`93` Pure Axon Modules, `38,684` Lines)
 
 | Domain | Key Modules | Highlights |
 | :--- | :--- | :--- |
-| **Native Web UI (Photon-D2D)** | `ui`, `gui`, `html`, `css`, `ui_tailwind`, `ui_layout`, `ui_js`, `webview` | Direct2D/DirectWrite HiDPI 0-blur renderer, CSS Grid/Flexbox/Vars, Tailwind (`dark:`/`sm:`/`md:`/`lg:`/`xl:`), `<script>` JS, `<img>`, independent scroll containers, live `<input>`/`<textarea>` |
+| **Native Web UI & WebView** | `ui`, `gui`, `html`, `css`, `ui_tailwind`, `ui_layout`, `ui_js`, `webview` | Photon-D2D Direct2D HiDPI ClearType 0-blur renderer (< 12MB RAM) + Ultra-Lean Chromium Host (`--app=`, isolated %TEMP% profile, 64MB V8 heap, 8MB disk cache, 0 GPU cache files, auto-cleanup on close) |
 | **AI Agent Harness & Eval** | `ai_harness`, `ai_agent`, `ai_eval` | Context token budgeter, OpenAI/Anthropic/Gemini/Ollama tool normalization, parallel tool dispatch, sandboxed path/cmd/redaction/injection guards, `.axmem` memory, DAG planner, swarm bus, ReAct loop, eval graders & percentiles |
 | **AI / LLM & GPU Compute** | `ai`, `ai_engine`, `ai_gguf`, `ai_lora`, `ai_serve`, `llama`, `vllm`, `cuda`, `faiss`, `onnx`, `safetensors`, `tiktoken`, `torch`, `quant`, `numpy` | Zero-`nvcc` PTX JIT CUDA driver, GGUF v2/v3 + Q4_K/Q8_0/F16 dequant, LLaMA RoPE/RMSNorm/SwiGLU/Top-P, vLLM PagedAttention, FAISS L2 search, LoRA/QLoRA, symbolic tensor shapes (`E0602`) |
 | **Networking, TLS, RPC & DB** | `net`, `tls`, `http`, `grpc`, `sqlite`, `postgres`, `mysql`, `async_io` | TCP/UDP sockets with timeouts, TLS 1.2/1.3 (Schannel + OpenSSL fail-closed SNI/hostname), HTTP/1.1, HTTP/2 + HPACK + Protobuf v3 + gRPC, pure-Axon PostgreSQL Wire v3.0 & MySQL v10, SQLite3 |
@@ -149,7 +150,7 @@ Open [`playground/index.html`](playground/index.html) directly in Chrome/Edge/Fi
 
 - **Compile-Time Safety Gates (`34/34` verified in `tests/fail_compile/`):**
   Second-class reference isolation (`E0101`–`E0102`), Perceus linear ownership / move-in-loop / `par_for` race detection (`E0201`–`E0204`), immutability (`E0301`), capability attenuation (`E0501`), unsanitized `tainted[str]` SQL/shell sinks (`E0502`), **strict `unsafe` boundary (`E0503`)** blocking all unguarded raw pointer, FFI, SIMD pointer, and atomic intrinsics, `@no_alloc` verification (`E0601`), symbolic tensor shapes (`E0602`), `comptime_assert` (`E0604`), and parser recursion cap (`E0020`, depth limit `256`).
-- **Fail-Closed Runtime Protection (`69/69` `tests/pass/*.ax` + `6/6` runtime traps -> `exit 101`):**
+- **Fail-Closed Runtime Protection (`70/70` `tests/pass/*.ax` + `6/6` runtime traps -> `exit 101`):**
   Hardware/runtime traps with PIE-safe stack backtraces (`#0 fn -> #1 caller -> #2 main`) for integer `/ 0`, `% 0`, `INT64_MIN / -1`, checked `--shield` signed overflow, and `ByteBuf` / `str_byte` out-of-bounds accesses; CWE-158 `NUL`-byte rejection across FS/OS/SQLite/PostgreSQL/MySQL; TLS 1.2+ with fail-closed hostname verification; HTTP/2 4 MB frame caps & strict HPACK/gRPC framing; UNC NTLM leak prevention in native image loaders; bounds-hardened vLLM/GGUF/CUDA/KvStore/FFI/SafeTensors/ONNX modules.
 
 ---

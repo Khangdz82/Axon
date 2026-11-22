@@ -2,6 +2,15 @@
 // Renders REAL HTML5, CSS3, Tailwind CSS, JavaScript, DirectWrite/ClearType fonts, and GPU compositing
 // via the OS native browser app-window engine (Microsoft Edge `--app=` on Win10/11, Chrome/Chromium on Linux/macOS)
 // backed by a zero-overhead pure-Axon `std::net` + `std::http` localhost IPC server (~0.05 ms latency, 0 Electron bloat).
+//
+// Ultra-Lean Desktop Runtime Optimization:
+// 1. Ephemeral Isolated Profile in %TEMP% (Zero junk folders in project directory/root).
+// 2. V8 Memory Heap Capping (`--js-flags="--max-old-space-size=64"`).
+// 3. Single Renderer Process (`--renderer-process-limit=1`).
+// 4. Zero Shader Disk Cache (`--disable-gpu-shader-disk-cache`).
+// 5. Clamped Disk & Media Cache (8 MB disk cache, 4 MB media cache).
+// 6. Zero Background Telemetry, Sync & Network Probing.
+// 7. Auto-cleanup of temporary profile directories on app exit.
 
 use std::os
 use std::str
@@ -9,6 +18,26 @@ use std::net
 use std::http
 use std::sys
 use std::ffi
+use std::path
+
+struct WebviewConfig {
+    title: str
+    port: i64
+    width: i64
+    height: i64
+    html_body: str
+    static_dir: str
+    ephemeral_profile: bool
+    custom_profile_dir: str
+    custom_browser_bin: str
+    max_memory_mb: i64
+    disk_cache_mb: i64
+    dev_tools: bool
+    headless: bool
+    disable_gpu_cache: bool
+    single_process: bool
+    inprivate: bool
+}
 
 struct WebviewApp {
     title: str
@@ -17,6 +46,13 @@ struct WebviewApp {
     height: i64
     listener: TcpListener
     html_body: str
+    static_dir: str
+    profile_dir: str
+    is_ephemeral: bool
+    browser_bin: str
+    proc_handle: i64
+    proc_id: i64
+    is_open: bool
 }
 
 struct WebviewReq {
@@ -27,11 +63,71 @@ struct WebviewReq {
     body: str
 }
 
-fn webview_has_browser() -> bool {
+struct WebviewLaunchResult {
+    success: bool
+    proc_handle: i64
+    proc_id: i64
+}
+
+// Scans standard system and user locations for native Chromium/Edge binaries.
+fn webview_find_browser() -> str {
+    // 1. Windows 10/11 built-in Microsoft Edge (system-wide 64-bit and 32-bit Program Files)
     edge1 := "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+    if sys_fs_exists(edge1) { return edge1 }
     edge2 := "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe"
+    if sys_fs_exists(edge2) { return edge2 }
+
+    local_app := sys_env_get("LOCALAPPDATA")
+    if str_len(local_app) > 0 {
+        edge_usr := f"{local_app}\\Microsoft\\Edge\\Application\\msedge.exe"
+        if sys_fs_exists(edge_usr) { return edge_usr }
+        chrome_usr := f"{local_app}\\Google\\Chrome\\Application\\chrome.exe"
+        if sys_fs_exists(chrome_usr) { return chrome_usr }
+        brave_usr := f"{local_app}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
+        if sys_fs_exists(brave_usr) { return brave_usr }
+    }
+
+    // 2. Google Chrome (Windows system-wide)
     chrome1 := "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-    return sys_fs_exists(edge1) or sys_fs_exists(edge2) or sys_fs_exists(chrome1)
+    if sys_fs_exists(chrome1) { return chrome1 }
+    chrome2 := "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"
+    if sys_fs_exists(chrome2) { return chrome2 }
+
+    // 3. Brave Browser (Windows system-wide)
+    brave1 := "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
+    if sys_fs_exists(brave1) { return brave1 }
+    brave2 := "C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
+    if sys_fs_exists(brave2) { return brave2 }
+
+    // 4. Linux standard distributions
+    if sys_fs_exists("/usr/bin/google-chrome-stable") { return "/usr/bin/google-chrome-stable" }
+    if sys_fs_exists("/usr/bin/google-chrome") { return "/usr/bin/google-chrome" }
+    if sys_fs_exists("/usr/bin/chromium") { return "/usr/bin/chromium" }
+    if sys_fs_exists("/usr/bin/chromium-browser") { return "/usr/bin/chromium-browser" }
+    if sys_fs_exists("/usr/bin/microsoft-edge-stable") { return "/usr/bin/microsoft-edge-stable" }
+    if sys_fs_exists("/usr/bin/microsoft-edge") { return "/usr/bin/microsoft-edge" }
+    if sys_fs_exists("/usr/bin/brave-browser") { return "/usr/bin/brave-browser" }
+    if sys_fs_exists("/snap/bin/chromium") { return "/snap/bin/chromium" }
+
+    // 5. macOS Application bundles
+    if sys_fs_exists("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge") {
+        return "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+    }
+    if sys_fs_exists("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome") {
+        return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    }
+    if sys_fs_exists("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser") {
+        return "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+    }
+    if sys_fs_exists("/Applications/Chromium.app/Contents/MacOS/Chromium") {
+        return "/Applications/Chromium.app/Contents/MacOS/Chromium"
+    }
+
+    return ""
+}
+
+fn webview_has_browser() -> bool {
+    return str_len(webview_find_browser()) > 0
 }
 
 // Strict URL validator: blocks OS command injection (CWE-78) & Chromium flag injection (CWE-88)
@@ -53,64 +149,395 @@ fn _webview_is_safe_url(url: str) -> bool {
     return true
 }
 
-// Finds an available native Chromium/Edge binary and launches a clean `--app=` window (no browser tabs/toolbar)
-fn webview_launch_window(url: str, width: i64, height: i64) -> bool {
-    if not _webview_is_safe_url(url) { return false }
-    w := if width > 100 and width <= 7680 { width } else { 1200 }
-    h := if height > 100 and height <= 4320 { height } else { 800 }
-    nonce := (clock_ns() ^ cpu_rdtsc()) & 0x7FFFFFFF
-    prof := f".axon_wv_{sys_pid()}_{nonce}"
-
-    // Windows 10/11 built-in Microsoft Edge (preinstalled on every Windows PC)
-    edge1 := "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
-    edge2 := "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe"
-    chrome1 := "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-
-    mut bin := ""
-    if sys_fs_exists(edge1) { bin = edge1 }
-    else if sys_fs_exists(edge2) { bin = edge2 }
-    else if sys_fs_exists(chrome1) { bin = chrome1 }
-
-    if str_len(bin) > 0 {
-        k := ffi_open_one("shell32.dll")
-        if k != 0 {
-            f_exec := ffi_sym(k, "ShellExecuteA")
-            if f_exec != 0 {
-                c_op := ffi_cstr("open")
-                c_bin := ffi_cstr(bin)
-                args := f"--app=\"{url}\" --window-size={w},{h} --user-data-dir=\"{sys_cwd()}\\{prof}\" --no-first-run --disable-extensions"
-                c_args := ffi_cstr(args)
-                rc := ffi_call6(f_exec, 0, c_op, c_bin, c_args, 0, 1)
-                ffi_free(c_op); ffi_free(c_bin); ffi_free(c_args)
-                return rc > 32
-            }
-        }
+// Validates profile paths to prevent traversal and injection
+fn _webview_is_safe_profile_path(p: str) -> bool {
+    n := str_len(p)
+    if n < 4 or n > 1024 { return false }
+    if str_contains(p, "..") { return false }
+    if str_contains(p, "\"") or str_contains(p, "'") or str_contains(p, ";") or
+       str_contains(p, "|") or str_contains(p, "&") or str_contains(p, "<") or
+       str_contains(p, ">") or str_contains(p, "\n") or str_contains(p, "\r") {
+        return false
     }
-
-    // Linux / macOS fallback (URL strictly whitelisted above — zero shell metacharacters possible)
-    _ := os_exec(f"google-chrome --app='{url}' --window-size={w},{h} --no-first-run >/dev/null 2>&1 &")
     return true
 }
 
-fn webview_create(title: str, port: i64, width: i64, height: i64, html_body: str) -> WebviewApp ! i64 {
-    if port < 1024 or port > 65535 { return err(-601) }
-    ln := tcp_listen("127.0.0.1", port, 64) or return
-    return ok(WebviewApp(
+// Generates an isolated ephemeral user data directory in OS %TEMP% (never pollutes project cwd).
+fn webview_make_profile_dir() -> str {
+    mut base := sys_env_get("TEMP")
+    if str_len(base) == 0 { base = sys_env_get("TMP") }
+    if str_len(base) == 0 { base = sys_env_get("LOCALAPPDATA") }
+    if str_len(base) == 0 {
+        if sys_fs_exists("C:\\Windows\\Temp") { base = "C:\\Windows\\Temp" }
+        else { base = "/tmp" }
+    }
+    nonce := (clock_ns() ^ cpu_rdtsc()) & 0x7FFFFFFF
+    sep := if str_contains(base, "\\") or sys_fs_exists("C:\\Windows") { "\\" } else { "/" }
+    return f"{base}{sep}axon_wv_{sys_pid()}_{nonce}"
+}
+
+// Recursively cleans and removes an ephemeral profile directory, deleting all caches and temp files.
+fn webview_clean_profile(p: str) -> bool {
+    n := str_len(p)
+    if n < 8 or not str_contains(p, "axon_wv_") or not _webview_is_safe_profile_path(p) {
+        return false
+    }
+    if not sys_fs_exists(p) { return true }
+    if str_contains(p, "\\") or sys_fs_exists("C:\\Windows") {
+        _ := os_exec(f"cmd.exe /c rmdir /s /q \"{p}\" >nul 2>&1")
+    } else {
+        _ := os_exec(f"rm -rf '{p}' >/dev/null 2>&1")
+    }
+    return not sys_fs_exists(p)
+}
+
+// Builds ultra-lean Chromium command line arguments optimized specifically for desktop app execution:
+// - Standalone desktop app window (`--app=`, no tabs/omnibox/bookmarks)
+// - V8 heap cap (`--js-flags="--max-old-space-size=64"`)
+// - Single renderer process (`--renderer-process-limit=1`)
+// - Zero shader disk cache (`--disable-gpu-shader-disk-cache`)
+// - Clamped disk cache (`--disk-cache-size=8388608`)
+// - Zero crash dumps / crashpad (`--disable-crash-reporter --no-crash-upload`)
+// - Disabled background networking, telemetry, syncing, and translation services
+fn webview_build_args(
+    url: str,
+    width: i64,
+    height: i64,
+    profile_dir: str,
+    dev_tools: bool = false,
+    inprivate: bool = false,
+    max_mem_mb: i64 = 64,
+    disk_cache_mb: i64 = 8,
+    single_process: bool = false
+) -> str {
+    w := if width > 100 and width <= 7680 { width } else { 1200 }
+    h := if height > 100 and height <= 4320 { height } else { 800 }
+    mem := if max_mem_mb >= 16 and max_mem_mb <= 4096 { max_mem_mb } else { 64 }
+    dcache := if disk_cache_mb >= 0 and disk_cache_mb <= 256 { disk_cache_mb * 1048576 } else { 8388608 }
+
+    mut args := f"--app=\"{url}\" --window-size={w},{h} --user-data-dir=\"{profile_dir}\""
+    // Core anti-bloat flags: skip first-run welcome and default browser checks
+    args = args + " --no-first-run --no-default-browser-check --disable-default-apps --disable-extensions"
+    // Memory and V8 optimization
+    args = args + f" --js-flags=\"--max-old-space-size={mem}\""
+    if single_process {
+        args = args + " --single-process"
+    } else {
+        args = args + " --renderer-process-limit=1"
+    }
+    // Disk cache reduction & zero GPU shader disk cache
+    args = args + f" --disk-cache-size={dcache} --media-cache-size=4194304"
+    args = args + " --disable-gpu-shader-disk-cache --disable-crash-reporter --no-crash-upload"
+    // Network telemetry, sync and background services suppression
+    args = args + " --disable-background-networking --disable-component-update --disable-sync --disable-domain-reliability --disable-client-side-phishing-detection"
+    // Drop heavy non-desktop browser features (ML hints, translation, media routers)
+    args = args + " --disable-features=Translate,OptimizationHints,MediaRouter,CalculateNativeWinOcclusion,InterestFeedContentSuggestions,AutofillServerCommunication,CertificateTransparencyComponentUpdater,SpeechAPI,DialLocalDiscovery"
+    // Desktop UI responsiveness and stability
+    args = args + " --disable-background-timer-throttling --disable-backgrounding-occluded-windows --password-store=basic"
+
+    if dev_tools {
+        args = args + " --auto-open-devtools-for-tabs"
+    }
+    if inprivate {
+        args = args + " --inprivate"
+    }
+    return args
+}
+
+// Launches a lean Chromium desktop app window with exact process tracking via Win32 ShellExecuteExA.
+fn webview_launch_window_ex(
+    url: str,
+    width: i64,
+    height: i64,
+    profile_dir: str,
+    dev_tools: bool = false,
+    inprivate: bool = false,
+    max_mem_mb: i64 = 64,
+    disk_cache_mb: i64 = 8,
+    single_process: bool = false,
+    custom_bin: str = ""
+) -> WebviewLaunchResult {
+    if not _webview_is_safe_url(url) {
+        return WebviewLaunchResult(success = false, proc_handle = 0, proc_id = 0)
+    }
+    mut bin := custom_bin
+    if str_len(bin) == 0 or not sys_fs_exists(bin) {
+        bin = webview_find_browser()
+    }
+    if str_len(bin) == 0 {
+        return WebviewLaunchResult(success = false, proc_handle = 0, proc_id = 0)
+    }
+
+    w := if width > 100 and width <= 7680 { width } else { 1200 }
+    h := if height > 100 and height <= 4320 { height } else { 800 }
+    args := webview_build_args(url, w, h, profile_dir, dev_tools, inprivate, max_mem_mb, disk_cache_mb, single_process)
+
+    // Windows native ShellExecuteExA with SEE_MASK_NOCLOSEPROCESS to capture process handle
+    if str_contains(bin, "\\") or str_ends_with(bin, ".exe") {
+        k := ffi_open_one("shell32.dll")
+        if k != 0 {
+            f_exec_ex := ffi_sym(k, "ShellExecuteExA")
+            c_op := ffi_cstr("open")
+            c_bin := ffi_cstr(bin)
+            c_args := ffi_cstr(args)
+
+            mut ok_launch := false
+            mut p_handle := 0
+            mut p_id := 0
+
+            if f_exec_ex != 0 {
+                // SHELLEXECUTEINFOA on Win64: 112 bytes
+                sei := ffi_alloc(128)
+                unsafe {
+                    // cbSize = 112 (offset 0), fMask = SEE_MASK_NOCLOSEPROCESS (0x40, offset 4)
+                    ptr_write_i64(sei, 0, (0x40 << 32) | 112)
+                    ptr_write_i64(sei, 1, 0)      // hwnd = 0
+                    ptr_write_i64(sei, 2, c_op)   // lpVerb = "open"
+                    ptr_write_i64(sei, 3, c_bin)  // lpFile = bin
+                    ptr_write_i64(sei, 4, c_args) // lpParameters = args
+                    ptr_write_i64(sei, 5, 0)      // lpDirectory = NULL
+                    ptr_write_i64(sei, 6, 1)      // nShow = SW_SHOWNORMAL (1)
+                    mut z := 7
+                    while z < 14 {
+                        ptr_write_i64(sei, z, 0)
+                        z += 1
+                    }
+                }
+                rc := ffi_call1(f_exec_ex, sei)
+                if rc != 0 {
+                    ok_launch = true
+                    unsafe {
+                        p_handle = ptr_read_i64(sei, 13) // offset 104 = index 13
+                    }
+                    if p_handle != 0 {
+                        k32 := _sys_kernel()
+                        f_gpid := ffi_sym(k32, "GetProcessId")
+                        if f_gpid != 0 {
+                            p_id = ffi_call1(f_gpid, p_handle) & 0xFFFFFFFF
+                        }
+                    }
+                }
+                ffi_free(sei)
+            }
+
+            if not ok_launch {
+                // Fallback to standard ShellExecuteA
+                f_exec := ffi_sym(k, "ShellExecuteA")
+                if f_exec != 0 {
+                    rc2 := ffi_call6(f_exec, 0, c_op, c_bin, c_args, 0, 1)
+                    ok_launch = rc2 > 32
+                }
+            }
+
+            ffi_free(c_op)
+            ffi_free(c_bin)
+            ffi_free(c_args)
+            return WebviewLaunchResult(success = ok_launch, proc_handle = p_handle, proc_id = p_id)
+        }
+    }
+
+    // Linux / macOS fallback
+    _ := os_exec(f"\"{bin}\" {args} >/dev/null 2>&1 &")
+    return WebviewLaunchResult(success = true, proc_handle = 0, proc_id = 0)
+}
+
+// Backward-compatible window launcher
+fn webview_launch_window(url: str, width: i64, height: i64) -> bool {
+    prof := webview_make_profile_dir()
+    res := webview_launch_window_ex(url, width, height, prof, false, false, 64, 8, false, "")
+    return res.success
+}
+
+// Default configuration with low-RAM parameters and ephemeral profile
+fn webview_default_config(title: str, port: i64, width: i64 = 1200, height: i64 = 800, html: str = "") -> WebviewConfig {
+    return WebviewConfig(
         title = title,
         port = port,
         width = width,
         height = height,
+        html_body = html,
+        static_dir = "",
+        ephemeral_profile = true,
+        custom_profile_dir = "",
+        custom_browser_bin = "",
+        max_memory_mb = 64,
+        disk_cache_mb = 8,
+        dev_tools = false,
+        headless = false,
+        disable_gpu_cache = true,
+        single_process = false,
+        inprivate = false
+    )
+}
+
+// Creates a WebView app with explicit configuration options
+fn webview_create_with_config(cfg: WebviewConfig) -> WebviewApp ! i64 {
+    if cfg.port < 1024 or cfg.port > 65535 { return err(-601) }
+    ln := tcp_listen("127.0.0.1", cfg.port, 64) or return
+
+    mut prof := cfg.custom_profile_dir
+    mut is_eph := false
+    if str_len(prof) == 0 {
+        prof = webview_make_profile_dir()
+        is_eph = cfg.ephemeral_profile
+    }
+
+    mut bin := cfg.custom_browser_bin
+    if str_len(bin) == 0 or not sys_fs_exists(bin) {
+        bin = webview_find_browser()
+    }
+
+    return ok(WebviewApp(
+        title = cfg.title,
+        port = cfg.port,
+        width = cfg.width,
+        height = cfg.height,
         listener = ln,
-        html_body = html_body
+        html_body = cfg.html_body,
+        static_dir = cfg.static_dir,
+        profile_dir = prof,
+        is_ephemeral = is_eph,
+        browser_bin = bin,
+        proc_handle = 0,
+        proc_id = 0,
+        is_open = false
     ))
 }
 
+// Standard WebView constructor with optimized defaults
+fn webview_create(title: str, port: i64, width: i64, height: i64, html_body: str) -> WebviewApp ! i64 {
+    cfg := webview_default_config(title, port, width, height, html_body)
+    return webview_create_with_config(cfg)
+}
+
+// Opens the WebView desktop window
 fn webview_open(wv: WebviewApp) -> bool {
-    return webview_launch_window(f"http://127.0.0.1:{wv.port}/", wv.width, wv.height)
+    url := f"http://127.0.0.1:{wv.port}/"
+    res := webview_launch_window_ex(url, wv.width, wv.height, wv.profile_dir, false, false, 64, 8, false, wv.browser_bin)
+    return res.success
+}
+
+// Opens the WebView desktop window with mutable tracking of process handle and PID
+fn webview_open_app(mut wv: WebviewApp, dev_tools: bool = false, inprivate: bool = false, max_mem_mb: i64 = 64, disk_cache_mb: i64 = 8) -> bool {
+    url := f"http://127.0.0.1:{wv.port}/"
+    res := webview_launch_window_ex(url, wv.width, wv.height, wv.profile_dir, dev_tools, inprivate, max_mem_mb, disk_cache_mb, false, wv.browser_bin)
+    wv.proc_handle = res.proc_handle
+    wv.proc_id = res.proc_id
+    wv.is_open = res.success
+    return res.success
+}
+
+// Checks if the browser window process is still running
+fn webview_is_alive(wv: WebviewApp) -> bool {
+    if wv.proc_handle == 0 { return wv.is_open }
+    k32 := _sys_kernel()
+    if k32 == 0 { return true }
+    f_exit := ffi_sym(k32, "GetExitCodeProcess")
+    if f_exit == 0 { return true }
+    buf := ffi_alloc(8)
+    rc := ffi_call2(f_exit, wv.proc_handle, buf)
+    mut code := 0
+    if rc != 0 {
+        unsafe {
+            code = ptr_read_u8(buf, 0) | (ptr_read_u8(buf, 1) << 8) | (ptr_read_u8(buf, 2) << 16) | (ptr_read_u8(buf, 3) << 24)
+        }
+    }
+    ffi_free(buf)
+    // 259 = STILL_ACTIVE
+    return code == 259
+}
+
+// Explicitly terminates the browser window process if active
+fn webview_terminate(mut wv: WebviewApp) {
+    if wv.proc_handle != 0 {
+        k32 := _sys_kernel()
+        if k32 != 0 {
+            f_term := ffi_sym(k32, "TerminateProcess")
+            f_close := ffi_sym(k32, "CloseHandle")
+            if f_term != 0 {
+                _ := ffi_call2(f_term, wv.proc_handle, 0)
+            }
+            if f_close != 0 {
+                _ := ffi_call1(f_close, wv.proc_handle)
+            }
+        }
+        wv.proc_handle = 0
+    }
+    wv.is_open = false
+}
+
+// Closes listener, terminates browser process if still active, and wipes ephemeral profile directory.
+fn webview_close(wv: WebviewApp) {
+    tcp_listener_close(wv.listener)
+
+    if wv.proc_handle != 0 {
+        k32 := _sys_kernel()
+        if k32 != 0 {
+            f_exit := ffi_sym(k32, "GetExitCodeProcess")
+            f_term := ffi_sym(k32, "TerminateProcess")
+            f_close := ffi_sym(k32, "CloseHandle")
+            if f_exit != 0 and f_term != 0 {
+                buf := ffi_alloc(8)
+                rc := ffi_call2(f_exit, wv.proc_handle, buf)
+                mut code := 0
+                if rc != 0 {
+                    unsafe {
+                        code = ptr_read_u8(buf, 0) | (ptr_read_u8(buf, 1) << 8) | (ptr_read_u8(buf, 2) << 16) | (ptr_read_u8(buf, 3) << 24)
+                    }
+                }
+                ffi_free(buf)
+                if code == 259 {
+                    _ := ffi_call2(f_term, wv.proc_handle, 0)
+                }
+            }
+            if f_close != 0 {
+                _ := ffi_call1(f_close, wv.proc_handle)
+            }
+        }
+    }
+
+    if wv.is_ephemeral and str_len(wv.profile_dir) > 0 {
+        _ := webview_clean_profile(wv.profile_dir)
+    }
+}
+
+// CWE-22 safe resolver for local static directory assets
+fn _webview_safe_resolve_static(static_dir: str, rel_path: str) -> str {
+    if str_len(static_dir) == 0 or str_len(rel_path) == 0 { return "" }
+    if str_contains(rel_path, "..") or str_contains(rel_path, "\\") or str_contains(rel_path, ":") {
+        return ""
+    }
+    mut sub := rel_path
+    if str_starts_with(sub, "/") {
+        sub = str_slice(sub, 1, str_len(sub))
+    }
+    if str_len(sub) == 0 { return "" }
+    sep := if sys_fs_exists("C:\\Windows") or str_contains(static_dir, "\\") { "\\" } else { "/" }
+    joined := f"{static_dir}{sep}{sub}"
+    return joined
+}
+
+// Maps file extensions to MIME content-types
+fn webview_content_type_from_path(p: str) -> str {
+    if str_ends_with(p, ".html") or str_ends_with(p, ".htm") { return "text/html; charset=utf-8" }
+    if str_ends_with(p, ".css") { return "text/css; charset=utf-8" }
+    if str_ends_with(p, ".js") or str_ends_with(p, ".mjs") { return "application/javascript; charset=utf-8" }
+    if str_ends_with(p, ".json") { return "application/json; charset=utf-8" }
+    if str_ends_with(p, ".png") { return "image/png" }
+    if str_ends_with(p, ".jpg") or str_ends_with(p, ".jpeg") { return "image/jpeg" }
+    if str_ends_with(p, ".gif") { return "image/gif" }
+    if str_ends_with(p, ".svg") { return "image/svg+xml" }
+    if str_ends_with(p, ".ico") { return "image/x-icon" }
+    if str_ends_with(p, ".wasm") { return "application/wasm" }
+    if str_ends_with(p, ".woff2") { return "font/woff2" }
+    if str_ends_with(p, ".woff") { return "font/woff" }
+    if str_ends_with(p, ".ttf") { return "font/ttf" }
+    if str_ends_with(p, ".txt") { return "text/plain; charset=utf-8" }
+    return "application/octet-stream"
 }
 
 // Accepts the next HTTP/IPC request from the WebView frontend.
-// Automatically serves `GET /` with `wv.html_body` and returns API requests (`/api/...`) to Axon!
+// Automatically serves `GET /` with `wv.html_body`, static directory assets, and returns API requests (`/api/...`) to Axon!
 fn webview_next_api_req(wv: WebviewApp) -> WebviewReq ! i64 {
     while true {
         sock := tcp_accept(wv.listener) or return
@@ -155,6 +582,24 @@ fn webview_next_api_req(wv: WebviewApp) -> WebviewReq ! i64 {
             tcp_close(sock)
             continue
         }
+        // Automatic static directory asset serving
+        if str_len(wv.static_dir) > 0 and str_eq(req.method, "GET") {
+            static_file := _webview_safe_resolve_static(wv.static_dir, req.path)
+            if str_len(static_file) > 0 and sys_fs_exists(static_file) {
+                b_file := fs_read_file(static_file) or buf_new(0)
+                flen := buf_len(b_file)
+                if flen > 0 {
+                    mime := webview_content_type_from_path(static_file)
+                    file_str := buf_to_owned_str(move b_file)
+                    resp := http_build_response(200, mime, file_str)
+                    _ := tcp_send_str(sock, resp) or 0
+                    tcp_close(sock)
+                    continue
+                } else {
+                    buf_free(move b_file)
+                }
+            }
+        }
         return ok(WebviewReq(sock = sock, method = req.method, path = req.path, query = req.query, body = req.body))
     }
     return err(-602)
@@ -181,6 +626,23 @@ fn webview_reply_text(req: WebviewReq, text_body: str, status: i64 = 200) -> boo
     return ok_s
 }
 
-fn webview_close(wv: WebviewApp) {
-    tcp_listener_close(wv.listener)
+// Sends raw binary bytes with MIME type
+fn webview_reply_bytes(req: WebviewReq, content_type: str, data: ByteBuf, status: i64 = 200) -> bool {
+    n := buf_len(data)
+    hdr := f"HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n"
+    s1 := (tcp_send_str(req.sock, hdr) or -1) >= 0
+    s2 := if s1 and n > 0 { (tcp_send_bytes(req.sock, data) or -1) >= 0 } else { s1 }
+    tcp_close(req.sock)
+    buf_free(move data)
+    return s1 and s2
+}
+
+// CWE-22 safe file server response
+fn webview_reply_file(req: WebviewReq, file_path: str, content_type: str = "") -> bool {
+    if str_contains(file_path, "..") {
+        return webview_reply_text(req, "Forbidden", 403)
+    }
+    b := fs_read_file(file_path) or return webview_reply_text(req, "Not Found", 404)
+    ct := if str_len(content_type) > 0 { content_type } else { webview_content_type_from_path(file_path) }
+    return webview_reply_bytes(req, ct, move b, 200)
 }

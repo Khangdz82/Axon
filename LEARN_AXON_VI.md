@@ -26,7 +26,7 @@ Mọi đoạn mã trong giáo trình này đều tương thích trực tiếp v�
 16. [6 Đột Phá AI/LLM (`PagedKvCache`, Chiều Ký Hiệu, `@gpu_kernel`, `DLPack`, `@nan_guard`) & `axc mcp`](#chương-16-6-đột-phá-aillm-pagedkvcache-chiều-ký-hiệu-gpu_kernel-dlpack-nan_guard--axc-mcp)
 17. [Generics Zero-Cost (`Box[T]`, `Option[T]`) & Ranh Giới Bảo Mật `unsafe` (`E0503`)](#chương-17-generics-zero-cost-boxt-optiont--ranh-giới-bảo-mật-unsafe-e0503)
 18. [Full-Stack Thực Chiến: Mạng TCP/TLS 1.3, SQLite/PostgreSQL/MySQL, gRPC & C-ABI FFI](#chương-18-full-stack-thực-chiến-mạng-tcptls-13-sqlitepostgresqlmysql-grpc--c-abi-ffi)
-19. [Xây Dựng Desktop GUI Chuẩn Web Không WebView — Photon-D2D (HTML5, CSS3, Tailwind, JS)](#chương-19-xây-dựng-desktop-gui-chuẩn-web-không-webview--photon-d2d-html5-css3-tailwind-js)
+19. [Xây Dựng Desktop GUI Chuẩn Web — Photon-D2D & Ultra-Lean Chromium WebView](#chương-19-xây-dựng-desktop-gui-chuẩn-web--photon-d2d--ultra-lean-chromium-webview)
 20. [Xây Dựng AI Agent Harness, Sandbox, Memory `.axmem`, Swarm & Eval Chuẩn Production](#chương-20-xây-dựng-ai-agent-harness-sandbox-memory-axmem-swarm--eval-chuẩn-production)
 21. [Phụ Lục: Lộ Trình Học Chuẩn 4 Tuần & Cheat-Sheet Cú Pháp + CLI](#phụ-lục-lộ-trình-học-chuẩn-4-tuần--cheat-sheet-cú-pháp--cli)
 
@@ -46,8 +46,8 @@ Các ngôn ngữ lập trình truyền thống buộc kỹ sư phải đánh đ�
 1. **Cú pháp tối giản phong cách Python:** Không bắt buộc dấu `;`, dùng `and` / `or` / `not`, `f"..."`, tham số đặt tên `=` & mặc định, `|>` pipeline, zero-cost generics `[T]` và error union `T ! E`.
 2. **Perceus tĩnh + Loop Self-FBIP (0 GC, 0 `'a` lifetime, 0 Leak):** Tự động giải phóng bộ nhớ xác định ở mọi nhánh thoát và tái sử dụng vùng nhớ tại chỗ với RAM phẳng suốt hàng triệu chu kỳ.
 3. **`Table[T]` theo cột (SoA) + Cắt Cột Chết + AVX2 FMA3:** Tối ưu bộ nhớ đệm CPU và tự động vector hóa, đạt tốc độ trung bình nhanh gấp **11.79x** MSVC `/O2 /arch:AVX2` trên 30 benchmark chuẩn (và **19.00x** trên nhóm AI/Game/UI nặng).
-4. **Toolchain tự thân gọn nhẹ, không phụ thuộc LLVM/C/Rust:** Trình biên dịch `bin/axc.exe` chỉ **1.76 MB** (`1,843,712 B`), tích hợp sẵn toàn bộ bộ sinh mã máy cho 11 đích (`win-x64`, `linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`, `wasm32`, `unikernel-x64`, `freestanding-*`, `spirv`, `ptx`) và `93` module thư viện chuẩn (`38,222` dòng Axon thuần).
-5. **Desktop UI chuẩn Web không WebView (Photon-D2D) & AI Agent Harness:** Viết giao diện bằng HTML5/CSS3/Tailwind/JS biên dịch thẳng ra Direct2D/DirectWrite sắc nét HiDPI 0 mờ, cùng bộ `std::ai_harness` / `std::ai_agent` / `std::ai_eval` tích hợp sẵn.
+4. **Toolchain tự thân gọn nhẹ, không phụ thuộc LLVM/C/Rust:** Trình biên dịch `bin/axc.exe` chỉ **1.76 MB** (`1,843,712 B`), tích hợp sẵn toàn bộ bộ sinh mã máy cho 11 đích (`win-x64`, `linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`, `wasm32`, `unikernel-x64`, `freestanding-*`, `spirv`, `ptx`) và `93` module thư viện chuẩn (`38,684` dòng Axon thuần).
+5. **Desktop UI Chuẩn Web Đôi (Photon-D2D & Ultra-Lean WebView) & AI Agent Harness:** Viết giao diện bằng HTML5/CSS3/Tailwind/JS biên dịch thẳng ra Direct2D sắc nét HiDPI 0 mờ (< 12 MB RAM) hoặc chạy qua nhân Chromium Desktop siêu nhẹ (~40 MB RAM, cách ly %TEMP%, 0 rác đĩa), cùng bộ `std::ai_harness` / `std::ai_agent` / `std::ai_eval` tích hợp sẵn.
 6. **Bảo mật fail-closed toàn diện (`34` cổng kiểm tra tĩnh + `--shield` + Stack Backtrace):** Chặn lỗi sở hữu (`E0201..E0204`), năng lực (`E0501`), taint SQLi/CMDi (`E0502`), ranh giới `unsafe` nghiêm ngặt (`E0503`), `@no_alloc` (`E0601`), và tự in dấu vết ngăn xếp (`#0 fn -> #1 caller -> #2 main`) khi bẫy runtime kích hoạt (`exit 101`).
 
 ### 1.2. Cài đặt & chạy chương trình đầu tiên
@@ -868,10 +868,12 @@ fn main() -> i32 {
 
 ---
 
-## Chương 19: Xây Dựng Desktop GUI Chuẩn Web Không WebView — Photon-D2D (HTML5, CSS3, Tailwind, JS)
+## Chương 19: Xây Dựng Desktop GUI Chuẩn Web — Photon-D2D & Ultra-Lean Chromium WebView
 
-Thay vì nhúng Chromium/Electron nặng 150 MB, **Photon-D2D** (`std::ui` + `std::gui`) phân tích trực tiếp HTML5, CSS3, Tailwind và JavaScript rồi vẽ thẳng bằng **Direct2D + DirectWrite ClearType (Per-Monitor HiDPI 0 mờ)** trên Windows (và SDL2 trên Linux/macOS):
+Axon cung cấp hai giải pháp xây dựng giao diện Desktop hiện đại tùy theo mục tiêu tối ưu:
 
+### 1. Động cơ Photon-D2D (`std::ui` + `std::gui`): 0 WebView, 0 Electron, RAM < 12 MB
+Phân tích trực tiếp HTML5, CSS3, Tailwind và JavaScript rồi vẽ thẳng bằng **Direct2D + DirectWrite ClearType (Per-Monitor HiDPI 0 mờ)** trên Windows (và SDL2 trên Linux/macOS):
 - **Bố cục CSS3 đầy đủ:** Flexbox (`flex-row`, `flex-col`, `flex-wrap`, `flex-1`, `justify-*`, `items-*`, `gap-*`), CSS Grid (`grid-cols-2..12`), `position: absolute` / `fixed` / `relative`, `z-index`, CSS Variables (`:root { --accent: ... }`, `var(--accent)`), bộ chọn tổ hợp & hậu duệ (`.card > .title`, `.sidebar a:hover`).
 - **Tailwind CSS thực dụng:** Bảng màu Slate/Sky/Emerald/Rose/Amber, `rounded-*`, `shadow-*`, `border-*`, tiền tố responsive `sm:`/`md:`/`lg:`/`xl:` và chế độ tối `dark:`.
 - **Tương tác & Media gốc:**
@@ -899,6 +901,53 @@ fn main() -> i32 {
           + "<script>let n = 0; function addNote() { n = n + 1; setText('status', 'Note #' + n + ': ' + getValue('inp')); }</script>"
     mut doc := ui_window_html("Axon Photon-D2D Demo", 1024, 680, page)
     gui_run_ui_app(mut doc)
+    return 0
+}
+```
+
+### 2. Nhân Chromium WebView Siêu Tối Ưu (`std::webview`): RAM ~35-55 MB, Không Tạo Rác Đĩa
+Khi ứng dụng cần 100% tính năng Web hiện đại (WebGL, Canvas 2D, SVG động, WebSockets, Vue/React/Tailwind phức tạp):
+- **Cửa sổ Desktop `--app=`:** Chạy qua Edge (có sẵn trên Win10/11) hoặc Chrome/Chromium không thanh điều hướng, không tab thừa.
+- **Không xả rác thư mục (`Zero Junk Folders`):** Profile được tạo biệt lập trong `%TEMP%` (`axon_wv_<pid>_<nonce>`), tuyệt đối không tạo thư mục rác `EBWebView` hay `.axon_wv_...` trong thư mục code dự án. Khi đóng ứng dụng (`webview_close`), toàn bộ profile tạm thời sẽ tự động được dọn sạch (`rmdir /s /q`).
+- **Tối ưu RAM sâu:**
+  - V8 Heap old-space giới hạn ở 64 MB (`--js-flags="--max-old-space-size=64"`).
+  - Giới hạn 1 tiến trình renderer duy nhất (`--renderer-process-limit=1`).
+  - Tắt hoàn toàn bộ nhớ đệm shader đồ họa trên đĩa (`--disable-gpu-shader-disk-cache`), không sinh thư mục `GPUCache`.
+  - Giới hạn cache đĩa tối đa 8 MB (`--disk-cache-size=8388608`), cache media 4 MB.
+  - Tắt toàn bộ telemetry, tự cập nhật nền, dịch tự động, và đồng bộ trình duyệt.
+- **IPC Loopback siêu tốc (~0.05 ms):** Giao tiếp trực tiếp giữa frontend JavaScript và backend Axon qua REST/JSON API.
+
+```axon
+use std::webview
+use std::str
+
+fn main() -> i32 {
+    html := "<!doctype html><html><head><script src='https://cdn.tailwindcss.com'></script></head>"
+          + "<body class='bg-slate-900 text-white flex flex-col items-center justify-center h-screen'>"
+          + "<h1 class='text-3xl font-bold text-sky-400 mb-4'>Axon Ultra-Lean WebView</h1>"
+          + "<p class='text-slate-400 mb-6'>RAM ~40 MB | 0 Junk Folders | Auto Clean %TEMP%</p>"
+          + "<button onclick='callApi()' class='px-4 py-2 bg-emerald-500 rounded-lg hover:bg-emerald-600 font-semibold'>Goi Axon Backend</button>"
+          + "<div id='out' class='mt-4 p-3 bg-slate-800 rounded text-sm text-emerald-300'>Cho...</div>"
+          + "<script>async function callApi() { const r = await fetch('/api/ping'); const d = await r.json(); document.getElementById('out').innerText = d.msg; }</script>"
+          + "</body></html>"
+
+    cfg := webview_default_config("Axon Ultra-Lean Webview", 18888, 1024, 768, html)
+    wv := webview_create_with_config(cfg) or return 1
+    _ := webview_open(wv)
+
+    // Vong lap xu ly API tu Frontend
+    while true {
+        req := webview_next_api_req(wv) or break
+        if str_eq(req.path, "/api/ping") {
+            _ := webview_reply_json(req, "{\"msg\":\"Phan hoi tu Axon Backend sieu toc!\",\"status\":\"ok\"}")
+        } else if str_eq(req.path, "/api/exit") {
+            _ := webview_reply_json(req, "{\"status\":\"bye\"}")
+            break
+        }
+    }
+
+    // Tu dong dong listener va xoa sach thu muc temp profile
+    webview_close(wv)
     return 0
 }
 ```

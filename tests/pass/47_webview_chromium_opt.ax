@@ -1,0 +1,156 @@
+// Test 47: Ultra-Lean Chromium Desktop Runtime Optimization (`std/webview.ax`)
+// Verifies:
+// 1. Browser binary detection across systems.
+// 2. Ephemeral isolated user-data-dir in %TEMP% (no junk folders in cwd).
+// 3. Low-RAM Chromium command-line switches generation (V8 heap cap, 1 renderer process, 0 GPU cache, 8MB disk cache).
+// 4. Safe URL & profile path validation against CWE-78 / CWE-88.
+// 5. Automatic ephemeral profile cleanup lifecycle.
+// 6. MIME content type resolution & CWE-22 static directory protection.
+
+use std::webview
+use std::str
+use std::sys
+use std::os
+
+@test
+fn test_browser_detection_and_paths() {
+    has_b := webview_has_browser()
+    bin := webview_find_browser()
+    // On Windows 10/11, Edge is guaranteed present
+    assert(has_b)
+    assert(str_len(bin) > 0)
+    assert(str_contains(bin, "msedge.exe") or str_contains(bin, "chrome.exe") or str_contains(bin, "brave.exe"))
+}
+
+@test
+fn test_ephemeral_profile_location_not_cwd() {
+    prof := webview_make_profile_dir()
+    cwd := sys_cwd()
+
+    // Must be in TEMP or LOCALAPPDATA, strictly NOT inside cwd
+    assert(str_len(prof) > 10)
+    assert(str_contains(prof, "axon_wv_"))
+    assert(not str_starts_with(prof, cwd))
+
+    // Must pass safety validation
+    assert(_webview_is_safe_profile_path(prof))
+    assert(not _webview_is_safe_profile_path("../bad/path"))
+    assert(not _webview_is_safe_profile_path("bad\"path"))
+    assert(not _webview_is_safe_profile_path("bad;rm -rf"))
+}
+
+@test
+fn test_url_security_validation() {
+    assert(_webview_is_safe_url("http://127.0.0.1:18432/"))
+    assert(_webview_is_safe_url("http://localhost:8080/dashboard?tab=1&user=admin"))
+    assert(_webview_is_safe_url("https://example.com/app/index.html#sec1"))
+
+    // Malicious injection attempts must be rejected
+    assert(not _webview_is_safe_url("http://127.0.0.1:8080/\" --disable-web-security"))
+    assert(not _webview_is_safe_url("http://127.0.0.1:8080/; calc.exe"))
+    assert(not _webview_is_safe_url("http://127.0.0.1:8080/ | calc.exe"))
+    assert(not _webview_is_safe_url("javascript:alert(1)"))
+    assert(not _webview_is_safe_url("file:///C:/Windows/win.ini"))
+}
+
+@test
+fn test_lean_chromium_switches_generation() {
+    url := "http://127.0.0.1:19999/"
+    prof := "C:\\Temp\\axon_wv_test"
+    args := webview_build_args(url, 1024, 768, prof, false, false, 64, 8, false)
+
+    // Window mode
+    assert(str_contains(args, "--app=\"http://127.0.0.1:19999/\""))
+    assert(str_contains(args, "--window-size=1024,768"))
+    assert(str_contains(args, "--user-data-dir=\"C:\\Temp\\axon_wv_test\""))
+
+    // Zero bloat & anti-wizard
+    assert(str_contains(args, "--no-first-run"))
+    assert(str_contains(args, "--no-default-browser-check"))
+    assert(str_contains(args, "--disable-default-apps"))
+    assert(str_contains(args, "--disable-extensions"))
+
+    // V8 RAM optimization & renderer limit
+    assert(str_contains(args, "--js-flags=\"--max-old-space-size=64\""))
+    assert(str_contains(args, "--renderer-process-limit=1"))
+
+    // Disk and GPU shader cache elimination
+    assert(str_contains(args, "--disk-cache-size=8388608"))
+    assert(str_contains(args, "--media-cache-size=4194304"))
+    assert(str_contains(args, "--disable-gpu-shader-disk-cache"))
+    assert(str_contains(args, "--disable-crash-reporter"))
+    assert(str_contains(args, "--no-crash-upload"))
+
+    // Background service suppression
+    assert(str_contains(args, "--disable-background-networking"))
+    assert(str_contains(args, "--disable-component-update"))
+    assert(str_contains(args, "--disable-sync"))
+    assert(str_contains(args, "--disable-domain-reliability"))
+    assert(str_contains(args, "--disable-client-side-phishing-detection"))
+    assert(str_contains(args, "Translate,OptimizationHints,MediaRouter"))
+
+    // Custom options (DevTools and InPrivate)
+    args_custom := webview_build_args(url, 1200, 800, prof, true, true, 128, 16, true)
+    assert(str_contains(args_custom, "--auto-open-devtools-for-tabs"))
+    assert(str_contains(args_custom, "--inprivate"))
+    assert(str_contains(args_custom, "--single-process"))
+    assert(str_contains(args_custom, "--js-flags=\"--max-old-space-size=128\""))
+    assert(str_contains(args_custom, "--disk-cache-size=16777216"))
+}
+
+@test
+fn test_config_and_ephemeral_cleanup_lifecycle() {
+    mut t := sys_env_get("TEMP")
+    if str_len(t) == 0 { t = "C:\\Windows\\Temp" }
+    test_dir := f"{t}\\axon_wv_test_{sys_pid()}_99"
+
+    // Create test ephemeral directory with dummy files
+    _ := sys_fs_mkdir(test_dir)
+    dummy := f"{test_dir}\\test_cache.bin"
+    b := buf_new(16)
+    buf_push_str(b, "dummy cache")
+    _ := fs_write_file(dummy, b)
+    buf_free(move b)
+
+    assert(sys_fs_exists(test_dir))
+    assert(sys_fs_exists(dummy))
+
+    // Cleanup ephemeral profile
+    ok_clean := webview_clean_profile(test_dir)
+    assert(ok_clean)
+    assert(not sys_fs_exists(test_dir))
+    assert(not sys_fs_exists(dummy))
+
+    // Default configuration verification
+    cfg := webview_default_config("Axon App", 18888, 1024, 768, "<h1>Hi</h1>")
+    assert(cfg.ephemeral_profile == true)
+    assert(cfg.max_memory_mb == 64)
+    assert(cfg.disk_cache_mb == 8)
+    assert(cfg.disable_gpu_cache == true)
+
+    wv := webview_create_with_config(cfg) or return
+    assert(wv.is_ephemeral == true)
+    assert(str_contains(wv.profile_dir, "axon_wv_"))
+    webview_close(wv)
+}
+
+@test
+fn test_mime_types_and_static_resolution() {
+    assert(str_eq(webview_content_type_from_path("index.html"), "text/html; charset=utf-8"))
+    assert(str_eq(webview_content_type_from_path("app.css"), "text/css; charset=utf-8"))
+    assert(str_eq(webview_content_type_from_path("bundle.js"), "application/javascript; charset=utf-8"))
+    assert(str_eq(webview_content_type_from_path("data.json"), "application/json; charset=utf-8"))
+    assert(str_eq(webview_content_type_from_path("logo.png"), "image/png"))
+    assert(str_eq(webview_content_type_from_path("icon.svg"), "image/svg+xml"))
+    assert(str_eq(webview_content_type_from_path("module.wasm"), "application/wasm"))
+
+    // CWE-22 protection in static resolver
+    res1 := _webview_safe_resolve_static("public", "style.css")
+    assert(str_contains(res1, "public") and str_contains(res1, "style.css"))
+
+    res_traversal := _webview_safe_resolve_static("public", "../secret.txt")
+    assert(str_len(res_traversal) == 0)
+
+    res_abs := _webview_safe_resolve_static("public", "C:\\Windows\\system.ini")
+    assert(str_len(res_abs) == 0)
+}
