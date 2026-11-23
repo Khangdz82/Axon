@@ -1,0 +1,162 @@
+// Axon Standard Library — Ergonomic Web Router, Params, Auth & Static Server (`std/web.ax`)
+// Express/Axum-style path parameter matching (`/users/:id/posts/:slug`), Bearer token extraction,
+// security-hardened HTTP response builders (`X-Content-Type-Options: nosniff`), and safe static file serving.
+
+use std::str
+use std::path
+use std::fs
+use std::http
+use std::ds
+
+fn _web_strip_query(req_path: str) -> str {
+    q := str_find_byte(req_path, 63, 0)
+    if q >= 0 { return str_slice(req_path, 0, q) }
+    return req_path
+}
+
+// Matches `req_path` (e.g. `/users/42/posts/hello?x=1`) against `pattern` (e.g. `/users/:id/posts/:slug` or `/static/*`).
+fn web_route_match(req_method: str, req_path: str, expect_method: str, pattern: str) -> bool {
+    if not str_eq(expect_method, "*") and not str_eq_ignore_case(req_method, expect_method) {
+        return false
+    }
+    clean := _web_strip_query(req_path)
+    if str_ends_with(pattern, "/*") {
+        prefix := str_slice(pattern, 0, str_len(pattern) - 1)
+        return str_starts_with(clean, prefix) or str_eq(clean + "/", prefix)
+    }
+    pr := str_split_ranges(clean, 47)
+    mr := str_split_ranges(pattern, 47)
+    pc := str_split_count(pr)
+    mc := str_split_count(mr)
+    if pc != mc {
+        buf_free(move pr); buf_free(move mr)
+        return false
+    }
+    mut ok_m := true
+    mut i := 0
+    while i < pc {
+        ps := str_split_at(clean, pr, i)
+        ms := str_split_at(pattern, mr, i)
+        if str_len(ms) > 1 and str_byte(ms, 0) == 58 {
+            if str_len(ps) == 0 { ok_m = false; break }
+        } else if not str_eq(ps, ms) {
+            ok_m = false; break
+        }
+        i += 1
+    }
+    buf_free(move pr); buf_free(move mr)
+    return ok_m
+}
+
+// Extracts `:param_name` value from `req_path` matched against `pattern` (URL-decoded).
+fn web_param(req_path: str, pattern: str, param_name: str) -> str {
+    clean := _web_strip_query(req_path)
+    pr := str_split_ranges(clean, 47)
+    mr := str_split_ranges(pattern, 47)
+    pc := str_split_count(pr)
+    mc := str_split_count(mr)
+    target := ":" + param_name
+    mut found := ""
+    if pc == mc {
+        mut i := 0
+        while i < pc {
+            if str_eq(str_split_at(pattern, mr, i), target) {
+                raw := str_split_at(clean, pr, i)
+                found = url_decode(raw) or raw
+                break
+            }
+            i += 1
+        }
+    }
+    buf_free(move pr); buf_free(move mr)
+    return found
+}
+
+fn web_status_text(code: i64) -> str {
+    if code == 200 { return "OK" }
+    if code == 201 { return "Created" }
+    if code == 204 { return "No Content" }
+    if code == 301 { return "Moved Permanently" }
+    if code == 302 { return "Found" }
+    if code == 400 { return "Bad Request" }
+    if code == 401 { return "Unauthorized" }
+    if code == 403 { return "Forbidden" }
+    if code == 404 { return "Not Found" }
+    if code == 405 { return "Method Not Allowed" }
+    if code == 429 { return "Too Many Requests" }
+    return "Internal Server Error"
+}
+
+fn web_response(status: i64, content_type: str, body: str, cors_origin: str = "") -> str {
+    blen := str_len(body)
+    out := buf_new(blen + 256)
+    buf_push_str(out, f"HTTP/1.1 {status} {web_status_text(status)}\r\n")
+    buf_push_str(out, "Content-Type: " + content_type + "\r\n")
+    buf_push_str(out, f"Content-Length: {blen}\r\n")
+    buf_push_str(out, "X-Content-Type-Options: nosniff\r\n")
+    buf_push_str(out, "Connection: close\r\n")
+    if str_len(cors_origin) > 0 and str_find_byte(cors_origin, 13, 0) < 0 and str_find_byte(cors_origin, 10, 0) < 0 {
+        buf_push_str(out, "Access-Control-Allow-Origin: " + cors_origin + "\r\n")
+    }
+    buf_push_str(out, "\r\n")
+    if blen > 0 { buf_push_str(out, body) }
+    return buf_to_owned_str(move out)
+}
+
+fn web_json(status: i64, json_body: str, cors_origin: str = "") -> str {
+    return web_response(status, "application/json; charset=utf-8", json_body, cors_origin)
+}
+
+fn web_html(status: i64, html_body: str) -> str {
+    return web_response(status, "text/html; charset=utf-8", html_body, "")
+}
+
+fn web_text(status: i64, text_body: str) -> str {
+    return web_response(status, "text/plain; charset=utf-8", text_body, "")
+}
+
+fn web_redirect(status: i64, location: str) -> str {
+    if str_find_byte(location, 13, 0) >= 0 or str_find_byte(location, 10, 0) >= 0 {
+        return web_json(400, "{\"error\":\"invalid redirect\"}")
+    }
+    return f"HTTP/1.1 {status} {web_status_text(status)}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+}
+
+fn web_bearer_token(raw_http_req: str) -> str {
+    auth := http_get_header(raw_http_req, "Authorization") or return ""
+    t := str_trim(auth)
+    if str_len(t) > 7 and str_eq_ignore_case(str_slice(t, 0, 7), "Bearer ") {
+        return str_trim(str_slice(t, 7, str_len(t)))
+    }
+    return ""
+}
+
+fn web_mime_for_path(p: str) -> str {
+    ext := str_to_lower(path_ext(p))
+    if str_eq(ext, ".html") or str_eq(ext, ".htm") { return "text/html; charset=utf-8" }
+    if str_eq(ext, ".css") { return "text/css; charset=utf-8" }
+    if str_eq(ext, ".js") or str_eq(ext, ".mjs") { return "application/javascript; charset=utf-8" }
+    if str_eq(ext, ".json") { return "application/json; charset=utf-8" }
+    if str_eq(ext, ".svg") { return "image/svg+xml" }
+    if str_eq(ext, ".png") { return "image/png" }
+    if str_eq(ext, ".jpg") or str_eq(ext, ".jpeg") { return "image/jpeg" }
+    if str_eq(ext, ".wasm") { return "application/wasm" }
+    if str_eq(ext, ".txt") or str_eq(ext, ".md") { return "text/plain; charset=utf-8" }
+    return "application/octet-stream"
+}
+
+// Safely serves a static file under `root_dir`, rejecting `..`, drive letters, UNC paths, and NUL bytes (`path_join_safe`).
+fn web_serve_static(root_dir: str, req_path: str) -> str {
+    mut rel := _web_strip_query(req_path)
+    if not http_is_safe_path(rel) {
+        return web_json(400, "{\"error\":\"bad path\"}")
+    }
+    if str_eq(rel, "/") { rel = "/index.html" }
+    if str_starts_with(rel, "/") { rel = str_slice(rel, 1, str_len(rel)) }
+    full := path_join_safe(root_dir, rel) or return web_json(403, "{\"error\":\"forbidden\"}")
+    if not fs_is_file(full) {
+        return web_json(404, "{\"error\":\"not found\"}")
+    }
+    content := fs_read_text(full) or return web_json(404, "{\"error\":\"not found\"}")
+    return web_response(200, web_mime_for_path(full), content, "")
+}

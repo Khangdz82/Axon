@@ -52,7 +52,13 @@ fn _pg_read_be16(b: ByteBuf, off: i64) -> i64 {
 }
 
 fn _pg_push_cstr(b: ByteBuf, s: str) {
-    buf_push_str(b, s)
+    n := str_len(s)
+    mut i := 0
+    while i < n {
+        ch := str_byte(s, i)
+        if ch != 0 { buf_push(b, ch) } // Strip NUL bytes to prevent startup/query parameter smuggling
+        i += 1
+    }
     buf_push(b, 0)
 }
 
@@ -95,7 +101,9 @@ fn pg_encode_password(pw: str) -> ByteBuf {
 // Build Parameterized Extended Query (`Parse` + `Bind` + `Describe` + `Execute` + `Sync`)
 // `params_csv`: NUL-separated or newline-separated parameter values (`param_vals` / `param_offs` / `param_lens`)
 fn pg_encode_extended_query(sql: str, param_buf: ByteBuf, param_offs: IntBuf, param_lens: IntBuf) -> ByteBuf {
-    pcnt := ibuf_len(param_offs)
+    mut pcnt := ibuf_len(param_offs)
+    if ibuf_len(param_lens) < pcnt { pcnt = ibuf_len(param_lens) }
+    if pcnt > 65535 { pcnt = 65535 }
     pkt := buf_new(str_len(sql) + buf_len(param_buf) + pcnt * 8 + 128)
 
     // 1. Parse ('P'): stmt="", sql, 0 param oids
@@ -110,8 +118,13 @@ fn pg_encode_extended_query(sql: str, param_buf: ByteBuf, param_offs: IntBuf, pa
     mut bind_len := 4 + 1 + 1 + 2 + 2 + 2
     mut i := 0
     while i < pcnt {
+        po := ibuf_get(param_offs, i)
         pl := ibuf_get(param_lens, i)
-        if pl >= 0 { bind_len += 4 + pl } else { bind_len += 4 }
+        if pl < 0 or po < 0 or po > pbuf_len or pl > pbuf_len - po {
+            bind_len += 4
+        } else {
+            bind_len += 4 + pl
+        }
         i += 1
     }
     buf_push(pkt, 66) // 'B'
@@ -238,6 +251,8 @@ fn _pg_read_query_result(sock: TcpStream) -> PgResult ! i64 {
         mt := ibuf_get(mtype_box, 0)
         if mt == 0 {
             buf_free(move payload); buf_free(move mtype_box)
+            buf_free(move cell_data); buf_free(move cell_offs); buf_free(move cell_lens)
+            buf_free(move col_names); buf_free(move col_offs); buf_free(move col_lens)
             return err(-310)
         }
         plen := buf_len(payload)
@@ -295,7 +310,7 @@ fn _pg_read_query_result(sock: TcpStream) -> PgResult ! i64 {
         } else if mt == 67 { // 'C' CommandComplete
             mut end := plen
             if end > 0 and buf_get(payload, end - 1) == 0 { end -= 1 }
-            cmd_tag = buf_slice_str(payload, 0, end)
+            cmd_tag = "" + buf_slice_str(payload, 0, end)
         } else if mt == 69 { // 'E' ErrorResponse
             ok_f = false
             mut pos := 0
@@ -306,7 +321,7 @@ fn _pg_read_query_result(sock: TcpStream) -> PgResult ! i64 {
                 vs := pos
                 while pos < plen and buf_get(payload, pos) != 0 { pos += 1 }
                 if ft == 77 { // 'M' message
-                    err_msg = buf_slice_str(payload, vs, pos)
+                    err_msg = "" + buf_slice_str(payload, vs, pos)
                 }
                 pos += 1
             }

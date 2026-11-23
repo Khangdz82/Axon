@@ -9,6 +9,7 @@ struct SqliteApi {
     lib: i64
     fn_open: i64
     fn_close: i64
+    fn_close_v2: i64
     fn_exec: i64
     fn_prepare_v2: i64
     fn_bind_int64: i64
@@ -17,6 +18,7 @@ struct SqliteApi {
     fn_col_count: i64
     fn_col_int64: i64
     fn_col_text: i64
+    fn_col_bytes: i64
     fn_col_name: i64
     fn_finalize: i64
     fn_changes: i64
@@ -43,6 +45,7 @@ fn sqlite_load() -> SqliteApi ! i64 {
         lib = lib,
         fn_open = ffi_sym(lib, "sqlite3_open"),
         fn_close = ffi_sym(lib, "sqlite3_close"),
+        fn_close_v2 = ffi_sym(lib, "sqlite3_close_v2"),
         fn_exec = ffi_sym(lib, "sqlite3_exec"),
         fn_prepare_v2 = ffi_sym(lib, "sqlite3_prepare_v2"),
         fn_bind_int64 = ffi_sym(lib, "sqlite3_bind_int64"),
@@ -51,6 +54,7 @@ fn sqlite_load() -> SqliteApi ! i64 {
         fn_col_count = ffi_sym(lib, "sqlite3_column_count"),
         fn_col_int64 = ffi_sym(lib, "sqlite3_column_int64"),
         fn_col_text = ffi_sym(lib, "sqlite3_column_text"),
+        fn_col_bytes = ffi_sym(lib, "sqlite3_column_bytes"),
         fn_col_name = ffi_sym(lib, "sqlite3_column_name"),
         fn_finalize = ffi_sym(lib, "sqlite3_finalize"),
         fn_changes = ffi_sym(lib, "sqlite3_changes"),
@@ -76,13 +80,18 @@ fn sqlite_open(path: str) -> SqliteDb ! i64 {
     api := sqlite_load() or return
     cp := ffi_cstr(path)
     out_box := ffi_alloc(16)
+    if cp == 0 or out_box == 0 {
+        ffi_free(cp)
+        ffi_free(out_box)
+        return err(-204)
+    }
     rc := ffi_sext32(ffi_call2(api.fn_open, cp, out_box))
     h := ffi_read_i64(out_box, 0)
     ffi_free(out_box)
     ffi_free(cp)
     if rc != 0 or h == 0 {
-        if h != 0 { _ := ffi_call1(api.fn_close, h) }
-        return err(rc)
+        if h != 0 { _ := ffi_call1(if api.fn_close_v2 != 0 { api.fn_close_v2 } else { api.fn_close }, h) }
+        return err(if rc != 0 { rc } else { -205 })
     }
     return ok(SqliteDb(handle = h, api = api))
 }
@@ -90,20 +99,26 @@ fn sqlite_open(path: str) -> SqliteDb ! i64 {
 fn sqlite_exec(db: SqliteDb, sql: str) -> bool {
     if db.handle == 0 or _sqlite_has_nul(sql) { return false }
     cs := ffi_cstr(sql)
+    if cs == 0 { return false }
     rc := ffi_sext32(ffi_call5(db.api.fn_exec, db.handle, cs, 0, 0, 0))
     ffi_free(cs)
     return rc == 0
 }
 
 fn sqlite_prepare(db: SqliteDb, sql: str) -> SqliteStmt ! i64 {
-    if db.handle == 0 or _sqlite_has_nul(sql) { return err(-202) }
+    if db.handle == 0 or _sqlite_has_nul(sql) or str_len(sql) > 0x7FFFFFFF { return err(-202) }
     cs := ffi_cstr(sql)
     out_box := ffi_alloc(16)
+    if cs == 0 or out_box == 0 {
+        ffi_free(cs)
+        ffi_free(out_box)
+        return err(-204)
+    }
     rc := ffi_sext32(ffi_call5(db.api.fn_prepare_v2, db.handle, cs, str_len(sql), out_box, 0))
     sh := ffi_read_i64(out_box, 0)
     ffi_free(out_box)
     ffi_free(cs)
-    if rc != 0 or sh == 0 { return err(rc) }
+    if rc != 0 or sh == 0 { return err(if rc != 0 { rc } else { -205 }) }
     return ok(SqliteStmt(handle = sh, api = db.api))
 }
 
@@ -113,8 +128,9 @@ fn sqlite_bind_i64(stmt: SqliteStmt, idx_1based: i64, val: i64) -> bool {
 }
 
 fn sqlite_bind_text(stmt: SqliteStmt, idx_1based: i64, text: str) -> bool {
-    if stmt.handle == 0 { return false }
+    if stmt.handle == 0 or str_len(text) > 0x7FFFFFFF { return false }
     ct := ffi_cstr(text)
+    if ct == 0 { return false }
     // SQLITE_TRANSIENT = -1 so SQLite copies the buffer immediately
     rc := ffi_sext32(ffi_call5(stmt.api.fn_bind_text, stmt.handle, idx_1based, ct, str_len(text), -1))
     ffi_free(ct)
@@ -141,6 +157,20 @@ fn sqlite_col_text(stmt: SqliteStmt, col_0based: i64) -> str {
     if stmt.handle == 0 or col_0based < 0 { return "" }
     p := ffi_call2(stmt.api.fn_col_text, stmt.handle, col_0based)
     if p == 0 { return "" }
+    if stmt.api.fn_col_bytes != 0 {
+        mut nb := ffi_sext32(ffi_call2(stmt.api.fn_col_bytes, stmt.handle, col_0based))
+        if nb <= 0 { return "" }
+        if nb > 67108864 { nb = 67108864 }
+        out := buf_new(nb + 4)
+        mut i := 0
+        unsafe {
+            while i < nb {
+                buf_push(out, ptr_read_u8(p + i, 0))
+                i += 1
+            }
+        }
+        return buf_to_owned_str(move out)
+    }
     return ffi_read_cstr(p, 65536)
 }
 
@@ -172,5 +202,8 @@ fn sqlite_errmsg(db: SqliteDb) -> str {
 }
 
 fn sqlite_close(db: SqliteDb) {
-    if db.handle != 0 { _ := ffi_call1(db.api.fn_close, db.handle) }
+    if db.handle != 0 {
+        f_cls := if db.api.fn_close_v2 != 0 { db.api.fn_close_v2 } else { db.api.fn_close }
+        _ := ffi_call1(f_cls, db.handle)
+    }
 }

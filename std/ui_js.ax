@@ -117,54 +117,156 @@ struct JsStateStore {
     map: IntBuf
     fn_names: ByteBuf
     fn_bodies: ByteBuf
-    fn_meta: IntBuf  // 4 ints per fn: [name_off, name_len, body_off, body_len]
+    fn_params: ByteBuf
+    fn_meta: IntBuf  // 6 ints per fn: [name_off, name_len, body_off, body_len, param_off, param_len]
     fn_count: i64
+    str_pool: ByteBuf
+    str_meta: IntBuf // slot 0 = count; then 3 ints per entry: [khash, off, len (-1 = deleted)]
 }
 
 fn js_state_new() -> JsStateStore {
+    sm := ibuf_new(784) // slot 0 + up to 256 string vars * 3
+    ibuf_push(sm, 0)
     return JsStateStore(
-        map = map_new(64),
-        fn_names = buf_new(1024),
-        fn_bodies = buf_new(8192),
-        fn_meta = ibuf_new(256),
-        fn_count = 0
+        map = map_new(128),
+        fn_names = buf_new(2048),
+        fn_bodies = buf_new(32768),
+        fn_params = buf_new(1024),
+        fn_meta = ibuf_new(768),
+        fn_count = 0,
+        str_pool = buf_new(32768),
+        str_meta = sm
     )
 }
 
-fn js_register_fn(mut store: JsStateStore, name: str, body: str) {
+fn js_register_fn_params(mut store: JsStateStore, name: str, params: str, body: str) {
     nl := str_len(name)
     bl := str_len(body)
-    if nl <= 0 or bl <= 0 or store.fn_count >= 64 { return }
-    if buf_len(store.fn_names) + nl >= 1020 or buf_len(store.fn_bodies) + bl >= 8180 { return }
+    pl := str_len(params)
+    if nl <= 0 or bl <= 0 or store.fn_count >= 128 { return }
+    if buf_len(store.fn_names) + nl >= 2040 or buf_len(store.fn_bodies) + bl >= 32760 or buf_len(store.fn_params) + pl >= 1020 { return }
     no := buf_len(store.fn_names)
     bo := buf_len(store.fn_bodies)
+    po := buf_len(store.fn_params)
     buf_push_str(store.fn_names, name)
     buf_push_str(store.fn_bodies, body)
+    if pl > 0 { buf_push_str(store.fn_params, params) }
     ibuf_push(store.fn_meta, no); ibuf_push(store.fn_meta, nl)
     ibuf_push(store.fn_meta, bo); ibuf_push(store.fn_meta, bl)
+    ibuf_push(store.fn_meta, po); ibuf_push(store.fn_meta, pl)
     store.fn_count += 1
 }
 
-fn js_find_fn_body(store: JsStateStore, name: str) -> str {
+fn js_register_fn(mut store: JsStateStore, name: str, body: str) {
+    js_register_fn_params(mut store, name, "", body)
+}
+
+fn _js_find_fn_idx(store: JsStateStore, name: str) -> i64 {
     nl := str_len(name)
     mut i := store.fn_count - 1
     while i >= 0 {
-        b := i * 4
+        b := i * 6
         if ibuf_get(store.fn_meta, b + 1) == nl {
             no := ibuf_get(store.fn_meta, b)
             if str_eq(buf_slice_str(store.fn_names, no, no + nl), name) {
-                bo := ibuf_get(store.fn_meta, b + 2)
-                bl := ibuf_get(store.fn_meta, b + 3)
-                return buf_slice_str(store.fn_bodies, bo, bo + bl)
+                return i
             }
         }
         i -= 1
     }
+    return -1
+}
+
+fn js_find_fn_body(store: JsStateStore, name: str) -> str {
+    idx := _js_find_fn_idx(store, name)
+    if idx < 0 { return "" }
+    b := idx * 6
+    bo := ibuf_get(store.fn_meta, b + 2)
+    bl := ibuf_get(store.fn_meta, b + 3)
+    return buf_slice_str(store.fn_bodies, bo, bo + bl)
+}
+
+fn js_find_fn_params(store: JsStateStore, name: str) -> str {
+    idx := _js_find_fn_idx(store, name)
+    if idx < 0 { return "" }
+    b := idx * 6
+    po := ibuf_get(store.fn_meta, b + 4)
+    pl := ibuf_get(store.fn_meta, b + 5)
+    if pl <= 0 { return "" }
+    return buf_slice_str(store.fn_params, po, po + pl)
+}
+
+fn js_state_set_str(store: JsStateStore, key: str, val: str) {
+    kh := fnv1a_64(key)
+    vl := str_len(val)
+    if buf_len(store.str_pool) + vl >= 32700 { return }
+    off := buf_len(store.str_pool)
+    if vl > 0 { buf_push_str(store.str_pool, val) }
+    cnt := ibuf_get(store.str_meta, 0)
+    mut i := 0
+    while i < cnt {
+        b := 1 + i * 3
+        if ibuf_get(store.str_meta, b) == kh {
+            ibuf_set(store.str_meta, b + 1, off)
+            ibuf_set(store.str_meta, b + 2, vl)
+            return
+        }
+        i += 1
+    }
+    if cnt >= 256 { return }
+    ibuf_push(store.str_meta, kh)
+    ibuf_push(store.str_meta, off)
+    ibuf_push(store.str_meta, vl)
+    ibuf_set(store.str_meta, 0, cnt + 1)
+}
+
+fn js_state_has_str(store: JsStateStore, key: str) -> bool {
+    kh := fnv1a_64(key)
+    cnt := ibuf_get(store.str_meta, 0)
+    mut i := 0
+    while i < cnt {
+        b := 1 + i * 3
+        if ibuf_get(store.str_meta, b) == kh {
+            return ibuf_get(store.str_meta, b + 2) >= 0
+        }
+        i += 1
+    }
+    return false
+}
+
+fn js_state_get_str(store: JsStateStore, key: str) -> str {
+    kh := fnv1a_64(key)
+    cnt := ibuf_get(store.str_meta, 0)
+    mut i := 0
+    while i < cnt {
+        b := 1 + i * 3
+        if ibuf_get(store.str_meta, b) == kh {
+            vl := ibuf_get(store.str_meta, b + 2)
+            if vl <= 0 { return "" }
+            off := ibuf_get(store.str_meta, b + 1)
+            return buf_slice_str(store.str_pool, off, off + vl)
+        }
+        i += 1
+    }
     return ""
+}
+
+fn _js_clear_str(store: JsStateStore, kh: i64) {
+    cnt := ibuf_get(store.str_meta, 0)
+    mut i := 0
+    while i < cnt {
+        b := 1 + i * 3
+        if ibuf_get(store.str_meta, b) == kh {
+            ibuf_set(store.str_meta, b + 2, -1)
+            return
+        }
+        i += 1
+    }
 }
 
 fn js_state_set(store: JsStateStore, key: str, val: i64) {
     k_hash := fnv1a_64(key)
+    _js_clear_str(store, k_hash)
     map_put(store.map, k_hash, val)
 }
 
@@ -180,106 +282,491 @@ fn js_state_inc(store: JsStateStore, key: str, step: i64 = 1) -> i64 {
     return new_val
 }
 
-// 3. Script & OnClick Action Dispatcher
-// Supports standard DOM JavaScript syntax:
-// - `document.getElementById('id').innerText = 'new text'`
-// - `document.getElementById('id').classList.toggle('class')`
-// - `#id.innerText = 'new text'`
-// - `#id.classList.toggle('class')`
-// - Declarative micro-actions:
-//   - "toggle:<id>:<class>" (e.g. "toggle:sidebar:hidden")
-//   - "set_text:<id>:<text>"
-//   - "increment:<state_key>:<target_elem_id>:<label_prefix>"
-fn _js_extract_quoted(s: str, start: i64) -> str {
-    mut q1 := str_find_byte(s, 39, start) // '\''
-    mut qc := 39
-    dq := str_find_byte(s, 34, start)     // '"'
-    if dq >= 0 and (q1 < 0 or dq < q1) {
-        q1 = dq
-        qc = 34
-    }
-    if q1 < 0 { return "" }
-    q2 := str_find_byte(s, qc, q1 + 1)
-    if q2 < 0 { return "" }
-    return str_slice(s, q1 + 1, q2)
+// 3. Embedded JavaScript Lexing, Expressions, Control Flow & DOM Dispatcher
+fn _js_is_ws(b: i64) -> bool {
+    return b == 32 or b == 9 or b == 10 or b == 13
 }
 
-// Evaluates a JS string/concat expression like `'Count: ' + count` or `'Hello'`
-fn _js_eval_str_expr(store: JsStateStore, raw_expr: str) -> str {
-    e := str_trim(raw_expr)
-    n := str_len(e)
-    if n == 0 { return "" }
-    out := buf_new(n + 64)
-    mut i := 0
-    while i < n {
-        while i < n and (str_byte(e, i) == 32 or str_byte(e, i) == 9 or str_byte(e, i) == 43) { i += 1 }
-        if i >= n { break }
-        b := str_byte(e, i)
-        if b == 39 or b == 34 {
-            q2 := str_find_byte(e, b, i + 1)
-            if q2 > i {
-                buf_push_str(out, str_slice(e, i + 1, q2))
-                i = q2 + 1
-            } else { break }
+fn _js_is_ident_char(b: i64) -> bool {
+    return (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or (b >= 48 and b <= 57) or b == 95 or b == 36
+}
+
+fn _js_skip_ws_comments(s: str, pos_in: i64) -> i64 {
+    n := str_len(s)
+    mut p := pos_in
+    while p < n {
+        b := str_byte(s, p)
+        if _js_is_ws(b) {
+            p += 1
+        } else if p + 1 < n and b == 47 and str_byte(s, p + 1) == 47 {
+            nl := str_find_byte(s, 10, p + 2)
+            p = if nl >= 0 { nl + 1 } else { n }
+        } else if p + 1 < n and b == 47 and str_byte(s, p + 1) == 42 {
+            ce := str_find(s, "*/", p + 2)
+            p = if ce >= 0 { ce + 2 } else { n }
         } else {
-            mut j := i
-            while j < n and str_byte(e, j) != 43 and str_byte(e, j) != 32 and str_byte(e, j) != 9 and str_byte(e, j) != 59 { j += 1 }
-            tok := str_slice(e, i, j)
-            c0 := str_byte(tok, 0)
-            if (c0 >= 48 and c0 <= 57) or c0 == 45 {
-                buf_push_str(out, tok)
-            } else {
-                v := js_state_get(store, tok, 0)
-                buf_push_str(out, f"{v}")
+            break
+        }
+    }
+    return p
+}
+
+// Finds matching closing delimiter (`)` or `}`) respecting quotes, escapes, and comments
+fn _js_find_matching(s: str, open_pos: i64, open_ch: i64, close_ch: i64) -> i64 {
+    n := str_len(s)
+    if open_pos < 0 or open_pos >= n or str_byte(s, open_pos) != open_ch { return -1 }
+    mut depth := 1
+    mut in_q := 0
+    mut i := open_pos + 1
+    while i < n and depth > 0 {
+        b := str_byte(s, i)
+        if in_q != 0 {
+            if b == 92 and i + 1 < n { i += 2; continue }
+            if b == in_q { in_q = 0 }
+        } else {
+            if b == 39 or b == 34 or b == 96 { in_q = b }
+            else if i + 1 < n and b == 47 and str_byte(s, i + 1) == 47 {
+                nl := str_find_byte(s, 10, i + 2)
+                i = if nl >= 0 { nl + 1 } else { n }
+                continue
+            } else if i + 1 < n and b == 47 and str_byte(s, i + 1) == 42 {
+                ce := str_find(s, "*/", i + 2)
+                i = if ce >= 0 { ce + 2 } else { n }
+                continue
+            } else if b == open_ch { depth += 1 }
+            else if b == close_ch {
+                depth -= 1
+                if depth == 0 { return i }
             }
-            i = j
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn _js_unescape_quoted(s: str, q_start: i64, q_end: i64) -> str {
+    out := buf_new(q_end - q_start + 8)
+    mut i := q_start
+    while i < q_end {
+        b := str_byte(s, i)
+        if b == 92 and i + 1 < q_end {
+            nx := str_byte(s, i + 1)
+            if nx == 110 { buf_push(out, 10) }
+            else if nx == 116 { buf_push(out, 9) }
+            else if nx == 114 { buf_push(out, 13) }
+            else { buf_push(out, nx) }
+            i += 2
+        } else {
+            buf_push(out, b)
+            i += 1
         }
     }
     return buf_to_owned_str(move out)
 }
 
+fn _js_extract_quoted(s: str, start: i64) -> str {
+    n := str_len(s)
+    mut q1 := -1
+    mut qc := 0
+    mut i := start
+    while i < n {
+        b := str_byte(s, i)
+        if b == 39 or b == 34 or b == 96 {
+            q1 = i; qc = b; break
+        }
+        i += 1
+    }
+    if q1 < 0 { return "" }
+    mut q2 := q1 + 1
+    while q2 < n {
+        b := str_byte(s, q2)
+        if b == 92 and q2 + 1 < n { q2 += 2; continue }
+        if b == qc { break }
+        q2 += 1
+    }
+    if q2 >= n { return "" }
+    return _js_unescape_quoted(s, q1 + 1, q2)
+}
+
+// Finds top-level binary operator (outside quotes, comments, and parens); `right_to_left` handles left-associative ops
+fn _js_find_top_op(e: str, op: str, right_to_left: bool) -> i64 {
+    n := str_len(e)
+    ol := str_len(op)
+    if ol == 0 or n < ol { return -1 }
+    mut in_q := 0
+    mut paren := 0
+    mut found := -1
+    mut i := 0
+    while i <= n - ol {
+        b := str_byte(e, i)
+        if in_q != 0 {
+            if b == 92 and i + 1 < n { i += 2; continue }
+            if b == in_q { in_q = 0 }
+        } else {
+            if b == 39 or b == 34 or b == 96 { in_q = b }
+            else if i + 1 < n and b == 47 and str_byte(e, i + 1) == 47 {
+                nl := str_find_byte(e, 10, i + 2)
+                i = if nl >= 0 { nl + 1 } else { n }
+                continue
+            } else if i + 1 < n and b == 47 and str_byte(e, i + 1) == 42 {
+                ce := str_find(e, "*/", i + 2)
+                i = if ce >= 0 { ce + 2 } else { n }
+                continue
+            } else if b == 40 { paren += 1 }
+            else if b == 41 { if paren > 0 { paren -= 1 } }
+            else if paren == 0 and str_eq(str_slice(e, i, i + ol), op) {
+                // Avoid matching `=` inside `==`/`!=`/`<=`/`>=`, `+` inside `++`, or unary `+`/`-` after an operator
+                mut ok_m := true
+                if ol == 1 and (b == 61 or b == 60 or b == 62) {
+                    if i + 1 < n and str_byte(e, i + 1) == 61 { ok_m = false }
+                    if i > 0 and (str_byte(e, i - 1) == 61 or str_byte(e, i - 1) == 33 or str_byte(e, i - 1) == 60 or str_byte(e, i - 1) == 62) { ok_m = false }
+                } else if ol == 2 and (str_eq(op, "==") or str_eq(op, "!=")) {
+                    if i + 2 < n and str_byte(e, i + 2) == 61 { ok_m = false }
+                    if i > 0 and str_byte(e, i - 1) == 61 { ok_m = false }
+                } else if ol == 1 and (b == 43 or b == 45) {
+                    if i == 0 { ok_m = false }
+                    if i + 1 < n and str_byte(e, i + 1) == b { ok_m = false }
+                    if i > 0 and str_byte(e, i - 1) == b { ok_m = false }
+                    if ok_m {
+                        mut pk := i - 1
+                        while pk >= 0 and _js_is_ws(str_byte(e, pk)) { pk -= 1 }
+                        if pk < 0 {
+                            ok_m = false
+                        } else {
+                            pb := str_byte(e, pk)
+                            if pb == 43 or pb == 45 or pb == 42 or pb == 47 or pb == 37 or pb == 61 or pb == 33 or pb == 60 or pb == 62 or pb == 38 or pb == 124 or pb == 40 or pb == 44 {
+                                ok_m = false
+                            }
+                        }
+                    }
+                }
+                if ok_m {
+                    if not right_to_left { return i }
+                    found = i
+                }
+            }
+        }
+        i += 1
+    }
+    return found
+}
+
+fn _js_strip_outer_parens(raw: str) -> str {
+    mut e := str_trim(raw)
+    while str_len(e) >= 2 and str_byte(e, 0) == 40 {
+        m := _js_find_matching(e, 0, 40, 41)
+        if m == str_len(e) - 1 {
+            e = str_trim(str_slice(e, 1, m))
+        } else {
+            break
+        }
+    }
+    return e
+}
+
+// Evaluates DOM read expressions (`document.getElementById('id').innerText`, `.value`, `.classList.contains('c')`, `#id.innerText`)
+fn _js_try_dom_read(tree: DomTree, expr: str) -> (bool, bool, str) {
+    e := str_trim(expr)
+    mut elem_id := ""
+    mut rest_pos := -1
+    if str_starts_with(e, "document.getElementById(") {
+        elem_id = _js_extract_quoted(e, 24)
+        rest_pos = _js_find_matching(e, 23, 40, 41)
+    } else if str_starts_with(e, "document.querySelector(") {
+        mut q := _js_extract_quoted(e, 23)
+        if str_len(q) > 1 and str_byte(q, 0) == 35 { q = str_slice(q, 1, str_len(q)) }
+        elem_id = q
+        rest_pos = _js_find_matching(e, 22, 40, 41)
+    } else if str_len(e) > 2 and str_byte(e, 0) == 35 {
+        dot := str_find_byte(e, 46, 1)
+        if dot > 1 {
+            elem_id = str_slice(e, 1, dot)
+            rest_pos = dot - 1
+        }
+    }
+    if str_len(elem_id) == 0 or rest_pos < 0 { return (false, false, "") }
+    tail := str_trim(str_slice(e, rest_pos + 1, str_len(e)))
+    if str_eq(tail, ".innerText") or str_eq(tail, ".textContent") or str_eq(tail, ".value") {
+        return (true, true, document_get_inner_text(tree, elem_id))
+    }
+    if str_eq(tail, ".className") {
+        idx := dom_find_by_id(tree, elem_id)
+        return (true, true, if idx >= 0 { dom_get_class(tree, idx) } else { "" })
+    }
+    if str_starts_with(tail, ".classList.contains(") {
+        cls := _js_extract_quoted(tail, 20)
+        idx := dom_find_by_id(tree, elem_id)
+        has := if idx >= 0 { js_has_class_token(dom_get_class(tree, idx), cls) } else { false }
+        return (true, false, if has { "1" } else { "0" })
+    }
+    return (false, false, "")
+}
+
+fn _js_expr_is_string(tree: DomTree, store: JsStateStore, raw: str, depth: i64 = 0) -> bool {
+    if depth >= 16 { return false }
+    e := _js_strip_outer_parens(raw)
+    n := str_len(e)
+    if n == 0 { return false }
+    b0 := str_byte(e, 0)
+    if b0 == 39 or b0 == 34 or b0 == 96 { return true }
+    (dom_ok, dom_is_str, _) := _js_try_dom_read(tree, e)
+    if dom_ok { return dom_is_str }
+    p_plus := _js_find_top_op(e, "+", true)
+    if p_plus > 0 {
+        return _js_expr_is_string(tree, store, str_slice(e, 0, p_plus), depth + 1) or _js_expr_is_string(tree, store, str_slice(e, p_plus + 1, n), depth + 1)
+    }
+    if js_state_has_str(store, e) { return true }
+    return false
+}
+
+fn _js_eval_num(tree: DomTree, store: JsStateStore, raw: str, depth: i64 = 0) -> i64 {
+    if depth >= 16 { return 0 }
+    e := _js_strip_outer_parens(raw)
+    n := str_len(e)
+    if n == 0 { return 0 }
+    if str_eq(e, "true") { return 1 }
+    if str_eq(e, "false") or str_eq(e, "null") or str_eq(e, "undefined") { return 0 }
+
+    // Delegate comparison & logical expressions to `_js_eval_bool` before arithmetic/unary ops
+    if _js_find_top_op(e, "||", true) > 0 or _js_find_top_op(e, "&&", true) > 0 or _js_find_top_op(e, "==", false) > 0 or _js_find_top_op(e, "!=", false) > 0 or _js_find_top_op(e, "<", false) > 0 or _js_find_top_op(e, ">", false) > 0 {
+        return if _js_eval_bool(tree, store, e, depth + 1) { 1 } else { 0 }
+    }
+
+    // Binary + / -
+    p_add := _js_find_top_op(e, "+", true)
+    p_sub := _js_find_top_op(e, "-", true)
+    if p_add > 0 or p_sub > 0 {
+        if p_add > p_sub {
+            return _js_eval_num(tree, store, str_slice(e, 0, p_add), depth + 1) +% _js_eval_num(tree, store, str_slice(e, p_add + 1, n), depth + 1)
+        } else {
+            return _js_eval_num(tree, store, str_slice(e, 0, p_sub), depth + 1) -% _js_eval_num(tree, store, str_slice(e, p_sub + 1, n), depth + 1)
+        }
+    }
+    // Binary * / %
+    p_mul := _js_find_top_op(e, "*", true)
+    p_div := _js_find_top_op(e, "/", true)
+    p_mod := _js_find_top_op(e, "%", true)
+    mut mpos := p_mul
+    mut mop := 1
+    if p_div > mpos { mpos = p_div; mop = 2 }
+    if p_mod > mpos { mpos = p_mod; mop = 3 }
+    if mpos > 0 {
+        lv := _js_eval_num(tree, store, str_slice(e, 0, mpos), depth + 1)
+        rv := _js_eval_num(tree, store, str_slice(e, mpos + 1, n), depth + 1)
+        if mop == 1 { return lv *% rv }
+        if rv == 0 or (lv == (1 << 63) and rv == -1) { return 0 }
+        if mop == 2 { return lv / rv }
+        return lv % rv
+    }
+    // Unary minus / plus / logical not
+    if str_byte(e, 0) == 45 and n > 1 {
+        return 0 -% _js_eval_num(tree, store, str_slice(e, 1, n), depth + 1)
+    }
+    if str_byte(e, 0) == 43 and n > 1 {
+        return _js_eval_num(tree, store, str_slice(e, 1, n), depth + 1)
+    }
+    if str_byte(e, 0) == 33 and n > 1 {
+        return if _js_eval_bool(tree, store, str_slice(e, 1, n), depth + 1) { 0 } else { 1 }
+    }
+    // `.length` property
+    if str_ends_with(e, ".length") and n > 7 {
+        base_s := _js_eval_str_dom(tree, store, str_slice(e, 0, n - 7), depth + 1)
+        return str_len(base_s)
+    }
+    // DOM read
+    (dom_ok, _, dom_val) := _js_try_dom_read(tree, e)
+    if dom_ok {
+        return parse_i64(str_trim(dom_val)) or 0
+    }
+    // Literal number
+    b0 := str_byte(e, 0)
+    if b0 >= 48 and b0 <= 57 {
+        return parse_i64(e) or 0
+    }
+    if b0 == 39 or b0 == 34 {
+        return parse_i64(_js_extract_quoted(e, 0)) or 0
+    }
+    if js_state_has_str(store, e) {
+        return parse_i64(str_trim(js_state_get_str(store, e))) or 0
+    }
+    return js_state_get(store, e, 0)
+}
+
+fn _js_eval_str_dom(tree: DomTree, store: JsStateStore, raw_expr: str, depth: i64 = 0) -> str {
+    if depth >= 16 { return "" }
+    e := _js_strip_outer_parens(raw_expr)
+    n := str_len(e)
+    if n == 0 { return "" }
+
+    // Top-level `+` (string concatenation or numeric addition)
+    p_plus := _js_find_top_op(e, "+", true)
+    if p_plus > 0 {
+        lhs := str_slice(e, 0, p_plus)
+        rhs := str_slice(e, p_plus + 1, n)
+        if _js_expr_is_string(tree, store, lhs) or _js_expr_is_string(tree, store, rhs) {
+            return _js_eval_str_dom(tree, store, lhs, depth + 1) + _js_eval_str_dom(tree, store, rhs, depth + 1)
+        }
+        v := _js_eval_num(tree, store, e, depth + 1)
+        return f"{v}"
+    }
+
+    b0 := str_byte(e, 0)
+    if (b0 == 39 or b0 == 34 or b0 == 96) and n >= 2 and str_byte(e, n - 1) == b0 {
+        return _js_unescape_quoted(e, 1, n - 1)
+    }
+
+    (dom_ok, _, dom_val) := _js_try_dom_read(tree, e)
+    if dom_ok { return dom_val }
+
+    if str_eq(e, "true") { return "true" }
+    if str_eq(e, "false") { return "false" }
+
+    if js_state_has_str(store, e) {
+        return js_state_get_str(store, e)
+    }
+
+    v := _js_eval_num(tree, store, e, depth + 1)
+    return f"{v}"
+}
+
+// Backwards-compatible helper used by direct callers
+fn _js_eval_str_expr(store: JsStateStore, raw_expr: str) -> str {
+    empty_t := dom_tree_new("")
+    res := _js_eval_str_dom(empty_t, store, raw_expr, 0)
+    dom_tree_free(move empty_t)
+    return res
+}
+
+fn _js_eval_bool(tree: DomTree, store: JsStateStore, raw: str, depth: i64 = 0) -> bool {
+    if depth >= 16 { return false }
+    e := _js_strip_outer_parens(raw)
+    n := str_len(e)
+    if n == 0 { return false }
+    if str_eq(e, "true") { return true }
+    if str_eq(e, "false") or str_eq(e, "0") or str_eq(e, "null") or str_eq(e, "undefined") { return false }
+
+    p_or := _js_find_top_op(e, "||", true)
+    if p_or > 0 {
+        return _js_eval_bool(tree, store, str_slice(e, 0, p_or), depth + 1) or _js_eval_bool(tree, store, str_slice(e, p_or + 2, n), depth + 1)
+    }
+    p_and := _js_find_top_op(e, "&&", true)
+    if p_and > 0 {
+        return _js_eval_bool(tree, store, str_slice(e, 0, p_and), depth + 1) and _js_eval_bool(tree, store, str_slice(e, p_and + 2, n), depth + 1)
+    }
+
+    // Equality & relational operators (lower precedence than unary `!`!)
+    p_seq := _js_find_top_op(e, "===", false)
+    if p_seq > 0 {
+        l := str_slice(e, 0, p_seq); r := str_slice(e, p_seq + 3, n)
+        if _js_expr_is_string(tree, store, l) or _js_expr_is_string(tree, store, r) {
+            return str_eq(_js_eval_str_dom(tree, store, l, depth + 1), _js_eval_str_dom(tree, store, r, depth + 1))
+        }
+        return _js_eval_num(tree, store, l, depth + 1) == _js_eval_num(tree, store, r, depth + 1)
+    }
+    p_sne := _js_find_top_op(e, "!==", false)
+    if p_sne > 0 {
+        l := str_slice(e, 0, p_sne); r := str_slice(e, p_sne + 3, n)
+        if _js_expr_is_string(tree, store, l) or _js_expr_is_string(tree, store, r) {
+            return not str_eq(_js_eval_str_dom(tree, store, l, depth + 1), _js_eval_str_dom(tree, store, r, depth + 1))
+        }
+        return _js_eval_num(tree, store, l, depth + 1) != _js_eval_num(tree, store, r, depth + 1)
+    }
+    p_eq := _js_find_top_op(e, "==", false)
+    if p_eq > 0 {
+        l := str_slice(e, 0, p_eq); r := str_slice(e, p_eq + 2, n)
+        if _js_expr_is_string(tree, store, l) or _js_expr_is_string(tree, store, r) {
+            return str_eq(_js_eval_str_dom(tree, store, l, depth + 1), _js_eval_str_dom(tree, store, r, depth + 1))
+        }
+        return _js_eval_num(tree, store, l, depth + 1) == _js_eval_num(tree, store, r, depth + 1)
+    }
+    p_ne := _js_find_top_op(e, "!=", false)
+    if p_ne > 0 {
+        l := str_slice(e, 0, p_ne); r := str_slice(e, p_ne + 2, n)
+        if _js_expr_is_string(tree, store, l) or _js_expr_is_string(tree, store, r) {
+            return not str_eq(_js_eval_str_dom(tree, store, l, depth + 1), _js_eval_str_dom(tree, store, r, depth + 1))
+        }
+        return _js_eval_num(tree, store, l, depth + 1) != _js_eval_num(tree, store, r, depth + 1)
+    }
+    p_le := _js_find_top_op(e, "<=", false)
+    if p_le > 0 { return _js_eval_num(tree, store, str_slice(e, 0, p_le), depth + 1) <= _js_eval_num(tree, store, str_slice(e, p_le + 2, n), depth + 1) }
+    p_ge := _js_find_top_op(e, ">=", false)
+    if p_ge > 0 { return _js_eval_num(tree, store, str_slice(e, 0, p_ge), depth + 1) >= _js_eval_num(tree, store, str_slice(e, p_ge + 2, n), depth + 1) }
+    p_lt := _js_find_top_op(e, "<", false)
+    if p_lt > 0 { return _js_eval_num(tree, store, str_slice(e, 0, p_lt), depth + 1) < _js_eval_num(tree, store, str_slice(e, p_lt + 1, n), depth + 1) }
+    p_gt := _js_find_top_op(e, ">", false)
+    if p_gt > 0 { return _js_eval_num(tree, store, str_slice(e, 0, p_gt), depth + 1) > _js_eval_num(tree, store, str_slice(e, p_gt + 1, n), depth + 1) }
+
+    // Unary logical `!` (binds tighter than `==`/`!=`/`<`/`>`)
+    if str_byte(e, 0) == 33 and (n < 2 or str_byte(e, 1) != 61) {
+        return not _js_eval_bool(tree, store, str_slice(e, 1, n), depth + 1)
+    }
+
+    (dom_ok, dom_is_str, dom_val) := _js_try_dom_read(tree, e)
+    if dom_ok {
+        if dom_is_str { return str_len(dom_val) > 0 }
+        return str_eq(dom_val, "1")
+    }
+    if _js_expr_is_string(tree, store, e) {
+        return str_len(_js_eval_str_dom(tree, store, e, depth + 1)) > 0
+    }
+    return _js_eval_num(tree, store, e, depth + 1) != 0
+}
+
+fn _js_is_safe_css_val(val: str) -> bool {
+    n := str_len(val)
+    if n > 256 { return false }
+    mut i := 0
+    while i < n {
+        b := str_byte(val, i)
+        if b == 59 or b == 123 or b == 125 or b == 10 or b == 13 or b == 0 { return false }
+        i += 1
+    }
+    return true
+}
+
 fn _js_apply_member_op(mut tree: DomTree, store: JsStateStore, elem_id: str, act: str, from_pos: i64) -> bool {
-    p_it := str_find(act, "innerText", from_pos)
-    p_tc := str_find(act, "textContent", from_pos)
-    p_vl := str_find(act, ".value", from_pos)
-    mut p_txt := if p_it >= 0 { p_it } else { p_tc }
-    if p_txt < 0 { p_txt = p_vl }
-    if p_txt >= 0 {
-        eq := str_find_byte(act, 61, p_txt)
+    mut p := from_pos
+    n := str_len(act)
+    if p < n and str_byte(act, p) == 41 { p += 1 }
+    while p < n and _js_is_ws(str_byte(act, p)) { p += 1 }
+    tail := str_slice(act, p, n)
+
+    if str_starts_with(tail, ".innerText") or str_starts_with(tail, ".textContent") or str_starts_with(tail, ".value") {
+        eq := str_find_byte(tail, 61, 0)
         if eq >= 0 {
-            val := _js_eval_str_expr(store, str_slice(act, eq + 1, str_len(act)))
+            val := _js_eval_str_dom(tree, store, str_slice(tail, eq + 1, str_len(tail)), 0)
             return document_set_inner_text(mut tree, elem_id, val)
         }
     }
 
-    p_tog := str_find(act, "classList.toggle(", from_pos)
-    if p_tog >= 0 {
-        cls := _js_extract_quoted(act, p_tog + 17)
+    if str_starts_with(tail, ".classList.toggle(") {
+        cls := _js_extract_quoted(tail, 18)
         if str_len(cls) > 0 { return document_toggle_class(mut tree, elem_id, cls) }
     }
-    p_add := str_find(act, "classList.add(", from_pos)
-    if p_add >= 0 {
-        cls := _js_extract_quoted(act, p_add + 14)
+    if str_starts_with(tail, ".classList.add(") {
+        cls := _js_extract_quoted(tail, 15)
         if str_len(cls) > 0 { return document_add_class(mut tree, elem_id, cls) }
     }
-    p_rem := str_find(act, "classList.remove(", from_pos)
-    if p_rem >= 0 {
-        cls := _js_extract_quoted(act, p_rem + 17)
+    if str_starts_with(tail, ".classList.remove(") {
+        cls := _js_extract_quoted(tail, 18)
         if str_len(cls) > 0 { return document_remove_class(mut tree, elem_id, cls) }
     }
 
-    p_st := str_find(act, "style.", from_pos)
-    if p_st >= 0 {
-        eq := str_find_byte(act, 61, p_st + 6)
-        if eq > p_st + 6 {
-            raw_prop := str_trim(str_slice(act, p_st + 6, eq))
-            val := _js_extract_quoted(act, eq)
+    if str_starts_with(tail, ".style.") {
+        eq := str_find_byte(tail, 61, 7)
+        if eq > 7 {
+            raw_prop := str_trim(str_slice(tail, 7, eq))
+            val := _js_eval_str_dom(tree, store, str_slice(tail, eq + 1, str_len(tail)), 0)
+            if not _js_is_safe_css_val(val) { return false }
             mut css_p := raw_prop
             if str_eq(raw_prop, "backgroundColor") { css_p = "background-color" }
             else if str_eq(raw_prop, "borderColor") { css_p = "border-color" }
             else if str_eq(raw_prop, "fontSize") { css_p = "font-size" }
+            else if str_eq(raw_prop, "borderRadius") { css_p = "border-radius" }
+            else if str_eq(raw_prop, "fontWeight") { css_p = "font-weight" }
+            else if str_eq(raw_prop, "textAlign") { css_p = "text-align" }
             idx := dom_find_by_id(tree, elem_id)
-            if idx >= 0 and str_len(css_p) > 0 {
+            if idx >= 0 and str_len(css_p) > 0 and _js_is_safe_css_val(css_p) {
                 cur_s := dom_get_style(tree, idx)
                 next_s := if str_len(cur_s) > 0 { cur_s + "; " + css_p + ": " + val } else { css_p + ": " + val }
                 return document_set_style(mut tree, elem_id, next_s)
@@ -289,22 +776,63 @@ fn _js_apply_member_op(mut tree: DomTree, store: JsStateStore, elem_id: str, act
     return false
 }
 
+fn _js_bind_call_args(tree: DomTree, store: JsStateStore, param_list: str, arg_list: str) {
+    pn := str_len(param_list)
+    an := str_len(arg_list)
+    if pn == 0 { return }
+    mut pi := 0
+    mut ai := 0
+    while pi < pn {
+        mut pj := pi
+        while pj < pn and str_byte(param_list, pj) != 44 { pj += 1 }
+        pname := str_trim(str_slice(param_list, pi, pj))
+        pi = pj + 1
+
+        mut aj := ai
+        mut in_q := 0
+        mut par := 0
+        while aj < an {
+            b := str_byte(arg_list, aj)
+            if in_q != 0 {
+                if b == 92 and aj + 1 < an { aj += 2; continue }
+                if b == in_q { in_q = 0 }
+            } else {
+                if b == 39 or b == 34 or b == 96 { in_q = b }
+                else if b == 40 { par += 1 }
+                else if b == 41 { if par > 0 { par -= 1 } }
+                else if b == 44 and par == 0 { break }
+            }
+            aj += 1
+        }
+        aexpr := if ai < an { str_trim(str_slice(arg_list, ai, aj)) } else { "" }
+        ai = aj + 1
+
+        if str_len(pname) > 0 {
+            if _js_expr_is_string(tree, store, aexpr) {
+                js_state_set_str(store, pname, _js_eval_str_dom(tree, store, aexpr, 0))
+            } else {
+                js_state_set(store, pname, _js_eval_num(tree, store, aexpr, 0))
+            }
+        }
+    }
+}
+
 fn _js_eval_single(mut tree: DomTree, store: JsStateStore, action_str: str, depth: i64 = 0) -> bool {
     if depth >= 16 { return false }
     act := str_trim(action_str)
     n := str_len(act)
     if n == 0 { return false }
+    if str_starts_with(act, "//") or str_eq(act, "return") or str_starts_with(act, "return ") { return false }
 
     // --- Standard JS: document.getElementById('id')... or document.querySelector('#id')... ---
-    p_dgi := str_find(act, "document.getElementById(", 0)
-    p_dqs := str_find(act, "document.querySelector(", 0)
-    if p_dgi >= 0 or p_dqs >= 0 {
-        base_p := if p_dgi >= 0 { p_dgi + 24 } else { p_dqs + 23 }
+    if str_starts_with(act, "document.getElementById(") or str_starts_with(act, "document.querySelector(") {
+        is_gi := str_starts_with(act, "document.getElementById(")
+        base_p := if is_gi { 24 } else { 23 }
         mut elem_id := _js_extract_quoted(act, base_p)
         if str_len(elem_id) > 1 and str_byte(elem_id, 0) == 35 {
             elem_id = str_slice(elem_id, 1, str_len(elem_id))
         }
-        rp := str_find_byte(act, 41, base_p)
+        rp := _js_find_matching(act, base_p - 1, 40, 41)
         if str_len(elem_id) > 0 and rp > base_p {
             return _js_apply_member_op(mut tree, store, elem_id, act, rp)
         }
@@ -319,12 +847,15 @@ fn _js_eval_single(mut tree: DomTree, store: JsStateStore, action_str: str, dept
         }
     }
 
-    // --- JS Variables & Arithmetic: `let x = 0`, `const x = 5`, `x++`, `x--`, `x += 2`, `x -= 1`, `x = 10` ---
+    // --- JS Variables & Expressions: `let x = ...`, `const x = ...`, `x++`, `x--`, `x += expr`, `x -= expr`, `x = expr` ---
     mut vsrc := act
+    mut is_decl := false
     if str_starts_with(vsrc, "let ") or str_starts_with(vsrc, "var ") {
         vsrc = str_trim(str_slice(vsrc, 4, str_len(vsrc)))
+        is_decl = true
     } else if str_starts_with(vsrc, "const ") {
         vsrc = str_trim(str_slice(vsrc, 6, str_len(vsrc)))
+        is_decl = true
     }
     vn := str_len(vsrc)
     if vn > 2 and str_ends_with(vsrc, "++") {
@@ -337,35 +868,51 @@ fn _js_eval_single(mut tree: DomTree, store: JsStateStore, action_str: str, dept
         _ := js_state_inc(store, vname, -1)
         return true
     }
-    p_peq := str_find(vsrc, "+=", 0)
+    p_peq := _js_find_top_op(vsrc, "+=", false)
     if p_peq > 0 {
         vname := str_trim(str_slice(vsrc, 0, p_peq))
-        rhs := parse_i64(str_trim(str_slice(vsrc, p_peq + 2, vn))) or 0
-        _ := js_state_inc(store, vname, rhs)
+        rhs_s := str_trim(str_slice(vsrc, p_peq + 2, vn))
+        if js_state_has_str(store, vname) or _js_expr_is_string(tree, store, rhs_s) {
+            cur_s := if js_state_has_str(store, vname) { js_state_get_str(store, vname) } else { f"{js_state_get(store, vname, 0)}" }
+            js_state_set_str(store, vname, cur_s + _js_eval_str_dom(tree, store, rhs_s, 0))
+        } else {
+            _ := js_state_inc(store, vname, _js_eval_num(tree, store, rhs_s, 0))
+        }
         return true
     }
-    p_meq := str_find(vsrc, "-=", 0)
+    p_meq := _js_find_top_op(vsrc, "-=", false)
     if p_meq > 0 {
         vname := str_trim(str_slice(vsrc, 0, p_meq))
-        rhs := parse_i64(str_trim(str_slice(vsrc, p_meq + 2, vn))) or 0
+        rhs := _js_eval_num(tree, store, str_slice(vsrc, p_meq + 2, vn), 0)
         _ := js_state_inc(store, vname, 0 - rhs)
         return true
     }
-    p_eq := str_find_byte(vsrc, 61, 0)
-    if p_eq > 0 and str_find_byte(vsrc, 40, 0) < 0 and str_find_byte(vsrc, 46, 0) < 0 {
-        vname := str_trim(str_slice(vsrc, 0, p_eq))
-        rhs := parse_i64(str_trim(str_slice(vsrc, p_eq + 1, vn))) or 0
-        js_state_set(store, vname, rhs)
-        return true
+    p_eq := _js_find_top_op(vsrc, "=", false)
+    if p_eq > 0 {
+        lhs := str_trim(str_slice(vsrc, 0, p_eq))
+        if is_decl or (str_find_byte(lhs, 40, 0) < 0 and str_find_byte(lhs, 46, 0) < 0 and str_find_byte(lhs, 58, 0) < 0) {
+            rhs_s := str_trim(str_slice(vsrc, p_eq + 1, vn))
+            if _js_expr_is_string(tree, store, rhs_s) {
+                js_state_set_str(store, lhs, _js_eval_str_dom(tree, store, rhs_s, 0))
+            } else {
+                js_state_set(store, lhs, _js_eval_num(tree, store, rhs_s, 0))
+            }
+            return true
+        }
     }
 
-    // --- JS Function Call: `myFunc()` ---
+    // --- JS Function Call with Arguments: `myFunc(arg1, arg2)` ---
     lp := str_find_byte(act, 40, 0)
-    if lp > 0 and str_ends_with(act, ")") and str_find_byte(act, 46, 0) < 0 {
+    if lp > 0 and str_ends_with(act, ")") {
         fname := str_trim(str_slice(act, 0, lp))
-        body := js_find_fn_body(store, fname)
-        if str_len(body) > 0 {
-            return _js_eval_stmts(mut tree, store, body, depth + 1)
+        if str_find_byte(fname, 46, 0) < 0 and str_find_byte(fname, 32, 0) < 0 {
+            body := js_find_fn_body(store, fname)
+            if str_len(body) > 0 {
+                params := js_find_fn_params(store, fname)
+                args_str := str_slice(act, lp + 1, n - 1)
+                _js_bind_call_args(tree, store, params, args_str)
+                return _js_eval_stmts(mut tree, store, body, depth + 1)
+            }
         }
     }
 
@@ -420,93 +967,207 @@ fn _js_eval_single(mut tree: DomTree, store: JsStateStore, action_str: str, dept
     return false
 }
 
-// Executes one or more semicolon/newline-separated DOM JS statements (quote-aware)
-fn _js_eval_stmts(mut tree: DomTree, store: JsStateStore, action_str: str, depth: i64) -> bool {
-    n := str_len(action_str)
-    if n == 0 or depth >= 16 { return false }
-    mut any_mut := false
-    mut start := 0
-    mut i := 0
+fn _js_find_stmt_end(src: str, start: i64) -> i64 {
+    n := str_len(src)
+    mut st_end := start
     mut in_q := 0
-    while i <= n {
-        mut is_sep := (i == n)
-        if not is_sep {
-            b := str_byte(action_str, i)
-            if in_q == 0 and (b == 39 or b == 34) {
-                in_q = b
-            } else if in_q != 0 and b == in_q {
-                in_q = 0
-            } else if in_q == 0 and (b == 59 or b == 10) { // ';' or '\n'
-                is_sep = true
-            }
+    mut par := 0
+    while st_end < n {
+        b := str_byte(src, st_end)
+        if in_q != 0 {
+            if b == 92 and st_end + 1 < n { st_end += 2; continue }
+            if b == in_q { in_q = 0 }
+        } else {
+            if b == 39 or b == 34 or b == 96 { in_q = b }
+            else if st_end + 1 < n and b == 47 and str_byte(src, st_end + 1) == 47 {
+                // Line comment terminates statement cleanly before `//` (caller advances past `\n`!)
+                return st_end
+            } else if st_end + 1 < n and b == 47 and str_byte(src, st_end + 1) == 42 {
+                ce := str_find(src, "*/", st_end + 2)
+                st_end = if ce >= 0 { ce + 2 } else { n }
+                continue
+            } else if b == 40 { par += 1 }
+            else if b == 41 { if par > 0 { par -= 1 } }
+            else if par == 0 and (b == 59 or b == 10) { return st_end }
         }
-        if is_sep {
-            if i > start {
-                if _js_eval_single(mut tree, store, str_slice(action_str, start, i), depth) {
-                    any_mut = true
+        st_end += 1
+    }
+    return st_end
+}
+
+fn _js_advance_after_stmt(src: str, st_end: i64) -> i64 {
+    n := str_len(src)
+    if st_end >= n { return n }
+    if st_end + 1 < n and str_byte(src, st_end) == 47 and str_byte(src, st_end + 1) == 47 {
+        nl := str_find_byte(src, 10, st_end + 2)
+        return if nl >= 0 { nl + 1 } else { n }
+    }
+    return st_end + 1
+}
+
+// Executes a block of JS statements with full `if / else if / else`, `while`, shared anti-DoS fuel, quotes & comments
+fn _js_eval_stmts_fuel(mut tree: DomTree, store: JsStateStore, action_str: str, depth: i64, fuel: IntBuf) -> bool {
+    n := str_len(action_str)
+    if n == 0 or depth >= 16 or ibuf_get(fuel, 0) <= 0 { return false }
+    mut any_mut := false
+    mut p := 0
+    while p < n {
+        rem_f := ibuf_get(fuel, 0)
+        if rem_f <= 0 { break }
+        ibuf_set(fuel, 0, rem_f - 1)
+        p = _js_skip_ws_comments(action_str, p)
+        if p >= n { break }
+
+        // --- `if (cond) { ... } [else if (cond) { ... }]* [else { ... }]` ---
+        if p + 2 <= n and str_eq(str_slice(action_str, p, p + 2), "if") and (p + 2 == n or not _js_is_ident_char(str_byte(action_str, p + 2))) {
+            mut cur := p
+            mut taken := false
+            mut loop_ok := true
+            while loop_ok and cur < n {
+                cur = _js_skip_ws_comments(action_str, cur)
+                if cur + 2 <= n and str_eq(str_slice(action_str, cur, cur + 2), "if") {
+                    lp := _js_skip_ws_comments(action_str, cur + 2)
+                    rp := _js_find_matching(action_str, lp, 40, 41)
+                    if rp <= lp { break }
+                    cond_s := str_slice(action_str, lp + 1, rp)
+                    lb := _js_skip_ws_comments(action_str, rp + 1)
+                    rb := _js_find_matching(action_str, lb, 123, 125)
+                    if rb <= lb { break }
+                    if not taken and _js_eval_bool(tree, store, cond_s, 0) {
+                        if _js_eval_stmts_fuel(mut tree, store, str_slice(action_str, lb + 1, rb), depth + 1, fuel) { any_mut = true }
+                        taken = true
+                    }
+                    cur = _js_skip_ws_comments(action_str, rb + 1)
+                    if cur + 4 <= n and str_eq(str_slice(action_str, cur, cur + 4), "else") and (cur + 4 == n or not _js_is_ident_char(str_byte(action_str, cur + 4))) {
+                        cur = _js_skip_ws_comments(action_str, cur + 4)
+                        if cur + 2 <= n and str_eq(str_slice(action_str, cur, cur + 2), "if") and (cur + 2 == n or not _js_is_ident_char(str_byte(action_str, cur + 2))) {
+                            continue
+                        }
+                        rb2 := _js_find_matching(action_str, cur, 123, 125)
+                        if rb2 > cur {
+                            if not taken {
+                                if _js_eval_stmts_fuel(mut tree, store, str_slice(action_str, cur + 1, rb2), depth + 1, fuel) { any_mut = true }
+                            }
+                            cur = rb2 + 1
+                        }
+                    }
+                    loop_ok = false
+                } else {
+                    loop_ok = false
                 }
             }
-            start = i + 1
+            if cur > p { p = cur; continue }
         }
-        i += 1
+
+        // --- `while (cond) { ... }` (bounded by shared global `fuel` against nested `while(1)` DoS!) ---
+        if p + 5 <= n and str_eq(str_slice(action_str, p, p + 5), "while") and (p + 5 == n or not _js_is_ident_char(str_byte(action_str, p + 5))) {
+            lp := _js_skip_ws_comments(action_str, p + 5)
+            rp := _js_find_matching(action_str, lp, 40, 41)
+            lb := if rp > lp { _js_skip_ws_comments(action_str, rp + 1) } else { -1 }
+            rb := if lb > rp { _js_find_matching(action_str, lb, 123, 125) } else { -1 }
+            if rb > lb {
+                cond_s := str_slice(action_str, lp + 1, rp)
+                body_s := str_slice(action_str, lb + 1, rb)
+                while ibuf_get(fuel, 0) > 0 and _js_eval_bool(tree, store, cond_s, 0) {
+                    ibuf_set(fuel, 0, ibuf_get(fuel, 0) - 1)
+                    if _js_eval_stmts_fuel(mut tree, store, body_s, depth + 1, fuel) { any_mut = true }
+                }
+                p = rb + 1
+                continue
+            }
+        }
+
+        // --- Single statement up to quote-, comment-, and paren-aware `;` or `\n` ---
+        st_end := _js_find_stmt_end(action_str, p)
+        stmt := str_trim(str_slice(action_str, p, st_end))
+        if str_eq(stmt, "return") or str_starts_with(stmt, "return ") {
+            return any_mut
+        }
+        if str_len(stmt) > 0 {
+            if _js_eval_single(mut tree, store, stmt, depth) { any_mut = true }
+        }
+        p = _js_advance_after_stmt(action_str, st_end)
     }
     return any_mut
+}
+
+fn _js_eval_stmts(mut tree: DomTree, store: JsStateStore, action_str: str, depth: i64) -> bool {
+    fuel := ibuf_new(2)
+    ibuf_push(fuel, 10000)
+    res := _js_eval_stmts_fuel(mut tree, store, action_str, depth, fuel)
+    buf_free(move fuel)
+    return res
 }
 
 fn js_eval_action(mut tree: DomTree, store: JsStateStore, action_str: str) -> bool {
     return _js_eval_stmts(mut tree, store, action_str, 0)
 }
 
-// Parses `<script>` blocks: registers `function name() { ... }` and executes top-level JS statements
+// Parses `<script>` blocks: registers `function name(params) { ... }` (quote-aware!) and executes top-level JS statements
 fn js_eval_script(mut tree: DomTree, mut store: JsStateStore, script: str) -> bool {
     n := str_len(script)
     if n == 0 { return false }
+    fuel := ibuf_new(2)
+    ibuf_push(fuel, 10000)
     mut any_mut := false
     mut p := 0
-    while p < n {
-        // Skip whitespace & line comments `// ...`
-        while p < n and (str_byte(script, p) == 32 or str_byte(script, p) == 9 or str_byte(script, p) == 10 or str_byte(script, p) == 13) { p += 1 }
+    while p < n and ibuf_get(fuel, 0) > 0 {
+        p = _js_skip_ws_comments(script, p)
         if p >= n { break }
-        if p + 1 < n and str_byte(script, p) == 47 and str_byte(script, p + 1) == 47 {
-            nl := str_find_byte(script, 10, p + 2)
-            p = if nl >= 0 { nl + 1 } else { n }
-            continue
-        }
-        if str_starts_with(str_slice(script, p, n), "function ") {
+        if p + 9 <= n and str_eq(str_slice(script, p, p + 9), "function ") {
             lp := str_find_byte(script, 40, p + 9)
-            lb := if lp > 0 { str_find_byte(script, 123, lp) } else { -1 }
-            if lb > lp {
+            rp := if lp > p + 9 { _js_find_matching(script, lp, 40, 41) } else { -1 }
+            lb := if rp > lp { _js_skip_ws_comments(script, rp + 1) } else { -1 }
+            rb := if lb > rp { _js_find_matching(script, lb, 123, 125) } else { -1 }
+            if rb > lb {
                 fname := str_trim(str_slice(script, p + 9, lp))
-                mut depth := 1
-                mut j := lb + 1
-                while j < n and depth > 0 {
-                    ch := str_byte(script, j)
-                    if ch == 123 { depth += 1 }
-                    else if ch == 125 { depth -= 1 }
-                    j += 1
-                }
-                fbody := str_slice(script, lb + 1, j - 1)
-                js_register_fn(mut store, fname, fbody)
-                p = j
+                fparams := str_trim(str_slice(script, lp + 1, rp))
+                fbody := str_slice(script, lb + 1, rb)
+                js_register_fn_params(mut store, fname, fparams, fbody)
+                p = rb + 1
                 continue
             }
         }
-        // Single top-level statement up to `;` or `\n`
-        mut st_end := p
-        mut in_q := 0
-        while st_end < n {
-            ch := str_byte(script, st_end)
-            if in_q == 0 and (ch == 39 or ch == 34) { in_q = ch }
-            else if in_q != 0 and ch == in_q { in_q = 0 }
-            else if in_q == 0 and (ch == 59 or ch == 10) { break }
-            st_end += 1
+        // Top-level `if` or `while` block or single statement
+        if (p + 2 <= n and str_eq(str_slice(script, p, p + 2), "if") and (p + 2 == n or not _js_is_ident_char(str_byte(script, p + 2)))) or
+           (p + 5 <= n and str_eq(str_slice(script, p, p + 5), "while") and (p + 5 == n or not _js_is_ident_char(str_byte(script, p + 5)))) {
+            lp := str_find_byte(script, 40, p)
+            rp := if lp > p { _js_find_matching(script, lp, 40, 41) } else { -1 }
+            lb := if rp > lp { _js_skip_ws_comments(script, rp + 1) } else { -1 }
+            mut rb := if lb > rp { _js_find_matching(script, lb, 123, 125) } else { -1 }
+            if rb > lb {
+                mut cur := rb + 1
+                while cur < n {
+                    nx := _js_skip_ws_comments(script, cur)
+                    if nx + 4 <= n and str_eq(str_slice(script, nx, nx + 4), "else") and (nx + 4 == n or not _js_is_ident_char(str_byte(script, nx + 4))) {
+                        nx2 := _js_skip_ws_comments(script, nx + 4)
+                        if nx2 + 2 <= n and str_eq(str_slice(script, nx2, nx2 + 2), "if") {
+                            lp2 := _js_skip_ws_comments(script, nx2 + 2)
+                            rp2 := _js_find_matching(script, lp2, 40, 41)
+                            lb2 := if rp2 > lp2 { _js_skip_ws_comments(script, rp2 + 1) } else { -1 }
+                            rb2 := if lb2 > rp2 { _js_find_matching(script, lb2, 123, 125) } else { -1 }
+                            if rb2 > lb2 { cur = rb2 + 1; continue }
+                        } else if nx2 < n and str_byte(script, nx2) == 123 {
+                            rb2 := _js_find_matching(script, nx2, 123, 125)
+                            if rb2 > nx2 { cur = rb2 + 1 }
+                        }
+                    }
+                    break
+                }
+                if _js_eval_stmts_fuel(mut tree, store, str_slice(script, p, cur), 0, fuel) { any_mut = true }
+                p = cur
+                continue
+            }
         }
+        st_end := _js_find_stmt_end(script, p)
         if st_end > p {
+            ibuf_set(fuel, 0, ibuf_get(fuel, 0) - 1)
             if _js_eval_single(mut tree, store, str_slice(script, p, st_end), 0) {
                 any_mut = true
             }
         }
-        p = st_end + 1
+        p = _js_advance_after_stmt(script, st_end)
     }
+    buf_free(move fuel)
     return any_mut
 }

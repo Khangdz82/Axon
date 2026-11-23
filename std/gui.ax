@@ -28,6 +28,13 @@ struct GuiWindow {
     last_char: i64
     scroll_delta: i64
     needs_redraw: bool
+    char_queue: IntBuf
+    char_count: i64
+    clicked_down: bool
+    clicked_up: bool
+    ctrl_v: bool
+    ctrl_c: bool
+    cur_cursor: i64
 }
 
 fn _gui_utf8_to_utf16(k32: i64, s: str) -> i64 {
@@ -145,7 +152,10 @@ fn _gui_win32_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64
         width = w, height = h, mouse_x = 0, mouse_y = 0,
         mouse_down = false, key_escape = false, is_open = true,
         user32 = u32, gdi32 = g32, sdl2 = 0,
-        last_char = 0, scroll_delta = 0, needs_redraw = true
+        last_char = 0, scroll_delta = 0, needs_redraw = true,
+        char_queue = ibuf_new(64), char_count = 0,
+        clicked_down = false, clicked_up = false,
+        ctrl_v = false, ctrl_c = false, cur_cursor = -1
     ))
 }
 
@@ -172,7 +182,10 @@ fn _gui_sdl2_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64 
         width = w, height = h, mouse_x = 0, mouse_y = 0,
         mouse_down = false, key_escape = false, is_open = true,
         user32 = 0, gdi32 = 0, sdl2 = sdl,
-        last_char = 0, scroll_delta = 0, needs_redraw = true
+        last_char = 0, scroll_delta = 0, needs_redraw = true,
+        char_queue = ibuf_new(64), char_count = 0,
+        clicked_down = false, clicked_up = false,
+        ctrl_v = false, ctrl_c = false, cur_cursor = -1
     ))
 }
 
@@ -226,7 +239,7 @@ fn gui_wait_event(win: GuiWindow, timeout_ms: i64 = 250) {
 
 // Set native Win32 window & taskbar icon from 32-bit BGRA pixel buffer (zero external .ico file)
 fn gui_set_icon_bgra(win: GuiWindow, w: i64, h: i64, pixels: ByteBuf) {
-    if not win.is_open or win.backend != 1 or w <= 0 or h <= 0 { return }
+    if not win.is_open or win.backend != 1 or w <= 0 or h <= 0 or w > 1024 or h > 1024 { return }
     if buf_len(pixels) < w * h * 4 { return }
     f_cbm  := ffi_sym(win.gdi32, "CreateBitmap")
     f_delo := ffi_sym(win.gdi32, "DeleteObject")
@@ -236,7 +249,13 @@ fn gui_set_icon_bgra(win: GuiWindow, w: i64, h: i64, pixels: ByteBuf) {
 
     px_ptr := unsafe { (pixels as i64) + 16 }
     hbm_col := ffi_call5(f_cbm, w, h, 1, 32, px_ptr)
-    mask_buf := ffi_alloc((w * h) / 8 + 32)
+    // Win32 1bpp mask requires 16-bit word-aligned scanlines: ((w + 15) / 16) * 2 bytes/row
+    mask_bytes := ((w + 15) / 16) * 2 * h + 16
+    mask_buf := ffi_alloc(mask_bytes)
+    if mask_buf == 0 {
+        if hbm_col != 0 { _ := ffi_call1(f_delo, hbm_col) }
+        return
+    }
     hbm_msk := ffi_call5(f_cbm, w, h, 1, 1, mask_buf)
     ffi_free(mask_buf)
     if hbm_col != 0 and hbm_msk != 0 {
@@ -255,10 +274,32 @@ fn gui_set_icon_bgra(win: GuiWindow, w: i64, h: i64, pixels: ByteBuf) {
     if hbm_msk != 0 { _ := ffi_call1(f_delo, hbm_msk) }
 }
 
+// Switch native OS mouse cursor (0 = arrow, 1 = hand/pointer, 2 = text/ibeam)
+fn gui_set_cursor(mut win: GuiWindow, kind: i64) {
+    if win.backend != 1 or win.user32 == 0 or kind == win.cur_cursor { return }
+    f_lc := ffi_sym(win.user32, "LoadCursorW")
+    f_sc := ffi_sym(win.user32, "SetCursor")
+    if f_lc == 0 or f_sc == 0 { return }
+    mut idc := 32512 // IDC_ARROW
+    if kind == 1 { idc = 32649 } // IDC_HAND
+    else if kind == 2 { idc = 32513 } // IDC_IBEAM
+    hc := ffi_call2(f_lc, 0, idc)
+    if hc != 0 {
+        _ := ffi_call1(f_sc, hc)
+        win.cur_cursor = kind
+    }
+}
+
 fn gui_poll_events(mut win: GuiWindow) -> bool {
     win.last_char = 0
+    win.char_count = 0
     win.scroll_delta = 0
     win.needs_redraw = false
+    win.clicked_down = false
+    win.clicked_up = false
+    win.ctrl_v = false
+    win.ctrl_c = false
+    win.key_escape = false
     if not win.is_open { return false }
     if win.backend == 1 {
         f_isw  := ffi_sym(win.user32, "IsWindow")
@@ -270,9 +311,11 @@ fn gui_poll_events(mut win: GuiWindow) -> bool {
         f_tr   := ffi_sym(win.user32, "TranslateMessage")
         f_disp := ffi_sym(win.user32, "DispatchMessageW")
         f_val  := ffi_sym(win.user32, "ValidateRect")
+        f_gks  := ffi_sym(win.user32, "GetKeyState")
         buf := ffi_alloc(64)
+        if buf == 0 { return win.is_open }
         mut guard := 0
-        while guard < 64 {
+        while guard < 128 {
             guard += 1
             got := ffi_call5(f_peek, buf, win.hwnd, 0, 0, 1) & 0xFFFFFFFF // PM_REMOVE
             if got == 0 { break }
@@ -288,9 +331,35 @@ fn gui_poll_events(mut win: GuiWindow) -> bool {
             }
             if mcode == 0x0005 or mcode == 0x0006 or mcode == 0x0007 or mcode == 0x02E0 { // WM_SIZE/ACTIVATE/SETFOCUS/DPICHANGED
                 win.needs_redraw = true
-            } else if mcode == 0x0102 { // WM_CHAR
+            } else if mcode == 0x0201 { // WM_LBUTTONDOWN
+                win.mouse_down = true
+                win.clicked_down = true
+                win.needs_redraw = true
+            } else if mcode == 0x0202 { // WM_LBUTTONUP
+                win.mouse_down = false
+                win.clicked_up = true
+                win.needs_redraw = true
+            } else if mcode == 0x0100 { // WM_KEYDOWN (focused window only!)
+                vk := ffi_read_i64(buf, 2) & 0xFFFF
+                if vk == 0x1B { // VK_ESCAPE
+                    win.key_escape = true
+                } else if f_gks != 0 and ((ffi_call1(f_gks, 0x11) & 0x8000) != 0) { // VK_CONTROL held
+                    if vk == 0x56 { win.ctrl_v = true }      // Ctrl+V
+                    else if vk == 0x43 { win.ctrl_c = true } // Ctrl+C
+                }
+            } else if mcode == 0x0102 { // WM_CHAR (full UTF-16 queue for IME/Vietnamese fast typing)
                 ch := ffi_read_i64(buf, 2) & 0xFFFF
-                if ch > 0 { win.last_char = ch }
+                if ch > 0 and ch != 3 and ch != 22 {
+                    win.last_char = ch
+                    if win.char_count < 64 {
+                        if win.char_count < ibuf_len(win.char_queue) {
+                            ibuf_set(win.char_queue, win.char_count, ch)
+                        } else {
+                            ibuf_push(win.char_queue, ch)
+                        }
+                        win.char_count += 1
+                    }
+                }
             } else if mcode == 0x020A { // WM_MOUSEWHEEL (signed 16-bit HIWORD)
                 raw_d := (ffi_read_i64(buf, 2) >> 16) & 0xFFFF
                 delta := if raw_d >= 32768 { raw_d - 65536 } else { raw_d }
@@ -314,19 +383,17 @@ fn gui_poll_events(mut win: GuiWindow) -> bool {
 
         f_cp := ffi_sym(win.user32, "GetCursorPos")
         f_sc := ffi_sym(win.user32, "ScreenToClient")
-        f_ks := ffi_sym(win.user32, "GetAsyncKeyState")
         _ := ffi_call1(f_cp, buf)
         _ := ffi_call2(f_sc, win.hwnd, buf)
         win.mouse_x = ffi_sext32(ffi_read_u32_le(buf, 0))
         win.mouse_y = ffi_sext32(ffi_read_u32_le(buf, 4))
         ffi_free(buf)
-        win.mouse_down = (ffi_call1(f_ks, 0x01) & 0x8000) != 0
-        win.key_escape = (ffi_call1(f_ks, 0x1B) & 0x8000) != 0
         return win.is_open
     }
     if win.backend == 2 {
         f_pe := ffi_sym(win.sdl2, "SDL_PollEvent")
         ev := ffi_alloc(64)
+        if ev == 0 { return win.is_open }
         while (ffi_call1(f_pe, ev) & 0xFFFFFFFF) != 0 {
             et := ffi_read_u32_le(ev, 0)
             if et == 0x100 { win.is_open = false } // SDL_QUIT
@@ -397,9 +464,21 @@ fn gui_close(mut win: GuiWindow) {
     if win.backend == 1 and win.hwnd != 0 {
         f := ffi_sym(win.user32, "DestroyWindow")
         _ := ffi_call1(f, win.hwnd)
-    } else if win.backend == 2 and win.hwnd != 0 {
-        f_dw := ffi_sym(win.sdl2, "SDL_DestroyWindow")
-        _ := ffi_call1(f_dw, win.hwnd)
+    } else if win.backend == 2 {
+        if win.aux2 != 0 {
+            f_dt := ffi_sym(win.sdl2, "SDL_DestroyTexture")
+            if f_dt != 0 { _ := ffi_call1(f_dt, win.aux2) }
+            win.aux2 = 0
+        }
+        if win.aux1 != 0 {
+            f_dr := ffi_sym(win.sdl2, "SDL_DestroyRenderer")
+            if f_dr != 0 { _ := ffi_call1(f_dr, win.aux1) }
+            win.aux1 = 0
+        }
+        if win.hwnd != 0 {
+            f_dw := ffi_sym(win.sdl2, "SDL_DestroyWindow")
+            _ := ffi_call1(f_dw, win.hwnd)
+        }
     }
     win.is_open = false
 }
@@ -412,7 +491,7 @@ struct GuiFontCache {
 }
 
 fn gui_font_cache_new() -> GuiFontCache {
-    return GuiFontCache(entries = ibuf_new(24), count = 0)
+    return GuiFontCache(entries = ibuf_new(96), count = 0)
 }
 
 fn _gui_font_index(c: GuiFontCache, size: i64, weight: i64) -> i64 {
@@ -449,10 +528,20 @@ fn gui_font_cache_get(mut c: GuiFontCache, gdi: i64, face: str, size: i64, weigh
     if idx >= 0 { return ibuf_get(c.entries, idx * 3 + 2) }
     h := _gui_create_font(gdi, face, sz, w)
     if h == 0 { return 0 }
-    ibuf_push(c.entries, sz)
-    ibuf_push(c.entries, w)
-    ibuf_push(c.entries, h)
-    c.count += 1
+    if c.count < 32 {
+        ibuf_push(c.entries, sz)
+        ibuf_push(c.entries, w)
+        ibuf_push(c.entries, h)
+        c.count += 1
+    } else {
+        // Evict slot 0 cleanly to avoid GDI leak or IntBuf OOB
+        f_delo := ffi_sym(gdi, "DeleteObject")
+        old_h := ibuf_get(c.entries, 2)
+        if f_delo != 0 and old_h != 0 { _ := ffi_call1(f_delo, old_h) }
+        ibuf_set(c.entries, 0, sz)
+        ibuf_set(c.entries, 1, w)
+        ibuf_set(c.entries, 2, h)
+    }
     return h
 }
 
@@ -516,13 +605,27 @@ fn _p2d_f32_ratio(num: i64, den: i64) -> i64 {
     mut s := 0
     mut a := num
     mut b := den
-    if a < 0 { s = 0x80000000; a = -a }
-    if b < 0 { s = s ^ 0x80000000; b = -b }
+    if a == (1 << 63) { s = 0x80000000; a = (1 << 62); b = if b > 1 or b < -1 { b / 2 } else { b } }
+    else if a < 0 { s = 0x80000000; a = 0 - a }
+    if b == (1 << 63) { s = s ^ 0x80000000; b = (1 << 62); a = a / 2 }
+    else if b < 0 { s = s ^ 0x80000000; b = 0 - b }
+    if a <= 0 or b <= 0 { return 0 }
     mut exp := 127
-    while a < b { a *= 2; exp -= 1 }
-    while a >= b * 2 { b *= 2; exp += 1 }
+    while a < b and exp > 1 and a <= (1 << 61) { a *= 2; exp -= 1 }
+    while b <= (1 << 61) and a >= b * 2 and exp < 254 { b *= 2; exp += 1 }
+    while a >= (1 << 39) or b >= (1 << 39) {
+        a = a >> 1
+        b = b >> 1
+    }
+    if b <= 0 { return s | (254 << 23) }
     mant := (((a - b) << 23) + (b / 2)) / b
-    if mant >= 0x800000 { return s | ((exp + 1) << 23) }
+    if mant >= 0x800000 {
+        exp += 1
+        if exp > 254 { exp = 254 }
+        return s | (exp << 23)
+    }
+    if exp < 1 { return 0 }
+    if exp > 254 { exp = 254 }
     return s | ((exp & 0xFF) << 23) | (mant & 0x7FFFFF)
 }
 
@@ -567,7 +670,7 @@ fn photon_d2d_init(win: GuiWindow) -> PhotonD2D {
     mut d2d := PhotonD2D(
         ok = false, d2d_fac = 0, dw_fac = 0, rt = 0, brush = 0,
         mem_dc = 0, hbm = 0, old_bm = 0, bb_w = 0, bb_h = 0,
-        tf_entries = ibuf_new(192), tf_count = 0,
+        tf_entries = ibuf_new(768), tf_count = 0,
         k32 = k32,
         f_mb2w = if k32 != 0 { ffi_sym(k32, "MultiByteToWideChar") } else { 0 },
         f_gdc = ffi_sym(win.user32, "GetDC"),
@@ -588,7 +691,7 @@ fn photon_d2d_init(win: GuiWindow) -> PhotonD2D {
         img_entries = ibuf_new(128),
         img_count = 0
     )
-    if win.backend != 1 { return d2d }
+    if win.backend != 1 or d2d.scratch == 0 or d2d.out_box == 0 or d2d.wbuf == 0 { return d2d }
     lib_d2d := ffi_open_one("d2d1.dll")
     lib_dw  := ffi_open_one("dwrite.dll")
     if lib_d2d == 0 or lib_dw == 0 { return d2d }
@@ -692,12 +795,12 @@ fn _p2d_ensure_bb(mut d2d: PhotonD2D, hdc: i64, w: i64, h: i64) -> bool {
     return (ffi_call3(_p2d_vt(d2d.rt, 57), d2d.rt, d2d.mem_dc, rc) & 0xFFFFFFFF) == 0
 }
 
-fn _p2d_get_text_format(mut d2d: PhotonD2D, sz_in: i64, weight_in: i64, h_align: i64, v_align: i64, wrap: i64, is_mono: bool = false) -> i64 {
+fn _p2d_get_text_format(mut d2d: PhotonD2D, sz_in: i64, weight_in: i64, h_align: i64, v_align: i64, wrap: i64, is_mono: bool = false, is_italic: bool = false) -> i64 {
     mut sz := sz_in
     if sz < 8 { sz = 8 } else if sz > 96 { sz = 96 }
     mut w := weight_in
     if w < 100 or w > 900 { w = 400 }
-    wrap_key := wrap | (if is_mono { 4 } else { 0 })
+    wrap_key := wrap | (if is_mono { 4 } else { 0 }) | (if is_italic { 8 } else { 0 })
     mut i := 0
     while i < d2d.tf_count {
         b := i * 6
@@ -706,11 +809,12 @@ fn _p2d_get_text_format(mut d2d: PhotonD2D, sz_in: i64, weight_in: i64, h_align:
         }
         i += 1
     }
-    w_face := ffi_wstr(if is_mono { "Consolas" } else { "Segoe UI Variable Text" })
+    w_face := ffi_wstr(if is_mono { "Consolas" } else { "Segoe UI" })
     w_loc := ffi_wstr("en-US")
+    fstyle := if is_italic { 2 } else { 0 } // DWRITE_FONT_STYLE_ITALIC = 2
     args := ibuf_new(12)
     ibuf_push(args, d2d.dw_fac); ibuf_push(args, w_face); ibuf_push(args, 0); ibuf_push(args, w)
-    ibuf_push(args, 0); ibuf_push(args, 5); ibuf_push(args, _p2d_f32(sz)); ibuf_push(args, w_loc); ibuf_push(args, d2d.out_box)
+    ibuf_push(args, fstyle); ibuf_push(args, 5); ibuf_push(args, _p2d_f32(sz)); ibuf_push(args, w_loc); ibuf_push(args, d2d.out_box)
     hr := ffi_call_arr(_p2d_vt(d2d.dw_fac, 15), 9, args) & 0xFFFFFFFF
     buf_free(move args)
     ffi_free(w_face); ffi_free(w_loc)
@@ -720,11 +824,18 @@ fn _p2d_get_text_format(mut d2d: PhotonD2D, sz_in: i64, weight_in: i64, h_align:
         _ := ffi_call2(_p2d_vt(tf, 3), tf, h_align)
         _ := ffi_call2(_p2d_vt(tf, 4), tf, v_align)
         _ := ffi_call2(_p2d_vt(tf, 5), tf, wrap)
-        if d2d.tf_count < 30 {
+        if d2d.tf_count < 126 {
             ibuf_push(d2d.tf_entries, sz); ibuf_push(d2d.tf_entries, w)
             ibuf_push(d2d.tf_entries, h_align); ibuf_push(d2d.tf_entries, v_align)
             ibuf_push(d2d.tf_entries, wrap_key); ibuf_push(d2d.tf_entries, tf)
             d2d.tf_count += 1
+        } else {
+            // Release & evict slot 0 to prevent COM IDWriteTextFormat leak
+            old_tf := ibuf_get(d2d.tf_entries, 5)
+            if old_tf != 0 { _ := ffi_call1(_p2d_vt(old_tf, 2), old_tf) }
+            ibuf_set(d2d.tf_entries, 0, sz); ibuf_set(d2d.tf_entries, 1, w)
+            ibuf_set(d2d.tf_entries, 2, h_align); ibuf_set(d2d.tf_entries, 3, v_align)
+            ibuf_set(d2d.tf_entries, 4, wrap_key); ibuf_set(d2d.tf_entries, 5, tf)
         }
     }
     return tf
@@ -741,15 +852,24 @@ fn _p2d_fill_rrect(d2d: PhotonD2D, x: i64, y: i64, w: i64, h: i64, rad: i64, arg
     _ := ffi_call3(_p2d_vt(d2d.rt, 19), d2d.rt, rr, d2d.brush)
 }
 
-fn _p2d_fill_grad_rrect(d2d: PhotonD2D, x: i64, y: i64, w: i64, h: i64, rad: i64, dir: i64, c_from: i64, c_to: i64) {
+fn _p2d_fill_grad_rrect(d2d: PhotonD2D, x: i64, y: i64, w: i64, h: i64, rad: i64, dir: i64, c_from: i64, c_to: i64, c_via: i64 = 0) {
     if w <= 0 or h <= 0 { return }
     stops := d2d.scratch + 160
+    mut stop_cnt := 2
     ffi_write_u32_le(stops, 0, _p2d_f32_ratio(0, 1))
     _p2d_write_color(stops + 4, c_from)
-    ffi_write_u32_le(stops, 20, _p2d_f32_ratio(1, 1))
-    _p2d_write_color(stops + 24, c_to)
+    if c_via != 0 {
+        ffi_write_u32_le(stops, 20, _p2d_f32_ratio(1, 2))
+        _p2d_write_color(stops + 24, c_via)
+        ffi_write_u32_le(stops, 40, _p2d_f32_ratio(1, 1))
+        _p2d_write_color(stops + 44, c_to)
+        stop_cnt = 3
+    } else {
+        ffi_write_u32_le(stops, 20, _p2d_f32_ratio(1, 1))
+        _p2d_write_color(stops + 24, c_to)
+    }
 
-    hr_s := ffi_call6(_p2d_vt(d2d.rt, 9), d2d.rt, stops, 2, 0, 0, d2d.out_box) & 0xFFFFFFFF
+    hr_s := ffi_call6(_p2d_vt(d2d.rt, 9), d2d.rt, stops, stop_cnt, 0, 0, d2d.out_box) & 0xFFFFFFFF
     if hr_s != 0 { _p2d_fill_rrect(d2d, x, y, w, h, rad, c_from); return }
     scoll := ffi_read_i64(d2d.out_box, 0)
     gp := d2d.scratch + 240
@@ -764,6 +884,7 @@ fn _p2d_fill_grad_rrect(d2d: PhotonD2D, x: i64, y: i64, w: i64, h: i64, rad: i64
     _ := ffi_call1(_p2d_vt(scoll, 2), scoll)
     if hr_g != 0 { _p2d_fill_rrect(d2d, x, y, w, h, rad, c_from); return }
     gb := ffi_read_i64(d2d.out_box, 0)
+    _ := ffi_call2(_p2d_vt(d2d.rt, 32), d2d.rt, if rad == 0 { 1 } else { 0 })
     rr := d2d.scratch + 32
     _p2d_write_rrect(rr, x, y, w, h, rad)
     _ := ffi_call3(_p2d_vt(d2d.rt, 19), d2d.rt, rr, gb)
@@ -774,8 +895,8 @@ fn _p2d_fill_grad_rrect(d2d: PhotonD2D, x: i64, y: i64, w: i64, h: i64, rad: i64
 fn _p2d_find_or_load_img(mut d2d: PhotonD2D, path: str) -> i64 {
     pn := str_len(path)
     if pn == 0 or pn > 512 or not d2d.ok { return -1 }
-    // Security (CWE-918 / CWE-40): block UNC network shares (`\\host\...` / `//host/...`) & embedded NULs
-    if pn >= 2 and ((str_byte(path, 0) == 92 and str_byte(path, 1) == 92) or (str_byte(path, 0) == 47 and str_byte(path, 1) == 47)) {
+    // Security (CWE-918 / CWE-40): block ALL UNC network shares (`\\`, `//`, `/\`, `\/`) & embedded NULs
+    if pn >= 2 and (str_byte(path, 0) == 92 or str_byte(path, 0) == 47) and (str_byte(path, 1) == 92 or str_byte(path, 1) == 47) {
         return -1
     }
     mut pi := 0
@@ -802,7 +923,7 @@ fn _p2d_find_or_load_img(mut d2d: PhotonD2D, path: str) -> i64 {
         st := ffi_call3(f_st, tok_box, si, 0) & 0xFFFFFFFF
         d2d.gdip_tok = ffi_read_i64(tok_box, 0)
         ffi_free(tok_box); ffi_free(si)
-        if st != 0 { return -1 }
+        if st != 0 { d2d.gdiplus = 0; return -1 }
     }
 
     f_load := ffi_sym(d2d.gdiplus, "GdipCreateBitmapFromFile")
@@ -899,13 +1020,28 @@ fn _p2d_draw_img_rrect(mut d2d: PhotonD2D, path: str, x: i64, y: i64, w: i64, h:
     _ := ffi_call1(_p2d_vt(bbrush, 2), bbrush)
 }
 
-fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: i64, acc_scroll_y: i64, dip_h: i64) {
-    if node_idx < 0 or node_idx >= app.tree.count { return }
+fn _p2d_is_node_or_ancestor(tree: DomTree, node_idx: i64, target_idx: i64) -> bool {
+    if target_idx < 0 or node_idx < 0 { return false }
+    mut cur := target_idx
+    mut hops := 0
+    while cur >= 0 and hops < 64 {
+        if cur == node_idx { return true }
+        cur = dom_parent(tree, cur)
+        hops += 1
+    }
+    return false
+}
+
+fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: i64, active_node: i64, acc_scroll_y: i64, dip_h: i64, depth: i64 = 0) {
+    if depth >= 64 or node_idx < 0 or node_idx >= app.tree.count { return }
     bx := layout_get_x(app.layout, node_idx)
     raw_by := layout_get_y(app.layout, node_idx)
     bw := layout_get_w(app.layout, node_idx)
     bh := layout_get_h(app.layout, node_idx)
-    style := css_compute_node_style_state(app.tree, node_idx, app.sheet, node_idx == hovered_node)
+    is_hov := _p2d_is_node_or_ancestor(app.tree, node_idx, hovered_node)
+    is_foc := (node_idx == app.focused_idx)
+    is_act := _p2d_is_node_or_ancestor(app.tree, node_idx, active_node)
+    style := css_compute_node_style_full(app.tree, node_idx, app.sheet, is_hov, is_foc, is_act)
     if style.display == 3 or style.opacity <= 0 { return }
 
     by := if style.position == 2 { raw_by } else { raw_by - acc_scroll_y }
@@ -918,46 +1054,63 @@ fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: 
         if rad > bh / 2 { rad = bh / 2 }
         if rad < 0 { rad = 0 }
 
-        // 1. Soft multi-layer Drop Shadow (`shadow-sm..2xl`, CSS `box-shadow`)
+        // 1. Feathered 3-layer Elevation Drop Shadow (`shadow-sm..2xl`, CSS `box-shadow`)
         if style.shadow > 0 and (style.bg_color != 0 or style.grad_dir > 0) {
             sh := style.shadow
-            _p2d_fill_rrect(d2d, bx - sh, by + sh * 2, bw + sh * 2, bh + sh, rad + sh, 0x16000000)
-            _p2d_fill_rrect(d2d, bx, by + sh, bw, bh + sh / 2 + 1, rad + 1, 0x26000000)
+            _p2d_fill_rrect(d2d, bx - sh * 2, by + sh * 2 + 2, bw + sh * 4, bh + sh * 2, rad + sh + 2, 0x0B000000)
+            _p2d_fill_rrect(d2d, bx - sh, by + sh + 1, bw + sh * 2, bh + sh, rad + sh, 0x15000000)
+            _p2d_fill_rrect(d2d, bx, by + (sh + 1) / 2, bw, bh + sh / 2 + 1, rad + 1, 0x24000000)
         }
 
-        // 2. Border + Background / Linear Gradient + Focus Ring (zero half-pixel blur!)
-        is_focused := (node_idx == app.focused_idx)
-        has_bd := (style.border_width > 0 and style.border_color != 0) or is_focused
+        // 2. Focus Glow + Background / 2-or-3-Stop Gradient + Per-Side or All-Side Borders
+        if is_foc {
+            glow_col := if style.focus_border != 0 { (style.focus_border & 0x00FFFFFF) | 0x38000000 } else { 0x383B82F6 }
+            _p2d_fill_rrect(d2d, bx - 2, by - 2, bw + 4, bh + 4, rad + 2, glow_col)
+        }
+
+        has_bd := (style.border_width > 0 and style.border_color != 0) or is_foc
         has_grad := style.grad_dir > 0 and (style.grad_from != 0 or style.grad_to != 0)
         has_bg := style.bg_color != 0
-        bd_w := if is_focused { 2 } else { (if has_bd { style.border_width } else { 0 }) }
-        eff_bd_col := if is_focused { 0xFF3B82F6 } else { style.border_color }
+        bd_w := if is_foc { 1 } else { (if has_bd { style.border_width } else { 0 }) }
+        eff_bd_col := if is_foc { (if style.focus_border != 0 { style.focus_border } else { 0xFF3B82F6 }) } else { style.border_color }
+        per_side := (not is_foc) and style.border_sides != 0
 
-        if has_bd and (has_grad or has_bg) {
+        mut ix := bx
+        mut iy := by
+        mut iw := bw
+        mut ih := bh
+        mut irad := rad
+
+        // All-4-sides border + opaque/gradient fill: crisp outer border rrect + inner fill rrect (zero half-pixel artifacts!)
+        if has_bd and not per_side and (has_grad or (has_bg and ((style.bg_color >> 24) & 0xFF) >= 220)) {
             bd_col := _p2d_apply_opacity(eff_bd_col, style.opacity)
             _p2d_fill_rrect(d2d, bx, by, bw, bh, rad, bd_col)
+            ix = bx + bd_w
+            iy = by + bd_w
+            iw = bw - bd_w * 2
+            ih = bh - bd_w * 2
+            irad = rad - bd_w
+            if irad < 0 { irad = 0 }
         }
-
-        ix := bx + bd_w
-        iy := by + bd_w
-        iw := bw - bd_w * 2
-        ih := bh - bd_w * 2
-        mut irad := rad - bd_w
-        if irad < 0 { irad = 0 }
 
         if has_grad {
             cf := _p2d_apply_opacity(if style.grad_from != 0 { style.grad_from } else { style.bg_color }, style.opacity)
             ct := _p2d_apply_opacity(if style.grad_to != 0 { style.grad_to } else { cf }, style.opacity)
-            _p2d_fill_grad_rrect(d2d, ix, iy, iw, ih, irad, style.grad_dir, cf, ct)
+            cv := if style.grad_via != 0 { _p2d_apply_opacity(style.grad_via, style.opacity) } else { 0 }
+            _p2d_fill_grad_rrect(d2d, ix, iy, iw, ih, irad, style.grad_dir, cf, ct, cv)
         } else if has_bg {
             bg_col := _p2d_apply_opacity(style.bg_color, style.opacity)
             _p2d_fill_rrect(d2d, ix, iy, iw, ih, irad, bg_col)
-        } else if has_bd {
+        }
+
+        // Per-side borders (`border-t/r/b/l/x/y`) OR transparent/glass box borders
+        if has_bd and (per_side or (not has_grad and (not has_bg or ((style.bg_color >> 24) & 0xFF) < 220))) {
             bd_col := _p2d_apply_opacity(eff_bd_col, style.opacity)
-            _p2d_fill_rrect(d2d, bx, by, bw, bd_w, 0, bd_col)
-            _p2d_fill_rrect(d2d, bx, by + bh - bd_w, bw, bd_w, 0, bd_col)
-            _p2d_fill_rrect(d2d, bx, by, bd_w, bh, 0, bd_col)
-            _p2d_fill_rrect(d2d, bx + bw - bd_w, by, bd_w, bh, 0, bd_col)
+            sides := if style.border_sides != 0 { style.border_sides } else { 15 }
+            if (sides & 1) != 0 { _p2d_fill_rrect(d2d, bx, by, bw, bd_w, 0, bd_col) }              // Top
+            if (sides & 4) != 0 { _p2d_fill_rrect(d2d, bx, by + bh - bd_w, bw, bd_w, 0, bd_col) } // Bottom
+            if (sides & 8) != 0 { _p2d_fill_rrect(d2d, bx, by, bd_w, bh, 0, bd_col) }              // Left
+            if (sides & 2) != 0 { _p2d_fill_rrect(d2d, bx + bw - bd_w, by, bd_w, bh, 0, bd_col) } // Right
         }
 
         // 3. Native `<img src="...">` Bitmap Rendering OR DirectWrite ClearType Typography
@@ -968,9 +1121,19 @@ fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: 
             }
         } else {
             mut raw_txt := dom_get_text(app.tree, node_idx)
-            if style.text_transform == 1 and str_len(raw_txt) > 0 { raw_txt = str_to_upper(raw_txt) }
-            else if style.text_transform == 2 and str_len(raw_txt) > 0 { raw_txt = str_to_lower(raw_txt) }
-            txt := if is_focused { raw_txt + "|" } else { raw_txt }
+            mut is_placeholder := false
+            if str_len(raw_txt) == 0 and (str_eq_ignore_case(tag, "input") or str_eq_ignore_case(tag, "textarea")) {
+                ph := dom_get_placeholder(app.tree, node_idx)
+                if str_len(ph) > 0 and not is_foc {
+                    raw_txt = ph
+                    is_placeholder = true
+                }
+            }
+            if not is_placeholder {
+                if style.text_transform == 1 and str_len(raw_txt) > 0 { raw_txt = str_to_upper(raw_txt) }
+                else if style.text_transform == 2 and str_len(raw_txt) > 0 { raw_txt = str_to_lower(raw_txt) }
+            }
+            txt := if is_foc { raw_txt + "|" } else { raw_txt }
             tlen := str_len(txt)
             if tlen > 0 and d2d.f_mb2w != 0 {
                 mut fz := style.font_size
@@ -982,11 +1145,11 @@ fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: 
                 if style.text_align == 1 { ha = 2 }
                 else if style.text_align == 2 { ha = 1 }
 
-                is_single := str_eq_ignore_case(tag, "button") or str_eq_ignore_case(tag, "input")
+                is_single := style.white_space == 1 or str_eq_ignore_case(tag, "button") or str_eq_ignore_case(tag, "input")
                 va := if is_single { 2 } else { 0 }
                 wrap := if is_single { 1 } else { 0 }
 
-                tf := _p2d_get_text_format(mut d2d, fz, fw, ha, va, wrap, style.font_mono)
+                tf := _p2d_get_text_format(mut d2d, fz, fw, ha, va, wrap, style.font_mono, style.font_italic)
                 if tf != 0 {
                     ctxt := ffi_cstr(txt)
                     wlen := ffi_sext32(ffi_call6(d2d.f_mb2w, 65001, 0, ctxt, tlen, d2d.wbuf, d2d.wcap))
@@ -1001,12 +1164,24 @@ fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: 
                         if tw < 4 { tw = bw }
                         if th < 4 { th = bh }
 
-                        tc := _p2d_apply_opacity(style.text_color, style.opacity)
+                        base_tc := if is_placeholder { 0xFF64748B } else { style.text_color }
+                        tc := _p2d_apply_opacity(base_tc, style.opacity)
                         _p2d_write_color(d2d.scratch, tc)
                         _ := ffi_call2(_p2d_vt(d2d.brush, 8), d2d.brush, d2d.scratch)
                         rc := d2d.scratch + 32
                         _p2d_write_rect(rc, tx, ty, tw, th)
                         _ := ffi_call8(_p2d_vt(d2d.rt, 27), d2d.rt, d2d.wbuf, wlen, tf, rc, d2d.brush, 6, 0)
+
+                        // Underline (1) / Strikethrough (2) decoration line
+                        if style.text_decoration == 1 or style.text_decoration == 2 {
+                            mut lw := layout_estimate_text_width(raw_txt, fz)
+                            if lw > tw { lw = tw }
+                            mut lx := tx
+                            if style.text_align == 1 { lx = tx + (tw - lw) / 2 }
+                            else if style.text_align == 2 { lx = tx + tw - lw }
+                            ly := if style.text_decoration == 1 { ty + fz + 2 } else { ty + (fz * 55) / 100 }
+                            _p2d_fill_rrect(d2d, lx, ly, lw, 1, 0, tc)
+                        }
                     }
                 }
             }
@@ -1027,19 +1202,20 @@ fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: 
 
         mut ch := fc
         while ch >= 0 {
-            _p2d_paint_node(mut d2d, app, ch, hovered_node, child_scroll, dip_h)
+            _p2d_paint_node(mut d2d, app, ch, hovered_node, active_node, child_scroll, dip_h, depth + 1)
             ch = dom_next_sibling(app.tree, ch)
         }
 
-        // Sleek 4px native scrollbar thumb when scrollable content overflows container
+        // Sleek 5px native translucent scrollbar thumb when scrollable content overflows container
         if style.overflow_scroll and vis {
             content_h := ui_node_content_height(app, node_idx)
             if content_h > bh and bh > 20 {
                 mut thumb_h := (bh * bh) / content_h
-                if thumb_h < 20 { thumb_h = 20 }
+                if thumb_h < 24 { thumb_h = 24 }
                 max_s := content_h - bh
                 thumb_y := by + ((bh - thumb_h) * own_scroll) / max_s
-                _p2d_fill_rrect(d2d, bx + bw - 6, thumb_y, 4, thumb_h, 2, 0x8871717A)
+                sb_col := if is_hov { 0xAA94A3B8 } else { 0x6671717A }
+                _p2d_fill_rrect(d2d, bx + bw - 7, thumb_y, 5, thumb_h, 2, sb_col)
             }
         }
         if do_clip {
@@ -1049,7 +1225,7 @@ fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: 
 }
 
 // Hardware Direct2D + DirectWrite Presenter for ALL `std::ui` HTML5/CSS3/Tailwind/JS apps!
-fn photon_d2d_present(win: GuiWindow, mut app: UiApp, mut d2d: PhotonD2D, hovered_node: i64 = -1) -> bool {
+fn photon_d2d_present(win: GuiWindow, mut app: UiApp, mut d2d: PhotonD2D, hovered_node: i64 = -1, active_node: i64 = -1) -> bool {
     if not win.is_open or not d2d.ok { return false }
     if not app.is_ready {
         parsed := html_parse(app.html_src) or dom_tree_new(app.html_src)
@@ -1075,8 +1251,10 @@ fn photon_d2d_present(win: GuiWindow, mut app: UiApp, mut d2d: PhotonD2D, hovere
     _ := ffi_call2(_p2d_vt(d2d.rt, 47), d2d.rt, d2d.scratch)
 
     dip_h := (h * 96) / d2d.dpi
-    if app.tree.root_idx >= 0 {
-        _p2d_paint_node(mut d2d, app, app.tree.root_idx, hovered_node, app.scroll_y, dip_h)
+    mut r := app.tree.root_idx
+    while r >= 0 {
+        _p2d_paint_node(mut d2d, app, r, hovered_node, active_node, app.scroll_y, dip_h)
+        r = dom_next_sibling(app.tree, r)
     }
 
     _ := ffi_call3(_p2d_vt(d2d.rt, 49), d2d.rt, 0, 0) // EndDraw
@@ -1267,13 +1445,13 @@ fn gui_present_photon_ui_cached(win: GuiWindow, mut app: UiApp, mut fonts: GuiFo
 }
 
 // 1-line production desktop app runner for `std::ui` (`UiApp`)
-// Pure Axon Photon-D2D Engine: Hardware Direct2D + DirectWrite, 0.00% idle CPU, live resize & `:hover`!
+// Pure Axon Photon-D2D Engine: Hardware Direct2D + DirectWrite, 0.00% idle CPU, live resize, `:hover`/`:active`/`:focus`, native cursors & IME/Clipboard!
 fn gui_run_ui_app(mut app: UiApp, max_frames: i64 = 0, visible: bool = true) -> i64 {
     mut win := gui_open(app.title, app.width, app.height, visible) or return -1
     mut d2d := photon_d2d_init(win)
     mut frames := 0
-    mut prev_down := false
     mut prev_hover := -1
+    mut active_node := -1
     mut dirty := true
     mut trimmed := false
     app.sheet.viewport_w = app.width
@@ -1303,23 +1481,56 @@ fn gui_run_ui_app(mut app: UiApp, max_frames: i64 = 0, visible: bool = true) -> 
             if ui_scroll_at(mut app, mx, my, 0 - (win.scroll_delta / 3)) { dirty = true }
         }
 
-        // Live Unicode / Vietnamese keyboard input into focused <input>/<textarea>
-        if win.last_char != 0 {
+        // Clipboard shortcuts (Ctrl+V paste / Ctrl+C copy) in focused <input>/<textarea>
+        if win.ctrl_v and app.focused_idx >= 0 {
+            clip := gui_clipboard_get()
+            if str_len(clip) > 0 and ui_handle_paste(mut app, clip) { dirty = true }
+        }
+        if win.ctrl_c and app.focused_idx >= 0 {
+            cur_val := dom_get_text(app.tree, app.focused_idx)
+            if str_len(cur_val) > 0 { _ := gui_clipboard_set(cur_val) }
+        }
+
+        // Drain full UTF-16/IME character queue (zero dropped keystrokes on fast typing!)
+        if win.char_count > 0 {
+            mut ci := 0
+            while ci < win.char_count {
+                if ui_handle_char(mut app, ibuf_get(win.char_queue, ci)) { dirty = true }
+                ci += 1
+            }
+        } else if win.last_char != 0 {
             if ui_handle_char(mut app, win.last_char) { dirty = true }
         }
 
-        // Hover-node dirty check (zero redraws when cursor moves within same element!)
+        // Hover-node dirty check + native OS cursor switching (IDC_HAND / IDC_IBEAM / IDC_ARROW)
         hovered := if app.is_ready { ui_hit_test(app, mx, my) } else { -1 }
         if hovered != prev_hover {
             prev_hover = hovered
             dirty = true
+            mut cur_kind := 0
+            if hovered >= 0 {
+                htag := dom_get_tag(app.tree, hovered)
+                hst := css_compute_node_style(app.tree, hovered, app.sheet)
+                if hst.cursor != 0 {
+                    cur_kind = hst.cursor
+                } else if str_eq_ignore_case(htag, "input") or str_eq_ignore_case(htag, "textarea") {
+                    cur_kind = 2
+                } else if str_eq_ignore_case(htag, "button") or str_eq_ignore_case(htag, "a") or str_len(dom_get_onclick(app.tree, hovered)) > 0 {
+                    cur_kind = 1
+                }
+            }
+            gui_set_cursor(mut win, cur_kind)
         }
 
-        if win.mouse_down and not prev_down {
+        if win.clicked_down {
+            active_node = hovered
             _ := ui_click(mut app, mx, my)
             dirty = true
         }
-        prev_down = win.mouse_down
+        if win.clicked_up and active_node >= 0 {
+            active_node = -1
+            dirty = true
+        }
 
         if not dirty and ui_patch_signals(mut app) > 0 {
             dirty = true
@@ -1327,7 +1538,7 @@ fn gui_run_ui_app(mut app: UiApp, max_frames: i64 = 0, visible: bool = true) -> 
 
         if dirty {
             if d2d.ok {
-                _ := photon_d2d_present(win, mut app, mut d2d, hovered)
+                _ := photon_d2d_present(win, mut app, mut d2d, hovered, active_node)
             } else {
                 _ := gui_present_photon_ui(win, mut app)
             }
@@ -1384,12 +1595,14 @@ fn gui_clipboard_set(text: str) -> bool {
     f_set  := ffi_sym(u32, "SetClipboardData")
     f_cls  := ffi_sym(u32, "CloseClipboard")
     f_ga   := ffi_sym(k32, "GlobalAlloc")
+    f_gf   := ffi_sym(k32, "GlobalFree")
     f_gl   := ffi_sym(k32, "GlobalLock")
     f_gu   := ffi_sym(k32, "GlobalUnlock")
     f_mb   := ffi_sym(k32, "MultiByteToWideChar")
     if (ffi_call1(f_open, 0) & 0xFFFFFFFF) == 0 { return false }
     _ := ffi_call0(f_emp)
     n := str_len(text)
+    mut ok_set := false
     if f_mb != 0 and n > 0 {
         cs := ffi_cstr(text)
         wcap := n + 4
@@ -1399,12 +1612,13 @@ fn gui_clipboard_set(text: str) -> bool {
             if p != 0 {
                 _ := ffi_call6(f_mb, 65001, 0, cs, n, p, wcap - 1)
                 _ := ffi_call1(f_gu, hmem)
-                _ := ffi_call2(f_set, 13, hmem) // CF_UNICODETEXT
+                ok_set = ffi_call2(f_set, 13, hmem) != 0 // CF_UNICODETEXT
             }
+            if not ok_set and f_gf != 0 { _ := ffi_call1(f_gf, hmem) }
         }
         ffi_free(cs)
         _ := ffi_call0(f_cls)
-        return hmem != 0
+        return ok_set
     }
     hmem := ffi_call2(f_ga, 0x0002, n + 1)
     if hmem != 0 {
@@ -1414,11 +1628,12 @@ fn gui_clipboard_set(text: str) -> bool {
             while i < n { ffi_write_u8(p, i, str_byte(text, i)); i += 1 }
             ffi_write_u8(p, n, 0)
             _ := ffi_call1(f_gu, hmem)
-            _ := ffi_call2(f_set, 1, hmem)
+            ok_set = ffi_call2(f_set, 1, hmem) != 0
         }
+        if not ok_set and f_gf != 0 { _ := ffi_call1(f_gf, hmem) }
     }
     _ := ffi_call0(f_cls)
-    return hmem != 0
+    return ok_set
 }
 
 fn gui_clipboard_get() -> str {

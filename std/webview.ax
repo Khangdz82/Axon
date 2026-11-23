@@ -149,15 +149,18 @@ fn _webview_is_safe_url(url: str) -> bool {
     return true
 }
 
-// Validates profile paths to prevent traversal and injection
+// Validates profile & binary paths via strict character whitelist (CWE-78 / CWE-22)
 fn _webview_is_safe_profile_path(p: str) -> bool {
     n := str_len(p)
     if n < 4 or n > 1024 { return false }
     if str_contains(p, "..") { return false }
-    if str_contains(p, "\"") or str_contains(p, "'") or str_contains(p, ";") or
-       str_contains(p, "|") or str_contains(p, "&") or str_contains(p, "<") or
-       str_contains(p, ">") or str_contains(p, "\n") or str_contains(p, "\r") {
-        return false
+    mut i := 0
+    while i < n {
+        b := str_byte(p, i)
+        ok_c := (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or
+                b == 47 or b == 92 or b == 58 or b == 45 or b == 95 or b == 46 or b == 32
+        if not ok_c { return false } // Blocks quotes, $, `, %, ^, !, ;, |, &, <, >, \0, \r, \n
+        i += 1
     }
     return true
 }
@@ -176,12 +179,19 @@ fn webview_make_profile_dir() -> str {
     return f"{base}{sep}axon_wv_{sys_pid()}_{nonce}"
 }
 
-// Recursively cleans and removes an ephemeral profile directory, deleting all caches and temp files.
+// Recursively cleans and removes an ephemeral profile directory ONLY under OS temp dir (`axon_wv_`).
 fn webview_clean_profile(p: str) -> bool {
     n := str_len(p)
-    if n < 8 or not str_contains(p, "axon_wv_") or not _webview_is_safe_profile_path(p) {
+    if n < 12 or not _webview_is_safe_profile_path(p) {
         return false
     }
+    // Strictly require `p` to reside directly under OS temp dir or `/tmp/axon_wv_` (prevent arbitrary dir deletion!)
+    t1 := sys_env_get("TEMP")
+    t2 := sys_env_get("TMP")
+    in_tmp := str_starts_with(p, "/tmp/axon_wv_") or str_starts_with(p, "C:\\Windows\\Temp\\axon_wv_") or
+              (str_len(t1) > 0 and (str_starts_with(p, f"{t1}\\axon_wv_") or str_starts_with(p, f"{t1}/axon_wv_"))) or
+              (str_len(t2) > 0 and (str_starts_with(p, f"{t2}\\axon_wv_") or str_starts_with(p, f"{t2}/axon_wv_")))
+    if not in_tmp { return false }
     if not sys_fs_exists(p) { return true }
     if str_contains(p, "\\") or sys_fs_exists("C:\\Windows") {
         _ := os_exec(f"cmd.exe /c rmdir /s /q \"{p}\" >nul 2>&1")
@@ -504,14 +514,24 @@ fn webview_close(wv: WebviewApp) {
 // CWE-22 safe resolver for local static directory assets
 fn _webview_safe_resolve_static(static_dir: str, rel_path: str) -> str {
     if str_len(static_dir) == 0 or str_len(rel_path) == 0 { return "" }
-    if str_contains(rel_path, "..") or str_contains(rel_path, "\\") or str_contains(rel_path, ":") {
+    if str_contains(rel_path, "..") or str_contains(rel_path, "\\") or str_contains(rel_path, ":") or str_contains(rel_path, "%") {
         return ""
     }
     mut sub := rel_path
-    if str_starts_with(sub, "/") {
+    while str_starts_with(sub, "/") {
         sub = str_slice(sub, 1, str_len(sub))
     }
     if str_len(sub) == 0 { return "" }
+    // Reject control bytes, trailing dot/space
+    sn := str_len(sub)
+    mut si := 0
+    while si < sn {
+        sb := str_byte(sub, si)
+        if sb < 32 or sb == 127 { return "" }
+        si += 1
+    }
+    last_b := str_byte(sub, sn - 1)
+    if last_b == 46 or last_b == 32 or last_b == 47 { return "" }
     sep := if sys_fs_exists("C:\\Windows") or str_contains(static_dir, "\\") { "\\" } else { "/" }
     joined := f"{static_dir}{sep}{sub}"
     return joined
@@ -542,6 +562,7 @@ fn webview_next_api_req(wv: WebviewApp) -> WebviewReq ! i64 {
     while true {
         sock := tcp_accept(wv.listener) or return
         _ := tcp_set_nodelay(sock, true)
+        _ := tcp_set_timeout_ms(sock, 15000)
         raw_b := tcp_recv(sock, 65536) or buf_new(0)
         raw_len := buf_len(raw_b)
         if raw_len <= 0 {
@@ -560,7 +581,7 @@ fn webview_next_api_req(wv: WebviewApp) -> WebviewReq ! i64 {
         expected_h1 := f"127.0.0.1:{wv.port}"
         expected_h2 := f"localhost:{wv.port}"
         host_hdr := http_get_header(raw, "Host") or ""
-        if str_len(host_hdr) > 0 and not str_eq(host_hdr, expected_h1) and not str_eq(host_hdr, expected_h2) {
+        if str_len(host_hdr) == 0 or (not str_eq(host_hdr, expected_h1) and not str_eq(host_hdr, expected_h2)) {
             _ := tcp_send_str(sock, http_build_response(403, "text/plain; charset=utf-8", "Forbidden Host")) or 0
             tcp_close(sock)
             continue
@@ -626,10 +647,11 @@ fn webview_reply_text(req: WebviewReq, text_body: str, status: i64 = 200) -> boo
     return ok_s
 }
 
-// Sends raw binary bytes with MIME type
+// Sends raw binary bytes with MIME type (rejects CRLF/NUL in content_type, CWE-113)
 fn webview_reply_bytes(req: WebviewReq, content_type: str, data: ByteBuf, status: i64 = 200) -> bool {
+    safe_ct := if http_is_safe_header_val(content_type) { content_type } else { "application/octet-stream" }
     n := buf_len(data)
-    hdr := f"HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n"
+    hdr := f"HTTP/1.1 {status} OK\r\nContent-Type: {safe_ct}\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n"
     s1 := (tcp_send_str(req.sock, hdr) or -1) >= 0
     s2 := if s1 and n > 0 { (tcp_send_bytes(req.sock, data) or -1) >= 0 } else { s1 }
     tcp_close(req.sock)

@@ -24,6 +24,19 @@ fn c_ibuf_has_room(b: IntBuf, need: i64) -> bool {
     return ibuf_len(b) + need <= cap
 }
 
+fn c_buf_has_room(b: ByteBuf, need: i64) -> bool {
+    cap := unsafe { ptr_read_i64(b as i64, 1) }
+    return buf_len(b) + need <= cap
+}
+
+fn c_unescape_byte(ch: i64) -> i64 {
+    if ch == 110 { return 10 }
+    if ch == 114 { return 13 }
+    if ch == 116 { return 9 }
+    if ch == 48  { return 0 }
+    return ch
+}
+
 // Tokenize C header into lightweight token stream `ctoks` (4 words/tok: `[kind, soff, slen, ival]`):
 //   0 = EOF, 1 = Ident, 2 = Int, 3 = Str, 4 = Punct (`ival` = ASCII char)
 // While scanning, directly extracts `#define NAME <int/hex/str>` into `out_consts`!
@@ -32,9 +45,10 @@ fn c_lex_header_and_defines(src: ByteBuf, pool: ByteBuf, nodes: IntBuf, ctoks: I
     mut i := 0
     mut line := 1
     mut at_bol := true
+    mut skip_if0_depth := 0
 
     while i < n {
-        if not c_ibuf_has_room(ctoks, 16) {
+        if not c_ibuf_has_room(ctoks, 16) or not c_buf_has_room(pool, 256) or not c_ibuf_has_room(nodes, 32) {
             break
         }
         b := buf_get(src, i)
@@ -70,15 +84,29 @@ fn c_lex_header_and_defines(src: ByteBuf, pool: ByteBuf, nodes: IntBuf, ctoks: I
             i += 1
             while i < n and (buf_get(src, i) == 32 or buf_get(src, i) == 9) { i += 1 }
             d_off := buf_len(pool)
-            while i < n and c_is_alnum(buf_get(src, i)) {
+            while i < n and c_is_alnum(buf_get(src, i)) and c_buf_has_room(pool, 4) {
                 buf_push(pool, buf_get(src, i))
                 i += 1
             }
             d_len := buf_len(pool) - d_off
-            if pool_str_eq_lit(pool, d_off, d_len, "define") {
+            if pool_str_eq_lit(pool, d_off, d_len, "if") {
+                mut pi := i
+                while pi < n and (buf_get(src, pi) == 32 or buf_get(src, pi) == 9) { pi += 1 }
+                if skip_if0_depth > 0 {
+                    skip_if0_depth += 1
+                } else if pi < n and buf_get(src, pi) == 48 and (pi + 1 >= n or not c_is_alnum(buf_get(src, pi + 1))) {
+                    skip_if0_depth = 1
+                }
+            } else if pool_str_eq_lit(pool, d_off, d_len, "ifdef") or pool_str_eq_lit(pool, d_off, d_len, "ifndef") {
+                if skip_if0_depth > 0 { skip_if0_depth += 1 }
+            } else if pool_str_eq_lit(pool, d_off, d_len, "endif") {
+                if skip_if0_depth > 0 { skip_if0_depth -= 1 }
+            } else if pool_str_eq_lit(pool, d_off, d_len, "else") {
+                if skip_if0_depth == 1 { skip_if0_depth = 0 }
+            } else if skip_if0_depth == 0 and pool_str_eq_lit(pool, d_off, d_len, "define") {
                 while i < n and (buf_get(src, i) == 32 or buf_get(src, i) == 9) { i += 1 }
                 m_off := buf_len(pool)
-                while i < n and c_is_alnum(buf_get(src, i)) {
+                while i < n and c_is_alnum(buf_get(src, i)) and c_buf_has_room(pool, 4) {
                     buf_push(pool, buf_get(src, i))
                     i += 1
                 }
@@ -99,6 +127,7 @@ fn c_lex_header_and_defines(src: ByteBuf, pool: ByteBuf, nodes: IntBuf, ctoks: I
                     }
                     if i < n and c_is_digit(buf_get(src, i)) {
                         mut val := 0
+                        mut bad_const := false
                         if buf_get(src, i) == 48 and i + 1 < n and (buf_get(src, i + 1) == 120 or buf_get(src, i + 1) == 88) {
                             i += 2
                             while i < n {
@@ -108,12 +137,18 @@ fn c_lex_header_and_defines(src: ByteBuf, pool: ByteBuf, nodes: IntBuf, ctoks: I
                                 else if hc >= 97 and hc <= 102 { val = (val << 4) | (hc - 87); i += 1 }
                                 else { break }
                             }
+                        } else if buf_get(src, i) == 48 and i + 1 < n and buf_get(src, i + 1) >= 48 and buf_get(src, i + 1) <= 55 {
+                            while i < n and buf_get(src, i) >= 48 and buf_get(src, i) <= 55 {
+                                val = (val << 3) | (buf_get(src, i) - 48)
+                                i += 1
+                            }
                         } else {
                             while i < n and c_is_digit(buf_get(src, i)) {
                                 val = val *% 10 +% (buf_get(src, i) - 48)
                                 i += 1
                             }
                         }
+                        if i < n and buf_get(src, i) == 46 { bad_const = true } // reject float like `3.14`
                         // Skip C integer suffixes `U`, `L`, `ULL`
                         while i < n and (buf_get(src, i) == 85 or buf_get(src, i) == 117 or buf_get(src, i) == 76 or buf_get(src, i) == 108) {
                             i += 1
@@ -125,17 +160,21 @@ fn c_lex_header_and_defines(src: ByteBuf, pool: ByteBuf, nodes: IntBuf, ctoks: I
                             while i < n and (buf_get(src, i) == 32 or buf_get(src, i) == 9) { i += 1 }
                             mut sh := 0
                             while i < n and c_is_digit(buf_get(src, i)) {
-                                if sh < 64 { sh = sh * 10 + (buf_get(src, i) - 48) }
+                                if sh < 128 { sh = sh * 10 + (buf_get(src, i) - 48) }
                                 i += 1
                             }
-                            val = val << (sh & 63)
+                            if sh >= 64 { bad_const = true }
+                            else { val = val << sh }
                         }
                         if neg { val = 0 -% val }
                         if wrapped_paren {
                             while i < n and (buf_get(src, i) == 32 or buf_get(src, i) == 9) { i += 1 }
-                            if i < n and buf_get(src, i) == 41 { i += 1 }
+                            if i < n and buf_get(src, i) == 41 { i += 1 } else { bad_const = true }
                         }
-                        if c_ibuf_has_room(out_consts, 1) {
+                        while i < n and (buf_get(src, i) == 32 or buf_get(src, i) == 9 or buf_get(src, i) == 13) { i += 1 }
+                        // Only accept if at end-of-line or comment (reject compound `#define N (1024 * 64)`)
+                        at_eol := i >= n or buf_get(src, i) == 10 or (buf_get(src, i) == 47 and i + 1 < n and (buf_get(src, i + 1) == 47 or buf_get(src, i + 1) == 42))
+                        if not bad_const and at_eol and c_ibuf_has_room(out_consts, 1) and c_ibuf_has_room(nodes, 32) {
                             inid := ast_alloc(nodes, nk_int(), sp)
                             ast_set(nodes, inid, 1, val)
                             cn := ast_alloc(nodes, nk_comptime_const(), sp)
@@ -148,16 +187,18 @@ fn c_lex_header_and_defines(src: ByteBuf, pool: ByteBuf, nodes: IntBuf, ctoks: I
                     } else if i < n and buf_get(src, i) == 34 and not neg {
                         i += 1
                         s_off := buf_len(pool)
-                        while i < n and buf_get(src, i) != 34 and buf_get(src, i) != 10 {
+                        while i < n and buf_get(src, i) != 34 and buf_get(src, i) != 10 and c_buf_has_room(pool, 4) {
                             if buf_get(src, i) == 92 and i + 1 < n {
                                 i += 1
+                                buf_push(pool, c_unescape_byte(buf_get(src, i)))
+                            } else {
+                                buf_push(pool, buf_get(src, i))
                             }
-                            buf_push(pool, buf_get(src, i))
                             i += 1
                         }
                         s_len := buf_len(pool) - s_off
                         if i < n and buf_get(src, i) == 34 { i += 1 }
-                        if c_ibuf_has_room(out_consts, 1) {
+                        if c_ibuf_has_room(out_consts, 1) and c_ibuf_has_room(nodes, 32) {
                             snid := ast_alloc(nodes, nk_str(), sp)
                             ast_set(nodes, snid, 1, s_off)
                             ast_set(nodes, snid, 2, s_len)
@@ -185,10 +226,13 @@ fn c_lex_header_and_defines(src: ByteBuf, pool: ByteBuf, nodes: IntBuf, ctoks: I
                     i += 1
                 }
             }
+        } else if skip_if0_depth > 0 {
+            at_bol = false
+            i += 1
         } else if c_is_alpha(b) {
             at_bol = false
             soff := buf_len(pool)
-            while i < n and c_is_alnum(buf_get(src, i)) {
+            while i < n and c_is_alnum(buf_get(src, i)) and c_buf_has_room(pool, 4) {
                 buf_push(pool, buf_get(src, i))
                 i += 1
             }
@@ -224,17 +268,40 @@ fn c_lex_header_and_defines(src: ByteBuf, pool: ByteBuf, nodes: IntBuf, ctoks: I
             at_bol = false
             i += 1
             soff := buf_len(pool)
-            while i < n and buf_get(src, i) != 34 {
-                if buf_get(src, i) == 92 and i + 1 < n { i += 1 }
-                if buf_get(src, i) == 10 { line += 1 }
-                buf_push(pool, buf_get(src, i))
+            while i < n and buf_get(src, i) != 34 and c_buf_has_room(pool, 4) {
+                if buf_get(src, i) == 92 and i + 1 < n {
+                    i += 1
+                    buf_push(pool, c_unescape_byte(buf_get(src, i)))
+                } else {
+                    if buf_get(src, i) == 10 { line += 1 }
+                    buf_push(pool, buf_get(src, i))
+                }
                 i += 1
             }
             slen := buf_len(pool) - soff
-            if i < n { i += 1 }
+            if i < n and buf_get(src, i) == 34 { i += 1 }
             ibuf_push(ctoks, 3)
             ibuf_push(ctoks, soff)
             ibuf_push(ctoks, slen)
+            ibuf_push(ctoks, line)
+        } else if b == 39 {
+            // Single-quoted C char literal (prevents `'"'` from desyncing string lexer!)
+            at_bol = false
+            i += 1
+            mut cv := 0
+            while i < n and buf_get(src, i) != 39 and buf_get(src, i) != 10 {
+                if buf_get(src, i) == 92 and i + 1 < n {
+                    i += 1
+                    cv = c_unescape_byte(buf_get(src, i))
+                } else {
+                    cv = buf_get(src, i)
+                }
+                i += 1
+            }
+            if i < n and buf_get(src, i) == 39 { i += 1 }
+            ibuf_push(ctoks, 2)
+            ibuf_push(ctoks, cv)
+            ibuf_push(ctoks, 0)
             ibuf_push(ctoks, line)
         } else {
             at_bol = false
@@ -402,7 +469,7 @@ fn c_parse_struct_fields(ctoks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: Int
                 }
                 if ct_kind(ctoks, p) == 4 { p += 1 }
             }
-            if c_ibuf_has_room(flist, 1) {
+            if c_ibuf_has_room(flist, 1) and c_ibuf_has_room(nodes, 32) {
                 fty := map_c_type_to_axon(pool, nodes, base_soff, base_slen, ptr_depth, is_const, false, sp)
                 fd := ast_alloc(nodes, nk_field_decl(), sp)
                 ast_set(nodes, fd, 1, fn_soff)
@@ -411,7 +478,16 @@ fn c_parse_struct_fields(ctoks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: Int
                 ibuf_push(flist, fd)
             }
         }
-        while ct_kind(ctoks, p) != 0 and not (ct_kind(ctoks, p) == 4 and (ct_a(ctoks, p) == 59 or ct_a(ctoks, p) == 125)) {
+        mut nested_b := 0
+        while ct_kind(ctoks, p) != 0 {
+            if ct_kind(ctoks, p) == 4 and ct_a(ctoks, p) == 123 {
+                nested_b += 1
+            } else if ct_kind(ctoks, p) == 4 and ct_a(ctoks, p) == 125 {
+                if nested_b > 0 { nested_b -= 1 }
+                else { break }
+            } else if nested_b == 0 and ct_kind(ctoks, p) == 4 and ct_a(ctoks, p) == 59 {
+                break
+            }
             p += 1
         }
         if ct_kind(ctoks, p) == 4 and ct_a(ctoks, p) == 59 {
@@ -422,12 +498,12 @@ fn c_parse_struct_fields(ctoks: IntBuf, pool: ByteBuf, nodes: IntBuf, extra: Int
     foff := ibuf_len(extra)
     fcnt := ibuf_len(flist)
     mut i := 0
-    while i < fcnt {
+    while i < fcnt and c_ibuf_has_room(extra, 1) {
         ibuf_push(extra, ibuf_get(flist, i))
         i += 1
     }
     buf_free(move flist)
-    return (foff << 16) | fcnt
+    return (foff << 16) | i
 }
 
 // Parse C `.h` buffer and append extracted structs, `@extern` functions, and `#define` constants!
@@ -602,7 +678,7 @@ fn parse_c_header_into_program(src: ByteBuf, pool: ByteBuf, nodes: IntBuf, extra
                             p += 1
                         }
                     }
-                    if p_tslen > 0 and c_ibuf_has_room(plist, 1) {
+                    if p_tslen > 0 and c_ibuf_has_room(plist, 1) and c_ibuf_has_room(nodes, 32) and c_buf_has_room(pool, 16) {
                         if p_nslen == 0 {
                             // Synthesize unique `arg0`, `arg1`, ..., `arg10`, ... for unnamed C header parameters
                             p_nsoff = buf_len(pool)
@@ -637,26 +713,23 @@ fn parse_c_header_into_program(src: ByteBuf, pool: ByteBuf, nodes: IntBuf, extra
                     buf_free(move plist)
                 } else {
                     if ct_kind(ctoks, p) == 4 and ct_a(ctoks, p) == 59 { p += 1 }
-                    poff := ibuf_len(extra)
                     pcnt := ibuf_len(plist)
-                    mut k := 0
-                    while k < pcnt {
-                        ibuf_push(extra, ibuf_get(plist, k))
-                        k += 1
-                    }
-                    buf_free(move plist)
-
-                    // Allocate 9-word `meta_off` storing `[dll_soff, dll_slen, 0..]`
-                    moff := ibuf_len(extra)
-                    ibuf_push(extra, dll_soff)
-                    ibuf_push(extra, dll_slen)
-                    mut zm := 2
-                    while zm < 9 {
-                        ibuf_push(extra, 0)
-                        zm += 1
-                    }
-
-                    if c_ibuf_has_room(out_funcs, 1) {
+                    if c_ibuf_has_room(out_funcs, 1) and c_ibuf_has_room(extra, pcnt + 16) and c_ibuf_has_room(nodes, 32) {
+                        poff := ibuf_len(extra)
+                        mut k := 0
+                        while k < pcnt {
+                            ibuf_push(extra, ibuf_get(plist, k))
+                            k += 1
+                        }
+                        // Allocate 9-word `meta_off` storing `[dll_soff, dll_slen, 0..]`
+                        moff := ibuf_len(extra)
+                        ibuf_push(extra, dll_soff)
+                        ibuf_push(extra, dll_slen)
+                        mut zm := 2
+                        while zm < 9 {
+                            ibuf_push(extra, 0)
+                            zm += 1
+                        }
                         rty_nid := map_c_type_to_axon(pool, nodes, ret_soff, ret_slen, ret_ptr, ret_const, false, sp)
                         fnid := ast_alloc(nodes, nk_fn(), sp)
                         ast_set(nodes, fnid, 1, fn_soff)
@@ -667,6 +740,7 @@ fn parse_c_header_into_program(src: ByteBuf, pool: ByteBuf, nodes: IntBuf, extra
                         ast_set(nodes, fnid, 6, fnflag_extern() << 32)
                         ibuf_push(out_funcs, fnid)
                     }
+                    buf_free(move plist)
                 }
             } else {
                 p = c_skip_To_semi_or_brace(ctoks, p)

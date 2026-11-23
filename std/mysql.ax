@@ -146,6 +146,7 @@ fn mysql_native_auth_token(password: str, scramble: ByteBuf) -> ByteBuf {
 
 fn _my_send_pkt(sock: TcpStream, seq: i64, payload: ByteBuf) -> bool {
     n := buf_len(payload)
+    if n < 0 or n >= 0xFFFFFF { return false } // Prevent silent 24-bit packet header truncation
     pkt := buf_new(n + 8)
     buf_push(pkt, n & 255)
     buf_push(pkt, (n >> 8) & 255)
@@ -184,7 +185,9 @@ fn _my_read_lenenc(b: ByteBuf, pos_box: IntBuf) -> i64 {
     }
     if first == 254 and p + 9 <= buf_len(b) {
         ibuf_set(pos_box, 0, p + 9)
-        return buf_get(b, p + 1) | (buf_get(b, p + 2) << 8) | (buf_get(b, p + 3) << 16) | (buf_get(b, p + 4) << 24)
+        lo := buf_get(b, p + 1) | (buf_get(b, p + 2) << 8) | (buf_get(b, p + 3) << 16) | (buf_get(b, p + 4) << 24)
+        hi := buf_get(b, p + 5) | (buf_get(b, p + 6) << 8) | (buf_get(b, p + 7) << 16) | ((buf_get(b, p + 8) & 0x7F) << 24)
+        return lo | (hi << 32)
     }
     ibuf_set(pos_box, 0, p + 1)
     return -1 // NULL (0xFB)
@@ -203,7 +206,7 @@ fn mysql_connect(host: str, port: i64, user: str, password: str, database: str) 
     }
     mut pos := 1
     while pos < hlen and buf_get(hs, pos) != 0 { pos += 1 }
-    ver := buf_slice_str(hs, 1, pos)
+    ver := "" + buf_slice_str(hs, 1, pos)
     pos += 1
     mut cid := 0
     if pos + 4 <= hlen {
@@ -271,12 +274,15 @@ fn mysql_query(conn: MysqlConn, sql: str) -> MysqlResult ! i64 {
     buf_free(move p)
     if not ok_s { return err(-410) }
 
+    first := _my_recv_pkt(conn.sock) or return
+    flen := buf_len(first)
+    if flen == 0 {
+        buf_free(move first)
+        return err(-411)
+    }
     cell_data := buf_new(4096)
     cell_offs := ibuf_new(256)
     cell_lens := ibuf_new(256)
-    first := _my_recv_pkt(conn.sock) or return
-    flen := buf_len(first)
-    if flen == 0 { buf_free(move first); return err(-411) }
     tag := buf_get(first, 0)
     if tag == 0x00 { // OK Packet
         pbox := ibuf_new(2); ibuf_push(pbox, 1)
@@ -297,7 +303,7 @@ fn mysql_query(conn: MysqlConn, sql: str) -> MysqlResult ! i64 {
         mut ms := 3
         if flen > 9 and buf_get(first, 3) == 35 { ms = 9 } // skip #SQLSTATE
         mut em := ""
-        if flen > ms { em = buf_slice_str(first, ms, flen) }
+        if flen > ms { em = "" + buf_slice_str(first, ms, flen) }
         buf_free(move first)
         return ok(MysqlResult(
             col_count = 0, row_count = 0, affected_rows = 0, last_insert_id = 0,

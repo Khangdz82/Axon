@@ -315,9 +315,16 @@ fn udp_send_to(u: UdpSocket, host: str, port: i64, data: ByteBuf) -> i64 ! i64 {
 }
 
 fn udp_recv_from(u: UdpSocket, max_bytes: i64 = 4096) -> ByteBuf ! i64 {
+    if max_bytes <= 0 or max_bytes > 65536 { return err(-44) }
     raw := ffi_alloc(max_bytes + 8)
     sa := ffi_alloc(16)
     slen := ffi_alloc(8)
+    if raw == 0 or sa == 0 or slen == 0 {
+        if raw != 0 { ffi_free(raw) }
+        if sa != 0 { ffi_free(sa) }
+        if slen != 0 { ffi_free(slen) }
+        return err(-45)
+    }
     ffi_write_u32_le(slen, 0, 16)
     rc := ffi_sext32(ffi_call6(u.api.fn_recvfrom, u.fd, raw, max_bytes, 0, sa, slen))
     ffi_free(sa)
@@ -337,10 +344,26 @@ fn udp_close(u: UdpSocket) {
     }
 }
 
+fn _net_is_safe_http_token(s: str) -> bool {
+    n := str_len(s)
+    if n <= 0 or n > 4096 { return false }
+    mut i := 0
+    while i < n {
+        b := str_byte(s, i)
+        if b <= 32 or b == 127 { return false } // Reject CR/LF/NUL/space/control chars (CWE-113)
+        i += 1
+    }
+    return true
+}
+
 // Live HTTP/1.1 client over native TCP socket
 fn http_fetch_plain(host: str, port: i64, method: str, path: str, body: str = "") -> str ! i64 {
+    if not _net_is_safe_http_token(host) or not _net_is_safe_http_token(method) or not _net_is_safe_http_token(path) {
+        return err(-50)
+    }
     conn := tcp_connect(host, port) or return
-    req := buf_new(str_len(path) + str_len(body) + 256)
+    _ := tcp_set_timeout_ms(conn, 30000)
+    req := buf_new(str_len(method) + str_len(host) + str_len(path) + str_len(body) + 256)
     buf_push_str(req, method); buf_push_str(req, " "); buf_push_str(req, path); buf_push_str(req, " HTTP/1.1\r\n")
     buf_push_str(req, "Host: "); buf_push_str(req, host); buf_push_str(req, "\r\n")
     buf_push_str(req, "Connection: close\r\n")
@@ -349,16 +372,35 @@ fn http_fetch_plain(host: str, port: i64, method: str, path: str, body: str = ""
     }
     buf_push_str(req, "\r\n")
     if str_len(body) > 0 { buf_push_str(req, body) }
-    _ := tcp_send_bytes(conn, req) or -1
+    sr := tcp_send_bytes(conn, req) or -1
     buf_free(move req)
+    if sr < 0 { tcp_close(conn); return err(-51) }
 
-    resp := buf_new(4096)
+    max_resp := 4194304
+    mut rcap := 8192
+    mut resp := buf_new(rcap)
     while true {
         chunk := tcp_recv(conn, 4096) or buf_new(0)
         clen := buf_len(chunk)
         if clen <= 0 {
             buf_free(move chunk)
             break
+        }
+        cur_l := buf_len(resp)
+        if cur_l + clen > max_resp {
+            buf_free(move chunk)
+            break
+        }
+        if cur_l + clen > rcap {
+            mut nc := rcap * 2
+            while nc < cur_l + clen { nc = nc * 2 }
+            if nc > max_resp { nc = max_resp }
+            nb := buf_new(nc)
+            mut ci := 0
+            while ci < cur_l { buf_push(nb, buf_get(resp, ci)); ci += 1 }
+            buf_free(move resp)
+            resp = nb
+            rcap = nc
         }
         mut i := 0
         while i < clen { buf_push(resp, buf_get(chunk, i)); i += 1 }

@@ -20,6 +20,7 @@ struct DomTree {
     nodes_cap: i64
     dynamic_buf: ByteBuf
     dyn_cap: i64
+    placeholders: IntBuf // triples [node_idx, ph_start, ph_len] (keeps placeholder separate from typed value!)
     extracted_css: str
     extracted_js: str
     root_idx: i64
@@ -32,12 +33,14 @@ fn dom_tree_new(html: str) -> DomTree {
     if ncap > 1024 { ncap = 1024 }
     nb := ibuf_new(ncap)
     db := buf_new(256)
+    ph := ibuf_new(64)
     return DomTree(
         raw_html = html,
         nodes = nb,
         nodes_cap = ncap,
         dynamic_buf = db,
         dyn_cap = 256,
+        placeholders = ph,
         extracted_css = "",
         extracted_js = "",
         root_idx = -1,
@@ -48,6 +51,22 @@ fn dom_tree_new(html: str) -> DomTree {
 fn dom_tree_free(move tree: DomTree) {
     buf_free(move tree.nodes)
     buf_free(move tree.dynamic_buf)
+    buf_free(move tree.placeholders)
+}
+
+fn dom_get_placeholder(tree: DomTree, node_idx: i64) -> str {
+    n := ibuf_len(tree.placeholders)
+    mut i := 0
+    while i + 2 < n {
+        if ibuf_get(tree.placeholders, i) == node_idx {
+            st := ibuf_get(tree.placeholders, i + 1)
+            ln := ibuf_get(tree.placeholders, i + 2)
+            if ln > 0 { return str_slice(tree.raw_html, st, st + ln) }
+            return ""
+        }
+        i += 3
+    }
+    return ""
 }
 
 fn dom_node_count(tree: DomTree) -> i64 {
@@ -98,10 +117,29 @@ fn dom_get_style(tree: DomTree, node_idx: i64) -> str {
     return buf_slice_str(tree.dynamic_buf, actual_off, actual_off + len)
 }
 
+fn _html_push_utf8(out: ByteBuf, cp: i64) {
+    if cp <= 0 or cp > 0x10FFFF { return }
+    if cp < 0x80 {
+        buf_push(out, cp)
+    } else if cp < 0x800 {
+        buf_push(out, 0xC0 | (cp >> 6))
+        buf_push(out, 0x80 | (cp & 0x3F))
+    } else if cp < 0x10000 {
+        buf_push(out, 0xE0 | (cp >> 12))
+        buf_push(out, 0x80 | ((cp >> 6) & 0x3F))
+        buf_push(out, 0x80 | (cp & 0x3F))
+    } else {
+        buf_push(out, 0xF0 | (cp >> 18))
+        buf_push(out, 0x80 | ((cp >> 12) & 0x3F))
+        buf_push(out, 0x80 | ((cp >> 6) & 0x3F))
+        buf_push(out, 0x80 | (cp & 0x3F))
+    }
+}
+
 fn _html_decode_entities(s: str) -> str {
     if str_find_byte(s, 38, 0) < 0 { return s } // fast path: no '&'
     n := str_len(s)
-    out := buf_new(n + 8)
+    out := buf_new(n * 2 + 16)
     mut i := 0
     while i < n {
         if str_byte(s, i) == 38 {
@@ -111,6 +149,46 @@ fn _html_decode_entities(s: str) -> str {
             if i + 6 <= n and str_eq(str_slice(s, i, i + 6), "&quot;") { buf_push(out, 34); i += 6; continue }
             if i + 6 <= n and str_eq(str_slice(s, i, i + 6), "&apos;") { buf_push(out, 39); i += 6; continue }
             if i + 6 <= n and str_eq(str_slice(s, i, i + 6), "&nbsp;") { buf_push(out, 32); i += 6; continue }
+            if i + 6 <= n and str_eq(str_slice(s, i, i + 6), "&bull;") { _html_push_utf8(out, 0x2022); i += 6; continue }
+            if i + 7 <= n and str_eq(str_slice(s, i, i + 7), "&mdash;") { _html_push_utf8(out, 0x2014); i += 7; continue }
+            if i + 7 <= n and str_eq(str_slice(s, i, i + 7), "&ndash;") { _html_push_utf8(out, 0x2013); i += 7; continue }
+            if i + 6 <= n and str_eq(str_slice(s, i, i + 6), "&rarr;") { _html_push_utf8(out, 0x2192); i += 6; continue }
+            if i + 6 <= n and str_eq(str_slice(s, i, i + 6), "&larr;") { _html_push_utf8(out, 0x2190); i += 6; continue }
+            if i + 8 <= n and str_eq(str_slice(s, i, i + 8), "&middot;") { _html_push_utf8(out, 0x00B7); i += 8; continue }
+            if i + 6 <= n and str_eq(str_slice(s, i, i + 6), "&copy;") { _html_push_utf8(out, 0x00A9); i += 6; continue }
+            // Numeric character references: `&#NNN;` and `&#xHHH;`
+            if i + 3 < n and str_byte(s, i + 1) == 35 {
+                semi := str_find_byte(s, 59, i + 2)
+                if semi > i + 2 and semi - i <= 10 {
+                    mut cp := 0
+                    mut ok_num := true
+                    if str_byte(s, i + 2) == 120 or str_byte(s, i + 2) == 88 {
+                        mut j := i + 3
+                        if j >= semi { ok_num = false }
+                        while j < semi {
+                            ch := str_byte(s, j)
+                            if ch >= 48 and ch <= 57 { cp = (cp << 4) | (ch - 48) }
+                            else if ch >= 97 and ch <= 102 { cp = (cp << 4) | (ch - 87) }
+                            else if ch >= 65 and ch <= 70 { cp = (cp << 4) | (ch - 55) }
+                            else { ok_num = false; break }
+                            j += 1
+                        }
+                    } else {
+                        mut j := i + 2
+                        while j < semi {
+                            ch := str_byte(s, j)
+                            if ch >= 48 and ch <= 57 { cp = cp * 10 + (ch - 48) }
+                            else { ok_num = false; break }
+                            j += 1
+                        }
+                    }
+                    if ok_num and cp > 0 and cp <= 0x10FFFF {
+                        _html_push_utf8(out, cp)
+                        i = semi + 1
+                        continue
+                    }
+                }
+            }
         }
         buf_push(out, str_byte(s, i))
         i += 1
@@ -187,6 +265,8 @@ fn dom_compact_dyn_buf(mut tree: DomTree, add_len: i64) {
                     k += 1
                 }
                 ibuf_set(tree.nodes, base + slot, 0 - (new_off + 1))
+            } else if st < 0 {
+                ibuf_set(tree.nodes, base + slot, 0)
             }
             slot += 2
         }
@@ -202,6 +282,11 @@ fn dom_set_dyn_slot(mut tree: DomTree, node_idx: i64, off_slot: i64, new_val: st
     if node_idx < 0 or node_idx >= tree.count { return }
     n := str_len(new_val)
     base := node_idx * 16
+    if n <= 0 {
+        ibuf_set(tree.nodes, base + off_slot, 0)
+        ibuf_set(tree.nodes, base + off_slot + 1, 0)
+        return
+    }
     old_st := ibuf_get(tree.nodes, base + off_slot)
 
     if old_st < 0 {
@@ -326,6 +411,7 @@ fn html_find_first_ws(html: str, start: i64, limit: i64) -> i64 {
 fn html_find_attr_range(html: str, tag_start: i64, tag_end: i64, attr_name: str) -> i64 {
     mut p := tag_start
     while p < tag_end {
+        prev_p := p
         // Skip attribute whitespace and trailing '/'
         while p < tag_end and (html_is_ws(str_byte(html, p)) or str_byte(html, p) == 47) {
             p += 1
@@ -375,6 +461,7 @@ fn html_find_attr_range(html: str, tag_start: i64, tag_end: i64, attr_name: str)
                 return (v_st << 32) | (len & 0xFFFFFFFF)
             }
         }
+        if p == prev_p { p += 1 }
     }
     return -1
 }
@@ -461,14 +548,33 @@ fn html_parse(raw_html: str) -> DomTree ! i64 {
                 continue
             }
 
-            // Closing tag </tag>
+            // Closing tag </tag> — match against open stack so stray close tags never corrupt the tree!
             if p + 1 < n and str_byte(raw_html, p + 1) == 47 {
                 tag_close_end := html_find_tag_end(raw_html, p + 2)
+                close_name := str_trim(str_slice(raw_html, p + 2, tag_close_end))
                 p = if tag_close_end < n { tag_close_end + 1 } else { n }
 
                 if stack_len > 0 {
-                    stack_len -= 1
-                    cur_parent = ibuf_get(stack, stack_len)
+                    // Check if cur_parent matches close_name; if not, search up the stack for matching tag
+                    if str_len(close_name) == 0 or str_eq_ignore_case(dom_get_tag(tree, cur_parent), close_name) {
+                        stack_len -= 1
+                        cur_parent = ibuf_get(stack, stack_len)
+                    } else {
+                        mut match_lvl := -1
+                        mut sl := stack_len - 1
+                        while sl >= 0 {
+                            cand_p := ibuf_get(stack, sl)
+                            if cand_p >= 0 and str_eq_ignore_case(dom_get_tag(tree, cand_p), close_name) {
+                                match_lvl = sl
+                                break
+                            }
+                            sl -= 1
+                        }
+                        if match_lvl >= 0 {
+                            cur_parent = if match_lvl > 0 { ibuf_get(stack, match_lvl - 1) } else { -1 }
+                            stack_len = if match_lvl > 0 { match_lvl - 1 } else { 0 }
+                        }
+                    }
                 } else {
                     cur_parent = -1
                 }
@@ -556,9 +662,12 @@ fn html_parse(raw_html: str) -> DomTree ! i64 {
             mut clk_l := 0
             mut val_st := 0
             mut val_l := 0
+            mut ph_st := 0
+            mut ph_l := 0
             if sp < content_end {
                 mut ap := sp
                 while ap < content_end {
+                    prev_ap := ap
                     while ap < content_end and (html_is_ws(str_byte(raw_html, ap)) or str_byte(raw_html, ap) == 47) {
                         ap += 1
                     }
@@ -595,34 +704,41 @@ fn html_parse(raw_html: str) -> DomTree ! i64 {
                         }
                         a_len := a_en - a_st
                         v_len := v_en - v_st
-                        if a_len == 5 and (str_byte(raw_html, a_st) | 32) == 99 { // class
+                        aname := str_slice(raw_html, a_st, a_en)
+                        if a_len == 5 and str_eq_ignore_case(aname, "class") {
                             cls_st = v_st; cls_l = v_len
-                        } else if a_len == 2 and (str_byte(raw_html, a_st) | 32) == 105 { // id
+                        } else if a_len == 2 and str_eq_ignore_case(aname, "id") {
                             id_st = v_st; id_l = v_len
-                        } else if a_len == 5 and (str_byte(raw_html, a_st) | 32) == 115 { // style
+                        } else if a_len == 5 and str_eq_ignore_case(aname, "style") {
                             st_st = v_st; st_l = v_len
-                        } else if a_len == 7 and (str_byte(raw_html, a_st) | 32) == 111 { // onclick
+                        } else if a_len == 7 and str_eq_ignore_case(aname, "onclick") {
                             clk_st = v_st; clk_l = v_len
-                        } else if a_len == 3 and (str_byte(raw_html, a_st) | 32) == 115 and str_eq_ignore_case(str_slice(raw_html, a_st, a_en), "src") {
+                        } else if a_len == 3 and str_eq_ignore_case(aname, "src") {
                             val_st = v_st; val_l = v_len
-                        } else if a_len == 5 and (str_byte(raw_html, a_st) | 32) == 118 and str_eq_ignore_case(str_slice(raw_html, a_st, a_en), "value") {
+                        } else if a_len == 5 and str_eq_ignore_case(aname, "value") {
                             val_st = v_st; val_l = v_len
-                        } else if a_len == 11 and val_l == 0 and (str_byte(raw_html, a_st) | 32) == 112 and str_eq_ignore_case(str_slice(raw_html, a_st, a_en), "placeholder") {
-                            val_st = v_st; val_l = v_len
+                        } else if a_len == 11 and str_eq_ignore_case(aname, "placeholder") {
+                            ph_st = v_st; ph_l = v_len
                         }
                     }
+                    if ap == prev_ap { ap += 1 }
                 }
             }
 
             node_idx := html_alloc_node(mut tree, tag_st, tag_l, id_st, id_l, cls_st, cls_l, st_st, st_l, val_st, val_l, cur_parent, 1, clk_st, clk_l)
             tree.count += 1
+            if ph_l > 0 and ibuf_len(tree.placeholders) + 3 <= 64 {
+                ibuf_push(tree.placeholders, node_idx)
+                ibuf_push(tree.placeholders, ph_st)
+                ibuf_push(tree.placeholders, ph_l)
+            }
 
             if tree.root_idx < 0 { tree.root_idx = node_idx }
             if cur_parent >= 0 { html_append_child(tree, cur_parent, node_idx) }
 
-            is_void := (tag_l >= 2 and tag_l <= 5) and (str_eq_ignore_case(tag_raw, "img") or str_eq_ignore_case(tag_raw, "input") or str_eq_ignore_case(tag_raw, "br") or str_eq_ignore_case(tag_raw, "hr") or str_eq_ignore_case(tag_raw, "meta") or str_eq_ignore_case(tag_raw, "link"))
+            is_void := (tag_l >= 2 and tag_l <= 6) and (str_eq_ignore_case(tag_raw, "img") or str_eq_ignore_case(tag_raw, "input") or str_eq_ignore_case(tag_raw, "br") or str_eq_ignore_case(tag_raw, "hr") or str_eq_ignore_case(tag_raw, "meta") or str_eq_ignore_case(tag_raw, "link") or str_eq_ignore_case(tag_raw, "wbr") or str_eq_ignore_case(tag_raw, "source") or str_eq_ignore_case(tag_raw, "track") or str_eq_ignore_case(tag_raw, "col") or str_eq_ignore_case(tag_raw, "area") or str_eq_ignore_case(tag_raw, "base") or str_eq_ignore_case(tag_raw, "embed"))
 
-            if not is_self_closing and not is_void {
+            if not is_self_closing and not is_void and stack_len < 64 {
                 if stack_len < ibuf_len(stack) {
                     ibuf_set(stack, stack_len, cur_parent)
                 } else {

@@ -2854,6 +2854,7 @@ fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBu
     if (pool_str_eq_lit(p, csoff, cslen, "buf_len") or pool_str_eq_lit(p, csoff, cslen, "ibuf_len")) and acnt == 1 {
         br := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
         mc_load_rax(c, er_slot(br), 0)
+        mc_b3(c, 0x48, 0x85, 0xC0); cg_jmp_fn(cg, 0x84, h_sec_trap())
         mc_b3(c, 0x48, 0x8B, 0x00)
         dst := cg_alloc_slots(cg, 1)
         mc_store_rax(c, dst, 0)
@@ -3346,15 +3347,30 @@ fn try_emit_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntBu
     }
 
     if pool_str_eq_lit(p, csoff, cslen, "str_eq") and acnt == 2 {
-        ar := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
-        br := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
-        aslot := er_slot(ar)
-        bslot := er_slot(br)
-        mc_load_rcx(c, aslot, 0)
+        e0 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4)
+        e1 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4)
+        mut aslot := local_str_slot_ax(cg, vars, e0)
+        if aslot <= 0 { aslot = er_slot(emit_expr_ax(cg, vars, drops, breaks, e0)) }
+        mut bslot := local_str_slot_ax(cg, vars, e1)
+        if bslot <= 0 { bslot = er_slot(emit_expr_ax(cg, vars, drops, breaks, e1)) }
         mc_load_rdx(c, aslot, 1)
-        mc_load_r8(c, bslot, 0)
         mc_load_r9(c, bslot, 1)
+        mc_b3(c, 0x4C, 0x39, 0xCA) // CMP RDX, R9 (inline len check!)
+        jne_len := mc_jcc8(c, 0x75)
+        mc_load_rcx(c, aslot, 0)
+        mc_load_r8(c, bslot, 0)
+        mc_b3(c, 0x4C, 0x39, 0xC1) // CMP RCX, R8 (inline ptr check!)
+        je_ptr := mc_jcc8(c, 0x74)
         cg_call_fn(cg, h_str_eq())
+        jmp_done := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jne_len, buf_len(c))
+        mc_b2(c, 0x31, 0xC0)       // XOR EAX, EAX
+        jmp_done2 := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, je_ptr, buf_len(c))
+        mc_b1(c, 0xB8); mc_u32(c, 1) // MOV EAX, 1
+        end_eq := buf_len(c)
+        mc_patch_jcc8(c, jmp_done, end_eq)
+        mc_patch_jcc8(c, jmp_done2, end_eq)
         dst := cg_alloc_slots(cg, 1)
         mc_store_rax(c, dst, 0)
         return er_pack(dst, ty_bool())
@@ -3767,6 +3783,9 @@ fn try_emit_inline_call_ax(cg: CodegenCtx, ev: IntBuf, fidx: i64, ret_dst: i64) 
             mc_store_rax(c, param_slot, 0)
             mc_mov_rax_imm(c, ibuf_get(ev, pi * 4 + 3))
             mc_store_rax(c, param_slot, 1)
+        } else if aslot == -3 {
+            param_slot = cg_alloc_slots(cg, 1)
+            mc_store_gpreg(c, param_slot, ibuf_get(ev, pi * 4 + 2))
         }
         ibuf_push(c_vars, ibuf_get(cg.sym, po))
         ibuf_push(c_vars, ibuf_get(cg.sym, po + 1))
@@ -3884,6 +3903,15 @@ fn emit_direct_fn_call(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntB
 
     // Evaluate each parameter (Named Args + Positional + Default Parameter Expressions + Duck Packing!)
     is_fast_int := (fast_abi == 1) and ((fn_flags & fnflag_extern()) == 0)
+    mut has_mut_arg := false
+    mut mi_chk := 0
+    while mi_chk < acnt {
+        if ast_get(cg.nodes, ibuf_get(cg.extra, aoff + mi_chk), 1) == pmode_mut() {
+            has_mut_arg = true
+            break
+        }
+        mi_chk += 1
+    }
     ev := ibuf_new(64)
     mut pi := 0
     while pi < p_cnt {
@@ -3925,10 +3953,15 @@ fn emit_direct_fn_call(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntB
                     wb_sub = (ushr64(lv, 32)) & 0xFFF
                 }
             }
-            if is_fast_int and amode != pmode_mut() and p_slots == 1 and (p_ty == ty_int() or p_ty == ty_bool()) and is_nonshadowed_const_int(cg, vars, aexpr) {
+            if is_fast_int and amode != pmode_mut() and p_slots == 1 and (p_ty == ty_int() or p_ty == ty_bool()) and is_folded_const_int_ax(cg, vars, aexpr) {
                 ibuf_push(ev, -1)
                 ibuf_push(ev, 1)
-                ibuf_push(ev, eval_const_int_val(p, cg.nodes, cg.sym, aexpr))
+                ibuf_push(ev, eval_folded_const_int_ax(cg, vars, aexpr))
+                ibuf_push(ev, 0)
+            } else if is_fast_int and not has_mut_arg and amode != pmode_mut() and p_slots == 1 and (p_ty == ty_int() or p_ty == ty_bool()) and ibuf_get(cg.state, 22) == 0 and (ast_kind(cg.nodes, aexpr) == nk_ident() or ast_kind(cg.nodes, aexpr) == nk_move_ident()) and cg_slot_reg(cg, local_scalar_slot_ax(cg, vars, aexpr)) >= 1 and cg_slot_reg(cg, local_scalar_slot_ax(cg, vars, aexpr)) <= cg_max_gpr(cg) {
+                ibuf_push(ev, -3)
+                ibuf_push(ev, 1)
+                ibuf_push(ev, cg_slot_reg(cg, local_scalar_slot_ax(cg, vars, aexpr)))
                 ibuf_push(ev, 0)
             } else if is_fast_int and amode != pmode_mut() and p_slots == 2 and p_ty == ty_str() and ast_kind(cg.nodes, aexpr) == nk_str() {
                 slen := ast_get(cg.nodes, aexpr, 2)
@@ -4110,6 +4143,9 @@ fn emit_direct_fn_call(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntB
                 cg_lea_reg_rdata(cg, cur_off, ibuf_get(ev, pi * 4 + 2))
                 mc_mov_reg_imm(c, cur_off + 1, ibuf_get(ev, pi * 4 + 3))
                 cur_off += 2
+            } else if aslot == -3 {
+                mc_mov_argreg_gpreg(c, cur_off, ibuf_get(ev, pi * 4 + 2))
+                cur_off += 1
             } else {
                 mut s := 0
                 while s < cnt {

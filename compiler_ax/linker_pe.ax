@@ -141,7 +141,7 @@ fn prepare_pe_rdata_v7(pool: ByteBuf, rdata_rva: i64, ext_imports: IntBuf, expor
     ext_cnt := ibuf_len(ext_imports) / 4
 
     // Group `ext_imports` by case-insensitive DLL name -> `dll_groups` (`[dll_soff, dll_slen, fn_count]`)
-    dll_groups := ibuf_new(32)
+    dll_groups := ibuf_new(ext_cnt * 3 + 16)
     ext_group_id := ibuf_new(ext_cnt + 4)
     mut ei := 0
     while ei < ext_cnt {
@@ -812,8 +812,9 @@ fn coff_merge_single_obj(pool: ByteBuf, raw: ByteBuf, obj_off: i64, obj_end: i64
         return false
     }
 
-    // `sec_map`: 2 words per 1-based section `[sec_kind (0=skip, 1=code, 2=rdata), base_off]`
-    sec_map := ibuf_new((nsec + 2) * 2)
+    // `sec_map`: 3 words per 1-based section `[sec_kind (0=skip, 1=code, 2=rdata), base_off, copied_sz]`
+    sec_map := ibuf_new((nsec + 2) * 3)
+    ibuf_push(sec_map, 0)
     ibuf_push(sec_map, 0)
     ibuf_push(sec_map, 0)
 
@@ -831,39 +832,51 @@ fn coff_merge_single_obj(pool: ByteBuf, raw: ByteBuf, obj_off: i64, obj_end: i64
         is_skip_sec := n0 == 46 and (n1 == 112 or n1 == 120 or (n1 == 100 and (n2 == 101 or n2 == 114)))
         mut skind := 0
         mut base_o := 0
+        mut copied_sz := 0
+        code_cap := unsafe { ptr_read_i64(code as i64, 1) }
+        rdata_cap := unsafe { ptr_read_i64(rdata as i64, 1) }
         if (chars & 0x02000000) == 0 and not is_skip_sec {
             if (chars & 0x20000020) != 0 {
-                while (buf_len(code) & 15) != 0 {
-                    buf_push(code, 0xCC)
-                }
-                skind = 1
-                base_o = buf_len(code)
-                if raw_ptr > 0 and raw_sz <= obj_end - obj_off and raw_ptr <= (obj_end - obj_off) - raw_sz {
+                if raw_ptr > 0 and raw_sz > 0 and raw_sz <= obj_end - obj_off and raw_ptr <= (obj_end - obj_off) - raw_sz and buf_len(code) + raw_sz + 16 <= code_cap {
+                    while (buf_len(code) & 15) != 0 {
+                        buf_push(code, 0xCC)
+                    }
+                    skind = 1
+                    base_o = buf_len(code)
                     mut bi := 0
                     while bi < raw_sz {
                         buf_push(code, buf_get(raw, obj_off + raw_ptr + bi))
                         bi += 1
                     }
+                    copied_sz = raw_sz
                 }
             } else if (chars & 0x000000C0) != 0 {
-                while (buf_len(rdata) & 15) != 0 {
-                    buf_push(rdata, 0)
-                }
-                skind = 2
-                base_o = buf_len(rdata)
-                if raw_ptr > 0 and raw_sz <= obj_end - obj_off and raw_ptr <= (obj_end - obj_off) - raw_sz {
+                if raw_ptr > 0 and raw_sz <= obj_end - obj_off and raw_ptr <= (obj_end - obj_off) - raw_sz and buf_len(rdata) + raw_sz + 16 <= rdata_cap {
+                    while (buf_len(rdata) & 15) != 0 {
+                        buf_push(rdata, 0)
+                    }
+                    skind = 2
+                    base_o = buf_len(rdata)
                     mut bi := 0
                     while bi < raw_sz {
                         buf_push(rdata, buf_get(raw, obj_off + raw_ptr + bi))
                         bi += 1
                     }
-                } else if raw_sz > 0 and raw_sz <= 67108864 and buf_len(rdata) + raw_sz <= unsafe { ptr_read_i64(rdata as i64, 1) } {
+                    copied_sz = raw_sz
+                } else if raw_ptr == 0 and raw_sz > 0 and raw_sz <= 67108864 and buf_len(rdata) + raw_sz + 16 <= rdata_cap {
+                    while (buf_len(rdata) & 15) != 0 {
+                        buf_push(rdata, 0)
+                    }
+                    skind = 2
+                    base_o = buf_len(rdata)
                     emit_zeros(rdata, raw_sz)
+                    copied_sz = raw_sz
                 }
             }
         }
         ibuf_push(sec_map, skind)
         ibuf_push(sec_map, base_o)
+        ibuf_push(sec_map, copied_sz)
         s += 1
     }
 
@@ -886,6 +899,9 @@ fn coff_merge_single_obj(pool: ByteBuf, raw: ByteBuf, obj_off: i64, obj_end: i64
         si += 1
     }
 
+    pool_cap := unsafe { ptr_read_i64(pool as i64, 1) }
+    csym_cap := unsafe { ptr_read_i64(coff_syms as i64, 1) }
+    fx_cap := unsafe { ptr_read_i64(fixups as i64, 1) }
     si = 0
     while si < nsyms {
         sb := obj_off + sym_ptr + si * 18
@@ -897,14 +913,14 @@ fn coff_merge_single_obj(pool: ByteBuf, raw: ByteBuf, obj_off: i64, obj_end: i64
         if coff_read_u32(raw, sb) == 0 {
             stroff := coff_read_u32(raw, sb + 4)
             mut p := str_tbl_base + stroff
-            while p >= str_tbl_base and p < obj_end and buf_get(raw, p) != 0 {
+            while p >= str_tbl_base and p < obj_end and buf_get(raw, p) != 0 and buf_len(pool) + 4 < pool_cap {
                 buf_push(pool, buf_get(raw, p))
                 nslen += 1
                 p += 1
             }
         } else {
             mut k := 0
-            while k < 8 and buf_get(raw, sb + k) != 0 {
+            while k < 8 and buf_get(raw, sb + k) != 0 and buf_len(pool) + 4 < pool_cap {
                 buf_push(pool, buf_get(raw, sb + k))
                 nslen += 1
                 k += 1
@@ -918,8 +934,8 @@ fn coff_merge_single_obj(pool: ByteBuf, raw: ByteBuf, obj_off: i64, obj_end: i64
         mut sk := 0
         mut moff := 0
         if sec_num >= 1 and sec_num <= nsec {
-            sk = ibuf_get(sec_map, sec_num * 2)
-            moff = ibuf_get(sec_map, sec_num * 2 + 1) + val
+            sk = ibuf_get(sec_map, sec_num * 3)
+            moff = ibuf_get(sec_map, sec_num * 3 + 1) + val
         }
         lb := si * 4
         ibuf_set(local_syms, lb, sk)
@@ -927,7 +943,7 @@ fn coff_merge_single_obj(pool: ByteBuf, raw: ByteBuf, obj_off: i64, obj_end: i64
         ibuf_set(local_syms, lb + 2, nsoff)
         ibuf_set(local_syms, lb + 3, nslen)
 
-        if sclass == 2 and sk > 0 and nslen > 0 {
+        if sclass == 2 and sk > 0 and nslen > 0 and ibuf_len(coff_syms) + 4 <= csym_cap {
             ibuf_push(coff_syms, nsoff)
             ibuf_push(coff_syms, nslen)
             ibuf_push(coff_syms, sk)
@@ -939,8 +955,9 @@ fn coff_merge_single_obj(pool: ByteBuf, raw: ByteBuf, obj_off: i64, obj_end: i64
     // Apply COFF `.text` relocations (`IMAGE_REL_AMD64_REL32 = 4`, `REL32_1..5 = 5..9`)
     s = 0
     while s < nsec {
-        if ibuf_get(sec_map, (s + 1) * 2) == 1 {
-            cbase := ibuf_get(sec_map, (s + 1) * 2 + 1)
+        if ibuf_get(sec_map, (s + 1) * 3) == 1 {
+            cbase := ibuf_get(sec_map, (s + 1) * 3 + 1)
+            csz := ibuf_get(sec_map, (s + 1) * 3 + 2)
             sh := sec_hdr_base + s * 40
             rel_ptr := coff_read_u32(raw, sh + 24)
             nrel := coff_read_u16(raw, sh + 32)
@@ -953,9 +970,8 @@ fn coff_merge_single_obj(pool: ByteBuf, raw: ByteBuf, obj_off: i64, obj_end: i64
                     rtype := coff_read_u16(raw, rb + 8)
                     if rtype >= 4 and rtype <= 9 and sym_i < nsyms {
                         s_raw_ptr := coff_read_u32(raw, sh + 20)
-                        s_raw_sz := coff_read_u32(raw, sh + 16)
                         add_off := obj_off + s_raw_ptr + vaddr
-                        if vaddr + 4 <= s_raw_sz and add_off >= obj_off and add_off + 4 <= obj_end {
+                        if vaddr + 4 <= csz and add_off >= obj_off and add_off + 4 <= obj_end {
                             extra_disp := rtype - 4
                             disp_pos := cbase + vaddr
                             next_rip := disp_pos + 4 + extra_disp
@@ -981,8 +997,11 @@ fn coff_merge_single_obj(pool: ByteBuf, raw: ByteBuf, obj_off: i64, obj_end: i64
                                 }
                             }
                             if t_sk == 1 and disp_pos >= 0 and disp_pos + 4 <= buf_len(code) {
-                                buf_put_u32(code, disp_pos, (t_off + addend) - next_rip)
-                            } else if t_sk == 2 {
+                                rel_d := (t_off + addend) - next_rip
+                                if rel_d >= -2147483648 and rel_d <= 2147483647 {
+                                    buf_put_u32(code, disp_pos, rel_d)
+                                }
+                            } else if t_sk == 2 and disp_pos >= 0 and disp_pos + 4 <= buf_len(code) and ibuf_len(fixups) + 4 <= fx_cap {
                                 // Record `fx_rdata()` (`2`) fixup!
                                 ibuf_push(fixups, disp_pos)
                                 ibuf_push(fixups, next_rip)

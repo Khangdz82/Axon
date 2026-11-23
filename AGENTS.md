@@ -1,7 +1,8 @@
-# AGENTS.md — AI Coding Agent Instructions for Axon (`axc` v1.0.0)
+# AGENTS.md — AI Coding Agent Instructions for Axon (`axc` v1.1.1)
 
 > **MANDATORY RULE FOR ALL AI AGENTS:**
-> Build **100% in pure Axon (`.ax`)**. **DO NOT** fall back to C, C++, Python, Node.js, or PowerShell helper scripts for networking, TLS/HTTPS, databases, gRPC, desktop GUI, FFI, OS/env/filesystem operations, AI/GPU compute, or parsing. Axon includes **77 native `std/*.ax` modules** and direct C-ABI FFI (`std::ffi`) that compile in milliseconds to standalone native executables (`win-x64`, `linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`, `wasm32`, `spirv`, `ptx`, bare-metal).
+> Build **100% in pure Axon (`.ax`)**. **DO NOT** fall back to C, C++, Python, Node.js, or PowerShell helper scripts for networking, TLS/HTTPS, databases, gRPC, WebSockets, JWT, URL/SSRF parsing, desktop GUI, FFI, OS/env/filesystem operations, dynamic containers, algorithms/graphs, AI/GPU compute, or parsing. Axon includes **103 native `std/*.ax` modules** and direct C-ABI FFI (`std::ffi`) that compile in milliseconds to standalone native executables (`win-x64`, `linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`, `wasm32`, `spirv`, `ptx`, bare-metal).
+> Read [docs/AGENT_MASTER_GUIDE.md](docs/AGENT_MASTER_GUIDE.md) and [MEMORY.md](MEMORY.md) for the full 103-module lookup matrix and `E0001..E0604` error dictionary.
 
 ---
 
@@ -43,6 +44,11 @@ For full copy-paste production recipes, read [docs/AGENT_FULLSTACK_GUIDE.md](doc
 | **Generics (Zero-Cost)** | `use std::vec` | `struct Box[T]`, `Pair[A, B]`, `Option[T]`, `some[T]`, `none_opt[T]`, `unwrap_or`, `min_val`, `max_val`, `clamp_val`, `swap_pair` |
 | **JSON, Regex, Compression, Encoding** | `use std::json`, `use std::regex`, `use std::compress`, `use std::encoding` | SWAR JSON parser + `to_json(val)`, regex engine, LZ/RLE compression, Base64/Hex/UTF-8 |
 | **Crypto, Hashing, UUID, Security** | `use std::crypto`, `use std::uuid`, `use std::taint`, `use std::cap` | SHA-256, constant-time `ct_eq_str`, `@whitebox`, `tainted[str]` (`E0502`), `RootCap`/`FsCap`/`NetCap` (`E0501`) |
+| **O(N) Sort, Binary Search, Heap, Union-Find** | `use std::algo` | `sort_i64` ($O(N)$ LSD Radix Sort), `sort_i64_range`, `bsearch_i64`, `lower_bound_i64`, `upper_bound_i64`, `ibuf_dedup_sorted`, `heap_new`/`heap_push_min`/`heap_pop_min`, `heap_kv_new`/`heap_push_kv_min`/`heap_pop_kv_min`, `dsu_new`/`dsu_find`/`dsu_union` |
+| **Auto-Growing Vec, Map, StrMap, Deque, BitSet** | `use std::ds` | `DynIntVec` (`dvec_*`), `StrVec` (`svec_*`), `DynMap` (`dmap_*`), `StrMap` (`smap_*`), `IntDeque` (`deque_*`), `BitSet` (`bitset_*`) |
+| **Graphs (BFS, Dijkstra, Topological Sort)** | `use std::graph` | `graph_new`, `graph_add_edge`, `graph_bfs`, `graph_dijkstra`, `graph_toposort` (cycle-detecting!), `graph_free` |
+| **Web Router, JWT, WebSockets, URL/SSRF Guard** | `use std::web`, `use std::jwt`, `use std::ws`, `use std::url` | `web_route_match`, `web_param`, `web_json`, `web_bearer_token`, `web_serve_static`, `jwt_sign_hs256`, `jwt_verify_hs256`, `ws_accept_key`, `ws_encode_frame`, `ws_decode_frame`, `url_parse`, `url_query_get`, `url_str_is_public_http` |
+| **Filesystem, Formatting & Benchmarking** | `use std::fs`, `use std::fmt`, `use std::bench` | `fs_read_text`, `fs_atomic_write`, `fs_mkdir_all`, `fs_read_lines`, `fs_list_dir`, `fmt_hex`, `fmt_bin`, `fmt_commas`, `fmt_f64`, `fmt_bytes_human`, `bench_compute_stats` |
 | **AI / LLM / CUDA GPU / Vector DB** | `use std::cuda`, `use std::ai_engine`, `use std::ai_gguf`, `use std::ai_lora`, `use std::faiss`, `use std::llama`, `use std::torch` | Zero-nvcc PTX JIT CUDA (`nvcuda.dll`/`libcuda.so`), GGUF loader, Q4/Q8/BitNet/BNN AVX2 kernels, LoRA, FAISS L2 search |
 | **2D / 3D Game Engine & Physics** | `use std::game2d`, `use std::game3d`, `use std::game_ecs`, `use std::game_physics`, `use std::math3d`, `use std::audio` | SoA `Table[T]` SIMD (`AVX2`/`NEON`), ECS, rigid-body physics, `vec3`/`mat4`/`quat`, audio |
 
@@ -50,7 +56,7 @@ For full copy-paste production recipes, read [docs/AGENT_FULLSTACK_GUIDE.md](doc
 
 ## 3. Critical Axon Grammar & Safety Rules (Avoid Common Agent Mistakes)
 
-1. **Boolean operators:** Use `and`, `or`, `not` (NEVER `&&`, `||`, `!`).
+1. **Boolean operators & reserved keywords:** Use `and`, `or`, `not` (NEVER `&&`, `||`, `!`), and NEVER name a variable `pass` (`pass` is a reserved no-op keyword -> `E0020`). Use `+%`, `-%`, `*%` for intentional 64-bit modular wrap-around (`--shield` traps signed overflow on `+`, `-`, `*`).
 2. **Error unions (`T ! i64`):**
    - Return: `return ok(val)` / `return err(-1)`.
    - Unwrap: `x := foo() or return` (propagate), `x := foo() or return -1` (return value), or `x := foo() or default_val` (fallback expression).

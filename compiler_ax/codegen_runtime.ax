@@ -76,6 +76,7 @@ fn h_ai_swiglu() -> i64       { return 10000049 }
 fn h_pow_i64() -> i64         { return 10000050 }
 fn h_chkstk() -> i64          { return 10000051 }
 fn h_ai_bnn_popcnt() -> i64   { return 10000052 }
+fn h_alloc_mem_raw() -> i64   { return 10000053 }
 
 // Fixup Kinds
 fn fx_iat() -> i64    { return 1 }
@@ -90,9 +91,12 @@ fn data_off_cpu_threads() -> i64 { return 0x08 }
 fn data_off_unix_rsp() -> i64    { return 0x10 }
 fn data_off_arena_ptr() -> i64   { return 0x18 }
 fn data_off_arena_off() -> i64   { return 0x20 }
+fn data_off_qpf() -> i64         { return 0x20 }
 fn data_off_bare_heap() -> i64   { return 0x28 }
 fn data_off_ai_pool() -> i64     { return 0x30 }
 fn data_off_par_ctx() -> i64     { return 0x40 }
+fn data_off_slab_lock() -> i64   { return 0x100 }
+fn data_off_mt_active() -> i64   { return 0x104 }
 
 fn mc_b1(code: ByteBuf, b0: i64) {
     buf_push(code, b0 & 255)
@@ -465,6 +469,56 @@ fn cg_intern_u64_rdata(cg: CodegenCtx, bits: i64, align16: bool) -> i64 {
     return roff
 }
 
+fn cg_intern_u64x4_rdata(cg: CodegenCtx, bits: i64) -> i64 {
+    icnt := ibuf_len(cg.interns) / 4
+    mut i := 0
+    while i < icnt {
+        base := i * 4
+        if ibuf_get(cg.interns, base) == 7 and ibuf_get(cg.interns, base + 1) == bits {
+            return ibuf_get(cg.interns, base + 3)
+        }
+        i += 1
+    }
+    while (buf_len(cg.rdata) & 31) != 0 {
+        buf_push(cg.rdata, 0)
+    }
+    roff := buf_len(cg.rdata)
+    buf_push_u64(cg.rdata, bits)
+    buf_push_u64(cg.rdata, bits)
+    buf_push_u64(cg.rdata, bits)
+    buf_push_u64(cg.rdata, bits)
+    ibuf_push(cg.interns, 7)
+    ibuf_push(cg.interns, bits)
+    ibuf_push(cg.interns, 0)
+    ibuf_push(cg.interns, roff)
+    return roff
+}
+
+fn cg_intern_vec4_seq_rdata(cg: CodegenCtx, base_v: i64, step_v: i64) -> i64 {
+    icnt := ibuf_len(cg.interns) / 4
+    mut i := 0
+    while i < icnt {
+        base := i * 4
+        if ibuf_get(cg.interns, base) == 8 and ibuf_get(cg.interns, base + 1) == base_v and ibuf_get(cg.interns, base + 2) == step_v {
+            return ibuf_get(cg.interns, base + 3)
+        }
+        i += 1
+    }
+    while (buf_len(cg.rdata) & 31) != 0 {
+        buf_push(cg.rdata, 0)
+    }
+    roff := buf_len(cg.rdata)
+    buf_push_u64(cg.rdata, base_v)
+    buf_push_u64(cg.rdata, base_v +% step_v)
+    buf_push_u64(cg.rdata, base_v +% (step_v *% 2))
+    buf_push_u64(cg.rdata, base_v +% (step_v *% 3))
+    ibuf_push(cg.interns, 8)
+    ibuf_push(cg.interns, base_v)
+    ibuf_push(cg.interns, step_v)
+    ibuf_push(cg.interns, roff)
+    return roff
+}
+
 fn rotl64(x: i64, k: i64) -> i64 {
     s := k & 63
     if s == 0 {
@@ -652,7 +706,14 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
     if cg_is_helper_used(cg, h_jbuf_raw()) or cg_is_helper_used(cg, h_jbuf_i64()) or cg_is_helper_used(cg, h_jbuf_qstr()) {
         cg_mark_helper_used(cg, h_jbuf_ensure())
     }
-    if cg_is_helper_used(cg, h_buf_new()) or cg_is_helper_used(cg, h_ibuf_new()) or cg_is_helper_used(cg, h_jbuf_ensure()) or cg_is_helper_used(cg, h_fs_read()) {
+    if cg_is_helper_used(cg, h_buf_new()) or cg_is_helper_used(cg, h_ibuf_new()) or cg_is_helper_used(cg, h_jbuf_ensure()) {
+        if ibuf_get(cg.state, 0) == 0 {
+            cg_mark_helper_used(cg, h_alloc_mem_raw())
+        } else {
+            cg_mark_helper_used(cg, h_alloc_mem())
+        }
+    }
+    if cg_is_helper_used(cg, h_fs_read()) {
         cg_mark_helper_used(cg, h_alloc_mem())
     }
     if cg_is_helper_used(cg, h_jbuf_ensure()) {
@@ -660,6 +721,7 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
     }
 
     // 0. Compact Shared `ByteBuf` / `IntBuf` / `str` Runtime Helpers (`h_buf_*`, `h_ibuf_*`, `h_str_byte`, `h_jbuf_*`)
+    alloc_buf_hid := if ibuf_get(cg.state, 0) == 0 { h_alloc_mem_raw() } else { h_alloc_mem() }
     if cg_is_helper_used(cg, h_buf_new()) {
         mc_align16(c)
         s_bn := buf_len(c)
@@ -672,11 +734,12 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
         mc_b1(c, 0x53)
         mc_b3(c, 0x48, 0x89, 0xCB)
         mc_b4(c, 0x48, 0x8D, 0x4B, 0x40)
-        cg_call_fn(cg, h_alloc_mem())
+        cg_call_fn(cg, alloc_buf_hid)
         mc_b3(c, 0x48, 0x85, 0xC0)
         cg_jmp_fn(cg, 0x84, h_sec_trap())
         mc_b3(c, 0x48, 0xC7, 0x00); mc_u32(c, 0)
         mc_b4(c, 0x48, 0x89, 0x58, 0x08)
+        mc_b4(c, 0xC6, 0x40, 0x10, 0x00) // NUL-terminate empty ByteBuf payload[0]
         mc_b1(c, 0x5B)
         mc_b1(c, 0xC3)
         cg_reg_helper(cg, h_buf_new(), s_bn, buf_len(c))
@@ -695,7 +758,7 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
         mc_b3(c, 0x48, 0x89, 0xCB)
         mc_b4(c, 0x48, 0xC1, 0xE1, 0x03)
         mc_b4(c, 0x48, 0x83, 0xC1, 0x40)
-        cg_call_fn(cg, h_alloc_mem())
+        cg_call_fn(cg, alloc_buf_hid)
         mc_b3(c, 0x48, 0x85, 0xC0)
         cg_jmp_fn(cg, 0x84, h_sec_trap())
         mc_b3(c, 0x48, 0xC7, 0x00); mc_u32(c, 0)
@@ -797,6 +860,18 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
         mc_b3(c, 0x4C, 0x89, 0x11)
         mc_b3(c, 0x4C, 0x01, 0xC9)
         mc_b2(c, 0x31, 0xC0)
+        // 8-byte bulk copy loop + scalar tail
+        mc_b3(c, 0x4D, 0x89, 0xC2)             // MOV R10, R8
+        mc_b4(c, 0x49, 0x83, 0xE2, 0xF8)       // AND R10, -8
+        lp_bps8 := buf_len(c)
+        mc_b3(c, 0x4C, 0x39, 0xD0)             // CMP RAX, R10
+        jae_bps8 := mc_jcc8(c, 0x73)
+        mc_b4(c, 0x4C, 0x8B, 0x1C, 0x02)       // MOV R11, [RDX + RAX]
+        mc_b4(c, 0x4C, 0x89, 0x5C, 0x01); mc_b1(c, 0x10) // MOV [RCX + RAX + 16], R11
+        mc_b4(c, 0x48, 0x83, 0xC0, 0x08)       // ADD RAX, 8
+        jmp_bps8 := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_bps8, lp_bps8)
+        mc_patch_jcc8(c, jae_bps8, buf_len(c))
         lp_bps := buf_len(c)
         mc_b3(c, 0x4C, 0x39, 0xC0)
         jae_bps := mc_jcc8(c, 0x73)
@@ -898,7 +973,7 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
         mc_b3(c, 0x4C, 0x8B, 0x2B)
         mc_b3(c, 0x4C, 0x89, 0xE1)
         mc_b4(c, 0x48, 0x83, 0xC1, 0x40)
-        cg_call_fn(cg, h_alloc_mem())
+        cg_call_fn(cg, alloc_buf_hid)
         mc_b3(c, 0x48, 0x85, 0xC0); cg_jmp_fn(cg, 0x84, h_sec_trap())
         mc_b4(c, 0x4C, 0x89, 0x60, 0x08)
         mc_b3(c, 0x4D, 0x89, 0xE8)
@@ -943,6 +1018,18 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
         mc_b2(c, 0x31, 0xD2)
         mc_b4(c, 0x4E, 0x8D, 0x0C, 0x00)
         mc_b4(c, 0x49, 0x83, 0xC1, 16)
+        // 8-byte bulk copy loop + scalar tail
+        mc_b3(c, 0x4D, 0x89, 0xE3)             // MOV R11, R12
+        mc_b4(c, 0x49, 0x83, 0xE3, 0xF8)       // AND R11, -8
+        lp_jr8 := buf_len(c)
+        mc_b3(c, 0x4C, 0x39, 0xDA)             // CMP RDX, R11
+        jae_jr8 := mc_jcc8(c, 0x73)
+        mc_b4(c, 0x4C, 0x8B, 0x14, 0x13)       // MOV R10, [RBX + RDX]
+        mc_b4(c, 0x4D, 0x89, 0x14, 0x11)       // MOV [R9 + RDX], R10
+        mc_b4(c, 0x48, 0x83, 0xC2, 0x08)       // ADD RDX, 8
+        jmp_jr8 := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_jr8, lp_jr8)
+        mc_patch_jcc8(c, jae_jr8, buf_len(c))
         lp_jr := buf_len(c)
         mc_b3(c, 0x4C, 0x39, 0xE2)
         jae_jr := mc_jcc8(c, 0x73)
@@ -979,14 +1066,20 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
         mc_patch_jcc8(c, jge_ji, buf_len(c))
         mc_b4(c, 0x4C, 0x8D, 0x4C, 0x24); mc_b1(c, 0x3F)
         mc_b3(c, 0x4D, 0x89, 0xCA)
-        mc_b3(c, 0x49, 0xC7, 0xC3); mc_u32(c, 10)
+        // Reciprocal multiply by 10 (`0xCCCCCCCCCCCCCCCD`) - zero DIV instructions!
+        mc_b2(c, 0x49, 0xBB); mc_u64(c, 0xCCCCCCCCCCCCCCCD) // MOV R11, magic10
         dl_ji := buf_len(c)
-        mc_b2(c, 0x31, 0xD2)
-        mc_b3(c, 0x49, 0xF7, 0xF3)
-        mc_b3(c, 0x80, 0xC2, 0x30)
-        mc_b3(c, 0x49, 0xFF, 0xC9)
-        mc_b3(c, 0x41, 0x88, 0x11)
-        mc_b3(c, 0x48, 0x85, 0xC0)
+        mc_b3(c, 0x48, 0x89, 0xC3)             // MOV RBX, RAX
+        mc_b3(c, 0x49, 0xF7, 0xE3)             // MUL R11
+        mc_b4(c, 0x48, 0xC1, 0xEA, 0x03)       // SHR RDX, 3 (q = n / 10)
+        mc_b4(c, 0x48, 0x8D, 0x04, 0x92)       // LEA RAX, [RDX + RDX*4]
+        mc_b3(c, 0x48, 0x01, 0xC0)             // ADD RAX, RAX (10*q)
+        mc_b3(c, 0x48, 0x29, 0xC3)             // SUB RBX, RAX (rem = n - 10*q)
+        mc_b3(c, 0x80, 0xC3, 0x30)             // ADD BL, '0'
+        mc_b3(c, 0x49, 0xFF, 0xC9)             // DEC R9
+        mc_b3(c, 0x41, 0x88, 0x19)             // MOV [R9], BL
+        mc_b3(c, 0x48, 0x89, 0xD0)             // MOV RAX, RDX
+        mc_b3(c, 0x48, 0x85, 0xC0)             // TEST RAX, RAX
         jnz_ji := mc_jcc8(c, 0x75)
         mc_patch_jcc8(c, jnz_ji, dl_ji)
         cp_ji := buf_len(c)
@@ -1344,91 +1437,172 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
         cg_reg_helper(cg, h_par_soa_worker(), s_pw, buf_len(c))
     }
 
-    // 4. `h_alloc_mem(RCX = bytes) -> RAX = 64B-aligned ptr` (Win64 ProcessHeap LFH / Linux+macOS mmap / Bare-Metal bump)
-    if cg_is_helper_used(cg, h_alloc_mem()) {
-        mc_align16(c)
-        s_am := buf_len(c)
-        mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
-        mc_b3(c, 0x48, 0x85, 0xC9) // TEST RCX, RCX
-        jle_zero := mc_jcc8(c, 0x7E) // <= 0 -> fail cleanly (return NULL)
-        if osm <= 1 {
-            mc_b4(c, 0x55, 0x48, 0x89, 0xE5) // PUSH RBP; MOV RBP, RSP
-            mc_b1(c, 0x53)                   // PUSH RBX
-            mc_b4(c, 0x48, 0x83, 0xEC, 0x28) // SUB RSP, 0x28 (32 shadow + 8 align)
-            mc_b3(c, 0x48, 0x89, 0xCB)       // MOV RBX, RCX
-            mc_b4(c, 0x48, 0x83, 0xC3, 0x48) // ADD RBX, 72 (8 raw ptr + up to 63 align pad)
-            js_ovf := mc_jcc8(c, 0x78)       // guard signed wraparound
+    // 4. `h_alloc_mem` (zeroed) & `h_alloc_mem_raw` (unzeroed safe-buf fastpath):
+    //    O(1) Branchless BSR 8-Class Slab Freelist + Zero-Atomic Single-Thread Fast Path + Win64 Heap / Unix mmap / Bare Bump
+    mut am_pass := 0
+    while am_pass < 2 {
+        am_hid := if am_pass == 0 { h_alloc_mem() } else { h_alloc_mem_raw() }
+        zero_mem := am_pass == 0
+        if cg_is_helper_used(cg, am_hid) {
+            mc_align16(c)
+            s_am := buf_len(c)
+            mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
+            mc_b3(c, 0x48, 0x85, 0xC9) // TEST RCX, RCX
+            jle_zero := mc_jcc32(c, 0x8E) // <= 0 -> return NULL
+            if osm <= 1 {
+                mc_b3(c, 0x45, 0x31, 0xC0)             // XOR R8D, R8D (class_tag = 0)
+                mc_b3(c, 0x49, 0x89, 0xC9)             // MOV R9, RCX (alloc_size = req)
+                mc_b3(c, 0x48, 0x81, 0xF9); mc_u32(c, 16448) // max slab = 16384 + 64
+                ja_noslab := mc_jcc32(c, 0x87)
+                // Branchless O(1) BSR class tag in 1..8: sizes (64 << tag) + 64 = {192, 320, 576, 1088, 2112, 4160, 8256, 16448}
+                mc_b1(c, 0xB8); mc_u32(c, 64)          // MOV EAX, 64
+                mc_b3(c, 0x8D, 0x51, 0xBF)             // LEA EDX, [RCX - 65]
+                mc_b2(c, 0x81, 0xF9); mc_u32(c, 129)   // CMP ECX, 129
+                mc_b3(c, 0x0F, 0x43, 0xC2)             // CMOVAE EAX, EDX
+                mc_b4(c, 0x44, 0x0F, 0xBD, 0xC0)       // BSR R8D, EAX (6..13)
+                mc_b4(c, 0x41, 0x83, 0xE8, 0x05)       // SUB R8D, 5   (1..8)
+                cg_lea_rax_data(cg, data_off_slab_lock())
+                mc_b3(c, 0x49, 0x89, 0xC2)             // MOV R10, RAX
+                mc_b4(c, 0x41, 0x80, 0x7A, 0x04); mc_b1(c, 0x00) // CMP BYTE PTR [R10 + 4], 0 (mt_active)
+                jnz_mt := mc_jcc8(c, 0x75)
+                // Single-threaded zero-atomic, zero-taken-branch slab HIT fast path!
+                mc_b4(c, 0x4F, 0x8B, 0x1C, 0xC2)       // MOV R11, [R10 + R8*8]
+                mc_b3(c, 0x4D, 0x85, 0xDB)             // TEST R11, R11
+                jz_miss_st := mc_jcc8(c, 0x74)
+                mc_b3(c, 0x49, 0x8B, 0x13)             // MOV RDX, [R11]
+                mc_b4(c, 0x4B, 0x89, 0x14, 0xC2)       // MOV [R10 + R8*8], RDX
+                mc_b4(c, 0x4B, 0xFF, 0x4C, 0xC2); mc_b1(c, 0x40) // DEC QWORD PTR [R10 + R8*8 + 64]
+                hit_ready := buf_len(c)
+                mc_b4(c, 0x49, 0xC7, 0x43, 0xE8); mc_u32(c, 1) // MOV QWORD PTR [R11 - 24], 1 (live)
+                if zero_mem {
+                    mc_b1(c, 0x57)                     // PUSH RDI
+                    mc_b3(c, 0x4C, 0x89, 0xDF)         // MOV RDI, R11
+                    mc_b4(c, 0x48, 0x83, 0xC1, 0x07)   // ADD RCX, 7
+                    mc_b4(c, 0x48, 0xC1, 0xE9, 0x03)   // SHR RCX, 3
+                    mc_b2(c, 0x31, 0xC0)               // XOR EAX, EAX
+                    mc_b3(c, 0xF3, 0x48, 0xAB)         // REP STOSQ
+                    mc_b1(c, 0x5F)                     // POP RDI
+                }
+                mc_b3(c, 0x4C, 0x89, 0xD8)             // MOV RAX, R11
+                mc_b1(c, 0xC3)                         // RET
+                // Cold multithreaded spinlock path
+                mc_patch_jcc8(c, jnz_mt, buf_len(c))
+                sp_a := buf_len(c)
+                mc_b1(c, 0xBA); mc_u32(c, 1)           // MOV EDX, 1
+                mc_b3(c, 0x41, 0x87, 0x12)             // XCHG [R10], EDX
+                mc_b2(c, 0x85, 0xD2)                   // TEST EDX, EDX
+                jz_la := mc_jcc8(c, 0x74)
+                mc_b2(c, 0xF3, 0x90)                   // PAUSE
+                jmp_spa := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_spa, sp_a)
+                mc_patch_jcc8(c, jz_la, buf_len(c))
+                mc_b4(c, 0x4F, 0x8B, 0x1C, 0xC2)       // MOV R11, [R10 + R8*8]
+                mc_b3(c, 0x4D, 0x85, 0xDB)             // TEST R11, R11
+                jz_miss_mt := mc_jcc8(c, 0x74)
+                mc_b3(c, 0x49, 0x8B, 0x13)             // MOV RDX, [R11]
+                mc_b4(c, 0x4B, 0x89, 0x14, 0xC2)       // MOV [R10 + R8*8], RDX
+                mc_b4(c, 0x4B, 0xFF, 0x4C, 0xC2); mc_b1(c, 0x40)
+                mc_b3(c, 0x41, 0xC7, 0x02); mc_u32(c, 0) // unlock
+                jmp_hit := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_hit, hit_ready)
+                mc_patch_jcc8(c, jz_miss_mt, buf_len(c))
+                mc_b3(c, 0x41, 0xC7, 0x02); mc_u32(c, 0) // unlock before slow path
+                // Compute slab class size `R9 = (64 << R8D) + 64` only on miss!
+                mc_patch_jcc8(c, jz_miss_st, buf_len(c))
+                mc_b3(c, 0x44, 0x89, 0xC1)             // MOV ECX, R8D
+                mc_b2(c, 0x41, 0xB9); mc_u32(c, 64)    // MOV R9D, 64
+                mc_b3(c, 0x49, 0xD3, 0xE1)             // SHL R9, CL
+                mc_b4(c, 0x49, 0x83, 0xC1, 0x40)       // ADD R9, 64
+                mc_patch_rel32(c, ja_noslab, buf_len(c))
 
-            cg_mov_rax_data(cg, data_off_arena_ptr())
-            mc_b3(c, 0x48, 0x85, 0xC0)       // TEST RAX, RAX
-            jnz_heap := mc_jcc8(c, 0x75)
-            cg_call_iat(cg, iat_get_process_heap())
-            mc_b3(c, 0x48, 0x85, 0xC0)
-            jz_hf1 := mc_jcc8(c, 0x74)
-            cg_store_rax_data(cg, data_off_arena_ptr())
-            mc_patch_jcc8(c, jnz_heap, buf_len(c))
+                // Slow path: Win64 ProcessHeap alloc (`R9` bytes + 128 header/align pad, `R8` = class_tag)
+                mc_b4(c, 0x55, 0x48, 0x89, 0xE5) // PUSH RBP; MOV RBP, RSP
+                mc_b1(c, 0x53)                   // PUSH RBX
+                mc_b2(c, 0x41, 0x54)             // PUSH R12 (stack now 16B aligned!)
+                mc_b4(c, 0x48, 0x83, 0xEC, 0x20) // SUB RSP, 0x20 (32B shadow space)
+                mc_b3(c, 0x4D, 0x89, 0xC4)       // MOV R12, R8 (save class_tag)
+                mc_b3(c, 0x4C, 0x89, 0xCB)       // MOV RBX, R9 (alloc_size)
+                mc_b3(c, 0x48, 0x81, 0xC3); mc_u32(c, 128) // ADD RBX, 128
+                js_ovf := mc_jcc8(c, 0x78)       // guard signed wraparound
 
-            mc_b3(c, 0x48, 0x89, 0xC1)       // RCX = hHeap
-            mc_b1(c, 0xBA); mc_u32(c, 8)     // EDX = HEAP_ZERO_MEMORY
-            mc_b3(c, 0x49, 0x89, 0xD8)       // R8  = bytes + 72
-            cg_call_iat(cg, iat_heap_alloc())
-            mc_b3(c, 0x48, 0x85, 0xC0)
-            jz_hf2 := mc_jcc8(c, 0x74)
+                cg_mov_rax_data(cg, data_off_arena_ptr())
+                mc_b3(c, 0x48, 0x85, 0xC0)       // TEST RAX, RAX
+                jnz_heap := mc_jcc8(c, 0x75)
+                cg_call_iat(cg, iat_get_process_heap())
+                mc_b3(c, 0x48, 0x85, 0xC0)
+                jz_hf1 := mc_jcc8(c, 0x74)
+                cg_store_rax_data(cg, data_off_arena_ptr())
+                mc_patch_jcc8(c, jnz_heap, buf_len(c))
 
-            // Store raw heap ptr at `[aligned - 8]` and return 64-byte aligned pointer
-            mc_b4(c, 0x48, 0x8D, 0x50, 71)   // LEA RDX, [RAX + 71]
-            mc_b4(c, 0x48, 0x83, 0xE2, 0xC0) // AND RDX, -64
-            mc_b4(c, 0x48, 0x89, 0x42, 0xF8) // MOV [RDX - 8], RAX
-            mc_b3(c, 0x48, 0x89, 0xD0)       // MOV RAX, RDX
-            mc_b4(c, 0x48, 0x83, 0xC4, 0x28)
-            mc_b1(c, 0x5B)
-            mc_b1(c, 0x5D)
-            mc_b1(c, 0xC3)
+                mc_b3(c, 0x48, 0x89, 0xC1)       // RCX = hHeap
+                if zero_mem {
+                    mc_b1(c, 0xBA); mc_u32(c, 8) // EDX = HEAP_ZERO_MEMORY
+                } else {
+                    mc_b2(c, 0x31, 0xD2)         // EDX = 0
+                }
+                mc_b3(c, 0x49, 0x89, 0xD8)       // R8  = alloc_size + 128
+                cg_call_iat(cg, iat_heap_alloc())
+                mc_b3(c, 0x48, 0x85, 0xC0)
+                jz_hf2 := mc_jcc8(c, 0x74)
 
-            fail_off := buf_len(c)
-            mc_patch_jcc8(c, js_ovf, fail_off)
-            mc_patch_jcc8(c, jz_hf1, fail_off)
-            mc_patch_jcc8(c, jz_hf2, fail_off)
+                // Store metadata: `[RDX-8]=raw_ptr`, `[RDX-16]=class_tag`, `[RDX-24]=1 (live)`
+                mc_b4(c, 0x48, 0x8D, 0x50, 0x5F) // LEA RDX, [RAX + 95]
+                mc_b4(c, 0x48, 0x83, 0xE2, 0xC0) // AND RDX, -64
+                mc_b4(c, 0x48, 0x89, 0x42, 0xF8) // MOV [RDX - 8], RAX
+                mc_b4(c, 0x4C, 0x89, 0x62, 0xF0) // MOV [RDX - 16], R12
+                mc_b4(c, 0x48, 0xC7, 0x42, 0xE8); mc_u32(c, 1) // MOV QWORD PTR [RDX - 24], 1
+                mc_b3(c, 0x48, 0x89, 0xD0)       // MOV RAX, RDX
+                mc_b4(c, 0x48, 0x83, 0xC4, 0x20)
+                mc_b2(c, 0x41, 0x5C)
+                mc_b1(c, 0x5B)
+                mc_b1(c, 0x5D)
+                mc_b1(c, 0xC3)
+
+                fail_off := buf_len(c)
+                mc_patch_jcc8(c, js_ovf, fail_off)
+                mc_patch_jcc8(c, jz_hf1, fail_off)
+                mc_patch_jcc8(c, jz_hf2, fail_off)
+                mc_b2(c, 0x31, 0xC0)
+                mc_b4(c, 0x48, 0x83, 0xC4, 0x20)
+                mc_b2(c, 0x41, 0x5C)
+                mc_b1(c, 0x5B)
+                mc_b1(c, 0x5D)
+                mc_b1(c, 0xC3)
+            } else if osm == 2 or osm == 3 {
+                mc_b2(c, 0x56, 0x57) // preserve RSI, RDI
+                mc_b3(c, 0x48, 0x89, 0xCE) // RSI = size
+                mc_b2(c, 0x31, 0xFF)       // RDI = NULL
+                mc_b1(c, 0xBA); mc_u32(c, 3) // PROT_READ | PROT_WRITE
+                mc_b3(c, 0x49, 0xC7, 0xC2)
+                if osm == 2 { mc_u32(c, 0x22) } else { mc_u32(c, 0x1002) } // MAP_PRIVATE | MAP_ANON
+                mc_b3(c, 0x49, 0xC7, 0xC0); mc_u32(c, 0xFFFFFFFF) // R8 = -1
+                mc_b3(c, 0x45, 0x31, 0xC9) // R9 = 0
+                mc_b1(c, 0xB8)
+                if osm == 2 { mc_u32(c, 9) } else { mc_u32(c, 0x20000C5) } // sys_mmap
+                mc_b2(c, 0x0F, 0x05)
+                // Normalize Linux/macOS `-errno` (`-4095..-1`) to NULL (`0`)
+                mc_b2(c, 0x48, 0x3D); mc_u32(c, 0xFFFFF000) // CMP RAX, -4096
+                jb_mok := mc_jcc8(c, 0x72)
+                mc_b2(c, 0x31, 0xC0) // XOR EAX, EAX
+                mc_patch_jcc8(c, jb_mok, buf_len(c))
+                mc_b2(c, 0x5F, 0x5E)
+                mc_b1(c, 0xC3)
+            } else {
+                // Bare-metal / Unikernel bump allocator starting at physical 4 MB (`0x400000`)
+                mc_b4(c, 0x48, 0x83, 0xC1, 0x3F)
+                mc_b4(c, 0x48, 0x83, 0xE1, 0xC0) // align_up(RCX, 64)
+                cg_mov_rax_data(cg, data_off_bare_heap())
+                mc_b3(c, 0x48, 0x89, 0xC2) // RDX = old_off
+                mc_b3(c, 0x48, 0x01, 0xC8) // RAX = old_off + aligned_size
+                cg_store_rax_data(cg, data_off_bare_heap())
+                mc_b3(c, 0x48, 0x8D, 0x82)
+                mc_u32(c, 0x400000) // LEA RAX, [RDX + 0x400000]
+                mc_b1(c, 0xC3)
+            }
+            mc_patch_rel32(c, jle_zero, buf_len(c))
             mc_b2(c, 0x31, 0xC0)
-            mc_b4(c, 0x48, 0x83, 0xC4, 0x28)
-            mc_b1(c, 0x5B)
-            mc_b1(c, 0x5D)
             mc_b1(c, 0xC3)
-        } else if osm == 2 or osm == 3 {
-            mc_b2(c, 0x56, 0x57) // preserve RSI, RDI
-            mc_b3(c, 0x48, 0x89, 0xCE) // RSI = size
-            mc_b2(c, 0x31, 0xFF)       // RDI = NULL
-            mc_b1(c, 0xBA); mc_u32(c, 3) // PROT_READ | PROT_WRITE
-            mc_b3(c, 0x49, 0xC7, 0xC2)
-            if osm == 2 { mc_u32(c, 0x22) } else { mc_u32(c, 0x1002) } // MAP_PRIVATE | MAP_ANON
-            mc_b3(c, 0x49, 0xC7, 0xC0); mc_u32(c, 0xFFFFFFFF) // R8 = -1
-            mc_b3(c, 0x45, 0x31, 0xC9) // R9 = 0
-            mc_b1(c, 0xB8)
-            if osm == 2 { mc_u32(c, 9) } else { mc_u32(c, 0x20000C5) } // sys_mmap
-            mc_b2(c, 0x0F, 0x05)
-            // Normalize Linux/macOS `-errno` (`-4095..-1`) to NULL (`0`)
-            mc_b2(c, 0x48, 0x3D); mc_u32(c, 0xFFFFF000) // CMP RAX, -4096
-            jb_mok := mc_jcc8(c, 0x72)
-            mc_b2(c, 0x31, 0xC0) // XOR EAX, EAX
-            mc_patch_jcc8(c, jb_mok, buf_len(c))
-            mc_b2(c, 0x5F, 0x5E)
-            mc_b1(c, 0xC3)
-        } else {
-            // Bare-metal / Unikernel bump allocator starting at physical 4 MB (`0x400000`)
-            mc_b4(c, 0x48, 0x83, 0xC1, 0x3F)
-            mc_b4(c, 0x48, 0x83, 0xE1, 0xC0) // align_up(RCX, 64)
-            cg_mov_rax_data(cg, data_off_bare_heap())
-            mc_b3(c, 0x48, 0x89, 0xC2) // RDX = old_off
-            mc_b3(c, 0x48, 0x01, 0xC8) // RAX = old_off + aligned_size
-            cg_store_rax_data(cg, data_off_bare_heap())
-            mc_b3(c, 0x48, 0x8D, 0x82)
-            mc_u32(c, 0x400000) // LEA RAX, [RDX + 0x400000]
-            mc_b1(c, 0xC3)
+            cg_reg_helper(cg, am_hid, s_am, buf_len(c))
         }
-        mc_patch_jcc8(c, jle_zero, buf_len(c))
-        mc_b2(c, 0x31, 0xC0)
-        mc_b1(c, 0xC3)
-        cg_reg_helper(cg, h_alloc_mem(), s_am, buf_len(c))
+        am_pass += 1
     }
 
     // 5. `h_free_mem(RCX = ptr)`
@@ -1437,16 +1611,63 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
         s_fm := buf_len(c)
         mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
         mc_b3(c, 0x48, 0x85, 0xC9)
-        jz_fm := mc_jcc8(c, 0x74)
+        jz_fm := mc_jcc32(c, 0x84)
         if osm <= 1 {
-            mc_b3(c, 0xF6, 0xC1, 0x3F)       // TEST CL, 63 (verify 64B alignment before deref [RCX-8])
-            jnz_bad := mc_jcc8(c, 0x75)
+            mc_b3(c, 0xF6, 0xC1, 0x3F)       // TEST CL, 63 (verify 64B alignment)
+            jnz_bad := mc_jcc32(c, 0x85)
+            // Double-free guard: require `[RCX - 24] == 1`, then immediately clear to 0
+            mc_b4(c, 0x48, 0x83, 0x79, 0xE8); mc_b1(c, 0x01) // CMP QWORD PTR [RCX - 24], 1
+            jne_df := mc_jcc32(c, 0x85)
+            mc_b4(c, 0x48, 0xC7, 0x41, 0xE8); mc_u32(c, 0) // MOV QWORD PTR [RCX - 24], 0
+            // Return slab-sized blocks (`1 <= tag <= 8`) to freelist (cap 64/class)
+            mc_b4(c, 0x4C, 0x8B, 0x41, 0xF0) // MOV R8, [RCX - 16] (class_tag)
+            mc_b3(c, 0x4D, 0x85, 0xC0)
+            jz_osfree := mc_jcc8(c, 0x74)
+            mc_b4(c, 0x49, 0x83, 0xF8, 0x08) // CMP R8, 8
+            ja_osfree := mc_jcc8(c, 0x77)
+            cg_lea_rax_data(cg, data_off_slab_lock())
+            mc_b3(c, 0x49, 0x89, 0xC2)       // MOV R10, RAX
+            mc_b4(c, 0x41, 0x80, 0x7A, 0x04); mc_b1(c, 0x00) // CMP BYTE PTR [R10 + 4], 0 (mt_active)
+            jnz_mt_f := mc_jcc8(c, 0x75)
+            // Single-threaded zero-atomic freelist push!
+            mc_b4(c, 0x4B, 0x83, 0x7C, 0xC2); mc_b2(c, 0x40, 0x40) // CMP QWORD PTR [R10 + R8*8 + 64], 64
+            jae_full_st := mc_jcc8(c, 0x73)
+            mc_b4(c, 0x4B, 0x8B, 0x14, 0xC2) // MOV RDX, [R10 + R8*8]
+            mc_b3(c, 0x48, 0x89, 0x11)       // MOV [RCX], RDX
+            mc_b4(c, 0x4B, 0x89, 0x0C, 0xC2) // MOV [R10 + R8*8], RCX
+            mc_b4(c, 0x4B, 0xFF, 0x44, 0xC2); mc_b1(c, 0x40) // INC QWORD PTR [R10 + R8*8 + 64]
+            mc_b1(c, 0xC3)                   // RET
+            // Cold multithreaded spinlock path
+            mc_patch_jcc8(c, jnz_mt_f, buf_len(c))
+            sp_f := buf_len(c)
+            mc_b1(c, 0xBA); mc_u32(c, 1)
+            mc_b3(c, 0x41, 0x87, 0x12)       // XCHG [R10], EDX
+            mc_b2(c, 0x85, 0xD2)
+            jz_lf := mc_jcc8(c, 0x74)
+            mc_b2(c, 0xF3, 0x90)
+            jmp_spf := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_spf, sp_f)
+            mc_patch_jcc8(c, jz_lf, buf_len(c))
+            mc_b4(c, 0x4B, 0x83, 0x7C, 0xC2); mc_b2(c, 0x40, 0x40) // CMP QWORD PTR [R10 + R8*8 + 64], 64
+            jae_full := mc_jcc8(c, 0x73)
+            mc_b4(c, 0x4B, 0x8B, 0x14, 0xC2) // MOV RDX, [R10 + R8*8]
+            mc_b3(c, 0x48, 0x89, 0x11)       // MOV [RCX], RDX
+            mc_b4(c, 0x4B, 0x89, 0x0C, 0xC2) // MOV [R10 + R8*8], RCX
+            mc_b4(c, 0x4B, 0xFF, 0x44, 0xC2); mc_b1(c, 0x40) // INC QWORD PTR [R10 + R8*8 + 64]
+            mc_b3(c, 0x41, 0xC7, 0x02); mc_u32(c, 0) // unlock
+            mc_b1(c, 0xC3)                   // RET
+            mc_patch_jcc8(c, jae_full, buf_len(c))
+            mc_b3(c, 0x41, 0xC7, 0x02); mc_u32(c, 0) // unlock before OS HeapFree
+            os_free_lbl := buf_len(c)
+            mc_patch_jcc8(c, jz_osfree, os_free_lbl)
+            mc_patch_jcc8(c, ja_osfree, os_free_lbl)
+            mc_patch_jcc8(c, jae_full_st, os_free_lbl)
+
             mc_b4(c, 0x55, 0x48, 0x89, 0xE5)
             mc_b4(c, 0x48, 0x83, 0xEC, 0x20)
             mc_b4(c, 0x4C, 0x8B, 0x41, 0xF8) // R8 = raw heap ptr `[RCX - 8]`
             mc_b3(c, 0x4D, 0x85, 0xC0)
             jz_nr := mc_jcc8(c, 0x74)
-            mc_b4(c, 0x48, 0xC7, 0x41, 0xF8); mc_u32(c, 0) // Zero `[RCX - 8]` to block double-free via aliases
+            mc_b4(c, 0x48, 0xC7, 0x41, 0xF8); mc_u32(c, 0)
             cg_mov_rax_data(cg, data_off_arena_ptr())
             mc_b3(c, 0x48, 0x85, 0xC0)
             jz_nh := mc_jcc8(c, 0x74)
@@ -1457,9 +1678,10 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
             mc_patch_jcc8(c, jz_nr, ep_fm)
             mc_patch_jcc8(c, jz_nh, ep_fm)
             mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
-            mc_patch_jcc8(c, jnz_bad, buf_len(c))
+            mc_patch_rel32(c, jnz_bad, buf_len(c))
+            mc_patch_rel32(c, jne_df, buf_len(c))
         }
-        mc_patch_jcc8(c, jz_fm, buf_len(c))
+        mc_patch_rel32(c, jz_fm, buf_len(c))
         mc_b1(c, 0xC3)
         cg_reg_helper(cg, h_free_mem(), s_fm, buf_len(c))
     }
@@ -1983,14 +2205,21 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
             mc_b4(c, 0x48, 0x83, 0xEC, 0x40)
             mc_b4(c, 0x48, 0x8D, 0x4D, 0xF8)
             cg_call_iat(cg, iat_qpc())
+            // Cache QueryPerformanceFrequency in `.data` (1 syscall per process instead of every clock_ns!)
+            cg_mov_rax_data(cg, data_off_qpf())
+            mc_b3(c, 0x48, 0x85, 0xC0)
+            jnz_qpf := mc_jcc8(c, 0x75)
             mc_b4(c, 0x48, 0x8D, 0x4D, 0xF0)
             cg_call_iat(cg, iat_qpf())
+            mc_b4(c, 0x48, 0x8B, 0x45, 0xF0)
+            cg_store_rax_data(cg, data_off_qpf())
+            mc_patch_jcc8(c, jnz_qpf, buf_len(c))
+            mc_b3(c, 0x49, 0x89, 0xC0)       // MOV R8, RAX (cached freq)
             mc_b4(c, 0x48, 0x8B, 0x45, 0xF8)
             mc_b3(c, 0x48, 0xC7, 0xC1)
             mc_u32(c, 1000000000)
             mc_b3(c, 0x48, 0xF7, 0xE1)
-            mc_b4(c, 0x48, 0x8B, 0x4D, 0xF0)
-            mc_b3(c, 0x48, 0xF7, 0xF1)
+            mc_b3(c, 0x49, 0xF7, 0xF0)       // DIV R8
             mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
             mc_b1(c, 0xC3)
         } else if osm == 2 {
@@ -2148,9 +2377,76 @@ fn emit_io_helpers_used(cg: CodegenCtx) {
         mc_align16(c)
         s_eq := buf_len(c)
         mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA)
-        mc_b3(c, 0x4C, 0x39, 0xCA)
-        jne_len := mc_jcc8(c, 0x75)
-        mc_b2(c, 0x31, 0xC0)
+        mc_b3(c, 0x4C, 0x39, 0xCA)             // CMP RDX, R9 (lenA == lenB)
+        jne_len := mc_jcc32(c, 0x85)
+        mc_b3(c, 0x4C, 0x39, 0xC1)             // CMP RCX, R8 (ptrA == ptrB fastpath!)
+        je_ptr := mc_jcc32(c, 0x84)
+        mc_b3(c, 0x48, 0x85, 0xD2)             // TEST RDX, RDX (len == 0)
+        jz_empty := mc_jcc32(c, 0x84)
+        // AVX2 32-byte/iter + overlapped last-32B fastpath when len >= 32 and g_simd_tier >= 1
+        mc_b4(c, 0x48, 0x83, 0xFA, 0x20)       // CMP RDX, 32
+        jb_lt32 := mc_jcc32(c, 0x82)
+        cg_mov_rax_data(cg, data_off_simd_tier())
+        mc_b3(c, 0x48, 0x85, 0xC0)             // TEST RAX, RAX
+        jz_no_avx := mc_jcc32(c, 0x84)
+        mc_b4(c, 0x4C, 0x8D, 0x5A, 0xE0)       // LEA R11, [RDX - 32]
+        // Single-shot 32..64B dual-YMM fastpath (0 loop overhead!)
+        mc_b4(c, 0x48, 0x83, 0xFA, 0x40)       // CMP RDX, 64
+        ja_gt64 := mc_jcc8(c, 0x77)
+        mc_b3(c, 0xC5, 0xFE, 0x6F); mc_b1(c, 0x01)                           // VMOVDQU YMM0, [RCX]
+        mc_b4(c, 0xC4, 0xC1, 0x7D, 0x74); mc_b1(c, 0x00)                     // VPCMPEQB YMM0, YMM0, [R8]
+        mc_b4(c, 0xC4, 0xA1, 0x7E, 0x6F); mc_b2(c, 0x0C, 0x19)               // VMOVDQU YMM1, [RCX + R11]
+        mc_b4(c, 0xC4, 0x81, 0x75, 0x74); mc_b2(c, 0x0C, 0x18)               // VPCMPEQB YMM1, YMM1, [R8 + R11]
+        mc_b4(c, 0xC5, 0xFD, 0xDB, 0xC1)                                     // VPAND YMM0, YMM0, YMM1
+        mc_b4(c, 0xC5, 0xFD, 0xD7, 0xC0)                                     // VPMOVMSKB EAX, YMM0
+        mc_b3(c, 0xC5, 0xF8, 0x77)                                           // VZEROUPPER
+        mc_b3(c, 0x83, 0xF8, 0xFF)                                           // CMP EAX, -1
+        mc_b3(c, 0x0F, 0x94, 0xC0)                                           // SETE AL
+        mc_b3(c, 0x0F, 0xB6, 0xC0)                                           // MOVZX EAX, AL
+        mc_b1(c, 0xC3)
+        mc_patch_jcc8(c, ja_gt64, buf_len(c))
+        mc_b2(c, 0x31, 0xC0)                   // XOR EAX, EAX
+        mc_b3(c, 0x4C, 0x39, 0xD8)             // CMP RAX, R11
+        jae_tail32 := mc_jcc8(c, 0x73)
+        lp_eq32 := buf_len(c)
+        mc_b4(c, 0xC5, 0xFE, 0x6F, 0x04); mc_b1(c, 0x01)                   // VMOVDQU YMM0, [RCX + RAX]
+        mc_b4(c, 0xC4, 0xC1, 0x7D, 0x74); mc_b2(c, 0x04, 0x00)             // VPCMPEQB YMM0, YMM0, [R8 + RAX]
+        mc_b4(c, 0xC5, 0x7D, 0xD7, 0xD0)                                   // VPMOVMSKB R10D, YMM0
+        mc_b4(c, 0x41, 0x83, 0xFA, 0xFF)                                   // CMP R10D, -1
+        jne_avx := mc_jcc8(c, 0x75)
+        mc_b4(c, 0x48, 0x83, 0xC0, 0x20)                                   // ADD RAX, 32
+        mc_b3(c, 0x4C, 0x39, 0xD8)                                         // CMP RAX, R11
+        jb_eq32 := mc_jcc8(c, 0x72)
+        mc_patch_jcc8(c, jb_eq32, lp_eq32)
+        mc_patch_jcc8(c, jae_tail32, buf_len(c))
+        mc_b4(c, 0xC4, 0xA1, 0x7E, 0x6F); mc_b2(c, 0x04, 0x19)             // VMOVDQU YMM0, [RCX + R11]
+        mc_b4(c, 0xC4, 0x81, 0x7D, 0x74); mc_b2(c, 0x04, 0x18)             // VPCMPEQB YMM0, YMM0, [R8 + R11]
+        mc_b4(c, 0xC5, 0xFD, 0xD7, 0xC0)                                   // VPMOVMSKB EAX, YMM0
+        mc_b3(c, 0xC5, 0xF8, 0x77)                                         // VZEROUPPER
+        mc_b3(c, 0x83, 0xF8, 0xFF)                                         // CMP EAX, -1
+        mc_b3(c, 0x0F, 0x94, 0xC0)                                         // SETE AL
+        mc_b3(c, 0x0F, 0xB6, 0xC0)                                         // MOVZX EAX, AL
+        mc_b1(c, 0xC3)
+        mc_patch_jcc8(c, jne_avx, buf_len(c))
+        mc_b3(c, 0xC5, 0xF8, 0x77)                                         // VZEROUPPER
+        mc_b3(c, 0x31, 0xC0, 0xC3)                                         // XOR EAX, EAX; RET
+        lt32_pos := buf_len(c)
+        mc_patch_rel32(c, jb_lt32, lt32_pos)
+        mc_patch_rel32(c, jz_no_avx, lt32_pos)
+        mc_b2(c, 0x31, 0xC0)                   // XOR EAX, EAX
+        // 8-byte SWAR compare loop + scalar tail
+        mc_b3(c, 0x49, 0x89, 0xD3)             // MOV R11, RDX
+        mc_b4(c, 0x49, 0x83, 0xE3, 0xF8)       // AND R11, -8
+        lp_eq8 := buf_len(c)
+        mc_b3(c, 0x4C, 0x39, 0xD8)             // CMP RAX, R11
+        jae_eq8 := mc_jcc8(c, 0x73)
+        mc_b4(c, 0x4C, 0x8B, 0x14, 0x01)       // MOV R10, [RCX + RAX]
+        mc_b4(c, 0x4D, 0x3B, 0x14, 0x00)       // CMP R10, [R8 + RAX]
+        jne_q := mc_jcc8(c, 0x75)
+        mc_b4(c, 0x48, 0x83, 0xC0, 0x08)       // ADD RAX, 8
+        jmp_eq8 := mc_jcc8(c, 0xEB)
+        mc_patch_jcc8(c, jmp_eq8, lp_eq8)
+        mc_patch_jcc8(c, jae_eq8, buf_len(c))
         lpos := buf_len(c)
         mc_b3(c, 0x48, 0x39, 0xD0)
         jae_t := mc_jcc8(c, 0x73)
@@ -2166,8 +2462,11 @@ fn emit_io_helpers_used(cg: CodegenCtx) {
         mc_b1(c, 0xC3)
         r_false := buf_len(c)
         mc_b3(c, 0x31, 0xC0, 0xC3)
+        mc_patch_rel32(c, je_ptr, r_true)
+        mc_patch_rel32(c, jz_empty, r_true)
         mc_patch_jcc8(c, jae_t, r_true)
-        mc_patch_jcc8(c, jne_len, r_false)
+        mc_patch_rel32(c, jne_len, r_false)
+        mc_patch_jcc8(c, jne_q, r_false)
         mc_patch_jcc8(c, jne_b, r_false)
         cg_reg_helper(cg, h_str_eq(), s_eq, buf_len(c))
     }
@@ -2983,6 +3282,8 @@ fn emit_ai_ffi_pool_helpers(cg: CodegenCtx) {
         if osm <= 1 {
             mc_b4(c, 0x48, 0x83, 0xFB, 0x01)
             jle_nothr := mc_jcc32(c, 0x8E)
+            cg_lea_rax_data(cg, data_off_mt_active())
+            mc_b2(c, 0xC7, 0x00); mc_u32(c, 1) // enable allocator spinlock before spawning worker threads
             mc_b2(c, 0x41, 0xBD); mc_u32(c, 1) // R13 = 1
             lp_mk := buf_len(c)
             mc_b2(c, 0x31, 0xC9); mc_b2(c, 0x31, 0xD2)

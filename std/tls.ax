@@ -174,14 +174,17 @@ fn tls_wrap_client(ctx: TlsCtx, sock: TcpStream, sni_host: str) -> TlsStream ! i
             // SSL_CTRL_SET_TLSEXT_HOSTNAME = 55, TLSEXT_NAMETYPE_host_name = 0
             _ := ffi_call4(ctx.api.fn_ssl_ctrl, ssl, 55, 0, sh)
         }
-        if ctx.api.fn_ssl_set1_host != 0 {
-            // CWE-297: bind peer certificate hostname verification to SNI host; fail closed if rejected
-            hr := ffi_sext32(ffi_call2(ctx.api.fn_ssl_set1_host, ssl, sh))
-            if hr != 1 {
-                ffi_free(sh)
-                _ := ffi_call1(ctx.api.fn_ssl_free, ssl)
-                return err(-114)
-            }
+        if ctx.api.fn_ssl_set1_host == 0 {
+            // Fail closed (CWE-297): never silently skip hostname verification when SNI host is specified!
+            ffi_free(sh)
+            _ := ffi_call1(ctx.api.fn_ssl_free, ssl)
+            return err(-114)
+        }
+        hr := ffi_sext32(ffi_call2(ctx.api.fn_ssl_set1_host, ssl, sh))
+        if hr != 1 {
+            ffi_free(sh)
+            _ := ffi_call1(ctx.api.fn_ssl_free, ssl)
+            return err(-114)
         }
         ffi_free(sh)
     }
@@ -241,6 +244,7 @@ fn tls_write_str(s: TlsStream, msg: str) -> i64 ! i64 {
 fn tls_read(s: TlsStream, max_bytes: i64 = 65536) -> ByteBuf ! i64 {
     if max_bytes <= 0 or max_bytes > 16777216 { return err(-123) }
     raw := ffi_alloc(max_bytes + 8)
+    if raw == 0 { return err(-124) }
     rc := ffi_sext32(ffi_call3(s.api.fn_ssl_read, s.ssl, raw, max_bytes))
     if rc < 0 {
         ffi_free(raw)
@@ -428,8 +432,13 @@ fn https_request(method: str, host: str, port: i64, path: str, headers: str = ""
     if str_len(body) > 0 { buf_push_str(req, f"Content-Length: {str_len(body)}\r\n") }
     buf_push_str(req, "\r\n")
     if str_len(body) > 0 { buf_push_str(req, body) }
-    _ := tls_write_bytes(ts, req) or -1
+    wr := tls_write_bytes(ts, req) or -1
     buf_free(move req)
+    if wr < 0 {
+        tls_close(ts)
+        tls_ctx_free(ctx)
+        return err(-134)
+    }
     max_ssl_cap := 4194304
     mut ssl_cap := 65536
     mut raw_resp := buf_new(ssl_cap)
@@ -457,7 +466,15 @@ fn https_request(method: str, host: str, port: i64, path: str, headers: str = ""
     tls_close(ts)
     tls_ctx_free(ctx)
     full := buf_to_owned_str(move raw_resp)
-    return ok(HttpsResponse(status = 200, body = full))
+    // Parse HTTP/1.1 status code & strip response headers properly
+    mut parsed_st := 200
+    sp1 := str_find_byte(full, 32, 0)
+    if sp1 > 0 and sp1 + 4 <= str_len(full) {
+        parsed_st = parse_i64(str_slice(full, sp1 + 1, sp1 + 4)) or 200
+    }
+    sep := str_find(full, "\r\n\r\n", 0)
+    parsed_body := if sep >= 0 { str_slice(full, sep + 4, str_len(full)) } else { full }
+    return ok(HttpsResponse(status = parsed_st, body = parsed_body))
 }
 
 fn https_get(host: str, path: str = "/") -> HttpsResponse ! i64 {

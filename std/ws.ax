@@ -1,0 +1,155 @@
+// Axon Standard Library — RFC-6455 WebSocket Protocol (`std/ws.ax`)
+// Pure-Axon SHA-1 + Base64 `Sec-WebSocket-Accept` handshake, upgrade HTTP builders,
+// masked client / unmasked server frame encoder, and bounds-hardened frame decoder.
+
+use std::str
+use std::mysql
+
+fn ws_op_cont() -> i64  { return 0 }
+fn ws_op_text() -> i64  { return 1 }
+fn ws_op_bin() -> i64   { return 2 }
+fn ws_op_close() -> i64 { return 8 }
+fn ws_op_ping() -> i64  { return 9 }
+fn ws_op_pong() -> i64  { return 10 }
+
+struct WsFrame {
+    fin: bool
+    opcode: i64
+    masked: bool
+    payload: str
+    next_off: i64
+}
+
+// Computes exact RFC-6455 `Sec-WebSocket-Accept = Base64(SHA1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`.
+fn ws_accept_key(client_key: str) -> str {
+    trimmed := str_trim(client_key)
+    combined := trimmed + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    in_b := buf_new(str_len(combined) + 8)
+    buf_push_str(in_b, combined)
+    sha_b := mysql_sha1(in_b)
+    buf_free(move in_b)
+    raw20 := buf_to_owned_str(move sha_b)
+    return base64_encode(raw20)
+}
+
+fn ws_build_upgrade_request(host: str, path: str, sec_key: str) -> str {
+    mut p := path
+    if str_len(p) == 0 or str_byte(p, 0) != 47 { p = "/" + p }
+    return "GET " + p + " HTTP/1.1\r\n"
+        + "Host: " + host + "\r\n"
+        + "Upgrade: websocket\r\n"
+        + "Connection: Upgrade\r\n"
+        + "Sec-WebSocket-Key: " + sec_key + "\r\n"
+        + "Sec-WebSocket-Version: 13\r\n\r\n"
+}
+
+fn ws_build_upgrade_response(client_key: str) -> str {
+    acc := ws_accept_key(client_key)
+    return "HTTP/1.1 101 Switching Protocols\r\n"
+        + "Upgrade: websocket\r\n"
+        + "Connection: Upgrade\r\n"
+        + "Sec-WebSocket-Accept: " + acc + "\r\n\r\n"
+}
+
+// Encodes an RFC-6455 frame. Pass `use_mask = true` for client->server frames, `false` for server->client.
+fn ws_encode_frame(opcode: i64, payload: str, use_mask: bool = false, mask_u32: i64 = 0x12345678, fin: bool = true) -> ByteBuf {
+    plen := str_len(payload)
+    out := buf_new(plen + 16)
+    b0 := (if fin { 0x80 } else { 0 }) | (opcode & 0x0F)
+    buf_push(out, b0)
+    mbit := if use_mask { 0x80 } else { 0 }
+    if plen < 126 {
+        buf_push(out, mbit | plen)
+    } else if plen <= 65535 {
+        buf_push(out, mbit | 126)
+        buf_push(out, (plen >> 8) & 255)
+        buf_push(out, plen & 255)
+    } else {
+        buf_push(out, mbit | 127)
+        buf_push(out, ushr64(plen, 56) & 255)
+        buf_push(out, ushr64(plen, 48) & 255)
+        buf_push(out, ushr64(plen, 40) & 255)
+        buf_push(out, ushr64(plen, 32) & 255)
+        buf_push(out, ushr64(plen, 24) & 255)
+        buf_push(out, ushr64(plen, 16) & 255)
+        buf_push(out, ushr64(plen, 8) & 255)
+        buf_push(out, plen & 255)
+    }
+    if use_mask {
+        m0 := (mask_u32 >> 24) & 255
+        m1 := (mask_u32 >> 16) & 255
+        m2 := (mask_u32 >> 8) & 255
+        m3 := mask_u32 & 255
+        buf_push(out, m0); buf_push(out, m1); buf_push(out, m2); buf_push(out, m3)
+        mut i := 0
+        while i < plen {
+            mut mk := m0
+            rem := i & 3
+            if rem == 1 { mk = m1 } else if rem == 2 { mk = m2 } else if rem == 3 { mk = m3 }
+            buf_push(out, str_byte(payload, i) ^ mk)
+            i += 1
+        }
+    } else if plen > 0 {
+        buf_push_str(out, payload)
+    }
+    return out
+}
+
+// Decodes an RFC-6455 frame starting at `offset` (caps max frame payload at 16 MB to block OOM attacks).
+fn ws_decode_frame(raw: ByteBuf, offset: i64 = 0, max_payload: i64 = 16777216) -> WsFrame ! i64 {
+    n := buf_len(raw)
+    if offset < 0 or offset + 2 > n { return err(11) } // EAGAIN / incomplete header
+    b0 := buf_get(raw, offset)
+    b1 := buf_get(raw, offset + 1)
+    if (b0 & 0x70) != 0 { return err(400) } // non-zero RSV bits without extension
+    fin := (b0 & 0x80) != 0
+    opcode := b0 & 0x0F
+    masked := (b1 & 0x80) != 0
+    mut plen := b1 & 0x7F
+    mut pos := offset + 2
+
+    // RFC-6455 §5.5: control frames (`opcode >= 8`) MUST NOT be fragmented and MUST have payload <= 125!
+    if opcode >= 8 and (not fin or plen > 125) { return err(400) }
+
+    if plen == 126 {
+        if pos + 2 > n { return err(11) }
+        plen = (buf_get(raw, pos) << 8) | buf_get(raw, pos + 1)
+        if plen < 126 { return err(400) } // non-minimal length encoding
+        pos += 2
+    } else if plen == 127 {
+        if pos + 8 > n { return err(11) }
+        hi0 := buf_get(raw, pos)
+        if (hi0 & 0x80) != 0 { return err(400) } // MSB must be 0 per RFC-6455
+        plen = (hi0 << 56) | (buf_get(raw, pos + 1) << 48) | (buf_get(raw, pos + 2) << 40) | (buf_get(raw, pos + 3) << 32)
+             | (buf_get(raw, pos + 4) << 24) | (buf_get(raw, pos + 5) << 16) | (buf_get(raw, pos + 6) << 8) | buf_get(raw, pos + 7)
+        if plen <= 65535 { return err(400) } // non-minimal length encoding
+        pos += 8
+    }
+    if plen < 0 or plen > max_payload { return err(413) } // payload too large
+
+    mut m0 := 0; mut m1 := 0; mut m2 := 0; mut m3 := 0
+    if masked {
+        if pos + 4 > n { return err(11) }
+        m0 = buf_get(raw, pos); m1 = buf_get(raw, pos + 1); m2 = buf_get(raw, pos + 2); m3 = buf_get(raw, pos + 3)
+        pos += 4
+    }
+    if pos + plen > n { return err(11) }
+
+    if plen == 0 {
+        return ok(WsFrame(fin = fin, opcode = opcode, masked = masked, payload = "", next_off = pos))
+    }
+    if not masked {
+        pay := "" + buf_slice_str(raw, pos, pos + plen)
+        return ok(WsFrame(fin = fin, opcode = opcode, masked = false, payload = pay, next_off = pos + plen))
+    }
+    pb := buf_new(plen + 8)
+    mut i := 0
+    while i < plen {
+        mut mk := m0
+        rem := i & 3
+        if rem == 1 { mk = m1 } else if rem == 2 { mk = m2 } else if rem == 3 { mk = m3 }
+        buf_push(pb, buf_get(raw, pos + i) ^ mk)
+        i += 1
+    }
+    return ok(WsFrame(fin = fin, opcode = opcode, masked = true, payload = buf_to_owned_str(move pb), next_off = pos + plen))
+}

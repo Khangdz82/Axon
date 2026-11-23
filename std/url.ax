@@ -1,0 +1,265 @@
+// Axon Standard Library — RFC-3986 URL Parser, Query Builder & SSRF Guard (`std/url.ax`)
+// Parses `scheme://[userinfo@]host[:port][/path][?query][#fragment]` (including IPv6 `[::1]:8080`),
+// query-string dictionaries (`StrMap`), and fail-closed SSRF private-IP/metadata validation.
+
+use std::str
+use std::ds
+
+struct Url {
+    scheme: str
+    userinfo: str
+    host: str
+    port: i64
+    path: str
+    query: str
+    fragment: str
+}
+
+fn url_default_port(scheme: str) -> i64 {
+    if str_eq(scheme, "http") or str_eq(scheme, "ws") { return 80 }
+    if str_eq(scheme, "https") or str_eq(scheme, "wss") { return 443 }
+    if str_eq(scheme, "ftp") { return 21 }
+    return 0
+}
+
+fn _url_has_ctl(s: str) -> bool {
+    n := str_len(s)
+    mut i := 0
+    while i < n {
+        b := str_byte(s, i)
+        if b <= 32 or b == 127 { return true }
+        i += 1
+    }
+    return false
+}
+
+fn url_parse(raw: str) -> Url ! i64 {
+    s := str_trim(raw)
+    n := str_len(s)
+    if n == 0 or n > 8192 or _url_has_ctl(s) { return err(400) }
+
+    sc_idx := str_find(s, "://", 0)
+    if sc_idx <= 0 { return err(400) }
+    scheme := str_to_lower(str_slice(s, 0, sc_idx))
+
+    mut pos := sc_idx + 3
+    // Split `#fragment`
+    mut end_main := n
+    mut fragment := ""
+    hash_p := str_find_byte(s, 35, pos)
+    if hash_p >= 0 {
+        fragment = str_slice(s, hash_p + 1, n)
+        end_main = hash_p
+    }
+    // Split `?query`
+    mut end_hier := end_main
+    mut query := ""
+    q_p := str_find_byte(s, 63, pos)
+    if q_p >= 0 and q_p < end_main {
+        query = str_slice(s, q_p + 1, end_main)
+        end_hier = q_p
+    }
+    // Split authority vs `/path`
+    mut auth_end := end_hier
+    mut path := "/"
+    sl_p := str_find_byte(s, 47, pos)
+    if sl_p >= 0 and sl_p < end_hier {
+        path = str_slice(s, sl_p, end_hier)
+        auth_end = sl_p
+    }
+    auth := str_slice(s, pos, auth_end)
+    if str_len(auth) == 0 and not str_eq(scheme, "file") { return err(400) }
+
+    mut userinfo := ""
+    mut hostport := auth
+    at_p := str_find_byte(auth, 64, 0)
+    if at_p >= 0 {
+        userinfo = str_slice(auth, 0, at_p)
+        hostport = str_slice(auth, at_p + 1, str_len(auth))
+    }
+
+    mut host := ""
+    mut port := url_default_port(scheme)
+    hp_len := str_len(hostport)
+    if hp_len > 0 and str_byte(hostport, 0) == 91 {
+        // IPv6 literal `[...]`
+        rb := str_find_byte(hostport, 93, 1)
+        if rb < 0 { return err(400) }
+        host = str_to_lower(str_slice(hostport, 0, rb + 1))
+        if rb + 1 < hp_len {
+            if str_byte(hostport, rb + 1) != 58 { return err(400) }
+            pstr := str_slice(hostport, rb + 2, hp_len)
+            pv := parse_i64(pstr) or return err(400)
+            if pv <= 0 or pv > 65535 { return err(400) }
+            port = pv
+        }
+    } else {
+        col := str_find_byte(hostport, 58, 0)
+        if col >= 0 {
+            host = str_to_lower(str_slice(hostport, 0, col))
+            pstr := str_slice(hostport, col + 1, hp_len)
+            pv := parse_i64(pstr) or return err(400)
+            if pv <= 0 or pv > 65535 { return err(400) }
+            port = pv
+        } else {
+            host = str_to_lower(hostport)
+        }
+    }
+    if str_len(host) == 0 and not str_eq(scheme, "file") { return err(400) }
+
+    return ok(Url(
+        scheme = scheme,
+        userinfo = userinfo,
+        host = host,
+        port = port,
+        path = path,
+        query = query,
+        fragment = fragment
+    ))
+}
+
+fn url_build(u: Url) -> str {
+    out := buf_new(256)
+    buf_push_str(out, u.scheme)
+    buf_push_str(out, "://")
+    if str_len(u.userinfo) > 0 {
+        buf_push_str(out, u.userinfo)
+        buf_push(out, 64)
+    }
+    buf_push_str(out, u.host)
+    def_p := url_default_port(u.scheme)
+    if u.port > 0 and u.port != def_p {
+        buf_push(out, 58)
+        buf_push_str(out, str_from_i64(u.port))
+    }
+    if str_len(u.path) > 0 {
+        if str_byte(u.path, 0) != 47 { buf_push(out, 47) }
+        buf_push_str(out, u.path)
+    } else {
+        buf_push(out, 47)
+    }
+    if str_len(u.query) > 0 {
+        buf_push(out, 63)
+        buf_push_str(out, u.query)
+    }
+    if str_len(u.fragment) > 0 {
+        buf_push(out, 35)
+        buf_push_str(out, u.fragment)
+    }
+    return buf_to_owned_str(move out)
+}
+
+fn _url_plus_to_space(s: str) -> str {
+    return str_replace(s, "+", " ")
+}
+
+fn url_query_parse(query_in: str) -> StrMap {
+    mut sm := smap_new(16)
+    mut q := query_in
+    if str_len(q) > 0 and str_byte(q, 0) == 63 {
+        q = str_slice(q, 1, str_len(q))
+    }
+    if str_len(q) == 0 { return sm }
+    ranges := str_split_ranges(q, 38) // '&'
+    cnt := str_split_count(ranges)
+    mut i := 0
+    while i < cnt {
+        pair := str_split_at(q, ranges, i)
+        if str_len(pair) > 0 {
+            eq := str_find_byte(pair, 61, 0)
+            if eq >= 0 {
+                rk := _url_plus_to_space(str_slice(pair, 0, eq))
+                rv := _url_plus_to_space(str_slice(pair, eq + 1, str_len(pair)))
+                dk := url_decode(rk) or rk
+                dv := url_decode(rv) or rv
+                smap_set_str(mut sm, dk, dv)
+            } else {
+                dk := url_decode(_url_plus_to_space(pair)) or pair
+                smap_set_str(mut sm, dk, "")
+            }
+        }
+        i += 1
+    }
+    buf_free(move ranges)
+    return sm
+}
+
+fn url_query_get(query: str, key: str, default_val: str = "") -> str {
+    sm := url_query_parse(query)
+    val := smap_get_str(sm, key, default_val)
+    smap_free(move sm)
+    return val
+}
+
+// Fail-closed SSRF guard: allows only public `http`/`https` hosts, blocking loopback, RFC1918, link-local & cloud metadata IPs.
+fn url_is_public_http(u: Url) -> bool {
+    if not str_eq(u.scheme, "http") and not str_eq(u.scheme, "https") { return false }
+    h := str_to_lower(u.host)
+    hl := str_len(h)
+    if hl == 0 { return false }
+    if str_eq(h, "localhost") or str_ends_with(h, ".localhost") or str_ends_with(h, ".local") or str_ends_with(h, ".internal") {
+        return false
+    }
+    if str_byte(h, 0) == 91 {
+        // Block IPv6 loopback `[::1]`, unspecified `[::]`, unique-local `[fc..]`/`[fd..]`, link-local `[fe80..]`
+        if str_eq(h, "[::1]") or str_eq(h, "[::]") or str_starts_with(h, "[fc") or str_starts_with(h, "[fd") or str_starts_with(h, "[fe80") or str_contains(h, "ffff:127.") or str_contains(h, "ffff:169.254.") or str_contains(h, "ffff:10.") {
+            return false
+        }
+        return true
+    }
+    // Check IPv4 dotted-quad & block octal/hex dotted bypasses (`0177.0.0.1`, `0x7f.0.0.1`)
+    ranges := str_split_ranges(h, 46)
+    cnt := str_split_count(ranges)
+    mut li := 0
+    while li < cnt {
+        lbl := str_split_at(h, ranges, li)
+        ll := str_len(lbl)
+        if ll == 0 { buf_free(move ranges); return false }
+        if str_starts_with(lbl, "0x") or (ll > 1 and str_byte(lbl, 0) == 48 and str_byte(lbl, 1) >= 48 and str_byte(lbl, 1) <= 57) {
+            buf_free(move ranges)
+            return false
+        }
+        li += 1
+    }
+    if cnt == 4 {
+        s0 := str_split_at(h, ranges, 0)
+        s1 := str_split_at(h, ranges, 1)
+        s2 := str_split_at(h, ranges, 2)
+        s3 := str_split_at(h, ranges, 3)
+        o0 := parse_i64(s0) or -1
+        o1 := parse_i64(s1) or -1
+        o2 := parse_i64(s2) or -1
+        o3 := parse_i64(s3) or -1
+        buf_free(move ranges)
+        if o0 >= 0 and o1 >= 0 and o2 >= 0 and o3 >= 0 and o0 <= 255 and o1 <= 255 and o2 <= 255 and o3 <= 255 {
+            if o0 == 0 or o0 == 10 or o0 == 127 { return false }
+            if o0 == 169 and o1 == 254 { return false } // AWS/GCP/Azure IMDS 169.254.169.254!
+            if o0 == 192 and o1 == 168 { return false }
+            if o0 == 172 and o1 >= 16 and o1 <= 31 { return false }
+            if o0 == 100 and o1 >= 64 and o1 <= 127 { return false } // CGNAT
+            if o0 >= 224 { return false } // multicast/reserved
+            return true
+        }
+        // Reject malformed numeric-ending 4-label hosts like `127.0.0.999` (`inet_aton` TLD must never be all digits!)
+        b_last := str_byte(s3, 0)
+        if b_last >= 48 and b_last <= 57 { return false }
+        return true
+    }
+    // Reject numeric TLD (`http://127.1/` 2-part/3-part `inet_aton` shorthand!)
+    last_lbl := str_split_at(h, ranges, cnt - 1)
+    mut last_digits := str_len(last_lbl) > 0
+    mut di := 0
+    while di < str_len(last_lbl) {
+        b := str_byte(last_lbl, di)
+        if b < 48 or b > 57 { last_digits = false; break }
+        di += 1
+    }
+    buf_free(move ranges)
+    if last_digits { return false }
+    return true
+}
+
+fn url_str_is_public_http(raw_url: str) -> bool {
+    u := url_parse(raw_url) or return false
+    return url_is_public_http(u)
+}

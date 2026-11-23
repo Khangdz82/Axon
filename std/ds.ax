@@ -1,0 +1,633 @@
+// Axon Standard Library — Dynamic Auto-Growing Data Structures (`std/ds.ax`)
+// Zero-GC Perceus-owned containers with geometric 2x growth:
+//   - `DynIntVec`: auto-resizing `i64` vector
+//   - `StrVec`:    contiguous-arena string list (`[off, len]` + `ByteBuf`)
+//   - `DynMap`:    auto-rehashing `i64 -> i64` open-addressing hash map
+//   - `StrMap`:    auto-rehashing `str -> str / i64` dictionary
+//   - `IntDeque`:  O(1) ring-buffer double-ended queue
+//   - `BitSet`:    64-bit word-packed bitset with hardware `popcnt64`
+
+use std::str
+use std::crypto
+
+// 1. `DynIntVec`
+struct DynIntVec {
+    buf: IntBuf
+    len: i64
+    cap: i64
+}
+
+fn dvec_new(init_cap: i64 = 16) -> DynIntVec {
+    mut c := init_cap
+    if c < 8 { c = 8 }
+    return DynIntVec(buf = ibuf_new(c), len = 0, cap = c)
+}
+
+fn dvec_free(move v: DynIntVec) {
+    buf_free(move v.buf)
+}
+
+fn dvec_len(v: DynIntVec) -> i64 {
+    return v.len
+}
+
+fn dvec_clear(mut v: DynIntVec) {
+    v.len = 0
+}
+
+fn dvec_push(mut v: DynIntVec, x: i64) {
+    if v.len >= v.cap {
+        new_cap := v.cap * 2
+        nb := ibuf_new(new_cap)
+        mut i := 0
+        while i < v.len {
+            ibuf_push(nb, ibuf_get(v.buf, i))
+            i += 1
+        }
+        buf_free(move v.buf)
+        v.buf = nb
+        v.cap = new_cap
+    }
+    if v.len < ibuf_len(v.buf) {
+        ibuf_set(v.buf, v.len, x)
+    } else {
+        ibuf_push(v.buf, x)
+    }
+    v.len = v.len + 1
+}
+
+fn dvec_pop(mut v: DynIntVec, default_val: i64 = 0) -> i64 {
+    if v.len <= 0 { return default_val }
+    v.len = v.len - 1
+    return ibuf_get(v.buf, v.len)
+}
+
+fn dvec_get(v: DynIntVec, idx: i64, default_val: i64 = 0) -> i64 {
+    if idx < 0 or idx >= v.len { return default_val }
+    return ibuf_get(v.buf, idx)
+}
+
+fn dvec_set(mut v: DynIntVec, idx: i64, x: i64) -> bool {
+    if idx < 0 or idx >= v.len { return false }
+    ibuf_set(v.buf, idx, x)
+    return true
+}
+
+// 2. `StrVec` (contiguous byte arena + `[off, len]` index)
+struct StrVec {
+    arena: ByteBuf
+    spans: IntBuf
+    count: i64
+    arena_cap: i64
+    span_cap: i64
+}
+
+fn svec_new(init_items: i64 = 16, init_bytes: i64 = 256) -> StrVec {
+    mut ic := init_items
+    if ic < 8 { ic = 8 }
+    mut bc := init_bytes
+    if bc < 64 { bc = 64 }
+    return StrVec(
+        arena = buf_new(bc),
+        spans = ibuf_new(ic * 2),
+        count = 0,
+        arena_cap = bc,
+        span_cap = ic
+    )
+}
+
+fn svec_free(move sv: StrVec) {
+    buf_free(move sv.arena)
+    buf_free(move sv.spans)
+}
+
+fn svec_len(sv: StrVec) -> i64 {
+    return sv.count
+}
+
+fn svec_push(mut sv: StrVec, s: str) {
+    sl := str_len(s)
+    cur_b := buf_len(sv.arena)
+    if cur_b + sl > sv.arena_cap {
+        mut nbc := sv.arena_cap * 2
+        while nbc < cur_b + sl + 64 { nbc = nbc * 2 }
+        na := buf_new(nbc)
+        if cur_b > 0 {
+            buf_push_str(na, buf_slice_str(sv.arena, 0, cur_b))
+        }
+        buf_free(move sv.arena)
+        sv.arena = na
+        sv.arena_cap = nbc
+    }
+    if sv.count >= sv.span_cap {
+        nsc := sv.span_cap * 2
+        ns := ibuf_new(nsc * 2)
+        mut i := 0
+        while i < sv.count * 2 {
+            ibuf_push(ns, ibuf_get(sv.spans, i))
+            i += 1
+        }
+        buf_free(move sv.spans)
+        sv.spans = ns
+        sv.span_cap = nsc
+    }
+    off := buf_len(sv.arena)
+    if sl > 0 { buf_push_str(sv.arena, s) }
+    ibuf_push(sv.spans, off)
+    ibuf_push(sv.spans, sl)
+    sv.count = sv.count + 1
+}
+
+fn svec_get(sv: StrVec, idx: i64) -> str {
+    if idx < 0 or idx >= sv.count { return "" }
+    off := ibuf_get(sv.spans, idx * 2)
+    ln := ibuf_get(sv.spans, idx * 2 + 1)
+    if ln <= 0 { return "" }
+    return buf_slice_str(sv.arena, off, off + ln)
+}
+
+fn svec_contains(sv: StrVec, needle: str) -> bool {
+    mut i := 0
+    while i < sv.count {
+        if str_eq(svec_get(sv, i), needle) { return true }
+        i += 1
+    }
+    return false
+}
+
+fn svec_join(sv: StrVec, sep: str) -> str {
+    if sv.count <= 0 { return "" }
+    sepl := str_len(sep)
+    out := buf_new(buf_len(sv.arena) + sv.count * sepl + 16)
+    mut i := 0
+    while i < sv.count {
+        if i > 0 and sepl > 0 { buf_push_str(out, sep) }
+        s := svec_get(sv, i)
+        if str_len(s) > 0 { buf_push_str(out, s) }
+        i += 1
+    }
+    return buf_to_owned_str(move out)
+}
+
+// 3. `DynMap` (auto-rehashing `i64 -> i64` map; slot stride 3: `[state(0=empty,1=live,2=tomb), key, val]`)
+struct DynMap {
+    cells: IntBuf
+    cap: i64
+    len: i64
+    used: i64
+}
+
+@inline
+fn _dmap_hash(k: i64, mask: i64) -> i64 {
+    mut h := k ^ ushr64(k, 30)
+    h = h *% 0xBF58476D1CE4E5B9
+    h = h ^ ushr64(h, 27)
+    return h & mask
+}
+
+fn dmap_new(init_cap: i64 = 32) -> DynMap {
+    mut c := 16
+    while c < init_cap { c = c << 1 }
+    b := ibuf_new(c * 3)
+    mut i := 0
+    while i < c * 3 { ibuf_push(b, 0); i += 1 }
+    return DynMap(cells = b, cap = c, len = 0, used = 0)
+}
+
+fn dmap_free(move m: DynMap) {
+    buf_free(move m.cells)
+}
+
+fn dmap_len(m: DynMap) -> i64 {
+    return m.len
+}
+
+fn _dmap_rehash(mut m: DynMap, new_cap: i64) {
+    nc := ibuf_new(new_cap * 3)
+    mut i := 0
+    while i < new_cap * 3 { ibuf_push(nc, 0); i += 1 }
+    mask := new_cap - 1
+    i = 0
+    while i < m.cap {
+        base := i * 3
+        if ibuf_get(m.cells, base) == 1 {
+            k := ibuf_get(m.cells, base + 1)
+            v := ibuf_get(m.cells, base + 2)
+            mut idx := _dmap_hash(k, mask)
+            while ibuf_get(nc, idx * 3) == 1 {
+                idx = (idx + 1) & mask
+            }
+            ibuf_set(nc, idx * 3, 1)
+            ibuf_set(nc, idx * 3 + 1, k)
+            ibuf_set(nc, idx * 3 + 2, v)
+        }
+        i += 1
+    }
+    buf_free(move m.cells)
+    m.cells = nc
+    m.cap = new_cap
+    m.used = m.len
+}
+
+fn dmap_put(mut m: DynMap, key: i64, val: i64) {
+    if (m.used + 1) * 10 >= m.cap * 7 {
+        _dmap_rehash(mut m, m.cap * 2)
+    }
+    mask := m.cap - 1
+    mut idx := _dmap_hash(key, mask)
+    mut tomb := -1
+    while true {
+        base := idx * 3
+        st := ibuf_get(m.cells, base)
+        if st == 0 {
+            target := if tomb >= 0 { tomb } else { base }
+            ibuf_set(m.cells, target, 1)
+            ibuf_set(m.cells, target + 1, key)
+            ibuf_set(m.cells, target + 2, val)
+            m.len = m.len + 1
+            if tomb < 0 { m.used = m.used + 1 }
+            return
+        }
+        if st == 1 and ibuf_get(m.cells, base + 1) == key {
+            ibuf_set(m.cells, base + 2, val)
+            return
+        }
+        if st == 2 and tomb < 0 { tomb = base }
+        idx = (idx + 1) & mask
+    }
+}
+
+fn dmap_get(m: DynMap, key: i64, default_val: i64 = 0) -> i64 {
+    mask := m.cap - 1
+    mut idx := _dmap_hash(key, mask)
+    mut probes := 0
+    while probes < m.cap {
+        base := idx * 3
+        st := ibuf_get(m.cells, base)
+        if st == 0 { return default_val }
+        if st == 1 and ibuf_get(m.cells, base + 1) == key {
+            return ibuf_get(m.cells, base + 2)
+        }
+        idx = (idx + 1) & mask
+        probes += 1
+    }
+    return default_val
+}
+
+fn dmap_contains(m: DynMap, key: i64) -> bool {
+    mask := m.cap - 1
+    mut idx := _dmap_hash(key, mask)
+    mut probes := 0
+    while probes < m.cap {
+        base := idx * 3
+        st := ibuf_get(m.cells, base)
+        if st == 0 { return false }
+        if st == 1 and ibuf_get(m.cells, base + 1) == key { return true }
+        idx = (idx + 1) & mask
+        probes += 1
+    }
+    return false
+}
+
+fn dmap_remove(mut m: DynMap, key: i64) -> bool {
+    mask := m.cap - 1
+    mut idx := _dmap_hash(key, mask)
+    mut probes := 0
+    while probes < m.cap {
+        base := idx * 3
+        st := ibuf_get(m.cells, base)
+        if st == 0 { return false }
+        if st == 1 and ibuf_get(m.cells, base + 1) == key {
+            ibuf_set(m.cells, base, 2)
+            m.len = m.len - 1
+            return true
+        }
+        idx = (idx + 1) & mask
+        probes += 1
+    }
+    return false
+}
+
+// 4. `StrMap` (auto-rehashing `str -> str / i64` dictionary)
+// Slot stride 6: `[state, hash, k_off, k_len, v_off_or_i64, v_len(-1 = i64)]`
+struct StrMap {
+    pool: ByteBuf
+    slots: IntBuf
+    cap: i64
+    len: i64
+    used: i64
+    pool_cap: i64
+}
+
+fn smap_new(init_cap: i64 = 32) -> StrMap {
+    mut c := 16
+    while c < init_cap { c = c << 1 }
+    sl := ibuf_new(c * 6)
+    mut i := 0
+    while i < c * 6 { ibuf_push(sl, 0); i += 1 }
+    return StrMap(pool = buf_new(512), slots = sl, cap = c, len = 0, used = 0, pool_cap = 512)
+}
+
+fn smap_free(move sm: StrMap) {
+    buf_free(move sm.pool)
+    buf_free(move sm.slots)
+}
+
+fn smap_len(sm: StrMap) -> i64 {
+    return sm.len
+}
+
+fn _smap_pool_push(mut sm: StrMap, s: str) -> i64 {
+    sl := str_len(s)
+    if sl <= 0 { return 0 }
+    cur := buf_len(sm.pool)
+    if cur + sl > sm.pool_cap {
+        mut nc := sm.pool_cap * 2
+        while nc < cur + sl + 64 { nc = nc * 2 }
+        np := buf_new(nc)
+        if cur > 0 { buf_push_str(np, buf_slice_str(sm.pool, 0, cur)) }
+        buf_free(move sm.pool)
+        sm.pool = np
+        sm.pool_cap = nc
+    }
+    off := buf_len(sm.pool)
+    buf_push_str(sm.pool, s)
+    return off
+}
+
+fn _smap_rehash(mut sm: StrMap, new_cap: i64) {
+    ns := ibuf_new(new_cap * 6)
+    mut i := 0
+    while i < new_cap * 6 { ibuf_push(ns, 0); i += 1 }
+    mask := new_cap - 1
+    i = 0
+    while i < sm.cap {
+        b := i * 6
+        if ibuf_get(sm.slots, b) == 1 {
+            h := ibuf_get(sm.slots, b + 1)
+            mut idx := h & mask
+            while ibuf_get(ns, idx * 6) == 1 {
+                idx = (idx + 1) & mask
+            }
+            nb := idx * 6
+            ibuf_set(ns, nb, 1)
+            ibuf_set(ns, nb + 1, h)
+            ibuf_set(ns, nb + 2, ibuf_get(sm.slots, b + 2))
+            ibuf_set(ns, nb + 3, ibuf_get(sm.slots, b + 3))
+            ibuf_set(ns, nb + 4, ibuf_get(sm.slots, b + 4))
+            ibuf_set(ns, nb + 5, ibuf_get(sm.slots, b + 5))
+        }
+        i += 1
+    }
+    buf_free(move sm.slots)
+    sm.slots = ns
+    sm.cap = new_cap
+    sm.used = sm.len
+}
+
+fn _smap_key_eq(sm: StrMap, base: i64, h: i64, key: str) -> bool {
+    if ibuf_get(sm.slots, base + 1) != h { return false }
+    kl := ibuf_get(sm.slots, base + 3)
+    if kl != str_len(key) { return false }
+    if kl == 0 { return true }
+    ko := ibuf_get(sm.slots, base + 2)
+    return str_eq(buf_slice_str(sm.pool, ko, ko + kl), key)
+}
+
+fn smap_set_str(mut sm: StrMap, key: str, val: str) {
+    if (sm.used + 1) * 10 >= sm.cap * 7 {
+        _smap_rehash(mut sm, sm.cap * 2)
+    }
+    h := fnv1a_str(key)
+    mask := sm.cap - 1
+    mut idx := h & mask
+    mut tomb := -1
+    while true {
+        b := idx * 6
+        st := ibuf_get(sm.slots, b)
+        if st == 0 {
+            t := if tomb >= 0 { tomb } else { b }
+            ko := _smap_pool_push(mut sm, key)
+            vo := _smap_pool_push(mut sm, val)
+            ibuf_set(sm.slots, t, 1)
+            ibuf_set(sm.slots, t + 1, h)
+            ibuf_set(sm.slots, t + 2, ko)
+            ibuf_set(sm.slots, t + 3, str_len(key))
+            ibuf_set(sm.slots, t + 4, vo)
+            ibuf_set(sm.slots, t + 5, str_len(val))
+            sm.len = sm.len + 1
+            if tomb < 0 { sm.used = sm.used + 1 }
+            return
+        }
+        if st == 1 and _smap_key_eq(sm, b, h, key) {
+            vo := _smap_pool_push(mut sm, val)
+            ibuf_set(sm.slots, b + 4, vo)
+            ibuf_set(sm.slots, b + 5, str_len(val))
+            return
+        }
+        if st == 2 and tomb < 0 { tomb = b }
+        idx = (idx + 1) & mask
+    }
+}
+
+fn smap_set_i64(mut sm: StrMap, key: str, val: i64) {
+    if (sm.used + 1) * 10 >= sm.cap * 7 {
+        _smap_rehash(mut sm, sm.cap * 2)
+    }
+    h := fnv1a_str(key)
+    mask := sm.cap - 1
+    mut idx := h & mask
+    mut tomb := -1
+    while true {
+        b := idx * 6
+        st := ibuf_get(sm.slots, b)
+        if st == 0 {
+            t := if tomb >= 0 { tomb } else { b }
+            ko := _smap_pool_push(mut sm, key)
+            ibuf_set(sm.slots, t, 1)
+            ibuf_set(sm.slots, t + 1, h)
+            ibuf_set(sm.slots, t + 2, ko)
+            ibuf_set(sm.slots, t + 3, str_len(key))
+            ibuf_set(sm.slots, t + 4, val)
+            ibuf_set(sm.slots, t + 5, -1)
+            sm.len = sm.len + 1
+            if tomb < 0 { sm.used = sm.used + 1 }
+            return
+        }
+        if st == 1 and _smap_key_eq(sm, b, h, key) {
+            ibuf_set(sm.slots, b + 4, val)
+            ibuf_set(sm.slots, b + 5, -1)
+            return
+        }
+        if st == 2 and tomb < 0 { tomb = b }
+        idx = (idx + 1) & mask
+    }
+}
+
+fn _smap_find(sm: StrMap, key: str) -> i64 {
+    h := fnv1a_str(key)
+    mask := sm.cap - 1
+    mut idx := h & mask
+    mut probes := 0
+    while probes < sm.cap {
+        b := idx * 6
+        st := ibuf_get(sm.slots, b)
+        if st == 0 { return -1 }
+        if st == 1 and _smap_key_eq(sm, b, h, key) { return b }
+        idx = (idx + 1) & mask
+        probes += 1
+    }
+    return -1
+}
+
+fn smap_has(sm: StrMap, key: str) -> bool {
+    return _smap_find(sm, key) >= 0
+}
+
+fn smap_contains(sm: StrMap, key: str) -> bool {
+    return _smap_find(sm, key) >= 0
+}
+
+fn smap_get_str(sm: StrMap, key: str, default_val: str = "") -> str {
+    b := _smap_find(sm, key)
+    if b < 0 { return default_val }
+    vl := ibuf_get(sm.slots, b + 5)
+    if vl < 0 { return str_from_i64(ibuf_get(sm.slots, b + 4)) }
+    if vl == 0 { return "" }
+    vo := ibuf_get(sm.slots, b + 4)
+    return buf_slice_str(sm.pool, vo, vo + vl)
+}
+
+fn smap_get_i64(sm: StrMap, key: str, default_val: i64 = 0) -> i64 {
+    b := _smap_find(sm, key)
+    if b < 0 { return default_val }
+    if ibuf_get(sm.slots, b + 5) == -1 { return ibuf_get(sm.slots, b + 4) }
+    return default_val
+}
+
+fn smap_remove(mut sm: StrMap, key: str) -> bool {
+    b := _smap_find(sm, key)
+    if b < 0 { return false }
+    ibuf_set(sm.slots, b, 2)
+    sm.len = sm.len - 1
+    return true
+}
+
+// 5. `IntDeque` (O(1) power-of-2 circular double-ended queue)
+struct IntDeque {
+    buf: IntBuf
+    head: i64
+    len: i64
+    cap: i64
+}
+
+fn deque_new(init_cap: i64 = 32) -> IntDeque {
+    mut c := 16
+    while c < init_cap { c = c << 1 }
+    b := ibuf_new(c)
+    mut i := 0
+    while i < c { ibuf_push(b, 0); i += 1 }
+    return IntDeque(buf = b, head = 0, len = 0, cap = c)
+}
+
+fn deque_free(move dq: IntDeque) {
+    buf_free(move dq.buf)
+}
+
+fn deque_len(dq: IntDeque) -> i64 {
+    return dq.len
+}
+
+fn _deque_grow(mut dq: IntDeque) {
+    nc := dq.cap * 2
+    nb := ibuf_new(nc)
+    mut i := 0
+    while i < nc { ibuf_push(nb, 0); i += 1 }
+    mask := dq.cap - 1
+    i = 0
+    while i < dq.len {
+        ibuf_set(nb, i, ibuf_get(dq.buf, (dq.head + i) & mask))
+        i += 1
+    }
+    buf_free(move dq.buf)
+    dq.buf = nb
+    dq.head = 0
+    dq.cap = nc
+}
+
+fn deque_push_back(mut dq: IntDeque, x: i64) {
+    if dq.len >= dq.cap { _deque_grow(mut dq) }
+    pos := (dq.head + dq.len) & (dq.cap - 1)
+    ibuf_set(dq.buf, pos, x)
+    dq.len = dq.len + 1
+}
+
+fn deque_push_front(mut dq: IntDeque, x: i64) {
+    if dq.len >= dq.cap { _deque_grow(mut dq) }
+    dq.head = (dq.head - 1) & (dq.cap - 1)
+    ibuf_set(dq.buf, dq.head, x)
+    dq.len = dq.len + 1
+}
+
+fn deque_pop_front(mut dq: IntDeque, default_val: i64 = 0) -> i64 {
+    if dq.len <= 0 { return default_val }
+    v := ibuf_get(dq.buf, dq.head)
+    dq.head = (dq.head + 1) & (dq.cap - 1)
+    dq.len = dq.len - 1
+    return v
+}
+
+fn deque_pop_back(mut dq: IntDeque, default_val: i64 = 0) -> i64 {
+    if dq.len <= 0 { return default_val }
+    dq.len = dq.len - 1
+    pos := (dq.head + dq.len) & (dq.cap - 1)
+    return ibuf_get(dq.buf, pos)
+}
+
+// 6. `BitSet` (64-bit word-packed bitset with hardware `popcnt64`)
+struct BitSet {
+    words: IntBuf
+    nbits: i64
+}
+
+fn bitset_new(nbits: i64) -> BitSet {
+    mut nb := nbits
+    if nb < 0 { nb = 0 }
+    nw := (nb + 63) >> 6
+    w := ibuf_new(nw + 2)
+    mut i := 0
+    while i < nw { ibuf_push(w, 0); i += 1 }
+    return BitSet(words = w, nbits = nb)
+}
+
+fn bitset_free(move bs: BitSet) {
+    buf_free(move bs.words)
+}
+
+fn bitset_set(bs: BitSet, bit: i64) {
+    if bit < 0 or bit >= bs.nbits { return }
+    wi := bit >> 6
+    ibuf_set(bs.words, wi, ibuf_get(bs.words, wi) | (1 << (bit & 63)))
+}
+
+fn bitset_clear(bs: BitSet, bit: i64) {
+    if bit < 0 or bit >= bs.nbits { return }
+    wi := bit >> 6
+    ibuf_set(bs.words, wi, ibuf_get(bs.words, wi) & (-1 ^ (1 << (bit & 63))))
+}
+
+fn bitset_test(bs: BitSet, bit: i64) -> bool {
+    if bit < 0 or bit >= bs.nbits { return false }
+    return (ibuf_get(bs.words, bit >> 6) & (1 << (bit & 63))) != 0
+}
+
+fn bitset_count(bs: BitSet) -> i64 {
+    nw := ibuf_len(bs.words)
+    mut tot := 0
+    mut i := 0
+    while i < nw {
+        tot += popcnt64(ibuf_get(bs.words, i))
+        i += 1
+    }
+    return tot
+}

@@ -1,0 +1,450 @@
+// Hostile Zero-Trust Verification Suite (`tests/pass/53_stdlib_v2_and_avx2_hostile.ax`)
+// Covers:
+//   1. Differential AVX2 `8x i64` / `64B VPSADBW` / `32B VPCMPEQB` / `fib` parity vs scalar reference
+//      across non-multiple-of-8/64 trip counts and `INT64_MIN..INT64_MAX` signed boundaries.
+//   2. All 10 new stdlib v2 modules (`algo`, `ds`, `fs`, `fmt`, `bench`, `url`, `jwt`, `ws`, `web`, `graph`)
+//      under adversarial/malformed/security-boundary inputs.
+
+use std::str
+use std::algo
+use std::ds
+use std::fs
+use std::fmt
+use std::bench
+use std::url
+use std::jwt
+use std::ws
+use std::web
+use std::graph
+use std::http
+
+fn fail_at(code: i64) {
+    println(f"FAIL_53 code={code}")
+    assert(false)
+}
+
+fn fib_fast(n: i64) -> i64 {
+    if n <= 1 { return n }
+    return fib_fast(n - 1) + fib_fast(n - 2)
+}
+
+fn fib_ref(n: i64) -> i64 {
+    if n <= 1 { return n }
+    mut a := 0
+    mut b := 1
+    mut i := 2
+    while i <= n {
+        c := a + b
+        a = b
+        b = c
+        i += 1
+    }
+    return b
+}
+
+// Scalar reference (uses `while` loop so it never triggers `nk_for_range` AVX2 vectorizer!)
+fn scalar_divmod_mix(n: i64) -> i64 {
+    mut acc := 0
+    mut i := 0
+    while i < n {
+        x := (i *% -1000000007) -% 25000000
+        q := (x / 8) +% (x % 16) +% (x / 64) +% (x % 64)
+        s := (q >> 3) ^ (q << 2) ^ ushr64(q, 11)
+        acc = acc +% s
+        i += 1
+    }
+    return acc
+}
+
+fn avx2_divmod_mix(n: i64) -> i64 {
+    mut acc := 0
+    for i in 0..n {
+        x := (i *% -1000000007) -% 25000000
+        q := (x / 8) +% (x % 16) +% (x / 64) +% (x % 64)
+        s := (q >> 3) ^ (q << 2) ^ ushr64(q, 11)
+        acc = acc +% s
+    }
+    return acc
+}
+
+fn scalar_splitmix(n: i64, z0: i64) -> i64 {
+    mut z := z0
+    mut s := 0
+    mut i := 0
+    while i < n {
+        z = z +% 0x9E3779B97F4A7C15
+        mut y := z
+        y = (y ^ (y >> 30)) *% 0xBF58476D1CE4E5B9
+        y = (y ^ (y >> 27)) *% 0x94D049BB133111EB
+        y = y ^ (y >> 31)
+        s = s ^ y
+        i += 1
+    }
+    return s ^ z
+}
+
+fn avx2_splitmix(n: i64, z0: i64) -> i64 {
+    mut z := z0
+    mut s := 0
+    for i in 0..n {
+        z = z +% 0x9E3779B97F4A7C15
+        mut y := z
+        y = (y ^ (y >> 30)) *% 0xBF58476D1CE4E5B9
+        y = (y ^ (y >> 27)) *% 0x94D049BB133111EB
+        y = y ^ (y >> 31)
+        s = s ^ y
+    }
+    return s ^ z
+}
+
+fn test_avx2_and_codegen_parity() {
+    // 1. Recursive shrink-wrapped `fib` (-5 .. 20)
+    mut fn_i := -5
+    while fn_i <= 20 {
+        if fib_fast(fn_i) != fib_ref(fn_i) { fail_at(101) }
+        fn_i += 1
+    }
+
+    // 2. Differential AVX2 `8x i64` vs scalar across hostile non-multiple-of-8 lengths
+    counts := ibuf_new(24)
+    ibuf_push(counts, 0); ibuf_push(counts, 1); ibuf_push(counts, 2); ibuf_push(counts, 7)
+    ibuf_push(counts, 8); ibuf_push(counts, 9); ibuf_push(counts, 15); ibuf_push(counts, 16)
+    ibuf_push(counts, 17); ibuf_push(counts, 23); ibuf_push(counts, 24); ibuf_push(counts, 25)
+    ibuf_push(counts, 63); ibuf_push(counts, 64); ibuf_push(counts, 65); ibuf_push(counts, 259)
+    ibuf_push(counts, 1027)
+    mut ci := 0
+    while ci < ibuf_len(counts) {
+        n := ibuf_get(counts, ci)
+        if avx2_divmod_mix(n) != scalar_divmod_mix(n) { fail_at(102) }
+        if avx2_splitmix(n, 0x123456789ABCDEF0) != scalar_splitmix(n, 0x123456789ABCDEF0) { fail_at(103) }
+        if avx2_splitmix(n, -1) != scalar_splitmix(n, -1) { fail_at(104) }
+        ci += 1
+    }
+
+    // Extreme `INT64_MIN` / `INT64_MAX` signed `/` & `%` & `>>` inside AVX2 vectorized loop
+    i64_min := 1 << 63
+    mut ex_avx := 0
+    for k in 0..33 {
+        v := i64_min +% (k - 16)
+        ex_avx = ex_avx +% (v / 2) +% (v % 2) +% (v / 8) +% (v % 8) +% (v >> 1) +% (v >> 62)
+    }
+    mut ex_ref := 0
+    mut kr := 0
+    while kr < 33 {
+        v := i64_min +% (kr - 16)
+        ex_ref = ex_ref +% (v / 2) +% (v % 2) +% (v / 8) +% (v % 8) +% (v >> 1) +% (v >> 62)
+        kr += 1
+    }
+    if ex_avx != ex_ref { fail_at(105) }
+
+    // 3. `VPSADBW` 64-byte/iter `u8` sum (`0x00`, `0xFF`, `0x80`, odd lengths)
+    raw := unsafe { mem_alloc_aligned(1024) }
+    mut bi := 0
+    while bi < 600 {
+        mut bv := (bi * 37) & 255
+        if (bi & 3) == 0 { bv = 255 }
+        else if (bi & 3) == 1 { bv = 128 }
+        else if (bi & 3) == 2 { bv = 0 }
+        unsafe { ptr_write_u8(raw, bi, bv) }
+        bi += 1
+    }
+    ci = 0
+    while ci < ibuf_len(counts) {
+        n := ibuf_get(counts, ci)
+        if n <= 550 {
+            mut ref_s := 0
+            mut j := 0
+            while j < n {
+                v := unsafe { ptr_read_u8(raw, j) }
+                ref_s = ref_s + v // separate var prevents pattern match -> pure scalar reference!
+                j += 1
+            }
+            mut w_lt := 0
+            mut wi := 0
+            while wi < n {
+                w_lt += unsafe { ptr_read_u8(raw, wi) }
+                wi += 1
+            }
+            if w_lt != ref_s or wi != n { fail_at(106) }
+
+            mut f_sum := 0
+            for fi in 0..n {
+                f_sum += unsafe { ptr_read_u8(raw, fi) }
+            }
+            if f_sum != ref_s { fail_at(107) }
+
+            if n > 0 {
+                mut w_lte := 0
+                mut w2 := 0
+                lim := n - 1
+                while w2 <= lim {
+                    w_lte += unsafe { ptr_read_u8(raw, w2) }
+                    w2 += 1
+                }
+                if w_lte != ref_s or w2 != n { fail_at(108) }
+            }
+        }
+        ci += 1
+    }
+    unsafe { mem_free_aligned(raw) }
+    buf_free(move counts)
+
+    // 4. Heap-allocated `str_eq` AVX2 32B/iter + overlapped tail (`ptrA != ptrB`)
+    lens := ibuf_new(16)
+    ibuf_push(lens, 0); ibuf_push(lens, 1); ibuf_push(lens, 7); ibuf_push(lens, 8)
+    ibuf_push(lens, 31); ibuf_push(lens, 32); ibuf_push(lens, 33); ibuf_push(lens, 63)
+    ibuf_push(lens, 64); ibuf_push(lens, 65); ibuf_push(lens, 131)
+    mut li := 0
+    while li < ibuf_len(lens) {
+        ln := ibuf_get(lens, li)
+        ba := buf_new(ln + 16)
+        bb := buf_new(ln + 16)
+        bc := buf_new(ln + 16)
+        mut k := 0
+        while k < ln {
+            ch := 65 + (k % 26)
+            buf_push(ba, ch)
+            buf_push(bb, ch)
+            buf_push(bc, if k == ln - 1 { ch + 1 } else { ch })
+            k += 1
+        }
+        sa := buf_to_owned_str(move ba)
+        sb := buf_to_owned_str(move bb)
+        sc := buf_to_owned_str(move bc)
+        if not str_eq(sa, sb) { fail_at(109) }
+        if ln > 0 and str_eq(sa, sc) { fail_at(110) }
+        li += 1
+    }
+    buf_free(move lens)
+}
+
+fn test_algo_and_ds() {
+    // 1. `std::algo` Radix Sort across `INT64_MIN .. INT64_MAX` + 3x consecutive slab reuse!
+    i64_min := 1 << 63
+    i64_max := i64_min -% 1
+    mut rep := 0
+    while rep < 3 {
+        arr := ibuf_new(160)
+        ibuf_push(arr, i64_max)
+        ibuf_push(arr, 0)
+        ibuf_push(arr, -1)
+        ibuf_push(arr, i64_min)
+        ibuf_push(arr, 42)
+        ibuf_push(arr, -999999999999)
+        ibuf_push(arr, 999999999999)
+        ibuf_push(arr, -1)
+        mut t := 0
+        while t < 100 {
+            ibuf_push(arr, (50 - t) * 1000003)
+            t += 1
+        }
+        sort_i64(arr)
+        if ibuf_get(arr, 0) != i64_min { fail_at(201) }
+        if ibuf_get(arr, ibuf_len(arr) - 1) != i64_max { fail_at(202) }
+        mut si := 1
+        while si < ibuf_len(arr) {
+            if ibuf_get(arr, si - 1) > ibuf_get(arr, si) { fail_at(203) }
+            si += 1
+        }
+        if bsearch_i64(arr, 42) < 0 or bsearch_i64(arr, i64_min) != 0 { fail_at(204) }
+        if upper_bound_i64(arr, -1) - lower_bound_i64(arr, -1) != 2 { fail_at(205) }
+        dn := ibuf_dedup_sorted(arr)
+        if dn != ibuf_len(arr) - 2 { fail_at(206) }
+        buf_free(move arr)
+        rep += 1
+    }
+
+    // Min-Heap & DSU
+    hp := heap_kv_new(16)
+    heap_push_kv_min(hp, 50, 5); heap_push_kv_min(hp, 10, 1); heap_push_kv_min(hp, 30, 3)
+    if heap_kv_len(hp) != 3 { fail_at(207) }
+    (k1, v1) := heap_pop_kv_min(hp)
+    (k2, v2) := heap_pop_kv_min(hp)
+    (k3, v3) := heap_pop_kv_min(hp)
+    if k1 != 10 or v1 != 1 or k2 != 30 or v2 != 3 or k3 != 50 or v3 != 5 { fail_at(208) }
+    buf_free(move hp)
+
+    dsu := dsu_new(6)
+    if dsu_components(dsu) != 6 { fail_at(209) }
+    dsu_union(dsu, 0, 1); dsu_union(dsu, 1, 2); dsu_union(dsu, 3, 4)
+    if not dsu_same(dsu, 0, 2) or dsu_same(dsu, 0, 4) or dsu_components(dsu) != 3 { fail_at(210) }
+    buf_free(move dsu)
+
+    // 2. `std::ds` auto-growing Perceus containers
+    mut dv := dvec_new(8)
+    mut di := 0
+    while di < 260 { dvec_push(mut dv, di * 10 - 500); di += 1 }
+    if dvec_len(dv) != 260 or dvec_get(dv, 0, -1) != -500 or dvec_get(dv, 259, -1) != 2090 { fail_at(211) }
+    if dvec_pop(mut dv, 0) != 2090 or dvec_len(dv) != 259 { fail_at(212) }
+    dvec_free(move dv)
+
+    mut sv := svec_new(4, 32)
+    svec_push(mut sv, "")
+    svec_push(mut sv, "axon")
+    svec_push(mut sv, "perceus_zero_gc_engine_long_entry")
+    if svec_len(sv) != 3 or not str_eq(svec_join(sv, "|"), "|axon|perceus_zero_gc_engine_long_entry") { fail_at(213) }
+    svec_free(move sv)
+
+    mut dm := dmap_new(8)
+    mut mk := 0
+    while mk < 220 { dmap_put(mut dm, mk * -17, mk + 1000); mk += 1 }
+    dmap_put(mut dm, -17, 9999)
+    if not dmap_remove(mut dm, -34) or dmap_contains(dm, -34) { fail_at(214) }
+    if dmap_len(dm) != 219 or dmap_get(dm, -17, -1) != 9999 or dmap_get(dm, 219 * -17, -1) != 1219 { fail_at(215) }
+    dmap_free(move dm)
+
+    mut sm := smap_new(8)
+    mut sk := 0
+    while sk < 150 { smap_set_str(mut sm, f"key_{sk}", f"val_{sk}"); sk += 1 }
+    smap_set_i64(mut sm, "answer", 42)
+    if not smap_remove(mut sm, "key_10") or smap_contains(sm, "key_10") { fail_at(216) }
+    if not str_eq(smap_get_str(sm, "key_149", ""), "val_149") or smap_get_i64(sm, "answer", 0) != 42 { fail_at(217) }
+    smap_free(move sm)
+
+    mut dq := deque_new(4)
+    deque_push_back(mut dq, 10); deque_push_front(mut dq, 5); deque_push_back(mut dq, 20); deque_push_front(mut dq, 1)
+    deque_push_back(mut dq, 30)
+    if deque_pop_front(mut dq, -1) != 1 or deque_pop_back(mut dq, -1) != 30 or deque_pop_front(mut dq, -1) != 5 { fail_at(218) }
+    deque_free(move dq)
+
+    mut bs := bitset_new(200)
+    bitset_set(mut bs, 0); bitset_set(mut bs, 63); bitset_set(mut bs, 64); bitset_set(mut bs, 199)
+    bitset_set(mut bs, -5); bitset_set(mut bs, 9999) // OOB safely ignored!
+    if bitset_count(bs) != 4 or not bitset_test(bs, 64) or bitset_test(bs, 65) { fail_at(219) }
+    bitset_clear(mut bs, 63)
+    if bitset_count(bs) != 3 { fail_at(220) }
+    bitset_free(move bs)
+}
+
+fn test_fs_fmt_bench() {
+    // 1. `std::fmt` & `std::bench`
+    if not str_eq("0x" + fmt_hex(0xDEAD, true, 6), "0x00DEAD") { fail_at(301) }
+    if not str_eq(fmt_bin(13, 8), "00001101") { fail_at(302) }
+    if not str_eq(fmt_commas(-50000000), "-50,000,000") { fail_at(303) }
+    if not str_eq(fmt_f64(-3.14159, 2), "-3.14") { fail_at(304) }
+    if not str_eq(fmt_bytes_human(1536), "1.50 KB") { fail_at(305) }
+
+    samples := ibuf_new(16)
+    ibuf_push(samples, 500); ibuf_push(samples, 100); ibuf_push(samples, 300); ibuf_push(samples, 200); ibuf_push(samples, 400)
+    st := bench_compute_stats(samples)
+    if st.min_ns != 100 or st.p50_ns != 300 or st.max_ns != 500 or st.mean_ns != 300 { fail_at(306) }
+    buf_free(move samples)
+
+    // 2. `std::fs` atomic write + mkdir_all + read_lines + list_dir + cleanup
+    base_tmp := fs_temp_dir() + "/axon_test53_dir/sub"
+    if not fs_mkdir_all(base_tmp) or not fs_is_dir(base_tmp) { fail_at(307) }
+    fpath := base_tmp + "/atomic_data.txt"
+    if not fs_atomic_write(fpath, "alpha\r\nbeta\ngamma") { fail_at(308) }
+    if not fs_append_text(fpath, "\ndelta") { fail_at(309) }
+    lines := fs_read_lines(fpath) or svec_new()
+    if svec_len(lines) != 4 or not str_eq(svec_get(lines, 1), "beta") or not str_eq(svec_get(lines, 3), "delta") { fail_at(310) }
+    svec_free(move lines)
+    entries := fs_list_dir(base_tmp)
+    if not svec_contains(entries, "atomic_data.txt") { fail_at(311) }
+    svec_free(move entries)
+    _ := sys_fs_remove(fpath)
+}
+
+fn test_url_jwt_ws_web_graph() {
+    // 1. `std::url` RFC-3986 + IPv6 + SSRF guard
+    u6 := url_parse("http://[::1]:8080/api/v1?q=hello+world&p=%2F#top") or Url("", "", "", 0, "", "", "")
+    if not str_eq(u6.host, "[::1]") or u6.port != 8080 or not str_eq(u6.fragment, "top") { fail_at(401) }
+    if not str_eq(url_query_get(u6.query, "q"), "hello world") or not str_eq(url_query_get(u6.query, "p"), "/") { fail_at(402) }
+
+    // Hostile SSRF bypass vectors MUST ALL BE BLOCKED!
+    if url_str_is_public_http("http://127.0.0.1/admin") { fail_at(403) }
+    if url_str_is_public_http("http://169.254.169.254/latest/meta-data/") { fail_at(404) }
+    if url_str_is_public_http("http://10.0.0.5:8080/") { fail_at(405) }
+    if url_str_is_public_http("http://192.168.1.1/") { fail_at(406) }
+    if url_str_is_public_http("http://172.16.0.1/") or url_str_is_public_http("http://172.31.255.9/") { fail_at(407) }
+    if url_str_is_public_http("http://100.64.0.1/") { fail_at(408) }
+    if url_str_is_public_http("http://localhost:3000/") or url_str_is_public_http("http://redis.internal/") { fail_at(409) }
+    if url_str_is_public_http("http://[::1]:8080/") or url_str_is_public_http("http://[fe80::1]/") { fail_at(410) }
+    if url_str_is_public_http("http://2130706433/") or url_str_is_public_http("http://0177.0.0.1/") or url_str_is_public_http("http://0x7f.0.0.1/") or url_str_is_public_http("http://127.1/") { fail_at(411) }
+    if url_str_is_public_http("file:///etc/passwd") { fail_at(412) }
+    if not url_str_is_public_http("https://api.example.com:8443/v1/items") { fail_at(413) }
+    if not url_str_is_public_http("http://172.32.0.1/") { fail_at(414) }
+
+    // 2. `std::jwt` HS256 + `"alg":"none"` downgrade rejection + `exp` enforcement + password hash
+    secret := "super_secret_axon_hmac_key_2026"
+    tok := jwt_sign_hs256("{\"sub\":\"u42\",\"exp\":2000000000}", secret) or ""
+    if str_len(tok) == 0 { fail_at(414) }
+    pay := jwt_verify_hs256(tok, secret, 1900000000) or ""
+    if not str_contains(pay, "\"sub\":\"u42\"") { fail_at(415) }
+    bad_exp := jwt_verify_hs256(tok, secret, 2000000001) or "EXPIRED"
+    if not str_eq(bad_exp, "EXPIRED") { fail_at(416) }
+    bad_sec := jwt_verify_hs256(tok, "wrong_secret", 1900000000) or "BAD_SIG"
+    if not str_eq(bad_sec, "BAD_SIG") { fail_at(417) }
+    none_tok := "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhZG1pbiJ9."
+    forged := jwt_verify_hs256(none_tok, secret, 0) or "BLOCKED_NONE"
+    if not str_eq(forged, "BLOCKED_NONE") { fail_at(418) }
+
+    ph := password_hash_sha256("correct-horse-battery", "salt_991", 1000)
+    if not password_verify_sha256("correct-horse-battery", "salt_991", ph, 1000) or password_verify_sha256("wrong", "salt_991", ph, 1000) { fail_at(419) }
+
+    // 3. `std::ws` RFC-6455 official accept key + masked 210B frame + hostile frame rejection
+    if not str_eq(ws_accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") { fail_at(420) }
+    msg200 := str_repeat("AxonWS!", 30) // 210 bytes -> exercises 16-bit extended length (126)!
+    wf := ws_encode_frame(ws_op_text(), msg200, true, 0x37FA213D, true)
+    df := ws_decode_frame(wf) or WsFrame(false, -1, false, "", 0)
+    buf_free(move wf)
+    if not df.fin or df.opcode != ws_op_text() or not str_eq(df.payload, msg200) { fail_at(421) }
+
+    // Hostile RSV != 0 frame & fragmented Ping MUST fail!
+    bad_rsv := buf_new(8); buf_push(bad_rsv, 0x91); buf_push(bad_rsv, 0)
+    rsv_res := ws_decode_frame(bad_rsv) or WsFrame(false, -1, false, "", 0)
+    buf_free(move bad_rsv)
+    if rsv_res.opcode >= 0 { fail_at(422) }
+    bad_ping := buf_new(8); buf_push(bad_ping, 0x09); buf_push(bad_ping, 0) // opcode=9 (Ping), FIN=0!
+    ping_res := ws_decode_frame(bad_ping) or WsFrame(false, -1, false, "", 0)
+    buf_free(move bad_ping)
+    if ping_res.opcode >= 0 { fail_at(423) }
+
+    // 4. `std::web` routing + URL-decoded `:param` + Bearer + static traversal guard
+    if not web_route_match("GET", "/users/42/posts/hello%20axon?x=1", "GET", "/users/:id/posts/:slug") { fail_at(424) }
+    if not str_eq(web_param("/users/42/posts/hello%20axon", "/users/:id/posts/:slug", "id"), "42") { fail_at(425) }
+    if not str_eq(web_param("/users/42/posts/hello%20axon", "/users/:id/posts/:slug", "slug"), "hello axon") { fail_at(426) }
+    raw_req := "GET /me HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer my_jwt_123\r\n\r\n"
+    if not str_eq(web_bearer_token(raw_req), "my_jwt_123") { fail_at(427) }
+    redir := web_redirect(302, "https://example.com/ok\r\nSet-Cookie: evil=1")
+    if str_contains(redir, "Set-Cookie:") or not str_starts_with(redir, "HTTP/1.1 400") { fail_at(428) }
+    trav := web_serve_static(".", "/../../AGENTS.md")
+    if not str_starts_with(trav, "HTTP/1.1 400") and not str_starts_with(trav, "HTTP/1.1 403") { fail_at(429) }
+
+    // 5. `std::graph` BFS + Dijkstra + Kahn topological sort + cycle detection
+    mut g := graph_new(5, 16)
+    graph_add_edge(mut g, 0, 1, 10)
+    graph_add_edge(mut g, 0, 2, 3)
+    graph_add_edge(mut g, 2, 1, 4)
+    graph_add_edge(mut g, 1, 3, 2)
+    graph_add_edge(mut g, 2, 3, 8)
+    graph_add_edge(mut g, 3, 4, 5)
+
+    bfs_d := graph_bfs(g, 0)
+    if ibuf_get(bfs_d, 4) != 3 { fail_at(430) }
+    buf_free(move bfs_d)
+
+    dist := graph_dijkstra(g, 0)
+    if ibuf_get(dist, 1) != 7 or ibuf_get(dist, 3) != 9 or ibuf_get(dist, 4) != 14 { fail_at(431) }
+    buf_free(move dist)
+
+    topo := graph_toposort(g) or ibuf_new(1)
+    if ibuf_len(topo) != 5 or ibuf_get(topo, 0) != 0 or ibuf_get(topo, 4) != 4 { fail_at(433) }
+    buf_free(move topo)
+
+    // Add cycle `4 -> 1` and verify `graph_toposort` returns `err`!
+    graph_add_edge(mut g, 4, 1, 1)
+    cyc := graph_toposort(g) or ibuf_new(1)
+    if ibuf_len(cyc) != 0 { fail_at(434) }
+    buf_free(move cyc)
+    graph_free(move g)
+}
+
+fn main() -> i32 {
+    test_avx2_and_codegen_parity()
+    test_algo_and_ds()
+    test_fs_fmt_bench()
+    test_url_jwt_ws_web_graph()
+    println("PASS: 53_stdlib_v2_and_avx2_hostile")
+    return 0
+}

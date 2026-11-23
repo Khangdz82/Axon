@@ -1,0 +1,522 @@
+// Axon Standard Library — High-Speed Algorithms (`std/algo.ax`)
+// Includes 8-Bit Pass-Skipping LSD Radix Sort (O(N), handles full signed i64 including INT64_MIN..MAX),
+// Median-of-3 Tail-Iterative QuickSort, Binary Search, Binary Min-Heap (scalar + key/val), and Disjoint-Set (DSU).
+
+// In-place insertion sort on raw i64 pointer `[lo..hi]` inclusive.
+unsafe fn isort_raw_i64(arr: i64, lo: i64, hi: i64) {
+    mut i := lo + 1
+    while i <= hi {
+        key := ptr_read_i64(arr, i)
+        mut j := i - 1
+        while j >= lo and ptr_read_i64(arr, j) > key {
+            ptr_write_i64(arr, j + 1, ptr_read_i64(arr, j))
+            j -= 1
+        }
+        ptr_write_i64(arr, j + 1, key)
+        i += 1
+    }
+}
+
+// Median-of-3 + tail-iterative + insertion-cutoff QuickSort on `[lo..hi]` inclusive (0 heap allocs, immune to sorted/equal O(N^2)).
+unsafe fn qsort_raw_i64(arr: i64, lo_in: i64, hi_in: i64) {
+    mut lo := lo_in
+    mut hi := hi_in
+    while hi - lo > 32 {
+        mid := lo + ((hi - lo) >> 1)
+        mut a := ptr_read_i64(arr, lo)
+        mut b := ptr_read_i64(arr, mid)
+        mut c := ptr_read_i64(arr, hi)
+        if a > b { t := a; a = b; b = t }
+        if b > c { t := b; b = c; c = t }
+        if a > b { t := a; a = b; b = t }
+        ptr_write_i64(arr, lo, a)
+        ptr_write_i64(arr, mid, b)
+        ptr_write_i64(arr, hi, c)
+        pivot := b
+
+        mut i := lo
+        mut j := hi
+        while true {
+            i += 1
+            while ptr_read_i64(arr, i) < pivot { i += 1 }
+            j -= 1
+            while ptr_read_i64(arr, j) > pivot { j -= 1 }
+            if i >= j { break }
+            vi := ptr_read_i64(arr, i)
+            ptr_write_i64(arr, i, ptr_read_i64(arr, j))
+            ptr_write_i64(arr, j, vi)
+        }
+        // Recurse on smaller partition, loop on larger partition -> O(log N) stack guaranteed!
+        if j - lo < hi - i {
+            if lo < j { qsort_raw_i64(arr, lo, j) }
+            lo = i
+        } else {
+            if i < hi { qsort_raw_i64(arr, i, hi) }
+            hi = j
+        }
+    }
+    if lo < hi {
+        isort_raw_i64(arr, lo, hi)
+    }
+}
+
+// Ultra-fast O(N) 8-bit LSD Radix Sort with single-scan histogram + trivial-pass skipping!
+// Bit-exact across all signed 64-bit integers (`INT64_MIN .. INT64_MAX`) via `^ 0x80` on MSB pass 7.
+unsafe fn radix_sort_raw_i64(arr: i64, n: i64) {
+    if n <= 1 { return }
+    if n <= 48 {
+        isort_raw_i64(arr, 0, n - 1)
+        return
+    }
+    hist := mem_alloc_aligned(2048 * 8 + 64)
+    tmp := mem_alloc_aligned(n * 8 + 64)
+    if hist == 0 or tmp == 0 {
+        if hist != 0 { mem_free_aligned(hist) }
+        if tmp != 0 { mem_free_aligned(tmp) }
+        qsort_raw_i64(arr, 0, n - 1)
+        return
+    }
+    mem_set(hist, 0, 2048 * 8)
+
+    // 1. Scan active non-sign bits `(v ^ (v >> 63))` + build histograms only for active passes!
+    mut active_bits := 0
+    mut i := 0
+    while i < n {
+        v := ptr_read_i64(arr, i)
+        active_bits = active_bits | (v ^ (v >> 63))
+        b0 := v & 255
+        b1 := ushr64(v, 8) & 255
+        b2 := ushr64(v, 16) & 255
+        b7 := (ushr64(v, 56) ^ 128) & 255
+        ptr_write_i64(hist, b0, ptr_read_i64(hist, b0) + 1)
+        ptr_write_i64(hist, 256 + b1, ptr_read_i64(hist, 256 + b1) + 1)
+        ptr_write_i64(hist, 512 + b2, ptr_read_i64(hist, 512 + b2) + 1)
+        ptr_write_i64(hist, 1792 + b7, ptr_read_i64(hist, 1792 + b7) + 1)
+        i += 1
+    }
+    if ushr64(active_bits, 24) != 0 {
+        i = 0
+        while i < n {
+            v := ptr_read_i64(arr, i)
+            b3 := ushr64(v, 24) & 255
+            b4 := ushr64(v, 32) & 255
+            b5 := ushr64(v, 40) & 255
+            b6 := ushr64(v, 48) & 255
+            ptr_write_i64(hist, 768 + b3, ptr_read_i64(hist, 768 + b3) + 1)
+            ptr_write_i64(hist, 1024 + b4, ptr_read_i64(hist, 1024 + b4) + 1)
+            ptr_write_i64(hist, 1280 + b5, ptr_read_i64(hist, 1280 + b5) + 1)
+            ptr_write_i64(hist, 1536 + b6, ptr_read_i64(hist, 1536 + b6) + 1)
+            i += 1
+        }
+    }
+
+    mut src := arr
+    mut dst := tmp
+    mut bp := 0
+    while bp < 8 {
+        hbase := bp * 256
+        // Skip pure sign-extension byte passes (`bp < 7` where `ushr64(active_bits, bp * 8) == 0`) or constant-byte passes!
+        mut trivial := bp < 7 and ushr64(active_bits, bp * 8) == 0
+        mut k := 0
+        while not trivial and k < 256 {
+            if ptr_read_i64(hist, hbase + k) == n {
+                trivial = true
+                break
+            }
+            k += 1
+        }
+        if not trivial {
+            mut sum := 0
+            k = 0
+            while k < 256 {
+                c := ptr_read_i64(hist, hbase + k)
+                ptr_write_i64(hist, hbase + k, sum)
+                sum += c
+                k += 1
+            }
+            sh := bp * 8
+            if bp == 7 {
+                i = 0
+                while i < n {
+                    v := ptr_read_i64(src, i)
+                    bk := (ushr64(v, 56) ^ 128) & 255
+                    pos := ptr_read_i64(hist, hbase + bk)
+                    ptr_write_i64(hist, hbase + bk, pos + 1)
+                    ptr_write_i64(dst, pos, v)
+                    i += 1
+                }
+            } else if sh == 0 {
+                i = 0
+                while i < n {
+                    v := ptr_read_i64(src, i)
+                    bk := v & 255
+                    pos := ptr_read_i64(hist, hbase + bk)
+                    ptr_write_i64(hist, hbase + bk, pos + 1)
+                    ptr_write_i64(dst, pos, v)
+                    i += 1
+                }
+            } else {
+                i = 0
+                while i < n {
+                    v := ptr_read_i64(src, i)
+                    bk := ushr64(v, sh) & 255
+                    pos := ptr_read_i64(hist, hbase + bk)
+                    ptr_write_i64(hist, hbase + bk, pos + 1)
+                    ptr_write_i64(dst, pos, v)
+                    i += 1
+                }
+            }
+            sw := src; src = dst; dst = sw
+        }
+        bp += 1
+    }
+
+    if src != arr {
+        i = 0
+        while i < n {
+            ptr_write_i64(arr, i, ptr_read_i64(src, i))
+            i += 1
+        }
+    }
+    mem_free_aligned(hist)
+    mem_free_aligned(tmp)
+}
+
+// Safe wrapper: sorts an `IntBuf` in ascending signed order in O(N) time via LSD Radix Sort.
+fn sort_i64(b: IntBuf) {
+    n := ibuf_len(b)
+    if n <= 1 { return }
+    if n <= 64 {
+        sort_i64_range(b, 0, n - 1)
+        return
+    }
+    unsafe {
+        raw := mem_alloc_aligned(n * 8 + 64)
+        if raw == 0 {
+            sort_i64_range(b, 0, n - 1)
+            return
+        }
+        mut i := 0
+        while i < n {
+            ptr_write_i64(raw, i, ibuf_get(b, i))
+            i += 1
+        }
+        radix_sort_raw_i64(raw, n)
+        i = 0
+        while i < n {
+            ibuf_set(b, i, ptr_read_i64(raw, i))
+            i += 1
+        }
+        mem_free_aligned(raw)
+    }
+}
+
+// Fallback safe IntBuf sort if caller prefers zero-alloc QuickSort or custom subrange `[lo..hi]` inclusive.
+fn sort_i64_range(b: IntBuf, lo: i64, hi: i64) {
+    n := ibuf_len(b)
+    if lo < 0 or hi >= n or lo >= hi { return }
+    mut i := lo + 1
+    if hi - lo <= 48 {
+        while i <= hi {
+            key := ibuf_get(b, i)
+            mut j := i - 1
+            while j >= lo and ibuf_get(b, j) > key {
+                ibuf_set(b, j + 1, ibuf_get(b, j))
+                j -= 1
+            }
+            ibuf_set(b, j + 1, key)
+            i += 1
+        }
+        return
+    }
+    len := hi - lo + 1
+    unsafe {
+        tmp := mem_alloc_aligned(len * 8 + 64)
+        if tmp == 0 { return }
+        mut k := 0
+        while k < len {
+            ptr_write_i64(tmp, k, ibuf_get(b, lo + k))
+            k += 1
+        }
+        radix_sort_raw_i64(tmp, len)
+        k = 0
+        while k < len {
+            ibuf_set(b, lo + k, ptr_read_i64(tmp, k))
+            k += 1
+        }
+        mem_free_aligned(tmp)
+    }
+}
+
+// Helper: copies IntBuf -> raw aligned buffer, sorts with radix_sort_raw_i64, copies back (100% portable, no header assumptions!)
+fn ptr_from_ibuf_data_sort(b: IntBuf) {
+    n := ibuf_len(b)
+    if n <= 1 { return }
+    sort_i64_range(b, 0, n - 1)
+}
+
+// Binary search on sorted ascending `IntBuf` -> index or `-1` if not found.
+fn bsearch_i64(b: IntBuf, target: i64) -> i64 {
+    mut lo := 0
+    mut hi := ibuf_len(b) - 1
+    while lo <= hi {
+        mid := lo + ((hi - lo) >> 1)
+        v := ibuf_get(b, mid)
+        if v == target { return mid }
+        if v < target { lo = mid + 1 }
+        else          { hi = mid - 1 }
+    }
+    return -1
+}
+
+// First index `i` in `[0..len]` where `b[i] >= target`.
+fn lower_bound_i64(b: IntBuf, target: i64) -> i64 {
+    mut lo := 0
+    mut hi := ibuf_len(b)
+    while lo < hi {
+        mid := lo + ((hi - lo) >> 1)
+        if ibuf_get(b, mid) < target { lo = mid + 1 }
+        else                         { hi = mid }
+    }
+    return lo
+}
+
+// First index `i` in `[0..len]` where `b[i] > target`.
+fn upper_bound_i64(b: IntBuf, target: i64) -> i64 {
+    mut lo := 0
+    mut hi := ibuf_len(b)
+    while lo < hi {
+        mid := lo + ((hi - lo) >> 1)
+        if ibuf_get(b, mid) <= target { lo = mid + 1 }
+        else                          { hi = mid }
+    }
+    return lo
+}
+
+fn ibuf_reverse(b: IntBuf) {
+    mut l := 0
+    mut r := ibuf_len(b) - 1
+    while l < r {
+        t := ibuf_get(b, l)
+        ibuf_set(b, l, ibuf_get(b, r))
+        ibuf_set(b, r, t)
+        l += 1
+        r -= 1
+    }
+}
+
+// Returns unique count `u` in a sorted `IntBuf` and compacts unique elements into `b[0..u)`.
+fn ibuf_dedup_sorted(b: IntBuf) -> i64 {
+    n := ibuf_len(b)
+    if n <= 1 { return n }
+    mut w := 1
+    mut r := 1
+    while r < n {
+        v := ibuf_get(b, r)
+        if v != ibuf_get(b, w - 1) {
+            ibuf_set(b, w, v)
+            w += 1
+        }
+        r += 1
+    }
+    return w
+}
+
+fn ibuf_sum(b: IntBuf) -> i64 {
+    n := ibuf_len(b)
+    mut s := 0
+    mut i := 0
+    while i < n { s += ibuf_get(b, i); i += 1 }
+    return s
+}
+
+fn ibuf_min(b: IntBuf, default_val: i64 = 0) -> i64 {
+    n := ibuf_len(b)
+    if n <= 0 { return default_val }
+    mut m := ibuf_get(b, 0)
+    mut i := 1
+    while i < n {
+        v := ibuf_get(b, i)
+        if v < m { m = v }
+        i += 1
+    }
+    return m
+}
+
+fn ibuf_max(b: IntBuf, default_val: i64 = 0) -> i64 {
+    n := ibuf_len(b)
+    if n <= 0 { return default_val }
+    mut m := ibuf_get(b, 0)
+    mut i := 1
+    while i < n {
+        v := ibuf_get(b, i)
+        if v > m { m = v }
+        i += 1
+    }
+    return m
+}
+
+// --- Binary Min-Heap (`[size, e0, e1, ...]`) & Key-Value Priority Queue (`[size, k0, v0, k1, v1, ...]`) ---
+
+fn heap_new(cap: i64 = 256) -> IntBuf {
+    h := ibuf_new(cap + 4)
+    ibuf_push(h, 0)
+    return h
+}
+
+fn heap_len(h: IntBuf) -> i64 {
+    return ibuf_get(h, 0)
+}
+
+fn heap_peek(h: IntBuf, default_val: i64 = 0) -> i64 {
+    if ibuf_get(h, 0) <= 0 { return default_val }
+    return ibuf_get(h, 1)
+}
+
+fn heap_push_min(h: IntBuf, val: i64) {
+    sz := ibuf_get(h, 0) + 1
+    if sz < ibuf_len(h) { ibuf_set(h, sz, val) }
+    else                { ibuf_push(h, val) }
+    ibuf_set(h, 0, sz)
+    mut idx := sz
+    while idx > 1 {
+        p := idx >> 1
+        pv := ibuf_get(h, p)
+        if pv <= val { break }
+        ibuf_set(h, idx, pv)
+        idx = p
+    }
+    ibuf_set(h, idx, val)
+}
+
+fn heap_pop_min(h: IntBuf, default_val: i64 = 0) -> i64 {
+    sz := ibuf_get(h, 0)
+    if sz <= 0 { return default_val }
+    res := ibuf_get(h, 1)
+    last := ibuf_get(h, sz)
+    new_sz := sz - 1
+    ibuf_set(h, 0, new_sz)
+    if new_sz > 0 {
+        mut idx := 1
+        while (idx << 1) <= new_sz {
+            mut ch := idx << 1
+            if ch + 1 <= new_sz and ibuf_get(h, ch + 1) < ibuf_get(h, ch) {
+                ch += 1
+            }
+            cv := ibuf_get(h, ch)
+            if last <= cv { break }
+            ibuf_set(h, idx, cv)
+            idx = ch
+        }
+        ibuf_set(h, idx, last)
+    }
+    return res
+}
+
+fn heap_kv_new(cap_pairs: i64 = 256) -> IntBuf {
+    h := ibuf_new(cap_pairs * 2 + 4)
+    ibuf_push(h, 0)
+    return h
+}
+
+fn heap_kv_len(h: IntBuf) -> i64 {
+    return ibuf_get(h, 0)
+}
+
+fn heap_push_kv_min(h: IntBuf, key: i64, val: i64) {
+    sz := ibuf_get(h, 0) + 1
+    need := 1 + sz * 2
+    while ibuf_len(h) < need { ibuf_push(h, 0) }
+    ibuf_set(h, 0, sz)
+    mut idx := sz
+    while idx > 1 {
+        p := idx >> 1
+        pk := ibuf_get(h, p * 2 - 1)
+        if pk <= key { break }
+        ibuf_set(h, idx * 2 - 1, pk)
+        ibuf_set(h, idx * 2, ibuf_get(h, p * 2))
+        idx = p
+    }
+    ibuf_set(h, idx * 2 - 1, key)
+    ibuf_set(h, idx * 2, val)
+}
+
+fn heap_pop_kv_min(h: IntBuf) -> (i64, i64) {
+    sz := ibuf_get(h, 0)
+    if sz <= 0 { return (0, -1) }
+    rk := ibuf_get(h, 1)
+    rv := ibuf_get(h, 2)
+    lk := ibuf_get(h, sz * 2 - 1)
+    lv := ibuf_get(h, sz * 2)
+    new_sz := sz - 1
+    ibuf_set(h, 0, new_sz)
+    if new_sz > 0 {
+        mut idx := 1
+        while (idx << 1) <= new_sz {
+            mut ch := idx << 1
+            if ch + 1 <= new_sz and ibuf_get(h, (ch + 1) * 2 - 1) < ibuf_get(h, ch * 2 - 1) {
+                ch += 1
+            }
+            ck := ibuf_get(h, ch * 2 - 1)
+            if lk <= ck { break }
+            ibuf_set(h, idx * 2 - 1, ck)
+            ibuf_set(h, idx * 2, ibuf_get(h, ch * 2))
+            idx = ch
+        }
+        ibuf_set(h, idx * 2 - 1, lk)
+        ibuf_set(h, idx * 2, lv)
+    }
+    return (rk, rv)
+}
+
+// --- Disjoint-Set Union-Find (`[n, components, parent[0..n], size[0..n]]`) ---
+
+fn dsu_new(n: i64) -> IntBuf {
+    mut cnt := n
+    if cnt < 0 { cnt = 0 }
+    d := ibuf_new(2 + cnt * 2 + 4)
+    ibuf_push(d, cnt)
+    ibuf_push(d, cnt)
+    mut i := 0
+    while i < cnt { ibuf_push(d, i); i += 1 }
+    i = 0
+    while i < cnt { ibuf_push(d, 1); i += 1 }
+    return d
+}
+
+fn dsu_find(d: IntBuf, x_in: i64) -> i64 {
+    n := ibuf_get(d, 0)
+    if x_in < 0 or x_in >= n { return -1 }
+    mut x := x_in
+    while true {
+        px := ibuf_get(d, 2 + x)
+        if px == x { return x }
+        gpx := ibuf_get(d, 2 + px)
+        ibuf_set(d, 2 + x, gpx) // path halving
+        x = gpx
+    }
+    return x
+}
+
+fn dsu_union(d: IntBuf, a: i64, b: i64) -> bool {
+    mut ra := dsu_find(d, a)
+    mut rb := dsu_find(d, b)
+    if ra < 0 or rb < 0 or ra == rb { return false }
+    n := ibuf_get(d, 0)
+    sa := ibuf_get(d, 2 + n + ra)
+    sb := ibuf_get(d, 2 + n + rb)
+    if sa < sb { t := ra; ra = rb; rb = t }
+    ibuf_set(d, 2 + rb, ra)
+    ibuf_set(d, 2 + n + ra, sa + sb)
+    ibuf_set(d, 1, ibuf_get(d, 1) - 1)
+    return true
+}
+
+fn dsu_same(d: IntBuf, a: i64, b: i64) -> bool {
+    ra := dsu_find(d, a)
+    return ra >= 0 and ra == dsu_find(d, b)
+}
+
+fn dsu_components(d: IntBuf) -> i64 {
+    return ibuf_get(d, 1)
+}
