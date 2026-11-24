@@ -490,38 +490,40 @@ fn _js_strip_outer_parens(raw: str) -> str {
     return e
 }
 
-// Evaluates DOM read expressions (`document.getElementById('id').innerText`, `.value`, `.classList.contains('c')`, `#id.innerText`)
+// Evaluates DOM read expressions (`document.getElementById('id').innerText`, `document.querySelector('.cls').value`, `.checked`, `.classList.contains('c')`, `#id.innerText`)
 fn _js_try_dom_read(tree: DomTree, expr: str) -> (bool, bool, str) {
     e := str_trim(expr)
-    mut elem_id := ""
+    mut idx := -1
     mut rest_pos := -1
     if str_starts_with(e, "document.getElementById(") {
-        elem_id = _js_extract_quoted(e, 24)
+        elem_id := _js_extract_quoted(e, 24)
+        idx = dom_find_by_id(tree, elem_id)
         rest_pos = _js_find_matching(e, 23, 40, 41)
     } else if str_starts_with(e, "document.querySelector(") {
-        mut q := _js_extract_quoted(e, 23)
-        if str_len(q) > 1 and str_byte(q, 0) == 35 { q = str_slice(q, 1, str_len(q)) }
-        elem_id = q
+        sel := _js_extract_quoted(e, 23)
+        idx = dom_query_selector(tree, sel)
         rest_pos = _js_find_matching(e, 22, 40, 41)
     } else if str_len(e) > 2 and str_byte(e, 0) == 35 {
         dot := str_find_byte(e, 46, 1)
         if dot > 1 {
-            elem_id = str_slice(e, 1, dot)
+            idx = dom_find_by_id(tree, str_slice(e, 1, dot))
             rest_pos = dot - 1
         }
     }
-    if str_len(elem_id) == 0 or rest_pos < 0 { return (false, false, "") }
+    if rest_pos < 0 { return (false, false, "") }
     tail := str_trim(str_slice(e, rest_pos + 1, str_len(e)))
     if str_eq(tail, ".innerText") or str_eq(tail, ".textContent") or str_eq(tail, ".value") {
-        return (true, true, document_get_inner_text(tree, elem_id))
+        return (true, true, if idx >= 0 { dom_get_text(tree, idx) } else { "" })
+    }
+    if str_eq(tail, ".checked") {
+        is_c := idx >= 0 and str_eq(dom_get_text(tree, idx), "1")
+        return (true, false, if is_c { "1" } else { "0" })
     }
     if str_eq(tail, ".className") {
-        idx := dom_find_by_id(tree, elem_id)
         return (true, true, if idx >= 0 { dom_get_class(tree, idx) } else { "" })
     }
     if str_starts_with(tail, ".classList.contains(") {
         cls := _js_extract_quoted(tail, 20)
-        idx := dom_find_by_id(tree, elem_id)
         has := if idx >= 0 { js_has_class_token(dom_get_class(tree, idx), cls) } else { false }
         return (true, false, if has { "1" } else { "0" })
     }
@@ -637,8 +639,32 @@ fn _js_eval_str_dom(tree: DomTree, store: JsStateStore, raw_expr: str, depth: i6
     }
 
     b0 := str_byte(e, 0)
-    if (b0 == 39 or b0 == 34 or b0 == 96) and n >= 2 and str_byte(e, n - 1) == b0 {
+    if (b0 == 39 or b0 == 34) and n >= 2 and str_byte(e, n - 1) == b0 {
         return _js_unescape_quoted(e, 1, n - 1)
+    }
+    // JS Template Literal interpolation: `Hello ${name}, total=${a + b}`!
+    if b0 == 96 and n >= 2 and str_byte(e, n - 1) == 96 {
+        inner := _js_unescape_quoted(e, 1, n - 1)
+        if str_find(inner, "${", 0) < 0 { return inner }
+        in_len := str_len(inner)
+        out := buf_new(in_len * 2 + 64)
+        mut k := 0
+        while k < in_len {
+            if k + 2 < in_len and str_byte(inner, k) == 36 and str_byte(inner, k + 1) == 123 {
+                rb := _js_find_matching(inner, k + 1, 123, 125)
+                if rb > k + 1 {
+                    sub_val := _js_eval_str_dom(tree, store, str_slice(inner, k + 2, rb), depth + 1)
+                    if buf_len(out) + str_len(sub_val) < 65536 {
+                        buf_push_str(out, sub_val)
+                    }
+                    k = rb + 1
+                    continue
+                }
+            }
+            if buf_len(out) < 65536 { buf_push(out, str_byte(inner, k)) }
+            k += 1
+        }
+        return buf_to_owned_str(move out)
     }
 
     (dom_ok, _, dom_val) := _js_try_dom_read(tree, e)
@@ -754,36 +780,172 @@ fn _js_is_safe_css_val(val: str) -> bool {
     return true
 }
 
-fn _js_apply_member_op(mut tree: DomTree, store: JsStateStore, elem_id: str, act: str, from_pos: i64) -> bool {
+// Native In-Process JS <-> Axon Zero-IPC Command Bridge (16-slot FIFO inside JsStateStore, < 1 us latency!)
+fn js_push_invoke(store: JsStateStore, cmd: str, arg: str) {
+    if str_len(cmd) == 0 { return }
+    head := js_state_get(store, "__ax_q_head", 0)
+    tail := js_state_get(store, "__ax_q_tail", 0)
+    if tail - head >= 16 { return } // Bounded anti-DoS queue
+    slot := tail % 16
+    js_state_set_str(store, f"__ax_qc_{slot}", cmd)
+    js_state_set_str(store, f"__ax_qa_{slot}", arg)
+    js_state_set(store, "__ax_q_tail", tail + 1)
+}
+
+fn js_has_invoke(store: JsStateStore) -> bool {
+    return js_state_get(store, "__ax_q_tail", 0) > js_state_get(store, "__ax_q_head", 0)
+}
+
+fn js_peek_invoke_cmd(store: JsStateStore) -> str {
+    head := js_state_get(store, "__ax_q_head", 0)
+    tail := js_state_get(store, "__ax_q_tail", 0)
+    if tail <= head { return "" }
+    return js_state_get_str(store, f"__ax_qc_{head % 16}")
+}
+
+fn js_peek_invoke_arg(store: JsStateStore) -> str {
+    head := js_state_get(store, "__ax_q_head", 0)
+    tail := js_state_get(store, "__ax_q_tail", 0)
+    if tail <= head { return "" }
+    return js_state_get_str(store, f"__ax_qa_{head % 16}")
+}
+
+fn js_consume_invoke(store: JsStateStore) {
+    head := js_state_get(store, "__ax_q_head", 0)
+    tail := js_state_get(store, "__ax_q_tail", 0)
+    if tail > head { js_state_set(store, "__ax_q_head", head + 1) }
+}
+
+fn document_set_inner_html_idx(mut tree: DomTree, idx: i64, html_frag: str) -> bool {
+    if idx < 0 or idx >= tree.count { return false }
+    safe_h := if str_len(html_frag) > 65536 { str_slice(html_frag, 0, 65536) } else { html_frag }
+    dom_clear_children(mut tree, idx)
+    if str_find_byte(safe_h, 60, 0) >= 0 {
+        _ := dom_parse_fragment_into(mut tree, idx, safe_h)
+    } else {
+        dom_set_text(mut tree, idx, safe_h)
+    }
+    return true
+}
+
+fn document_append_inner_html_idx(mut tree: DomTree, idx: i64, html_frag: str) -> bool {
+    if idx < 0 or idx >= tree.count { return false }
+    safe_h := if str_len(html_frag) > 65536 { str_slice(html_frag, 0, 65536) } else { html_frag }
+    if str_find_byte(safe_h, 60, 0) >= 0 {
+        _ := dom_parse_fragment_into(mut tree, idx, safe_h)
+    } else {
+        cur_t := dom_get_text(tree, idx)
+        combined := cur_t + safe_h
+        dom_set_text(mut tree, idx, if str_len(combined) > 65536 { str_slice(combined, 0, 65536) } else { combined })
+    }
+    return true
+}
+
+fn document_set_inner_html(mut tree: DomTree, id: str, html_frag: str) -> bool {
+    idx := dom_find_by_id(tree, id)
+    return document_set_inner_html_idx(mut tree, idx, html_frag)
+}
+
+fn document_append_inner_html(mut tree: DomTree, id: str, html_frag: str) -> bool {
+    idx := dom_find_by_id(tree, id)
+    return document_append_inner_html_idx(mut tree, idx, html_frag)
+}
+
+fn _js_set_class_idx(mut tree: DomTree, idx: i64, mode: i64, cls_name: str) -> bool {
+    // mode: 0=add, 1=remove, 2=toggle
+    if idx < 0 or idx >= tree.count { return false }
+    clean := str_trim(cls_name)
+    if str_len(clean) == 0 { return true }
+    cur_cls := dom_get_class(tree, idx)
+    has := js_has_class_token(cur_cls, clean)
+    do_add := (mode == 0) or (mode == 2 and not has)
+    if do_add {
+        if has { return true }
+        ct := str_trim(cur_cls)
+        dom_set_class(mut tree, idx, if str_len(ct) == 0 { clean } else { ct + " " + clean })
+        return true
+    }
+    if not has { return true }
+    ln := str_len(cur_cls)
+    out := buf_new(ln + 4)
+    mut i := 0
+    mut any := false
+    while i < ln {
+        while i < ln and _js_is_ws(str_byte(cur_cls, i)) { i += 1 }
+        mut j := i
+        while j < ln and not _js_is_ws(str_byte(cur_cls, j)) { j += 1 }
+        if j > i {
+            tok := str_slice(cur_cls, i, j)
+            if not str_eq(tok, clean) {
+                if any { buf_push(out, 32) }
+                buf_push_str(out, tok)
+                any = true
+            }
+        }
+        i = j + 1
+    }
+    dom_set_class(mut tree, idx, buf_to_owned_str(move out))
+    return true
+}
+
+fn _js_apply_member_op_idx(mut tree: DomTree, store: JsStateStore, idx: i64, act: str, from_pos: i64) -> bool {
+    if idx < 0 or idx >= tree.count { return false }
     mut p := from_pos
     n := str_len(act)
     if p < n and str_byte(act, p) == 41 { p += 1 }
     while p < n and _js_is_ws(str_byte(act, p)) { p += 1 }
     tail := str_slice(act, p, n)
 
-    if str_starts_with(tail, ".innerText") or str_starts_with(tail, ".textContent") or str_starts_with(tail, ".value") or str_starts_with(tail, ".innerHTML") {
+    if str_starts_with(tail, ".remove(") {
+        return dom_remove_node(mut tree, idx)
+    }
+
+    if str_starts_with(tail, ".checked") {
+        eq := str_find_byte(tail, 61, 8)
+        if eq >= 8 {
+            bv := _js_eval_bool(tree, store, str_slice(tail, eq + 1, str_len(tail)), 0)
+            dom_set_text(mut tree, idx, if bv { "1" } else { "0" })
+            return true
+        }
+    }
+
+    if str_starts_with(tail, ".innerHTML") {
+        eq := str_find_byte(tail, 61, 0)
+        if eq >= 0 {
+            val := _js_eval_str_dom(tree, store, str_slice(tail, eq + 1, str_len(tail)), 0)
+            if eq > 0 and str_byte(tail, eq - 1) == 43 {
+                return document_append_inner_html_idx(mut tree, idx, val)
+            }
+            return document_set_inner_html_idx(mut tree, idx, val)
+        }
+    }
+
+    if str_starts_with(tail, ".innerText") or str_starts_with(tail, ".textContent") or str_starts_with(tail, ".value") {
         eq := str_find_byte(tail, 61, 0)
         if eq >= 0 {
             val := _js_eval_str_dom(tree, store, str_slice(tail, eq + 1, str_len(tail)), 0)
             if eq > 0 and str_byte(tail, eq - 1) == 43 { // '+=' append!
-                cur_t := document_get_inner_text(tree, elem_id)
-                return document_set_inner_text(mut tree, elem_id, cur_t + val)
+                cur_t := dom_get_text(tree, idx)
+                comb := cur_t + val
+                dom_set_text(mut tree, idx, if str_len(comb) > 65536 { str_slice(comb, 0, 65536) } else { comb })
+                return true
             }
-            return document_set_inner_text(mut tree, elem_id, val)
+            dom_set_text(mut tree, idx, if str_len(val) > 65536 { str_slice(val, 0, 65536) } else { val })
+            return true
         }
     }
 
     if str_starts_with(tail, ".classList.toggle(") {
         cls := _js_extract_quoted(tail, 18)
-        if str_len(cls) > 0 { return document_toggle_class(mut tree, elem_id, cls) }
+        if str_len(cls) > 0 { return _js_set_class_idx(mut tree, idx, 2, cls) }
     }
     if str_starts_with(tail, ".classList.add(") {
         cls := _js_extract_quoted(tail, 15)
-        if str_len(cls) > 0 { return document_add_class(mut tree, elem_id, cls) }
+        if str_len(cls) > 0 { return _js_set_class_idx(mut tree, idx, 0, cls) }
     }
     if str_starts_with(tail, ".classList.remove(") {
         cls := _js_extract_quoted(tail, 18)
-        if str_len(cls) > 0 { return document_remove_class(mut tree, elem_id, cls) }
+        if str_len(cls) > 0 { return _js_set_class_idx(mut tree, idx, 1, cls) }
     }
 
     if str_starts_with(tail, ".style.") {
@@ -807,8 +969,7 @@ fn _js_apply_member_op(mut tree: DomTree, store: JsStateStore, elem_id: str, act
             else if str_eq(raw_prop, "minHeight") { css_p = "min-height" }
             else if str_eq(raw_prop, "maxHeight") { css_p = "max-height" }
             else if str_eq(raw_prop, "backdropFilter") { css_p = "backdrop-filter" }
-            idx := dom_find_by_id(tree, elem_id)
-            if idx >= 0 and str_len(css_p) > 0 and _js_is_safe_css_val(css_p) {
+            if str_len(css_p) > 0 and _js_is_safe_css_val(css_p) {
                 cur_s := dom_get_style(tree, idx)
                 // Deduplicate existing property so repeated `.style.color = ...` never grows unboundedly!
                 cn := str_len(cur_s)
@@ -844,6 +1005,11 @@ fn _js_apply_member_op(mut tree: DomTree, store: JsStateStore, elem_id: str, act
         }
     }
     return false
+}
+
+fn _js_apply_member_op(mut tree: DomTree, store: JsStateStore, elem_id: str, act: str, from_pos: i64) -> bool {
+    idx := dom_find_by_id(tree, elem_id)
+    return _js_apply_member_op_idx(mut tree, store, idx, act, from_pos)
 }
 
 fn _js_bind_call_args(tree: DomTree, store: JsStateStore, param_list: str, arg_list: str) {
@@ -894,17 +1060,72 @@ fn _js_eval_single_fuel(mut tree: DomTree, store: JsStateStore, action_str: str,
     if n == 0 { return false }
     if str_starts_with(act, "//") or str_eq(act, "return") or str_starts_with(act, "return ") { return false }
 
-    // --- Standard JS: document.getElementById('id')... or document.querySelector('#id')... ---
-    if str_starts_with(act, "document.getElementById(") or str_starts_with(act, "document.querySelector(") {
-        is_gi := str_starts_with(act, "document.getElementById(")
-        base_p := if is_gi { 24 } else { 23 }
-        mut elem_id := _js_extract_quoted(act, base_p)
-        if str_len(elem_id) > 1 and str_byte(elem_id, 0) == 35 {
-            elem_id = str_slice(elem_id, 1, str_len(elem_id))
-        }
+    // --- Native In-Process Axon Bridge: `axon.invoke('cmd', payload)` / `window.axonInvoke('cmd', payload)` ---
+    if str_starts_with(act, "axon.invoke(") or str_starts_with(act, "window.axonInvoke(") {
+        base_p := if str_starts_with(act, "axon.invoke(") { 12 } else { 18 }
         rp := _js_find_matching(act, base_p - 1, 40, 41)
-        if str_len(elem_id) > 0 and rp > base_p {
+        if rp > base_p {
+            inner := str_slice(act, base_p, rp)
+            comma := _js_find_top_op(inner, ",", false)
+            if comma > 0 {
+                cmd_s := _js_eval_str_dom(tree, store, str_slice(inner, 0, comma), 0)
+                arg_s := _js_eval_str_dom(tree, store, str_slice(inner, comma + 1, str_len(inner)), 0)
+                js_push_invoke(store, cmd_s, arg_s)
+            } else {
+                cmd_s := _js_eval_str_dom(tree, store, inner, 0)
+                js_push_invoke(store, cmd_s, "")
+            }
+            return true
+        }
+    }
+
+    // --- Standard JS: document.getElementById('id')... or document.querySelector('sel')... ---
+    if str_starts_with(act, "document.getElementById(") {
+        elem_id := _js_extract_quoted(act, 24)
+        rp := _js_find_matching(act, 23, 40, 41)
+        if str_len(elem_id) > 0 and rp > 24 {
             return _js_apply_member_op(mut tree, store, elem_id, act, rp)
+        }
+    }
+    if str_starts_with(act, "document.querySelectorAll(") {
+        sel := _js_extract_quoted(act, 26)
+        rp := _js_find_matching(act, 25, 40, 41)
+        if str_len(sel) > 0 and rp > 26 {
+            rest := str_trim(str_slice(act, rp + 1, n))
+            if str_starts_with(rest, ".forEach(") {
+                fp := _js_find_matching(rest, 8, 40, 41)
+                if fp > 9 {
+                    cb := str_trim(str_slice(rest, 9, fp))
+                    arr_pos := str_find(cb, "=>", 0)
+                    if arr_pos > 0 {
+                        param_n := str_trim(str_slice(cb, 0, arr_pos))
+                        body_c := str_trim(str_slice(cb, arr_pos + 2, str_len(cb)))
+                        // Support `el => el.classList.add(...)` / `el => el.style.color = ...` / `el => el.remove()`
+                        if str_starts_with(body_c, param_n + ".") {
+                            dot_p := str_len(param_n)
+                            matches := dom_query_selector_all(tree, sel)
+                            mn := ibuf_len(matches)
+                            mut mi := 0
+                            mut any_m := false
+                            while mi < mn and ibuf_get(fuel, 0) > 0 {
+                                ibuf_set(fuel, 0, ibuf_get(fuel, 0) - 1)
+                                if _js_apply_member_op_idx(mut tree, store, ibuf_get(matches, mi), body_c, dot_p) { any_m = true }
+                                mi += 1
+                            }
+                            buf_free(move matches)
+                            return any_m
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if str_starts_with(act, "document.querySelector(") {
+        sel := _js_extract_quoted(act, 23)
+        rp := _js_find_matching(act, 22, 40, 41)
+        if str_len(sel) > 0 and rp > 23 {
+            idx := dom_query_selector(tree, sel)
+            return _js_apply_member_op_idx(mut tree, store, idx, act, rp)
         }
     }
 
@@ -1129,6 +1350,35 @@ fn _js_eval_stmts_fuel(mut tree: DomTree, store: JsStateStore, action_str: str, 
             if cur > p { p = cur; continue }
         }
 
+        // --- `for (init; cond; step) { ... }` (bounded by shared global anti-DoS `fuel`!) ---
+        if p + 3 <= n and str_eq(str_slice(action_str, p, p + 3), "for") and (p + 3 == n or not _js_is_ident_char(str_byte(action_str, p + 3))) {
+            lp := _js_skip_ws_comments(action_str, p + 3)
+            rp := _js_find_matching(action_str, lp, 40, 41)
+            lb := if rp > lp { _js_skip_ws_comments(action_str, rp + 1) } else { -1 }
+            rb := if lb > rp { _js_find_matching(action_str, lb, 123, 125) } else { -1 }
+            if rb > lb {
+                hdr := str_slice(action_str, lp + 1, rp)
+                s1 := str_find_byte(hdr, 59, 0)
+                s2 := if s1 >= 0 { str_find_byte(hdr, 59, s1 + 1) } else { -1 }
+                if s1 >= 0 and s2 > s1 {
+                    init_s := str_trim(str_slice(hdr, 0, s1))
+                    cond_s := str_trim(str_slice(hdr, s1 + 1, s2))
+                    step_s := str_trim(str_slice(hdr, s2 + 1, str_len(hdr)))
+                    body_s := str_slice(action_str, lb + 1, rb)
+                    if str_len(init_s) > 0 { _ := _js_eval_single_fuel(mut tree, store, init_s, depth + 1, fuel) }
+                    while ibuf_get(fuel, 0) > 0 and (str_len(cond_s) == 0 or _js_eval_bool(tree, store, cond_s, 0)) {
+                        ibuf_set(fuel, 0, ibuf_get(fuel, 0) - 1)
+                        if _js_eval_stmts_fuel(mut tree, store, body_s, depth + 1, fuel) { any_mut = true }
+                        if str_len(step_s) > 0 and ibuf_get(fuel, 0) > 0 {
+                            _ := _js_eval_single_fuel(mut tree, store, step_s, depth + 1, fuel)
+                        }
+                    }
+                    p = rb + 1
+                    continue
+                }
+            }
+        }
+
         // --- `while (cond) { ... }` (bounded by shared global `fuel` against nested `while(1)` DoS!) ---
         if p + 5 <= n and str_eq(str_slice(action_str, p, p + 5), "while") and (p + 5 == n or not _js_is_ident_char(str_byte(action_str, p + 5))) {
             lp := _js_skip_ws_comments(action_str, p + 5)
@@ -1198,8 +1448,9 @@ fn js_eval_script(mut tree: DomTree, mut store: JsStateStore, script: str) -> bo
                 continue
             }
         }
-        // Top-level `if` or `while` block or single statement
+        // Top-level `if`, `for`, or `while` block or single statement
         if (p + 2 <= n and str_eq(str_slice(script, p, p + 2), "if") and (p + 2 == n or not _js_is_ident_char(str_byte(script, p + 2)))) or
+           (p + 3 <= n and str_eq(str_slice(script, p, p + 3), "for") and (p + 3 == n or not _js_is_ident_char(str_byte(script, p + 3)))) or
            (p + 5 <= n and str_eq(str_slice(script, p, p + 5), "while") and (p + 5 == n or not _js_is_ident_char(str_byte(script, p + 5)))) {
             lp := str_find_byte(script, 40, p)
             rp := if lp > p { _js_find_matching(script, lp, 40, 41) } else { -1 }
