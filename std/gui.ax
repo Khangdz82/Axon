@@ -55,18 +55,117 @@ struct GuiWindow {
 }
 
 fn _gui_utf8_to_utf16(k32: i64, s: str) -> i64 {
-    n := str_len(s)
+    mut n := str_len(s)
+    if n > 65536 { n = 65536 } // Security (CWE-400): cap UTF-16 conversion buffer
     f_mb := if k32 != 0 { ffi_sym(k32, "MultiByteToWideChar") } else { 0 }
     if f_mb == 0 or n == 0 { return ffi_wstr(s) }
     cs := ffi_cstr(s)
+    if cs == 0 { return 0 }
     wcap := n + 4
     wbuf := ffi_alloc(wcap * 2 + 8)
+    if wbuf == 0 { ffi_free(cs); return 0 }
     _ := ffi_call6(f_mb, 65001, 0, cs, n, wbuf, wcap)
     ffi_free(cs)
     return wbuf
 }
 
-fn _gui_win32_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64 {
+// Synthesizes a crisp 32x32 32-bit BGRA native Axon desktop icon (rounded gradient badge + geometric 'A')
+// Eliminates blank/globe window & taskbar icons with zero external .ico asset dependencies!
+fn gui_build_axon_icon_bgra(accent_rgb: i64 = 0xD97757) -> ByteBuf {
+    sz := 32
+    b := buf_new(sz * sz * 4 + 16)
+    r0 := (accent_rgb >> 16) & 255
+    g0 := (accent_rgb >> 8) & 255
+    b0 := accent_rgb & 255
+    mut y := 0
+    while y < sz {
+        mut x := 0
+        while x < sz {
+            // Rounded square SDF (radius 7px inside 1..30)
+            mut dx := 0
+            mut dy := 0
+            if x < 8 { dx = 8 - x } else if x > 23 { dx = x - 23 }
+            if y < 8 { dy = 8 - y } else if y > 23 { dy = y - 23 }
+            d2 := dx * dx + dy * dy
+            if x < 1 or x > 30 or y < 1 or y > 30 or d2 > 49 {
+                buf_push_u32(b, 0)
+            } else {
+                // Subtle diagonal gradient across badge
+                grad := (x + y) - 32
+                mut cr := r0 - grad / 2
+                mut cg := g0 - grad / 2
+                mut cb := b0 - grad / 3
+                if cr < 20 { cr = 20 } else if cr > 255 { cr = 255 }
+                if cg < 20 { cg = 20 } else if cg > 255 { cg = 255 }
+                if cb < 20 { cb = 20 } else if cb > 255 { cb = 255 }
+
+                // Crisp geometric white 'A' glyph centered in 32x32 badge
+                mut is_a := false
+                if y >= 7 and y <= 24 {
+                    half_span := ((y - 7) * 7) / 17
+                    left_edge := 15 - half_span
+                    right_edge := 16 + half_span
+                    if (x >= left_edge and x <= left_edge + 2) or (x >= right_edge - 2 and x <= right_edge) {
+                        is_a = true
+                    }
+                    if y >= 17 and y <= 19 and x >= left_edge and x <= right_edge {
+                        is_a = true
+                    }
+                }
+                mut a := 255
+                if d2 > 38 { a = 190 } // soft anti-aliased corner pixel
+                if is_a {
+                    buf_push_u32(b, (255 << 24) | (255 << 16) | (255 << 8) | 255)
+                } else {
+                    buf_push_u32(b, (a << 24) | (cr << 16) | (cg << 8) | cb)
+                }
+            }
+            x += 1
+        }
+        y += 1
+    }
+    return b
+}
+
+fn _gui_create_hicon_bgra(u32: i64, g32: i64, w: i64, h: i64, pixels: ByteBuf) -> i64 {
+    if u32 == 0 or g32 == 0 or w <= 0 or h <= 0 or w > 256 or h > 256 { return 0 }
+    if buf_len(pixels) < w * h * 4 { return 0 }
+    f_cbm  := ffi_sym(g32, "CreateBitmap")
+    f_delo := ffi_sym(g32, "DeleteObject")
+    f_ci   := ffi_sym(u32, "CreateIconIndirect")
+    if f_cbm == 0 or f_ci == 0 { return 0 }
+    px_ptr := unsafe { (pixels as i64) + 16 }
+    hbm_col := ffi_call5(f_cbm, w, h, 1, 32, px_ptr)
+    mask_bytes := ((w + 15) / 16) * 2 * h + 16
+    mask_buf := ffi_alloc(mask_bytes)
+    if mask_buf == 0 {
+        if hbm_col != 0 and f_delo != 0 { _ := ffi_call1(f_delo, hbm_col) }
+        return 0
+    }
+    hbm_msk := ffi_call5(f_cbm, w, h, 1, 1, mask_buf)
+    ffi_free(mask_buf)
+    mut hico := 0
+    if hbm_col != 0 and hbm_msk != 0 {
+        ii := ffi_alloc(32)
+        if ii != 0 {
+            ffi_write_u32_le(ii, 0, 1)
+            ffi_write_i64(ii, 2, hbm_msk)
+            ffi_write_i64(ii, 3, hbm_col)
+            hico = ffi_call1(f_ci, ii)
+            ffi_free(ii)
+        }
+    }
+    if hbm_col != 0 and f_delo != 0 { _ := ffi_call1(f_delo, hbm_col) }
+    if hbm_msk != 0 and f_delo != 0 { _ := ffi_call1(f_delo, hbm_msk) }
+    return hico
+}
+
+fn _gui_win32_open(title: str, w_in: i64, h_in: i64, visible: bool) -> GuiWindow ! i64 {
+    // Security (CWE-190 / CWE-400): clamp native window geometry to safe display bounds
+    mut w := w_in
+    mut h := h_in
+    if w < 64 { w = 64 } else if w > 16384 { w = 16384 }
+    if h < 64 { h = 64 } else if h > 16384 { h = 16384 }
     u32 := ffi_open_one("user32.dll")
     g32 := ffi_open_one("gdi32.dll")
     k32 := ffi_open_one("kernel32.dll")
@@ -149,13 +248,25 @@ fn _gui_win32_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64
         return err(-602)
     }
 
+    mut hico_def := 0
     if visible {
-        // Enable native Windows 10/11 Dark Title Bar (DWMWA_USE_IMMERSIVE_DARK_MODE = 20 and legacy 19)
+        // Attach native Axon rounded app icon immediately (0 blank/globe icon in titlebar & taskbar!)
+        ico_px := gui_build_axon_icon_bgra(0xD97757)
+        hico_def = _gui_create_hicon_bgra(u32, g32, 32, 32, ico_px)
+        buf_free(move ico_px)
+        if hico_def != 0 {
+            f_sm := ffi_sym(u32, "SendMessageW")
+            if f_sm != 0 {
+                _ := ffi_call4(f_sm, hwnd, 0x0080, 0, hico_def) // ICON_SMALL
+                _ := ffi_call4(f_sm, hwnd, 0x0080, 1, hico_def) // ICON_BIG
+            }
+        }
+        // Enable native Windows 10/11 Dark Title Bar + Win11 Rounded Corners
         dwm := ffi_open_one("dwmapi.dll")
         if dwm != 0 {
             f_dwm := ffi_sym(dwm, "DwmSetWindowAttribute")
             if f_dwm != 0 {
-                dark_box := ffi_alloc(16)
+                dark_box := ffi_alloc(20)
                 ffi_write_u32_le(dark_box, 0, 1)
                 _ := ffi_call4(f_dwm, hwnd, 20, dark_box, 4)
                 _ := ffi_call4(f_dwm, hwnd, 19, dark_box, 4)
@@ -163,6 +274,8 @@ fn _gui_win32_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64
                 _ := ffi_call4(f_dwm, hwnd, 35, dark_box + 4, 4)
                 ffi_write_u32_le(dark_box, 8, 0x001F1B1B) // DWMWA_BORDER_COLOR = #1B1B1F
                 _ := ffi_call4(f_dwm, hwnd, 34, dark_box + 8, 4)
+                ffi_write_u32_le(dark_box, 12, 2) // DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND
+                _ := ffi_call4(f_dwm, hwnd, 33, dark_box + 12, 4)
                 ffi_free(dark_box)
             }
         }
@@ -192,7 +305,7 @@ fn _gui_win32_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64
         f_lcur = f_cur,
         f_scur = ffi_sym(u32, "SetCursor"),
         hbr_bg = hbr,
-        hico = 0,
+        hico = hico_def,
         dpi_changed = false
     ))
 }
@@ -1009,8 +1122,12 @@ fn _p2d_fill_rrect(mut d2d: PhotonD2D, x: i64, y: i64, w: i64, h: i64, rad: i64,
 
 // Hardware anti-aliased hollow rounded border/ring (100% pointer ABI via D2D GeometryGroup ALTERNATE fill!)
 // Renders crisp rounded borders on glass/transparent surfaces & focus rings with zero XMM float ABI issues!
-fn _p2d_stroke_rrect(mut d2d: PhotonD2D, x: i64, y: i64, w: i64, h: i64, rad: i64, bw: i64, argb: i64) {
-    if w <= 0 or h <= 0 or bw <= 0 or ((argb >> 24) & 0xFF) == 0 { return }
+fn _p2d_stroke_rrect(mut d2d: PhotonD2D, x: i64, y: i64, w: i64, h: i64, rad_in: i64, bw_in: i64, argb: i64) {
+    if w <= 0 or h <= 0 or bw_in <= 0 or ((argb >> 24) & 0xFF) == 0 { return }
+    mut bw := bw_in
+    if bw > 256 { bw = 256 }
+    mut rad := rad_in
+    if rad < 0 { rad = 0 } else if rad > 8192 { rad = 8192 }
     if rad <= 0 {
         _p2d_fill_rrect(mut d2d, x, y, w, bw, 0, argb)
         _p2d_fill_rrect(mut d2d, x, y + h - bw, w, bw, 0, argb)
@@ -1128,13 +1245,102 @@ fn _p2d_cache_neg_img(mut d2d: PhotonD2D, ph: i64) {
     }
 }
 
-// Native PNG/JPG/BMP/GIF/ICO image loader via Windows `gdiplus.dll` -> cached `ID2D1Bitmap` (with negative-caching!)
+// Hardware Direct2D Vector Icon Renderer for `<svg data-icon="...">` / `<icon>` (zero external icon fonts!)
+fn _p2d_fill_circle(mut d2d: PhotonD2D, cx: i64, cy: i64, r: i64, argb: i64) {
+    if r <= 0 or ((argb >> 24) & 0xFF) == 0 { return }
+    _p2d_set_aa(mut d2d, 0)
+    _p2d_write_color_lut(d2d.color_lut, d2d.scratch, argb)
+    _ := ffi_call2(_p2d_vt(d2d.brush, 8), d2d.brush, d2d.scratch)
+    el := d2d.scratch + 32
+    ffi_write_u32_le(el, 0, _p2d_f32(cx))
+    ffi_write_u32_le(el, 4, _p2d_f32(cy))
+    ffi_write_u32_le(el, 8, _p2d_f32(r))
+    ffi_write_u32_le(el, 12, _p2d_f32(r))
+    _ := ffi_call3(_p2d_vt(d2d.rt, 21), d2d.rt, el, d2d.brush) // FillEllipse
+}
+
+fn _p2d_draw_svg_icon(mut d2d: PhotonD2D, name: str, x: i64, y: i64, w: i64, h: i64, col: i64) {
+    sz := if w < h { w } else { h }
+    if sz < 6 { return }
+    ox := x + (w - sz) / 2
+    oy := y + (h - sz) / 2
+    cx := ox + sz / 2
+    cy := oy + sz / 2
+    r := sz / 2 - 2
+    if str_eq(name, "moon") or str_eq(name, "theme") {
+        _p2d_stroke_rrect(mut d2d, ox + 2, oy + 2, sz - 4, sz - 4, r, 2, col)
+        _p2d_fill_rrect(mut d2d, cx, oy + 3, sz / 2 - 3, sz - 6, r - 1, col)
+    } else if str_eq(name, "gear") or str_eq(name, "settings") {
+        _p2d_stroke_rrect(mut d2d, ox + 3, oy + 3, sz - 6, sz - 6, r - 1, 2, col)
+        _p2d_fill_circle(mut d2d, cx, cy, 2, col)
+        _p2d_fill_rrect(mut d2d, cx - 1, oy + 1, 2, 3, 1, col)
+        _p2d_fill_rrect(mut d2d, cx - 1, oy + sz - 4, 2, 3, 1, col)
+        _p2d_fill_rrect(mut d2d, ox + 1, cy - 1, 3, 2, 1, col)
+        _p2d_fill_rrect(mut d2d, ox + sz - 4, cy - 1, 3, 2, 1, col)
+    } else if str_eq(name, "plus") {
+        _p2d_fill_rrect(mut d2d, cx - 1, oy + 3, 2, sz - 6, 1, col)
+        _p2d_fill_rrect(mut d2d, ox + 3, cy - 1, sz - 6, 2, 1, col)
+    } else if str_eq(name, "sidebar") or str_eq(name, "collapse") {
+        _p2d_stroke_rrect(mut d2d, ox + 2, oy + 3, sz - 4, sz - 6, 3, 1, col)
+        _p2d_fill_rrect(mut d2d, ox + 6, oy + 3, 1, sz - 6, 0, col)
+    } else if str_eq(name, "search") {
+        _p2d_stroke_rrect(mut d2d, ox + 2, oy + 2, sz - 6, sz - 6, (sz - 6) / 2, 2, col)
+        _p2d_fill_rrect(mut d2d, ox + sz - 5, oy + sz - 5, 4, 2, 1, col)
+    } else if str_eq(name, "artifacts") or str_eq(name, "layers") {
+        _p2d_stroke_rrect(mut d2d, ox + 2, oy + 2, sz - 5, sz - 5, 3, 1, col)
+        _p2d_fill_rrect(mut d2d, ox + 5, oy + 6, sz - 10, 2, 1, col)
+        _p2d_fill_rrect(mut d2d, ox + 5, oy + 10, sz - 12, 2, 1, col)
+    } else if str_eq(name, "send") {
+        _p2d_fill_rrect(mut d2d, ox + 3, cy - 1, sz - 6, 2, 1, col)
+        _p2d_fill_rrect(mut d2d, ox + sz - 5, oy + 4, 2, cy - oy - 3, 1, col)
+        _p2d_fill_rrect(mut d2d, ox + 3, cy - 3, 2, 6, 1, col)
+    } else if str_eq(name, "shield") {
+        _p2d_stroke_rrect(mut d2d, ox + 3, oy + 2, sz - 6, sz - 4, 4, 2, col)
+        _p2d_fill_rrect(mut d2d, cx - 1, oy + 6, 2, sz - 12, 1, col)
+    } else if str_eq(name, "terminal") {
+        _p2d_stroke_rrect(mut d2d, ox + 2, oy + 3, sz - 4, sz - 6, 3, 1, col)
+        _p2d_fill_rrect(mut d2d, ox + 5, cy - 2, 3, 2, 0, col)
+        _p2d_fill_rrect(mut d2d, ox + 9, cy + 1, 4, 2, 0, col)
+    } else {
+        // Default crisp rounded emblem dot
+        _p2d_fill_circle(mut d2d, cx, cy, if r > 2 { r - 1 } else { 2 }, col)
+    }
+}
+
+fn _p2d_is_reserved_img_path(path: str) -> bool {
+    if str_contains(path, "..") { return true }
+    n := str_len(path)
+    mut st := 0
+    while st < n {
+        mut en := st
+        while en < n and str_byte(path, en) != 47 and str_byte(path, en) != 92 { en += 1 }
+        seg := str_slice(path, st, en)
+        dot := str_find_byte(seg, 46, 0)
+        base := if dot >= 0 { str_slice(seg, 0, dot) } else { seg }
+        bl := str_len(base)
+        if bl == 3 and (str_eq_ignore_case(base, "CON") or str_eq_ignore_case(base, "PRN") or str_eq_ignore_case(base, "AUX") or str_eq_ignore_case(base, "NUL")) {
+            return true
+        }
+        if bl == 4 {
+            b3 := str_byte(base, 3)
+            if b3 >= 49 and b3 <= 57 {
+                pr := str_slice(base, 0, 3)
+                if str_eq_ignore_case(pr, "COM") or str_eq_ignore_case(pr, "LPT") { return true }
+            }
+        }
+        st = en + 1
+    }
+    return false
+}
+
+// Native PNG/JPG/BMP/GIF/ICO image loader via Windows `gdiplus.dll` -> cached `ID2D1Bitmap` (with negative-caching & CWE-22 guard!)
 fn _p2d_find_or_load_img(mut d2d: PhotonD2D, path: str) -> i64 {
     pn := str_len(path)
     if pn == 0 or pn > 512 or not d2d.ok { return -1 }
     if pn >= 2 and (str_byte(path, 0) == 92 or str_byte(path, 0) == 47) and (str_byte(path, 1) == 92 or str_byte(path, 1) == 47) {
         return -1
     }
+    if _p2d_is_reserved_img_path(path) { return -1 }
     mut pi := 0
     while pi < pn {
         if str_byte(path, pi) == 0 { return -1 }
@@ -1433,11 +1639,17 @@ fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: 
             }
         }
 
-        // 3. Native `<img src="...">` Bitmap Rendering OR DirectWrite ClearType Typography (with gradient text + ellipsis!)
+        // 3. Native `<img src="...">` Bitmap, `<svg data-icon="...">` Vector Icon, OR DirectWrite ClearType Typography
         if str_eq_ignore_case(tag, "img") {
             src_path := dom_get_text(app.tree, node_idx)
             if str_len(src_path) > 0 {
                 _p2d_draw_img_rrect(mut d2d, src_path, ix, iy, iw, ih, irad, style.object_fit)
+            }
+        } else if str_eq_ignore_case(tag, "svg") or str_eq_ignore_case(tag, "icon") {
+            iname := dom_get_text(app.tree, node_idx)
+            if str_len(iname) > 0 {
+                ic_col := _p2d_apply_opacity(style.text_color, style.opacity)
+                _p2d_draw_svg_icon(mut d2d, iname, ix, iy, iw, ih, ic_col)
             }
         } else {
             mut raw_txt := dom_get_text(app.tree, node_idx)
@@ -1458,12 +1670,14 @@ fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: 
             mut fz := style.font_size
             if fz <= 0 { fz = 14 }
             is_single := style.white_space == 1 or str_eq_ignore_case(tag, "button") or str_eq_ignore_case(tag, "input")
-            pad_x := if style.padding_x > 0 { style.padding_x / 2 } else { (if style.display == 2 { 2 } else { 0 }) }
-            pad_y := if is_single { 0 } else { style.padding_y / 2 }
-            tx := bx + pad_x
-            ty := by + pad_y
-            mut tw := bw - pad_x * 2
-            mut th := bh - pad_y * 2
+            pad_l := if style.padding_x > 0 { style_pad_left(style) } else { (if style.display == 2 { 2 } else { 0 }) }
+            pad_r := if style.padding_x > 0 { style_pad_right(style) } else { (if style.display == 2 { 2 } else { 0 }) }
+            pad_t := if is_single { 0 } else { style_pad_top(style) }
+            pad_b := if is_single { 0 } else { style_pad_bottom(style) }
+            tx := bx + pad_l
+            ty := by + pad_t
+            mut tw := bw - pad_l - pad_r
+            mut th := bh - pad_t - pad_b
             if tw < 4 { tw = bw }
             if th < 4 { th = bh }
 
@@ -1527,14 +1741,49 @@ fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: 
         }
     }
 
-    // 4. Recursively paint children with hardware Direct2D clip & per-container scroll offset
+    // 4. Recursively paint children with hardware Direct2D clip (rounded PushLayer when rad > 0!) & per-container scroll offset
     fc := dom_first_child(app.tree, node_idx)
     if fc >= 0 {
         do_clip := (style.overflow_hidden or style.overflow_scroll) and bw > 0 and bh > 0
+        mut used_rclip := false
+        mut rclip_layer := 0
+        mut rclip_geom := 0
         if do_clip {
-            crc := d2d.scratch + 64
-            _p2d_write_rect(crc, bx, by, bw, bh)
-            _ := ffi_call3(_p2d_vt(d2d.rt, 45), d2d.rt, crc, 1) // PushAxisAlignedClip
+            mut c_rad := style.border_radius
+            if c_rad > bw / 2 { c_rad = bw / 2 }
+            if c_rad > bh / 2 { c_rad = bh / 2 }
+            if c_rad > 2 {
+                rr_c := d2d.scratch + 32
+                _p2d_write_rrect(rr_c, bx, by, bw, bh, c_rad)
+                hr_g := ffi_call3(_p2d_vt(d2d.d2d_fac, 6), d2d.d2d_fac, rr_c, d2d.out_box) & 0xFFFFFFFF
+                if hr_g == 0 {
+                    rclip_geom = ffi_read_i64(d2d.out_box, 0)
+                    hr_l := ffi_call3(_p2d_vt(d2d.rt, 13), d2d.rt, 0, d2d.out_box) & 0xFFFFFFFF // CreateLayer
+                    if hr_l == 0 {
+                        rclip_layer = ffi_read_i64(d2d.out_box, 0)
+                        lp := d2d.scratch + 400 // D2D1_LAYER_PARAMETERS (72 bytes, fits inside 512B scratch!)
+                        _p2d_write_rect(lp, bx, by, bw, bh)
+                        ffi_write_i64(lp, 2, rclip_geom)       // offset 16: geometricMask
+                        ffi_write_u32_le(lp, 24, 0)            // maskAntialiasMode = PER_PRIMITIVE
+                        ffi_write_u32_le(lp, 28, 0x3F800000)   // maskTransform._11 = 1.0f
+                        ffi_write_u32_le(lp, 32, 0)
+                        ffi_write_u32_le(lp, 36, 0)
+                        ffi_write_u32_le(lp, 40, 0x3F800000)   // maskTransform._22 = 1.0f
+                        ffi_write_u32_le(lp, 44, 0)
+                        ffi_write_u32_le(lp, 48, 0)
+                        ffi_write_u32_le(lp, 52, 0x3F800000)   // opacity = 1.0f
+                        ffi_write_i64(lp, 7, 0)                // offset 56: opacityBrush = NULL
+                        ffi_write_u32_le(lp, 64, 1)            // D2D1_LAYER_OPTIONS_INITIALIZE_FOR_CLEARTYPE
+                        _ := ffi_call3(_p2d_vt(d2d.rt, 40), d2d.rt, lp, rclip_layer) // PushLayer
+                        used_rclip = true
+                    }
+                }
+            }
+            if not used_rclip {
+                crc := d2d.scratch + 64
+                _p2d_write_rect(crc, bx, by, bw, bh)
+                _ := ffi_call3(_p2d_vt(d2d.rt, 45), d2d.rt, crc, 1) // PushAxisAlignedClip
+            }
         }
         own_scroll := if style.overflow_scroll { ui_node_scroll_y(app, node_idx) } else { 0 }
         child_scroll := if style.position == 2 { own_scroll } else { acc_scroll_y + own_scroll }
@@ -1558,7 +1807,13 @@ fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: 
             }
         }
         if do_clip {
-            _ := ffi_call1(_p2d_vt(d2d.rt, 46), d2d.rt) // PopAxisAlignedClip
+            if used_rclip {
+                _ := ffi_call1(_p2d_vt(d2d.rt, 41), d2d.rt) // PopLayer
+            } else {
+                _ := ffi_call1(_p2d_vt(d2d.rt, 46), d2d.rt) // PopAxisAlignedClip
+            }
+            if rclip_layer != 0 { _ := ffi_call1(_p2d_vt(rclip_layer, 2), rclip_layer) }
+            if rclip_geom != 0 { _ := ffi_call1(_p2d_vt(rclip_geom, 2), rclip_geom) }
         }
     }
 }

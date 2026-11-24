@@ -15,7 +15,9 @@ fn document_get_element_by_id(tree: DomTree, id: str) -> i64 {
 fn document_set_inner_text(mut tree: DomTree, id: str, text: str) -> bool {
     idx := dom_find_by_id(tree, id)
     if idx < 0 { return false }
-    dom_set_text(mut tree, idx, text)
+    // Security (CWE-400): cap DOM text mutation size to 65536 bytes
+    safe_t := if str_len(text) > 65536 { str_slice(text, 0, 65536) } else { text }
+    dom_set_text(mut tree, idx, safe_t)
     return true
 }
 
@@ -745,6 +747,10 @@ fn _js_is_safe_css_val(val: str) -> bool {
         if b == 59 or b == 123 or b == 125 or b == 10 or b == 13 or b == 0 { return false }
         i += 1
     }
+    low := str_to_lower(val)
+    if str_contains(low, "javascript:") or str_contains(low, "vbscript:") or str_contains(low, "expression(") or str_contains(low, "url(") {
+        return false
+    }
     return true
 }
 
@@ -755,10 +761,14 @@ fn _js_apply_member_op(mut tree: DomTree, store: JsStateStore, elem_id: str, act
     while p < n and _js_is_ws(str_byte(act, p)) { p += 1 }
     tail := str_slice(act, p, n)
 
-    if str_starts_with(tail, ".innerText") or str_starts_with(tail, ".textContent") or str_starts_with(tail, ".value") {
+    if str_starts_with(tail, ".innerText") or str_starts_with(tail, ".textContent") or str_starts_with(tail, ".value") or str_starts_with(tail, ".innerHTML") {
         eq := str_find_byte(tail, 61, 0)
         if eq >= 0 {
             val := _js_eval_str_dom(tree, store, str_slice(tail, eq + 1, str_len(tail)), 0)
+            if eq > 0 and str_byte(tail, eq - 1) == 43 { // '+=' append!
+                cur_t := document_get_inner_text(tree, elem_id)
+                return document_set_inner_text(mut tree, elem_id, cur_t + val)
+            }
             return document_set_inner_text(mut tree, elem_id, val)
         }
     }
@@ -877,8 +887,8 @@ fn _js_bind_call_args(tree: DomTree, store: JsStateStore, param_list: str, arg_l
     }
 }
 
-fn _js_eval_single(mut tree: DomTree, store: JsStateStore, action_str: str, depth: i64 = 0) -> bool {
-    if depth >= 16 { return false }
+fn _js_eval_single_fuel(mut tree: DomTree, store: JsStateStore, action_str: str, depth: i64, fuel: IntBuf) -> bool {
+    if depth >= 16 or ibuf_get(fuel, 0) <= 0 { return false }
     act := str_trim(action_str)
     n := str_len(act)
     if n == 0 { return false }
@@ -961,7 +971,7 @@ fn _js_eval_single(mut tree: DomTree, store: JsStateStore, action_str: str, dept
         }
     }
 
-    // --- JS Function Call with Arguments: `myFunc(arg1, arg2)` ---
+    // --- JS Function Call with Arguments (shares global anti-DoS `fuel` across recursion!) ---
     lp := str_find_byte(act, 40, 0)
     if lp > 0 and str_ends_with(act, ")") {
         fname := str_trim(str_slice(act, 0, lp))
@@ -971,7 +981,7 @@ fn _js_eval_single(mut tree: DomTree, store: JsStateStore, action_str: str, dept
                 params := js_find_fn_params(store, fname)
                 args_str := str_slice(act, lp + 1, n - 1)
                 _js_bind_call_args(tree, store, params, args_str)
-                return _js_eval_stmts(mut tree, store, body, depth + 1)
+                return _js_eval_stmts_fuel(mut tree, store, body, depth + 1, fuel)
             }
         }
     }
@@ -1144,7 +1154,7 @@ fn _js_eval_stmts_fuel(mut tree: DomTree, store: JsStateStore, action_str: str, 
             return any_mut
         }
         if str_len(stmt) > 0 {
-            if _js_eval_single(mut tree, store, stmt, depth) { any_mut = true }
+            if _js_eval_single_fuel(mut tree, store, stmt, depth, fuel) { any_mut = true }
         }
         p = _js_advance_after_stmt(action_str, st_end)
     }
@@ -1222,7 +1232,7 @@ fn js_eval_script(mut tree: DomTree, mut store: JsStateStore, script: str) -> bo
         st_end := _js_find_stmt_end(script, p)
         if st_end > p {
             ibuf_set(fuel, 0, ibuf_get(fuel, 0) - 1)
-            if _js_eval_single(mut tree, store, str_slice(script, p, st_end), 0) {
+            if _js_eval_single_fuel(mut tree, store, str_slice(script, p, st_end), 0, fuel) {
                 any_mut = true
             }
         }
