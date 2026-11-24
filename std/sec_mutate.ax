@@ -1,0 +1,184 @@
+// Axon Deep Security Testing Library — Security Mutation Testing Engine (`std/sec_mutate.ax`)
+// 100% Pure Axon, Zero-GC, `--shield` Safe.
+// Measures the true bug-catching power of a security test suite by injecting targeted security mutants
+// into an isolated temporary copy of the source (never modifying original files!):
+//   - MUT_BOUNDARY     : `< ` <-> `<= `, `> ` <-> `>= ` (off-by-one / OOB regressions)
+//   - MUT_LOGIC_FLIP   : ` and ` <-> ` or `, `if not ` -> `if ` (auth/validation bypasses)
+//   - MUT_GUARD_DROP   : `return false` -> `return true` (fail-closed guard removal)
+//   - MUT_CT_DOWNGRADE : `ct_eq_str(` -> `str_eq(` (constant-time timing regression)
+//   - MUT_WRAP_MATH    : ` +% ` -> ` + `, ` -% ` -> ` - ` (`--shield` overflow regressions)
+
+use std::os
+use std::str
+use std::ds
+use std::fmt
+use std::fs
+use std::sys
+use std::sec_oracle
+
+struct MutationReport {
+    baseline_passed: bool
+    total_mutants: i64
+    killed: i64
+    survived: i64
+    compile_errors: i64
+    score_pct: f64
+    survived_details: StrVec
+    summary: str
+}
+
+fn mutation_report_free(move mr: MutationReport) {
+    svec_free(move mr.survived_details)
+}
+
+fn _mut_try_line(line: str) -> (bool, str, str) {
+    trim := str_trim(line)
+    if str_len(trim) == 0 or str_starts_with(trim, "//") or str_starts_with(trim, "use ")
+        or str_starts_with(trim, "fn ") or str_starts_with(trim, "struct ") or str_starts_with(trim, "println")
+        or str_contains(trim, "assert") or str_contains(trim, "sec_") {
+        return (false, "", "")
+    }
+    if str_contains(line, "ct_eq_str(") {
+        return (true, "MUT_CT_DOWNGRADE", str_replace(line, "ct_eq_str(", "str_eq("))
+    }
+    if str_contains(line, "return false") and str_contains(line, "if ") {
+        return (true, "MUT_GUARD_DROP", str_replace(line, "return false", "return true"))
+    }
+    if str_contains(line, " <= ") {
+        return (true, "MUT_BOUNDARY", str_replace(line, " <= ", " < "))
+    }
+    if str_contains(line, " >= ") {
+        return (true, "MUT_BOUNDARY", str_replace(line, " >= ", " > "))
+    }
+    if str_contains(line, " < ") and (not str_contains(line, "while ")) {
+        return (true, "MUT_BOUNDARY", str_replace(line, " < ", " <= "))
+    }
+    if str_contains(line, " > ") and (not str_contains(line, "while ")) {
+        return (true, "MUT_BOUNDARY", str_replace(line, " > ", " >= "))
+    }
+    if str_contains(line, "if not ") {
+        return (true, "MUT_LOGIC_FLIP", str_replace(line, "if not ", "if "))
+    }
+    if str_contains(line, " and ") and str_starts_with(trim, "if ") {
+        return (true, "MUT_LOGIC_FLIP", str_replace(line, " and ", " or "))
+    }
+    return (false, "", "")
+}
+
+fn _mut_join_with_replace(lines: StrVec, rep_idx: i64, rep_line: str) -> str {
+    n := svec_len(lines)
+    b := buf_new(buf_len(lines.arena) + str_len(rep_line) + n + 64)
+    mut i := 0
+    while i < n {
+        if i == rep_idx { buf_push_str(b, rep_line) }
+        else { buf_push_str(b, svec_get(lines, i)) }
+        buf_push(b, 10)
+        i += 1
+    }
+    return buf_to_owned_str(move b)
+}
+
+// Runs Security Mutation Testing over `source_code` (which includes both the target functions and `main()` tests).
+// Only lines strictly BEFORE `stop_before_fn` (default `"fn main("`) are mutated so test assertions remain intact!
+fn sec_mutate_source(
+    axc_path: str,
+    source_code: str,
+    max_mutants: i64 = 10,
+    timeout_ms: i64 = 5000,
+    stop_before_fn: str = "fn main("
+) -> MutationReport {
+    mut surv := svec_new(16, 1024)
+    tmp_base := _sec_tmp_name("mutbase", ".ax")
+    tmp_base_exe := _sec_tmp_name("mutbase", ".exe")
+    if not fs_write_text(tmp_base, source_code) {
+        return MutationReport(
+            baseline_passed = false, total_mutants = 0, killed = 0, survived = 0, compile_errors = 0,
+            score_pct = 0.0, survived_details = surv, summary = "MUTATION_ERROR failed to write baseline"
+        )
+    }
+    b_res := sec_exec_timeout(f"{axc_path} build {tmp_base} -o {tmp_base_exe}", timeout_ms)
+    _ := sys_fs_remove(tmp_base)
+    if b_res.exit_code != 0 or b_res.timed_out {
+        _ := sys_fs_remove(tmp_base_exe)
+        return MutationReport(
+            baseline_passed = false, total_mutants = 0, killed = 0, survived = 0, compile_errors = 0,
+            score_pct = 0.0, survived_details = surv,
+            summary = f"MUTATION_ABORT baseline build failed (rc={b_res.exit_code})"
+        )
+    }
+    base_res := sec_exec_timeout(tmp_base_exe, timeout_ms)
+    _ := sys_fs_remove(tmp_base_exe)
+    if base_res.exit_code != 0 or base_res.timed_out or base_res.crashed {
+        return MutationReport(
+            baseline_passed = false, total_mutants = 0, killed = 0, survived = 0, compile_errors = 0,
+            score_pct = 0.0, survived_details = surv,
+            summary = f"MUTATION_ABORT baseline failed (rc={base_res.exit_code} sig={base_res.signal_name})"
+        )
+    }
+
+    // Split source into lines
+    mut lines := svec_new(64, str_len(source_code) + 64)
+    n := str_len(source_code)
+    mut pos := 0
+    while pos <= n {
+        mut nl := str_find_byte(source_code, 10, pos)
+        if nl < 0 { nl = n }
+        mut end_l := nl
+        if end_l > pos and str_byte(source_code, end_l - 1) == 13 { end_l -= 1 }
+        svec_push(mut lines, str_slice(source_code, pos, end_l))
+        if nl >= n { break }
+        pos = nl + 1
+    }
+
+    mut total := 0
+    mut killed := 0
+    mut survived := 0
+    mut comp_err := 0
+    mut i := 0
+    ln_cnt := svec_len(lines)
+    while i < ln_cnt and total < max_mutants {
+        cur_line := svec_get(lines, i)
+        if str_len(stop_before_fn) > 0 and str_starts_with(str_trim(cur_line), stop_before_fn) {
+            break
+        }
+        (can_mut, kind, mut_line) := _mut_try_line(cur_line)
+        if can_mut {
+            total += 1
+            mut_src := _mut_join_with_replace(lines, i, mut_line)
+            tmp_m := _sec_tmp_name("mut", ".ax")
+            tmp_m_exe := _sec_tmp_name("mut", ".exe")
+            _ := fs_write_text(tmp_m, mut_src)
+            // Build directly to a unique temp `.exe` (safe even inside nested `axc run`!)
+            bm := sec_exec_timeout(f"{axc_path} build {tmp_m} -o {tmp_m_exe}", timeout_ms)
+            if bm.exit_code != 0 {
+                comp_err += 1
+            } else {
+                rr := sec_exec_timeout(tmp_m_exe, timeout_ms)
+                if rr.exit_code != 0 or rr.timed_out or rr.crashed {
+                    killed += 1
+                } else {
+                    survived += 1
+                    svec_push(mut surv, f"L{i + 1} [{kind}] `{str_trim(cur_line)}` -> `{str_trim(mut_line)}`")
+                }
+            }
+            _ := sys_fs_remove(tmp_m)
+            _ := sys_fs_remove(tmp_m_exe)
+        }
+        i += 1
+    }
+    svec_free(move lines)
+
+    eval_n := killed + survived
+    score := if eval_n > 0 { ((killed as f64) * 100.0) / (eval_n as f64) } else { 100.0 }
+    summ := f"MUTATION_SCORE={fmt_f64(score, 1)}% killed={killed}/{eval_n} survived={survived} compile_err={comp_err}"
+    return MutationReport(
+        baseline_passed = true,
+        total_mutants = total,
+        killed = killed,
+        survived = survived,
+        compile_errors = comp_err,
+        score_pct = score,
+        survived_details = surv,
+        summary = summ
+    )
+}

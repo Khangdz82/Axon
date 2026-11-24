@@ -1,0 +1,564 @@
+// Axon Deep Security & Bug-Finding Testing Library — Umbrella API & Detailed Reporter (`std/sec_test.ax`)
+// 100% Pure Axon, Zero-GC, `--shield` Safe.
+// Importing `use std::sec_test` transitively loads:
+//   - `std::sec_corpus` (OWASP/CWE attack corpora & boundary/hostile/ReDoS generators)
+//   - `std::sec_fuzz`   (Greybox 64KB-bitmap coverage fuzzer, 14 mutators, property gen & ddmin shrinker)
+//   - `std::sec_oracle` (Dudect timing CWE-208, complexity/ReDoS, ASan-lite redzone canary, process/diff-build runner)
+// Plus `SecReport`: structured, patch-ready English vulnerability & bug reporting (Console, Markdown, JSON).
+
+use std::os
+use std::str
+use std::ds
+use std::fmt
+use std::sec_corpus
+use std::sec_fuzz
+use std::sec_oracle
+use std::sec_sast
+use std::sec_meta
+use std::sec_instr
+use std::sec_mutate
+
+// --- 1. Severity Constants ---
+
+fn SEC_SEV_INFO() -> i64     { return 0 }
+fn SEC_SEV_LOW() -> i64      { return 1 }
+fn SEC_SEV_MEDIUM() -> i64   { return 2 }
+fn SEC_SEV_HIGH() -> i64     { return 3 }
+fn SEC_SEV_CRITICAL() -> i64 { return 4 }
+
+fn SEC_CONF_MEDIUM() -> i64  { return 1 }
+fn SEC_CONF_HIGH() -> i64    { return 2 }
+fn SEC_CONF_PROVEN() -> i64  { return 3 }
+
+fn sec_conf_name(conf: i64) -> str {
+    if conf >= 3 { return "PROVEN_DYNAMIC" }
+    if conf == 2 { return "STATIC_HIGH" }
+    return "STATIC_MEDIUM"
+}
+
+fn sec_sarif_level(sev: i64) -> str {
+    if sev >= 3 { return "error" }
+    if sev == 2 { return "warning" }
+    return "note"
+}
+
+fn sec_sev_name(sev: i64) -> str {
+    if sev >= 4 { return "CRITICAL" }
+    if sev == 3 { return "HIGH" }
+    if sev == 2 { return "MEDIUM" }
+    if sev == 1 { return "LOW" }
+    return "INFO"
+}
+
+fn _sec_json_escape(s: str) -> str {
+    n := str_len(s)
+    b := buf_new(n * 2 + 16)
+    mut i := 0
+    while i < n {
+        ch := str_byte(s, i)
+        if ch == 34 { buf_push_str(b, "\\\"") }
+        else if ch == 92 { buf_push_str(b, "\\\\") }
+        else if ch == 10 { buf_push_str(b, "\\n") }
+        else if ch == 13 { buf_push_str(b, "\\r") }
+        else if ch == 9 { buf_push_str(b, "\\t") }
+        else if ch < 32 or ch >= 127 {
+            buf_push_str(b, "\\u00")
+            buf_push(b, hex_nibble_char((ch >> 4) & 15))
+            buf_push(b, hex_nibble_char(ch & 15))
+        } else {
+            buf_push(b, ch)
+        }
+        i += 1
+    }
+    return buf_to_owned_str(move b)
+}
+
+// --- 2. Structured Security & Bug Report (`SecReport`) ---
+
+struct SecReport {
+    suite_name: str
+    passed_checks: i64
+    finding_count: i64
+    sev_counts: IntBuf // [0]=INFO, [1]=LOW, [2]=MEDIUM, [3]=HIGH, [4]=CRITICAL
+    sevs: DynIntVec
+    confs: DynIntVec   // [1]=STATIC_MEDIUM, [2]=STATIC_HIGH, [3]=PROVEN_DYNAMIC
+    cwes: StrVec
+    cats: StrVec
+    targets: StrVec
+    titles: StrVec
+    observeds: StrVec
+    expecteds: StrVec
+    repros: StrVec
+    fixes: StrVec
+    start_ns: i64
+}
+
+fn sec_report_new(suite_name: str) -> SecReport {
+    sc := ibuf_new(8)
+    ibuf_push(sc, 0); ibuf_push(sc, 0); ibuf_push(sc, 0); ibuf_push(sc, 0); ibuf_push(sc, 0)
+    return SecReport(
+        suite_name = suite_name,
+        passed_checks = 0,
+        finding_count = 0,
+        sev_counts = sc,
+        sevs = dvec_new(32),
+        confs = dvec_new(32),
+        cwes = svec_new(32, 512),
+        cats = svec_new(32, 512),
+        targets = svec_new(32, 2048),
+        titles = svec_new(32, 2048),
+        observeds = svec_new(32, 4096),
+        expecteds = svec_new(32, 4096),
+        repros = svec_new(32, 4096),
+        fixes = svec_new(32, 4096),
+        start_ns = clock_ns()
+    )
+}
+
+fn sec_report_free(move r: SecReport) {
+    buf_free(move r.sev_counts)
+    dvec_free(move r.sevs)
+    dvec_free(move r.confs)
+    svec_free(move r.cwes)
+    svec_free(move r.cats)
+    svec_free(move r.targets)
+    svec_free(move r.titles)
+    svec_free(move r.observeds)
+    svec_free(move r.expecteds)
+    svec_free(move r.repros)
+    svec_free(move r.fixes)
+}
+
+fn sec_pass(mut r: SecReport) {
+    r.passed_checks = r.passed_checks + 1
+}
+
+// Records a complete, patch-ready English bug/vulnerability finding with explicit confidence level.
+fn sec_finding_with_conf(
+    mut r: SecReport,
+    severity: i64,
+    confidence: i64,
+    cwe: str,
+    category: str,
+    target: str,
+    title: str,
+    observed: str,
+    expected: str,
+    reproducer: str,
+    remediation: str
+) {
+    mut s := severity
+    if s < 0 { s = 0 }
+    if s > 4 { s = 4 }
+    ibuf_set(r.sev_counts, s, ibuf_get(r.sev_counts, s) + 1)
+    dvec_push(mut r.sevs, s)
+    dvec_push(mut r.confs, confidence)
+    svec_push(mut r.cwes, cwe)
+    svec_push(mut r.cats, category)
+    svec_push(mut r.targets, target)
+    svec_push(mut r.titles, title)
+    svec_push(mut r.observeds, observed)
+    svec_push(mut r.expecteds, expected)
+    svec_push(mut r.repros, reproducer)
+    svec_push(mut r.fixes, remediation)
+    r.finding_count = r.finding_count + 1
+}
+
+// Records a dynamically verified finding (default confidence = PROVEN_DYNAMIC).
+fn sec_finding_detailed(
+    mut r: SecReport,
+    severity: i64,
+    cwe: str,
+    category: str,
+    target: str,
+    title: str,
+    observed: str,
+    expected: str,
+    reproducer: str,
+    remediation: str
+) {
+    sec_finding_with_conf(
+        mut r, severity, SEC_CONF_PROVEN(), cwe, category, target, title,
+        observed, expected, reproducer, remediation
+    )
+}
+
+// Shorthand finding recorder for quick fuzz/corpus harnesses.
+fn sec_finding(mut r: SecReport, severity: i64, cwe: str, category: str, title: str, reproducer: str) {
+    sec_finding_detailed(
+        mut r, severity, cwe, category, category, title,
+        "Security or correctness invariant violated.",
+        "Target must enforce invariant safely without bypass or corruption.",
+        reproducer,
+        "Inspect the target handler with the minimized reproducer and enforce fail-closed validation."
+    )
+}
+
+// --- 3. High-Level Security & Correctness Assertion Helpers ---
+
+fn sec_assert(
+    mut r: SecReport,
+    cond: bool,
+    severity: i64,
+    cwe: str,
+    target: str,
+    title: str,
+    observed: str,
+    expected: str,
+    reproducer: str = "",
+    remediation: str = "Fix the violated boundary or validation condition in the target function."
+) -> bool {
+    if cond {
+        r.passed_checks = r.passed_checks + 1
+        return true
+    }
+    sec_finding_detailed(mut r, severity, cwe, "ASSERT", target, title, observed, expected, reproducer, remediation)
+    return false
+}
+
+fn sec_assert_eq_i64(mut r: SecReport, got: i64, expected: i64, cwe: str, target: str, title: str, remediation: str = "Fix integer computation or boundary handling.") -> bool {
+    if got == expected {
+        r.passed_checks = r.passed_checks + 1
+        return true
+    }
+    sec_finding_detailed(
+        mut r, SEC_SEV_HIGH(), cwe, "INVARIANT", target, title,
+        f"Got i64 value {got}",
+        f"Expected exact i64 value {expected}",
+        f"got={got} expected={expected}",
+        remediation
+    )
+    return false
+}
+
+fn sec_assert_eq_str(mut r: SecReport, got: str, expected: str, cwe: str, target: str, title: str, remediation: str = "Fix string parsing, normalization, or encoding logic.") -> bool {
+    if str_eq(got, expected) {
+        r.passed_checks = r.passed_checks + 1
+        return true
+    }
+    sec_finding_detailed(
+        mut r, SEC_SEV_HIGH(), cwe, "INVARIANT", target, title,
+        f"Got string \"{sec_escape_str(got, 96)}\" (len={str_len(got)})",
+        f"Expected string \"{sec_escape_str(expected, 96)}\" (len={str_len(expected)})",
+        f"got_hex={str_to_hex(str_slice(got, 0, if str_len(got) < 48 { str_len(got) } else { 48 }))}",
+        remediation
+    )
+    return false
+}
+
+fn sec_assert_roundtrip(mut r: SecReport, original: str, roundtripped: str, target: str, label: str) -> bool {
+    if str_eq(original, roundtripped) {
+        r.passed_checks = r.passed_checks + 1
+        return true
+    }
+    sec_finding_detailed(
+        mut r, SEC_SEV_MEDIUM(), "CWE-682", "PROP", target,
+        f"Roundtrip data corruption in {label}",
+        f"decode(encode(x)) produced \"{sec_escape_str(roundtripped, 80)}\" (len={str_len(roundtripped)})",
+        f"decode(encode(x)) must equal original \"{sec_escape_str(original, 80)}\" (len={str_len(original)})",
+        sec_format_repro(0, original),
+        "Verify encoder/decoder boundary handling, padding, escaping, and embedded NUL/high-byte preservation."
+    )
+    return false
+}
+
+fn sec_assert_no_timing_leak(mut r: SecReport, res: DudectResult, target: str, label: str) -> bool {
+    if not res.leaked {
+        r.passed_checks = r.passed_checks + 1
+        return true
+    }
+    sec_finding_detailed(
+        mut r, SEC_SEV_HIGH(), "CWE-208", "TIMING", target,
+        f"Observable timing side-channel detected in {label}",
+        res.summary,
+        f"Welch's |t| must remain <= {fmt_f64(res.threshold_t, 1)} across interleaved fixed vs random classes.",
+        f"t_stat={fmt_f64(res.t_stat, 3)} mean0={fmt_f64(res.mean0, 1)}cy mean1={fmt_f64(res.mean1, 1)}cy",
+        "Replace early-exit comparisons or secret-dependent branches with branchless constant-time logic (e.g., `std::crypto::ct_eq_str` / `ct_eq_i64`)."
+    )
+    return false
+}
+
+fn sec_assert_no_dos(mut r: SecReport, res: ComplexityResult, target: str, label: str) -> bool {
+    if not res.is_dos_risk {
+        r.passed_checks = r.passed_checks + 1
+        return true
+    }
+    sev := if res.budget_exceeded or res.max_exponent > 2.35 { SEC_SEV_CRITICAL() } else { SEC_SEV_HIGH() }
+    sec_finding_detailed(
+        mut r, sev, "CWE-400", "COMPLEXITY", target,
+        f"Algorithmic complexity / DoS blowup in {label} ({res.class_label})",
+        res.summary,
+        f"Scaling exponent alpha must stay <= 1.55 and peak latency <= {res.budget_ms}ms.",
+        f"alpha={fmt_f64(res.max_exponent, 2)} max_ratio={fmt_f64(res.max_ratio, 2)}x peak_ms={res.max_single_ms}",
+        "Eliminate nested quadratic rescans or exponential backtracking; add memoization, linear scanning, or hard step/recursion fuel limits."
+    )
+    return false
+}
+
+fn sec_assert_mem_clean(mut r: SecReport, res: RedzoneReport, target: str, label: str) -> bool {
+    if res.is_clean {
+        r.passed_checks = r.passed_checks + 1
+        return true
+    }
+    mut cwe := "CWE-401"
+    mut sev := SEC_SEV_MEDIUM()
+    if res.underflows > 0 or res.overflows > 0 {
+        cwe = "CWE-120"
+        sev = SEC_SEV_CRITICAL()
+    } else if res.double_frees > 0 or res.invalid_frees > 0 {
+        cwe = "CWE-415"
+        sev = SEC_SEV_CRITICAL()
+    }
+    sec_finding_detailed(
+        mut r, sev, cwe, "MEMORY", target,
+        f"Memory safety / redzone violation in {label}",
+        res.summary,
+        "Zero leaks, zero head/tail redzone overwrites, zero double-frees, and zero invalid frees.",
+        res.summary,
+        "Audit raw pointer arithmetic and bounds checks inside `unsafe` blocks; ensure every allocation has an exact 1-to-1 free path."
+    )
+    return false
+}
+
+fn sec_assert_no_crash(mut r: SecReport, res: ProcOutcome, target: str, label: str) -> bool {
+    if (not res.crashed) and (not res.timed_out) and res.exit_code == 0 {
+        r.passed_checks = r.passed_checks + 1
+        return true
+    }
+    cwe := if res.timed_out { "CWE-835" } else { "CWE-119" }
+    sec_finding_detailed(
+        mut r, SEC_SEV_CRITICAL(), cwe, "CRASH", target,
+        f"Isolated process failure in {label} ({res.signal_name})",
+        f"exit_code={res.exit_code} signal={res.signal_name} timed_out={res.timed_out} elapsed={res.elapsed_ms}ms",
+        "Child process must exit cleanly with code 0 within timeout.",
+        sec_escape_str(res.output, 200),
+        "Inspect the stack backtrace or timeout site and add explicit bounds, overflow, or loop-termination guards."
+    )
+    return false
+}
+
+fn sec_assert_check_fails(mut r: SecReport, res: CheckFailResult, target: str, label: str) -> bool {
+    if res.passed {
+        r.passed_checks = r.passed_checks + 1
+        return true
+    }
+    sec_finding_detailed(
+        mut r, SEC_SEV_CRITICAL(), "CWE-693", "NEGATIVE", target,
+        f"Compiler security gate bypass in {label}",
+        f"`axc check --json` returned exit_code={res.exit_code} without expected diagnostic {res.expected_code}",
+        f"Compiler must reject unsafe/tainted code with diagnostic {res.expected_code}",
+        sec_escape_str(res.output, 200),
+        "Inspect `compiler_ax/sema_effects.ax` and `compiler_ax/sema_perceus.ax` to close the missing static check."
+    )
+    return false
+}
+
+fn sec_assert_diff_build(mut r: SecReport, res: DiffBuildResult, target: str, label: str) -> bool {
+    if res.passed {
+        r.passed_checks = r.passed_checks + 1
+        return true
+    }
+    sec_finding_detailed(
+        mut r, SEC_SEV_CRITICAL(), "CWE-682", "DIFF", target,
+        f"Differential compiler/SIMD/Shield mismatch in {label}",
+        res.summary,
+        "Outputs and exit codes must be byte-identical across `--simd=avx2`, `--simd=scalar`, and `--shield`.",
+        res.summary,
+        "Compare generated x86-64 AVX2 vs scalar codegen or `--shield` overflow traps (`+` vs `+%`) for the diverging expression."
+    )
+    return false
+}
+
+// Merges all findings from a `SastResults` scan into `SecReport` with exact `file:line` & confidence.
+fn sec_report_merge_sast(mut r: SecReport, sr: SastResults) {
+    mut i := 0
+    while i < sr.count {
+        sev := dvec_get(sr.sevs, i, 2)
+        conf := dvec_get(sr.confs, i, SEC_CONF_MEDIUM())
+        rule := svec_get(sr.rules, i)
+        cwe := svec_get(sr.cwes, i)
+        fp := svec_get(sr.files, i)
+        lno := dvec_get(sr.line_nos, i, 1)
+        ttl := svec_get(sr.titles, i)
+        snip := svec_get(sr.snippets, i)
+        fix := svec_get(sr.fixes, i)
+        sec_finding_with_conf(
+            mut r, sev, conf, cwe, "SAST", f"{fp}:{lno}",
+            f"[{rule}] {ttl}",
+            f"Matched vulnerable pattern at {fp}:{lno}",
+            "Code must satisfy Axon security and bounds-safety invariants.",
+            snip,
+            fix
+        )
+        i += 1
+    }
+}
+
+// One-call SAST directory bug hunt: scans every `.ax` file in `dir_path` and merges findings into `r`.
+fn sec_hunt_sast_dir(dir_path: str, mut r: SecReport) -> i64 {
+    mut sr := sast_results_new()
+    scanned := sast_scan_dir(dir_path, mut sr)
+    cnt := sr.count
+    sec_report_merge_sast(mut r, sr)
+    sast_results_free(move sr)
+    return scanned
+}
+
+// --- 4. Ultra-Detailed Standard English Report Exporters (Console, Markdown, JSON) ---
+
+fn sec_report_to_markdown(r: SecReport) -> str {
+    elapsed_ms := (clock_ns() - r.start_ns) / 1000000
+    c_crit := ibuf_get(r.sev_counts, 4)
+    c_high := ibuf_get(r.sev_counts, 3)
+    c_med := ibuf_get(r.sev_counts, 2)
+    c_low := ibuf_get(r.sev_counts, 1)
+    c_info := ibuf_get(r.sev_counts, 0)
+
+    raw_bytes := buf_len(r.cwes.arena) + buf_len(r.cats.arena) + buf_len(r.targets.arena)
+        + buf_len(r.titles.arena) + buf_len(r.observeds.arena) + buf_len(r.expecteds.arena)
+        + buf_len(r.repros.arena) + buf_len(r.fixes.arena)
+    b := buf_new(4096 + raw_bytes * 2 + r.finding_count * 512)
+    buf_push_str(b, f"# Security & Bug Audit Report: {r.suite_name}\n\n")
+    buf_push_str(b, f"- **Passed Checks:** `{r.passed_checks}`\n")
+    buf_push_str(b, f"- **Total Findings:** `{r.finding_count}` (CRITICAL: `{c_crit}`, HIGH: `{c_high}`, MEDIUM: `{c_med}`, LOW: `{c_low}`, INFO: `{c_info}`)\n")
+    buf_push_str(b, f"- **Elapsed:** `{elapsed_ms} ms`\n\n")
+
+    if r.finding_count == 0 {
+        buf_push_str(b, "**Result:** ALL CHECKS PASSED — 0 security vulnerabilities or bugs detected.\n")
+        return buf_to_owned_str(move b)
+    }
+
+    buf_push_str(b, "## Summary Table\n\n")
+    buf_push_str(b, "| ID | Severity | CWE | Category | Target | Title |\n")
+    buf_push_str(b, "| :--- | :--- | :--- | :--- | :--- | :--- |\n")
+    mut i := 0
+    while i < r.finding_count {
+        sev_s := sec_sev_name(dvec_get(r.sevs, i, 0))
+        cwe_s := svec_get(r.cwes, i)
+        cat_s := svec_get(r.cats, i)
+        tgt_s := svec_get(r.targets, i)
+        ttl_s := svec_get(r.titles, i)
+        buf_push_str(b, f"| SEC-{i + 1} | **{sev_s}** | `{cwe_s}` | `{cat_s}` | `{tgt_s}` | {ttl_s} |\n")
+        i += 1
+    }
+
+    buf_push_str(b, "\n## Detailed Patch-Ready Findings\n\n")
+    i = 0
+    while i < r.finding_count {
+        sev_s := sec_sev_name(dvec_get(r.sevs, i, 0))
+        cwe_s := svec_get(r.cwes, i)
+        cat_s := svec_get(r.cats, i)
+        tgt_s := svec_get(r.targets, i)
+        ttl_s := svec_get(r.titles, i)
+        obs_s := svec_get(r.observeds, i)
+        exp_s := svec_get(r.expecteds, i)
+        rep_s := svec_get(r.repros, i)
+        fix_s := svec_get(r.fixes, i)
+        buf_push_str(b, f"### [SEC-{i + 1}] [{sev_s}] {ttl_s}\n")
+        buf_push_str(b, f"- **CWE:** `{cwe_s}` | **Category:** `{cat_s}` | **Target:** `{tgt_s}`\n")
+        buf_push_str(b, f"- **Observed Behavior:** {obs_s}\n")
+        buf_push_str(b, f"- **Expected Behavior:** {exp_s}\n")
+        buf_push_str(b, f"- **Minimized Reproducer:** `{rep_s}`\n")
+        buf_push_str(b, f"- **Recommended Patch:** {fix_s}\n\n")
+        i += 1
+    }
+    return buf_to_owned_str(move b)
+}
+
+fn sec_report_to_json(r: SecReport) -> str {
+    elapsed_ms := (clock_ns() - r.start_ns) / 1000000
+    raw_bytes := buf_len(r.cwes.arena) + buf_len(r.cats.arena) + buf_len(r.targets.arena)
+        + buf_len(r.titles.arena) + buf_len(r.observeds.arena) + buf_len(r.expecteds.arena)
+        + buf_len(r.repros.arena) + buf_len(r.fixes.arena)
+    b := buf_new(4096 + raw_bytes * 2 + r.finding_count * 512)
+    buf_push_str(b, "{\"suite\":\"")
+    buf_push_str(b, _sec_json_escape(r.suite_name))
+    buf_push_str(b, f"\",\"passed_checks\":{r.passed_checks},\"finding_count\":{r.finding_count},\"elapsed_ms\":{elapsed_ms},\"findings\":[")
+    mut i := 0
+    while i < r.finding_count {
+        if i > 0 { buf_push_str(b, ",") }
+        buf_push_str(b, f"{{\"id\":\"SEC-{i + 1}\",\"severity\":\"{sec_sev_name(dvec_get(r.sevs, i, 0))}\",")
+        buf_push_str(b, f"\"cwe\":\"{_sec_json_escape(svec_get(r.cwes, i))}\",")
+        buf_push_str(b, f"\"category\":\"{_sec_json_escape(svec_get(r.cats, i))}\",")
+        buf_push_str(b, f"\"target\":\"{_sec_json_escape(svec_get(r.targets, i))}\",")
+        buf_push_str(b, f"\"title\":\"{_sec_json_escape(svec_get(r.titles, i))}\",")
+        buf_push_str(b, f"\"observed\":\"{_sec_json_escape(svec_get(r.observeds, i))}\",")
+        buf_push_str(b, f"\"expected\":\"{_sec_json_escape(svec_get(r.expecteds, i))}\",")
+        buf_push_str(b, f"\"reproducer\":\"{_sec_json_escape(svec_get(r.repros, i))}\",")
+        buf_push_str(b, f"\"remediation\":\"{_sec_json_escape(svec_get(r.fixes, i))}\"}}")
+        i += 1
+    }
+    buf_push_str(b, "]}")
+    return buf_to_owned_str(move b)
+}
+
+// Exports findings in industry-standard SARIF v2.1.0 JSON format (GitHub Code Scanning / VS Code / AI Patchers).
+fn sec_report_to_sarif(r: SecReport) -> str {
+    raw_bytes := buf_len(r.cwes.arena) + buf_len(r.cats.arena) + buf_len(r.targets.arena)
+        + buf_len(r.titles.arena) + buf_len(r.observeds.arena) + buf_len(r.expecteds.arena)
+        + buf_len(r.repros.arena) + buf_len(r.fixes.arena)
+    b := buf_new(4096 + raw_bytes * 4 + r.finding_count * 768)
+    buf_push_str(b, "{\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\",\"version\":\"2.1.0\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"Axon SecTest Bug Hunter\",\"version\":\"3.0.0\",\"informationUri\":\"https://axon-lang.dev/sec_test\"}},\"results\":[")
+    mut i := 0
+    while i < r.finding_count {
+        if i > 0 { buf_push_str(b, ",") }
+        sev := dvec_get(r.sevs, i, 2)
+        conf := dvec_get(r.confs, i, SEC_CONF_PROVEN())
+        cwe := svec_get(r.cwes, i)
+        tgt := svec_get(r.targets, i)
+        ttl := svec_get(r.titles, i)
+        obs := svec_get(r.observeds, i)
+        rep := svec_get(r.repros, i)
+        fix := svec_get(r.fixes, i)
+
+        // Parse optional `file:line` suffix from `tgt` for precise SARIF physicalLocation!
+        mut uri := tgt
+        mut start_line := 1
+        col_p := str_rfind(tgt, ":")
+        if col_p > 1 and col_p + 1 < str_len(tgt) {
+            cand_ln := parse_i64(str_slice(tgt, col_p + 1, str_len(tgt))) or -1
+            if cand_ln > 0 {
+                uri = str_slice(tgt, 0, col_p)
+                start_line = cand_ln
+            }
+        }
+        buf_push_str(b, f"{{\"ruleId\":\"{_sec_json_escape(cwe)}\",\"level\":\"{sec_sarif_level(sev)}\",")
+        buf_push_str(b, f"\"message\":{{\"text\":\"{_sec_json_escape(ttl)} — {_sec_json_escape(obs)}\"}},")
+        buf_push_str(b, f"\"locations\":[{{\"physicalLocation\":{{\"artifactLocation\":{{\"uri\":\"{_sec_json_escape(uri)}\"}},\"region\":{{\"startLine\":{start_line}}}}}}}],")
+        buf_push_str(b, f"\"properties\":{{\"severity\":\"{sec_sev_name(sev)}\",\"confidence\":\"{sec_conf_name(conf)}\",\"cwe\":\"{_sec_json_escape(cwe)}\",\"reproducer\":\"{_sec_json_escape(rep)}\",\"remediation\":\"{_sec_json_escape(fix)}\"}}}}")
+        i += 1
+    }
+    buf_push_str(b, "]}]}")
+    return buf_to_owned_str(move b)
+}
+
+fn sec_report_print(r: SecReport) {
+    elapsed_ms := (clock_ns() - r.start_ns) / 1000000
+    c_crit := ibuf_get(r.sev_counts, 4)
+    c_high := ibuf_get(r.sev_counts, 3)
+    c_med := ibuf_get(r.sev_counts, 2)
+    c_low := ibuf_get(r.sev_counts, 1)
+    if r.finding_count == 0 {
+        println(f"[SEC PASS] {r.suite_name}: {r.passed_checks} checks passed, 0 findings ({elapsed_ms} ms)")
+        return
+    }
+    println(f"[SEC FAIL] {r.suite_name}: {r.finding_count} findings (CRIT={c_crit} HIGH={c_high} MED={c_med} LOW={c_low}), {r.passed_checks} checks passed ({elapsed_ms} ms)")
+    mut i := 0
+    while i < r.finding_count {
+        sev_s := sec_sev_name(dvec_get(r.sevs, i, 0))
+        println(f"  [SEC-{i + 1}] [{sev_s}] [{svec_get(r.cwes, i)}] {svec_get(r.targets, i)} :: {svec_get(r.titles, i)}")
+        println(f"    Observed   : {svec_get(r.observeds, i)}")
+        println(f"    Expected   : {svec_get(r.expecteds, i)}")
+        println(f"    Reproducer : {svec_get(r.repros, i)}")
+        println(f"    Patch Hint : {svec_get(r.fixes, i)}")
+        i += 1
+    }
+}
+
+// Prints the report, frees all resources, and returns `0` if clean or `1` if any findings exist.
+fn sec_report_finish(move r: SecReport) -> i32 {
+    fc := r.finding_count
+    sec_report_print(r)
+    sec_report_free(move r)
+    return if fc == 0 { 0 } else { 1 }
+}

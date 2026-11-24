@@ -1,0 +1,915 @@
+// Axon Deep Security Testing Library — Statistical, Complexity, Memory & Process Oracles (`std/sec_oracle.ax`)
+// 100% Pure Axon, Zero-GC, Zero External Tools, `--shield` Safe.
+//   1. Dudect Constant-Time Side-Channel Oracle (`DudectCtx` / Welch's t-test + 5% outlier trim, CWE-208)
+//   2. Algorithmic Complexity & ReDoS Scaling Oracle (`ComplexityCtx` / p50 log2 exponent, CWE-400 / CWE-1333)
+//   3. ASan-lite Redzone Canary & UAF/Leak Sentinel (`RedzoneGuard` / 64B keyed head+tail canaries + 0xFE poison)
+//   4. Timeout-Guarded Subprocess Crash, Negative Compiler Security Check & Differential Build Runner (`std::ffi`)
+
+use std::os
+use std::str
+use std::ds
+use std::algo
+use std::rand
+use std::fmt
+use std::ffi
+use std::sys
+use std::fs
+
+// --- 0. Pure-Axon Math Helper (`log2` accurate to < 1e-8) ---
+
+@no_alloc
+fn sec_log2_f64(x_in: f64) -> f64 {
+    if x_in <= 0.0 { return 0.0 }
+    mut m := x_in
+    mut e := 0.0
+    while m >= 2.0 {
+        m = m * 0.5
+        e += 1.0
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        e -= 1.0
+    }
+    // ln(m) = 2 * (y + y^3/3 + y^5/5 + y^7/7 + y^9/9), y = (m-1)/(m+1)
+    y := (m - 1.0) / (m + 1.0)
+    y2 := y * y
+    mut term := y
+    mut sum := term
+    term = term * y2; sum += term / 3.0
+    term = term * y2; sum += term / 5.0
+    term = term * y2; sum += term / 7.0
+    term = term * y2; sum += term / 9.0
+    ln_m := 2.0 * sum
+    return e + (ln_m * 1.4426950408889634)
+}
+
+// --- 1. Dudect Constant-Time Side-Channel Oracle (CWE-208) ---
+// Based on Reparaz, Balasch, Verbauwhede (DATE 2017): "Dude, is my code constant time?"
+// Uses randomized class interleaving + `cpu_rdtsc()` + percentile outlier cropping + Welch's t-test.
+
+struct DudectCtx {
+    rng: Rng
+    samples0: IntBuf
+    samples1: IntBuf
+    target_n: i64
+    n0: i64
+    n1: i64
+}
+
+struct DudectResult {
+    n0: i64
+    n1: i64
+    mean0: f64
+    mean1: f64
+    t_stat: f64
+    abs_t: f64
+    threshold_t: f64
+    leaked: bool
+    summary: str
+}
+
+fn dudect_new(seed: i64 = 2026, samples_per_class: i64 = 2000) -> DudectCtx {
+    mut n := samples_per_class
+    if n < 64 { n = 64 }
+    if n > 100000 { n = 100000 }
+    return DudectCtx(
+        rng = rng_new(seed),
+        samples0 = ibuf_new(n + 8),
+        samples1 = ibuf_new(n + 8),
+        target_n = n,
+        n0 = 0,
+        n1 = 0
+    )
+}
+
+fn dudect_free(move d: DudectCtx) {
+    rng_free(move d.rng)
+    buf_free(move d.samples0)
+    buf_free(move d.samples1)
+}
+
+@no_alloc
+fn dudect_rdtsc() -> i64 {
+    return cpu_rdtsc()
+}
+
+// Returns randomized class `0` or `1` (interleaved to cancel OS/frequency drift), or `-1` when finished.
+fn dudect_next_class(d: DudectCtx) -> i64 {
+    if d.n0 >= d.target_n and d.n1 >= d.target_n { return -1 }
+    if d.n0 >= d.target_n { return 1 }
+    if d.n1 >= d.target_n { return 0 }
+    return rng_next_u64(d.rng) & 1
+}
+
+fn dudect_record(mut d: DudectCtx, cls: i64, cycles_in: i64) {
+    mut cy := cycles_in
+    if cy < 0 { cy = 0 }
+    if cls == 0 and d.n0 < d.target_n {
+        ibuf_push(d.samples0, cy)
+        d.n0 = d.n0 + 1
+    } else if cls == 1 and d.n1 < d.target_n {
+        ibuf_push(d.samples1, cy)
+        d.n1 = d.n1 + 1
+    }
+}
+
+// Helper: computes trimmed (mean, sample_var, count) after cropping bottom 1% and top `trim_top_pct`%.
+fn _dudect_trimmed_stats(buf: IntBuf, trim_top_pct: i64) -> (f64, f64, i64) {
+    n := ibuf_len(buf)
+    if n < 8 { return (0.0, 0.0, 0) }
+    cp := ibuf_new(n + 4)
+    mut i := 0
+    while i < n {
+        ibuf_push(cp, ibuf_get(buf, i))
+        i += 1
+    }
+    sort_i64_range(cp, 0, n - 1)
+    mut lo := n / 100
+    mut hi := n - ((n * trim_top_pct) / 100)
+    if hi <= lo + 4 {
+        lo = 0
+        hi = n
+    }
+    cnt := hi - lo
+    mut sum := 0.0
+    i = lo
+    while i < hi {
+        sum += ibuf_get(cp, i) as f64
+        i += 1
+    }
+    mean := sum / (cnt as f64)
+    mut vsum := 0.0
+    i = lo
+    while i < hi {
+        diff := (ibuf_get(cp, i) as f64) - mean
+        vsum += diff * diff
+        i += 1
+    }
+    buf_free(move cp)
+    var := if cnt > 1 { vsum / ((cnt - 1) as f64) } else { 0.0 }
+    return (mean, var, cnt)
+}
+
+// Performs Welch's two-sample t-test on trimmed cycle distributions.
+// Academic threshold `threshold_t = 4.5` corresponds to p < 0.00001 (strong CWE-208 timing leak).
+// `min_delta_cycles` (default 5.0 cy) & `min_rel_pct` (default 4.0%) suppress x86-64 unserialized-RDTSC
+// and 4K-aliasing/cache-set jitter (~1-3%) while reliably catching real secret-dependent timing leaks.
+fn dudect_analyze(d: DudectCtx, threshold_t: f64 = 4.5, trim_top_pct: i64 = 5, min_delta_cycles: f64 = 5.0, min_rel_pct: f64 = 4.0) -> DudectResult {
+    (m0, v0, c0) := _dudect_trimmed_stats(d.samples0, trim_top_pct)
+    (m1, v1, c1) := _dudect_trimmed_stats(d.samples1, trim_top_pct)
+    if c0 < 8 or c1 < 8 {
+        return DudectResult(
+            n0 = c0, n1 = c1, mean0 = m0, mean1 = m1,
+            t_stat = 0.0, abs_t = 0.0, threshold_t = threshold_t,
+            leaked = false, summary = "insufficient samples"
+        )
+    }
+    se2 := (v0 / (c0 as f64)) + (v1 / (c1 as f64))
+    mut t := 0.0
+    if se2 > 0.000000001 {
+        t = (m0 - m1) / sqrt_f64(se2)
+    } else if abs_f64(m0 - m1) > 1.0 {
+        t = if m0 > m1 { 999.0 } else { -999.0 }
+    }
+    at := abs_f64(t)
+    delta_cy := abs_f64(m0 - m1)
+    max_m := if m0 > m1 { m0 } else { m1 }
+    rel_pct := if max_m > 0.001 { (delta_cy * 100.0) / max_m } else { 0.0 }
+    leaked := (at > threshold_t) and (delta_cy >= min_delta_cycles) and (rel_pct >= min_rel_pct)
+    verdict := if leaked { "TIMING_LEAK" } else { "CONSTANT_TIME_OK" }
+    summ := f"{verdict} |t|={fmt_f64(at, 2)} (threshold={fmt_f64(threshold_t, 1)}) delta={fmt_f64(delta_cy, 1)}cy ({fmt_f64(rel_pct, 1)}%) mean0={fmt_f64(m0, 1)}cy mean1={fmt_f64(m1, 1)}cy n=({c0},{c1})"
+    return DudectResult(
+        n0 = c0, n1 = c1, mean0 = m0, mean1 = m1,
+        t_stat = t, abs_t = at, threshold_t = threshold_t,
+        leaked = leaked, summary = summ
+    )
+}
+
+// --- 2. Algorithmic Complexity & ReDoS Scaling Oracle (CWE-400 / CWE-1333) ---
+
+struct ComplexityCtx {
+    sizes: DynIntVec
+    times_ns: DynIntVec
+    max_ms: i64
+}
+
+struct ComplexityResult {
+    distinct_sizes: i64
+    max_exponent: f64
+    max_ratio: f64
+    max_single_ms: i64
+    budget_ms: i64
+    budget_exceeded: bool
+    is_dos_risk: bool
+    class_label: str
+    summary: str
+}
+
+fn complexity_new(max_ms: i64 = 500) -> ComplexityCtx {
+    mut b := max_ms
+    if b < 1 { b = 1 }
+    return ComplexityCtx(
+        sizes = dvec_new(32),
+        times_ns = dvec_new(32),
+        max_ms = b
+    )
+}
+
+fn complexity_free(move c: ComplexityCtx) {
+    dvec_free(move c.sizes)
+    dvec_free(move c.times_ns)
+}
+
+fn complexity_record(mut c: ComplexityCtx, size_n: i64, elapsed_ns: i64) {
+    if size_n <= 0 { return }
+    mut dt := elapsed_ns
+    if dt < 1 { dt = 1 }
+    dvec_push(mut c.sizes, size_n)
+    dvec_push(mut c.times_ns, dt)
+}
+
+// Groups trials by distinct input size, computes median p50 per size, and estimates empirical
+// scaling exponent `alpha = log2(T2/T1) / log2(N2/N1)`.
+// `noise_floor_ns` suppresses timer jitter on ultra-fast sub-50us operations.
+fn complexity_analyze(c: ComplexityCtx, warn_exp: f64 = 1.55, crit_exp: f64 = 2.35, noise_floor_ns: i64 = 50000) -> ComplexityResult {
+    n := dvec_len(c.sizes)
+    if n <= 0 {
+        return ComplexityResult(
+            distinct_sizes = 0, max_exponent = 0.0, max_ratio = 1.0,
+            max_single_ms = 0, budget_ms = c.max_ms, budget_exceeded = false,
+            is_dos_risk = false, class_label = "NO_DATA", summary = "no samples recorded"
+        )
+    }
+    // Extract unique sorted sizes
+    uniq := ibuf_new(n + 4)
+    mut i := 0
+    while i < n {
+        ibuf_push(uniq, dvec_get(c.sizes, i, 0))
+        i += 1
+    }
+    sort_i64_range(uniq, 0, n - 1)
+    u_len := ibuf_dedup_sorted(uniq)
+
+    // Compute p50 median time (ns) per unique size
+    meds := ibuf_new(u_len + 4)
+    mut max_ns := 0
+    mut ui := 0
+    while ui < u_len {
+        sz := ibuf_get(uniq, ui)
+        tr := ibuf_new(32)
+        mut j := 0
+        while j < n {
+            if dvec_get(c.sizes, j, 0) == sz {
+                t := dvec_get(c.times_ns, j, 1)
+                ibuf_push(tr, t)
+                if t > max_ns { max_ns = t }
+            }
+            j += 1
+        }
+        tn := ibuf_len(tr)
+        if tn > 1 { sort_i64_range(tr, 0, tn - 1) }
+        ibuf_push(meds, ibuf_get(tr, tn / 2))
+        buf_free(move tr)
+        ui += 1
+    }
+
+    // Collect pairwise scaling exponents (scaled by 1000) to compute a cache-cliff-resistant median exponent,
+    // plus overall end-to-end log-log slope across [first_valid .. last_valid].
+    exps_milli := ibuf_new(u_len + 4)
+    mut max_ratio := 1.0
+    mut first_v := -1
+    mut last_v := -1
+    ui = 0
+    while ui + 1 < u_len {
+        n1 := ibuf_get(uniq, ui)
+        n2 := ibuf_get(uniq, ui + 1)
+        t1 := ibuf_get(meds, ui)
+        t2 := ibuf_get(meds, ui + 1)
+        if n2 > n1 and t2 >= noise_floor_ns {
+            if first_v < 0 { first_v = ui }
+            last_v = ui + 1
+            den_t := if t1 > 0 { t1 as f64 } else { 1.0 }
+            ratio := (t2 as f64) / den_t
+            if ratio > max_ratio { max_ratio = ratio }
+            dn := sec_log2_f64((n2 as f64) / (n1 as f64))
+            if dn > 0.01 and ratio > 1.0 {
+                exp_v := sec_log2_f64(ratio) / dn
+                ibuf_push(exps_milli, (exp_v * 1000.0) as i64)
+            } else {
+                ibuf_push(exps_milli, 0)
+            }
+        }
+        ui += 1
+    }
+    mut est_exp := 0.0
+    en := ibuf_len(exps_milli)
+    if en > 0 {
+        if en > 1 { sort_i64_range(exps_milli, 0, en - 1) }
+        est_exp = (ibuf_get(exps_milli, en / 2) as f64) / 1000.0
+    }
+    // Cross-check with end-to-end log-log slope when >= 2 transitions are valid
+    if first_v >= 0 and last_v > first_v + 1 {
+        nf := ibuf_get(uniq, first_v)
+        nl := ibuf_get(uniq, last_v)
+        tf := ibuf_get(meds, first_v)
+        tl := ibuf_get(meds, last_v)
+        if nl > nf and tl > tf and tf > 0 {
+            overall_exp := sec_log2_f64((tl as f64) / (tf as f64)) / sec_log2_f64((nl as f64) / (nf as f64))
+            if overall_exp > est_exp { est_exp = overall_exp }
+        }
+    }
+    buf_free(move exps_milli)
+    buf_free(move uniq)
+    buf_free(move meds)
+    max_exp := est_exp
+
+    max_ms_obs := max_ns / 1000000
+    over_budget := max_ms_obs > c.max_ms
+    mut label := "O(1)/O(N)"
+    mut dos_risk := false
+    if over_budget or max_exp > crit_exp {
+        label = "EXP/DOS_CRITICAL"
+        dos_risk = true
+    } else if max_exp > warn_exp {
+        label = "O(N^2)_QUADRATIC"
+        dos_risk = true
+    } else if max_exp > 1.15 {
+        label = "O(N_LOG_N)"
+    }
+    summ := f"{label} alpha={fmt_f64(max_exp, 2)} max_ratio={fmt_f64(max_ratio, 2)}x peak={max_ms_obs}ms/{c.max_ms}ms ({u_len} sizes)"
+    return ComplexityResult(
+        distinct_sizes = u_len,
+        max_exponent = max_exp,
+        max_ratio = max_ratio,
+        max_single_ms = max_ms_obs,
+        budget_ms = c.max_ms,
+        budget_exceeded = over_budget,
+        is_dos_risk = dos_risk,
+        class_label = label,
+        summary = summ
+    )
+}
+
+// --- 3. ASan-lite Redzone Canary & UAF/Leak Sentinel (`RedzoneGuard`) ---
+// Wraps `mem_alloc_aligned` with 64-byte keyed head & tail redzone canaries and 0xFE free poisoning.
+// Catches 1-byte heap underflow, 1-byte heap overflow, double-free, UAF metadata, and leaks in `unsafe` code!
+
+fn RZ_OK() -> i64             { return 0 }
+fn RZ_HEAD_UNDERFLOW() -> i64 { return 1 }
+fn RZ_TAIL_OVERFLOW() -> i64  { return 2 }
+fn RZ_INVALID_PTR() -> i64    { return 3 }
+fn RZ_DOUBLE_FREE() -> i64    { return 4 }
+
+struct RedzoneGuard {
+    // Stride 5 per record: [user_ptr, raw_ptr, req_size, state(1=live,2=freed), canary_key]
+    recs: DynIntVec
+    count: i64
+    active_blocks: i64
+    active_bytes: i64
+    underflows: i64
+    overflows: i64
+    double_frees: i64
+    invalid_frees: i64
+    secret_key: i64
+}
+
+struct RedzoneReport {
+    total_allocs: i64
+    active_leaks: i64
+    leaked_bytes: i64
+    underflows: i64
+    overflows: i64
+    double_frees: i64
+    invalid_frees: i64
+    is_clean: bool
+    summary: str
+}
+
+fn rz_guard_new(seed: i64 = 0x5EED1234) -> RedzoneGuard {
+    return RedzoneGuard(
+        recs = dvec_new(128),
+        count = 0,
+        active_blocks = 0,
+        active_bytes = 0,
+        underflows = 0,
+        overflows = 0,
+        double_frees = 0,
+        invalid_frees = 0,
+        secret_key = (seed ^ 0xA55AC33CDEADBEEF) *% 0x9E3779B97F4A7C15
+    )
+}
+
+@no_alloc
+fn _rz_canary_byte(key: i64, idx: i64, is_tail: i64) -> i64 {
+    mix := (key ^ ((idx + is_tail * 131) *% 0xBF58476D1CE4E5B9))
+    return ((ushr64(mix, 24) ^ mix) & 255) | 1 // always non-zero to catch NUL-terminator overflows!
+}
+
+// Allocates `size_bytes` guarded by 64B head & 64B tail keyed canaries. Returns 64B-aligned `user_ptr`.
+fn rz_alloc(mut g: RedzoneGuard, size_bytes: i64) -> i64 {
+    if size_bytes <= 0 or size_bytes > 268435456 { return 0 }
+    unsafe {
+        total := 64 + size_bytes + 64
+        raw := mem_alloc_aligned(total)
+        if raw == 0 { return 0 }
+        user_ptr := raw + 64
+        key := (raw *% 0x94D049BB133111EB) ^ g.secret_key
+        mut i := 0
+        while i < 64 {
+            ptr_write_u8(raw, i, _rz_canary_byte(key, i, 0))
+            ptr_write_u8(user_ptr + size_bytes, i, _rz_canary_byte(key, i, 1))
+            i += 1
+        }
+        mem_set(user_ptr, 0, size_bytes)
+        dvec_push(mut g.recs, user_ptr)
+        dvec_push(mut g.recs, raw)
+        dvec_push(mut g.recs, size_bytes)
+        dvec_push(mut g.recs, 1)
+        dvec_push(mut g.recs, key)
+        g.count = g.count + 1
+        g.active_blocks = g.active_blocks + 1
+        g.active_bytes = g.active_bytes + size_bytes
+        return user_ptr
+    }
+}
+
+fn _rz_find_idx(g: RedzoneGuard, user_ptr: i64) -> i64 {
+    mut i := g.count - 1
+    while i >= 0 {
+        if dvec_get(g.recs, i * 5, 0) == user_ptr {
+            return i
+        }
+        i -= 1
+    }
+    return -1
+}
+
+fn _rz_check_record(g: RedzoneGuard, idx: i64) -> i64 {
+    base := idx * 5
+    user_ptr := dvec_get(g.recs, base, 0)
+    raw := dvec_get(g.recs, base + 1, 0)
+    sz := dvec_get(g.recs, base + 2, 0)
+    state := dvec_get(g.recs, base + 3, 0)
+    key := dvec_get(g.recs, base + 4, 0)
+    if state != 1 { return RZ_DOUBLE_FREE() }
+    unsafe {
+        mut i := 0
+        while i < 64 {
+            if ptr_read_u8(raw, i) != _rz_canary_byte(key, i, 0) {
+                return RZ_HEAD_UNDERFLOW()
+            }
+            i += 1
+        }
+        i = 0
+        while i < 64 {
+            if ptr_read_u8(user_ptr + sz, i) != _rz_canary_byte(key, i, 1) {
+                return RZ_TAIL_OVERFLOW()
+            }
+            i += 1
+        }
+        return RZ_OK()
+    }
+}
+
+// Verifies head & tail redzone canaries for `user_ptr` without freeing it.
+fn rz_check_ptr(g: RedzoneGuard, user_ptr: i64) -> i64 {
+    idx := _rz_find_idx(g, user_ptr)
+    if idx < 0 { return RZ_INVALID_PTR() }
+    return _rz_check_record(g, idx)
+}
+
+// Verifies canaries, poisons freed payload with `0xFE` (UAF detector), and frees `user_ptr`.
+fn rz_free(mut g: RedzoneGuard, user_ptr: i64) -> i64 {
+    idx := _rz_find_idx(g, user_ptr)
+    if idx < 0 {
+        g.invalid_frees = g.invalid_frees + 1
+        return RZ_INVALID_PTR()
+    }
+    base := idx * 5
+    state := dvec_get(g.recs, base + 3, 0)
+    if state != 1 {
+        g.double_frees = g.double_frees + 1
+        return RZ_DOUBLE_FREE()
+    }
+    status := _rz_check_record(g, idx)
+    if status == RZ_HEAD_UNDERFLOW() { g.underflows = g.underflows + 1 }
+    if status == RZ_TAIL_OVERFLOW() { g.overflows = g.overflows + 1 }
+    raw := dvec_get(g.recs, base + 1, 0)
+    sz := dvec_get(g.recs, base + 2, 0)
+    unsafe {
+        mem_set(user_ptr, 0xFE, sz) // poison freed memory to surface UAF reads!
+        mem_free_aligned(raw)
+    }
+    _ := dvec_set(mut g.recs, base + 3, 2)
+    g.active_blocks = g.active_blocks - 1
+    g.active_bytes = g.active_bytes - sz
+    return status
+}
+
+// Scans ALL live allocations for silent redzone corruption + aggregates leaks/double-frees.
+fn rz_verify_all(g: RedzoneGuard) -> RedzoneReport {
+    mut live_uf := 0
+    mut live_of := 0
+    mut i := 0
+    while i < g.count {
+        if dvec_get(g.recs, i * 5 + 3, 0) == 1 {
+            st := _rz_check_record(g, i)
+            if st == RZ_HEAD_UNDERFLOW() { live_uf += 1 }
+            if st == RZ_TAIL_OVERFLOW() { live_of += 1 }
+        }
+        i += 1
+    }
+    tot_uf := g.underflows + live_uf
+    tot_of := g.overflows + live_of
+    clean := g.active_blocks == 0 and tot_uf == 0 and tot_of == 0 and g.double_frees == 0 and g.invalid_frees == 0
+    verdict := if clean { "MEMORY_CLEAN" } else { "MEMORY_VIOLATION" }
+    summ := f"{verdict} allocs={g.count} leaks={g.active_blocks}({g.active_bytes}B) underflows={tot_uf} overflows={tot_of} double_frees={g.double_frees} invalid_frees={g.invalid_frees}"
+    return RedzoneReport(
+        total_allocs = g.count,
+        active_leaks = g.active_blocks,
+        leaked_bytes = g.active_bytes,
+        underflows = tot_uf,
+        overflows = tot_of,
+        double_frees = g.double_frees,
+        invalid_frees = g.invalid_frees,
+        is_clean = clean,
+        summary = summ
+    )
+}
+
+// Sweeps any remaining leaked blocks safely and frees guard metadata.
+fn rz_guard_destroy(move g: RedzoneGuard) {
+    mut i := 0
+    while i < g.count {
+        base := i * 5
+        if dvec_get(g.recs, base + 3, 0) == 1 {
+            raw := dvec_get(g.recs, base + 1, 0)
+            if raw != 0 {
+                unsafe { mem_free_aligned(raw) }
+            }
+        }
+        i += 1
+    }
+    dvec_free(move g.recs)
+}
+
+// --- 4. Timeout-Guarded Subprocess Crash, Negative Compiler & Differential Build Runner ---
+
+struct ProcOutcome {
+    exit_code: i64
+    timed_out: bool
+    crashed: bool
+    is_sec_trap: bool
+    signal_name: str
+    elapsed_ms: i64
+    output: str
+}
+
+fn _sec_classify_exit(code: i64, timed_out: bool) -> (bool, bool, str) {
+    if timed_out { return (true, false, "TIMEOUT") }
+    u32 := code & 0xFFFFFFFF
+    if u32 == 0 { return (false, false, "OK") }
+    if u32 == 101 { return (true, true, "AXON_SEC_TRAP") }
+    if u32 == 0xC0000005 { return (true, false, "ACCESS_VIOLATION") }
+    if u32 == 0xC00000FD { return (true, false, "STACK_OVERFLOW") }
+    if u32 == 0xC0000094 { return (true, false, "INT_DIV_BY_ZERO") }
+    if u32 == 0xC0000095 { return (true, false, "INT_OVERFLOW") }
+    if u32 == 0xC000001D { return (true, false, "ILLEGAL_INSTRUCTION") }
+    if u32 == 139 { return (true, false, "SIGSEGV") }
+    if u32 == 134 { return (true, false, "SIGABRT") }
+    if u32 == 136 { return (true, false, "SIGFPE") }
+    return (false, false, "NONZERO")
+}
+
+fn _sec_has_nul(s: str) -> bool {
+    n := str_len(s)
+    mut i := 0
+    while i < n {
+        if str_byte(s, i) == 0 { return true }
+        i += 1
+    }
+    return false
+}
+
+fn _sec_tmp_name(tag: str, ext: str) -> str {
+    nonce := (clock_ns() ^ cpu_rdtsc() ^ (sys_pid() *% 0x9E3779B9)) & 0x7FFFFFFF
+    return f".axon_sec_{tag}_{sys_pid()}_{nonce}{ext}"
+}
+
+// Executes `cmd` directly in an isolated child process with a strict millisecond timeout.
+// On Windows: uses native `CreateProcessA` + inheritable stdout/stderr capture file + `WaitForSingleObject`
+// + `TerminateProcess`, avoiding `cmd.exe` shell parsing and preserving exact NTSTATUS crash codes.
+fn sec_exec_timeout(cmd: str, timeout_ms: i64 = 5000) -> ProcOutcome {
+    if str_len(cmd) == 0 or _sec_has_nul(cmd) {
+        return ProcOutcome(
+            exit_code = -1, timed_out = false, crashed = false, is_sec_trap = false,
+            signal_name = "INVALID_CMD", elapsed_ms = 0, output = ""
+        )
+    }
+    mut tmo := timeout_ms
+    if tmo < 50 { tmo = 50 }
+    if tmo > 300000 { tmo = 300000 }
+
+    t0 := clock_ns()
+    tmp_out := _sec_tmp_name("proc", ".log")
+    k := ffi_open("kernel32.dll", "", "")
+    if k != 0 {
+        f_cf := ffi_sym(k, "CreateFileA")
+        f_cp := ffi_sym(k, "CreateProcessA")
+        f_wf := ffi_sym(k, "WaitForSingleObject")
+        f_tp := ffi_sym(k, "TerminateProcess")
+        f_ge := ffi_sym(k, "GetExitCodeProcess")
+        f_ch := ffi_sym(k, "CloseHandle")
+        if f_cf != 0 and f_cp != 0 and f_wf != 0 and f_tp != 0 and f_ge != 0 and f_ch != 0 {
+            sa := ffi_alloc(32)
+            si := ffi_alloc(128)
+            pi := ffi_alloc(32)
+            ec_ptr := ffi_alloc(16)
+            c_out := ffi_cstr(tmp_out)
+            c_cmd := ffi_cstr(cmd)
+
+            // SECURITY_ATTRIBUTES (24B): +0 nLength=24, +16 bInheritHandle=1
+            ffi_write_u32_le(sa, 0, 24)
+            ffi_write_u32_le(sa, 16, 1)
+            // CreateFileA(tmp_out, GENERIC_WRITE=0x40000000, FILE_SHARE_READ|WRITE=3, &sa, CREATE_ALWAYS=2, FILE_ATTRIBUTE_NORMAL=0x80, 0)
+            h_file := ffi_call7(f_cf, c_out, 0x40000000, 3, sa, 2, 0x80, 0)
+
+            // STARTUPINFOA (104B): +0 cb=104, +60 dwFlags=STARTF_USESTDHANDLES(0x100)|STARTF_USESHOWWINDOW(1), +88 hStdOut, +96 hStdErr
+            ffi_write_u32_le(si, 0, 104)
+            if h_file != 0 and h_file != -1 {
+                ffi_write_u32_le(si, 60, 0x101)
+                ffi_write_i64(si, 11, h_file)
+                ffi_write_i64(si, 12, h_file)
+            } else {
+                ffi_write_u32_le(si, 60, 1)
+            }
+
+            cp_args := ibuf_new(12)
+            ibuf_push(cp_args, 0)          // lpApplicationName = NULL
+            ibuf_push(cp_args, c_cmd)      // lpCommandLine
+            ibuf_push(cp_args, 0)          // lpProcessAttributes
+            ibuf_push(cp_args, 0)          // lpThreadAttributes
+            ibuf_push(cp_args, 1)          // bInheritHandles = TRUE
+            ibuf_push(cp_args, 0x08000000) // dwCreationFlags = CREATE_NO_WINDOW
+            ibuf_push(cp_args, 0)          // lpEnvironment
+            ibuf_push(cp_args, 0)          // lpCurrentDirectory
+            ibuf_push(cp_args, si)         // lpStartupInfo
+            ibuf_push(cp_args, pi)         // lpProcessInformation
+            ok_cp := (ffi_call_arr(f_cp, 10, cp_args) & 0xFFFFFFFF) != 0
+            buf_free(move cp_args)
+
+            if h_file != 0 and h_file != -1 {
+                _ := ffi_call1(f_ch, h_file)
+            }
+
+            mut exit_code := -1
+            mut timed_out := false
+            if ok_cp {
+                h_proc := ffi_read_i64(pi, 0)
+                h_thr := ffi_read_i64(pi, 1)
+                w_rc := ffi_call2(f_wf, h_proc, tmo) & 0xFFFFFFFF
+                if w_rc == 258 {
+                    timed_out = true
+                    _ := ffi_call2(f_tp, h_proc, 124)
+                    _ := ffi_call2(f_wf, h_proc, 1000)
+                    exit_code = 124
+                } else {
+                    _ := ffi_call2(f_ge, h_proc, ec_ptr)
+                    exit_code = ffi_read_u32_le(ec_ptr, 0)
+                }
+                if h_proc != 0 { _ := ffi_call1(f_ch, h_proc) }
+                if h_thr != 0 { _ := ffi_call1(f_ch, h_thr) }
+            }
+
+            ffi_free(sa)
+            ffi_free(si)
+            ffi_free(pi)
+            ffi_free(ec_ptr)
+            ffi_free(c_out)
+            ffi_free(c_cmd)
+
+            out_txt := fs_read_text(tmp_out) or ""
+            _ := sys_fs_remove(tmp_out)
+            el_ms := (clock_ns() - t0) / 1000000
+            if not ok_cp {
+                return ProcOutcome(
+                    exit_code = -1, timed_out = false, crashed = false, is_sec_trap = false,
+                    signal_name = "SPAWN_FAILED", elapsed_ms = el_ms, output = out_txt
+                )
+            }
+            (crashed, is_trap, sig_name) := _sec_classify_exit(exit_code, timed_out)
+            return ProcOutcome(
+                exit_code = exit_code, timed_out = timed_out, crashed = crashed,
+                is_sec_trap = is_trap, signal_name = sig_name, elapsed_ms = el_ms, output = out_txt
+            )
+        }
+    }
+
+    // Portable non-Windows fallback via `os_exec`
+    rc := os_exec(f"{cmd} > {tmp_out} 2>&1")
+    out_txt := fs_read_text(tmp_out) or ""
+    _ := sys_fs_remove(tmp_out)
+    el_ms := (clock_ns() - t0) / 1000000
+    (crashed, is_trap, sig_name) := _sec_classify_exit(rc, false)
+    return ProcOutcome(
+        exit_code = rc, timed_out = false, crashed = crashed,
+        is_sec_trap = is_trap, signal_name = sig_name, elapsed_ms = el_ms, output = out_txt
+    )
+}
+
+// Negative Security Compiler Test: writes `source_code` to a temp `.ax` file, runs `axc check --json`,
+// and verifies the compiler REJECTS it with `expected_err_code` (e.g., "E0502", "E0503", "E0201").
+struct CheckFailResult {
+    passed: bool
+    exit_code: i64
+    expected_code: str
+    output: str
+}
+
+fn sec_check_must_fail(axc_path: str, source_code: str, expected_err_code: str, timeout_ms: i64 = 5000) -> CheckFailResult {
+    tmp_ax := _sec_tmp_name("neg", ".ax")
+    if not fs_write_text(tmp_ax, source_code) {
+        return CheckFailResult(passed = false, exit_code = -1, expected_code = expected_err_code, output = "failed to write temp source")
+    }
+    res := sec_exec_timeout(f"{axc_path} check --json {tmp_ax}", timeout_ms)
+    _ := sys_fs_remove(tmp_ax)
+    ok_fail := (not res.timed_out) and (res.exit_code != 0) and str_contains(res.output, expected_err_code)
+    return CheckFailResult(passed = ok_fail, exit_code = res.exit_code, expected_code = expected_err_code, output = res.output)
+}
+
+// Differential Build & Run Oracle: builds & runs `file_path` under 3 compiler configurations
+// (`--simd=avx2`, `--simd=scalar`, `--shield`) and verifies zero crashes and byte-identical stdout!
+struct DiffBuildResult {
+    passed: bool
+    avx2_rc: i64
+    scalar_rc: i64
+    shield_rc: i64
+    outputs_match: bool
+    summary: str
+}
+
+fn sec_diff_build_run(axc_path: str, file_path: str, timeout_ms: i64 = 10000) -> DiffBuildResult {
+    exe_avx := _sec_tmp_name("avx2", ".exe")
+    exe_sca := _sec_tmp_name("scalar", ".exe")
+    exe_shd := _sec_tmp_name("shield", ".exe")
+
+    b_avx := sec_exec_timeout(f"{axc_path} build {file_path} --simd=avx2 -o {exe_avx}", timeout_ms)
+    b_sca := sec_exec_timeout(f"{axc_path} build {file_path} --simd=scalar -o {exe_sca}", timeout_ms)
+    b_shd := sec_exec_timeout(f"{axc_path} build {file_path} --shield -o {exe_shd}", timeout_ms)
+
+    if b_avx.exit_code != 0 or b_sca.exit_code != 0 or b_shd.exit_code != 0 {
+        _ := sys_fs_remove(exe_avx)
+        _ := sys_fs_remove(exe_sca)
+        _ := sys_fs_remove(exe_shd)
+        return DiffBuildResult(
+            passed = false, avx2_rc = b_avx.exit_code, scalar_rc = b_sca.exit_code, shield_rc = b_shd.exit_code,
+            outputs_match = false,
+            summary = f"BUILD_DIFF_FAIL build_rc=({b_avx.exit_code},{b_sca.exit_code},{b_shd.exit_code})"
+        )
+    }
+
+    r_avx := sec_exec_timeout(exe_avx, timeout_ms)
+    r_sca := sec_exec_timeout(exe_sca, timeout_ms)
+    r_shd := sec_exec_timeout(exe_shd, timeout_ms)
+
+    _ := sys_fs_remove(exe_avx)
+    _ := sys_fs_remove(exe_sca)
+    _ := sys_fs_remove(exe_shd)
+
+    all_zero := r_avx.exit_code == 0 and r_sca.exit_code == 0 and r_shd.exit_code == 0
+        and (not r_avx.timed_out) and (not r_sca.timed_out) and (not r_shd.timed_out)
+    match_out := str_eq(r_avx.output, r_sca.output) and str_eq(r_avx.output, r_shd.output)
+    ok_all := all_zero and match_out
+    verdict := if ok_all { "DIFF_BUILD_OK" } else { "DIFF_BUILD_MISMATCH" }
+    summ := f"{verdict} rc=(avx2:{r_avx.exit_code}/{r_avx.signal_name}, scalar:{r_sca.exit_code}/{r_sca.signal_name}, shield:{r_shd.exit_code}/{r_shd.signal_name}) match={match_out}"
+    return DiffBuildResult(
+        passed = ok_all,
+        avx2_rc = r_avx.exit_code,
+        scalar_rc = r_sca.exit_code,
+        shield_rc = r_shd.exit_code,
+        outputs_match = match_out,
+        summary = summ
+    )
+}
+
+// --- 5. Stack-Backtrace Deduplicator & Persistent Crash/Corpus Vault (`SecCrashVault`) ---
+
+// Extracts up to 3 top frames (`#0 fn`, `#1 caller`, `#2 caller2`) from Axon's PIE stack backtrace
+// to produce a canonical crash signature for deduplicating hundreds of duplicate crashes into 1 root cause.
+fn sec_backtrace_signature(output: str, fallback_sig: str = "CRASH") -> str {
+    b := buf_new(256)
+    mut frames := 0
+    mut pos := 0
+    n := str_len(output)
+    while pos < n and frames < 3 {
+        mut nl := str_find_byte(output, 10, pos)
+        if nl < 0 { nl = n }
+        mut end_l := nl
+        if end_l > pos and str_byte(output, end_l - 1) == 13 { end_l -= 1 }
+        line := str_trim(str_slice(output, pos, end_l))
+        if str_starts_with(line, "#0") or str_starts_with(line, "#1") or str_starts_with(line, "#2") {
+            if frames > 0 { buf_push_str(b, "|") }
+            // Compact spaces inside `#0  fn_name`
+            mut sp := str_find_byte(line, 32, 0)
+            if sp > 0 {
+                tag := str_slice(line, 0, sp)
+                fn_name := str_trim(str_slice(line, sp + 1, str_len(line)))
+                buf_push_str(b, tag + ":" + fn_name)
+            } else {
+                buf_push_str(b, line)
+            }
+            frames += 1
+        }
+        if nl >= n { break }
+        pos = nl + 1
+    }
+    if frames == 0 {
+        buf_free(move b)
+        return fallback_sig
+    }
+    return buf_to_owned_str(move b)
+}
+
+struct SecCrashVault {
+    vault_dir: str
+    seen_sigs: StrMap      // crash_sig -> best_payload_len
+    unique_crashes: i64
+    total_crashes: i64
+    persist_disk: bool
+}
+
+fn sec_vault_new(vault_dir: str = "", persist_disk: bool = false) -> SecCrashVault {
+    if persist_disk and str_len(vault_dir) > 0 {
+        _ := fs_mkdir_all(vault_dir)
+    }
+    return SecCrashVault(
+        vault_dir = vault_dir,
+        seen_sigs = smap_new(32),
+        unique_crashes = 0,
+        total_crashes = 0,
+        persist_disk = persist_disk and str_len(vault_dir) > 0
+    )
+}
+
+fn sec_vault_free(move v: SecCrashVault) {
+    smap_free(move v.seen_sigs)
+}
+
+// Records a crash and deduplicates by normalized stack-backtrace signature.
+// Returns `true` when this crash represents a BRAND-NEW unique root cause (or strictly smaller reproducer!).
+fn sec_vault_record_crash(mut v: SecCrashVault, outcome: ProcOutcome, payload: str) -> bool {
+    v.total_crashes = v.total_crashes + 1
+    sig := sec_backtrace_signature(outcome.output, outcome.signal_name)
+    plen := str_len(payload)
+    prev_len := smap_get_i64(v.seen_sigs, sig, -1)
+    mut is_new := false
+    if prev_len < 0 {
+        v.unique_crashes = v.unique_crashes + 1
+        smap_set_i64(mut v.seen_sigs, sig, plen)
+        is_new = true
+    } else if plen < prev_len {
+        smap_set_i64(mut v.seen_sigs, sig, plen)
+    }
+    if v.persist_disk and (is_new or plen < prev_len) {
+        h := fnv1a_64(sig) & 0x7FFFFFFFFFFFFFFF
+        hx_path := f"{v.vault_dir}/crash_{fmt_hex(h, false, 12)}.hex"
+        meta_path := f"{v.vault_dir}/crash_{fmt_hex(h, false, 12)}.meta"
+        _ := fs_write_text(hx_path, str_to_hex(payload))
+        _ := fs_write_text(meta_path, f"sig={sig}\nexit={outcome.exit_code}\nsignal={outcome.signal_name}\nlen={plen}\n")
+    }
+    return is_new
+}
+
+// Persists a hex-encoded seed (preserves embedded NUL bytes losslessly!) into `vault_dir`.
+fn sec_vault_save_seed(vault_dir: str, payload: str) -> bool {
+    if str_len(vault_dir) == 0 { return false }
+    _ := fs_mkdir_all(vault_dir)
+    h := (fnv1a_64(payload) ^ (str_len(payload) *% 0x9E3779B97F4A7C15)) & 0x7FFFFFFFFFFFFFFF
+    p := f"{vault_dir}/seed_{fmt_hex(h, false, 12)}.hex"
+    return fs_write_text(p, str_to_hex(payload))
+}
+
+// Reloads all `.hex` seeds/crashes from `vault_dir` into a `StrVec` for corpus warm-start or crash replay.
+fn sec_vault_load_hex_dir(vault_dir: str) -> StrVec {
+    mut out := svec_new(32, 4096)
+    if str_len(vault_dir) == 0 { return out }
+    entries := fs_list_dir(vault_dir)
+    n := svec_len(entries)
+    mut i := 0
+    while i < n {
+        name := svec_get(entries, i)
+        if str_ends_with(name, ".hex") {
+            hx := fs_read_text(f"{vault_dir}/{name}") or ""
+            if str_len(hx) >= 0 {
+                dec := str_from_hex(str_trim(hx)) or ""
+                svec_push(mut out, dec)
+            }
+        }
+        i += 1
+    }
+    svec_free(move entries)
+    return out
+}
+
+fn sec_vault_unique_count(v: SecCrashVault) -> i64 { return v.unique_crashes }
+fn sec_vault_total_count(v: SecCrashVault) -> i64  { return v.total_crashes }

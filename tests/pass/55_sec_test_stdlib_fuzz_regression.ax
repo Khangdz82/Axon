@@ -1,0 +1,253 @@
+// Stdlib Deep Fuzzing, Property-Based, Timing & Complexity Regression Suite (`tests/pass/55_sec_test_stdlib_fuzz_regression.ax`)
+// Exercises `std::sec_test` continuously across Axon's core stdlib parsers, encoders, crypto, and security guards.
+
+use std::str
+use std::encoding
+use std::url
+use std::http
+use std::jwt
+use std::json
+use std::ws
+use std::html
+use std::css
+use std::regex
+use std::csv
+use std::toml
+use std::shield
+use std::sec_test
+
+fn _fuzz_http_rc(raw: str) -> i64 {
+    _ := http_parse_request(raw) or return 400
+    return 200
+}
+
+fn _fuzz_url_rc(raw: str) -> i64 {
+    _ := url_parse(raw) or return 400
+    return 200
+}
+
+fn _fuzz_jwt_rc(tok: str, sec: str, now_ts: i64) -> i64 {
+    _ := jwt_verify_hs256(tok, sec, now_ts) or return 401
+    return 200
+}
+
+fn _fuzz_ws_rc(raw: ByteBuf, max_pay: i64) -> i64 {
+    _ := ws_decode_frame(raw, 0, max_pay) or return 400
+    return 200
+}
+
+fn _fuzz_html_rc(raw: str) -> i64 {
+    _ := html_parse(raw) or return 400
+    return 200
+}
+
+fn _has_nul_byte(s: str) -> bool {
+    n := str_len(s)
+    mut i := 0
+    while i < n {
+        if str_byte(s, i) == 0 { return true }
+        i += 1
+    }
+    return false
+}
+
+fn main() -> i32 {
+    mut rep := sec_report_new("Axon Stdlib Deep Fuzz, Property, Timing & Complexity Gate")
+
+    // 1. Property-based roundtrip verification on binary & hostile strings (200 iterations each)
+    mut gen := gen_new(9001)
+    mut i := 0
+    while i < 200 {
+        mode := if i % 2 == 0 { GEN_STR_BINARY() } else { GEN_STR_HOSTILE() }
+        raw := gen_str(gen, 96, mode)
+
+        b64 := base64_encode(raw)
+        d64 := base64_decode(b64) or "__ERR__"
+        _ := sec_assert_roundtrip(mut rep, raw, d64, "std::str::base64", "base64 binary roundtrip")
+
+        b64u := base64url_encode(raw)
+        d64u := base64url_decode(b64u) or "__ERR__"
+        _ := sec_assert_roundtrip(mut rep, raw, d64u, "std::encoding::base64url", "base64url binary roundtrip")
+
+        hx := str_to_hex(raw)
+        dhx := str_from_hex(hx) or "__ERR__"
+        _ := sec_assert_roundtrip(mut rep, raw, dhx, "std::str::hex", "hex binary roundtrip")
+
+        // url_decode intentionally blocks %00 (CWE-158 NUL defense); verify both properties!
+        ue := url_encode(raw)
+        if _has_nul_byte(raw) {
+            du_ok := str_eq(url_decode(ue) or "__NUL_BLOCKED__", "__NUL_BLOCKED__")
+            _ := sec_assert(
+                mut rep, du_ok, SEC_SEV_HIGH(), "CWE-158", "std::str::url_decode",
+                "url_decode failed to reject percent-encoded NUL byte (%00)",
+                "decoded %00 into output string", "must return err(400) for %00",
+                sec_format_repro(i, raw)
+            )
+        } else {
+            du := url_decode(ue) or "__ERR__"
+            _ := sec_assert_roundtrip(mut rep, raw, du, "std::str::url_encode/decode", "non-NUL percent-encoding roundtrip")
+        }
+        i += 1
+    }
+    gen_free(move gen)
+
+    // 2. JWT Attack Corpus (all forged/alg:none/downgrade/malformed tokens MUST be rejected)
+    secret := "axon_sec_test_hmac_key_2026"
+    jwt_sv := corpus_jwt_attacks()
+    i = 0
+    while i < svec_len(jwt_sv) {
+        tok := svec_get(jwt_sv, i)
+        _ := sec_assert(
+            mut rep, _fuzz_jwt_rc(tok, secret, 1700000000) != 200,
+            SEC_SEV_CRITICAL(), "CWE-347", "std::jwt::jwt_verify_hs256",
+            "JWT verifier accepted forged/downgraded token",
+            "returned ok", "must return err(401)", sec_format_repro(i, tok)
+        )
+        i += 1
+    }
+    svec_free(move jwt_sv)
+
+    // 3. Dudect Constant-Time Verification on `jwt_verify_hs256` & `shield_mba_verify_eq`
+    valid_tok := jwt_sign_hs256("{\"sub\":\"u1\",\"exp\":2000000000}", secret) or ""
+    d2 := str_find_byte(valid_tok, 46, str_find_byte(valid_tok, 46, 0) + 1)
+    pref := str_slice(valid_tok, 0, d2 + 1)
+    sig := str_slice(valid_tok, d2 + 1, str_len(valid_tok))
+    c0 := if str_byte(sig, 0) == 65 { "B" } else { "A" }
+    cl := if str_byte(sig, str_len(sig) - 1) == 65 { "B" } else { "A" }
+    bad_first := pref + c0 + str_slice(sig, 1, str_len(sig))
+    bad_last := pref + str_slice(sig, 0, str_len(sig) - 1) + cl
+
+    mut d_jwt := dudect_new(9101, 600)
+    mut sink := 0
+    while true {
+        cls := dudect_next_class(d_jwt)
+        if cls < 0 { break }
+        cand := if cls == 0 { bad_first } else { bad_last }
+        t0 := dudect_rdtsc()
+        sink = sink +% _fuzz_jwt_rc(cand, secret, 1900000000)
+        t1 := dudect_rdtsc()
+        dudect_record(mut d_jwt, cls, t1 -% t0)
+    }
+    res_jwt := dudect_analyze(d_jwt, 6.0, 5)
+    dudect_free(move d_jwt)
+    _ := sec_assert_no_timing_leak(mut rep, res_jwt, "std::jwt::jwt_verify_hs256", "HS256 MAC verification")
+
+    sealed_val := shield_mba_seal(0x123456789ABCDEF0, 0x778899AABBCCDDEE)
+    mut d_mba := dudect_new(9102, 1200)
+    while true {
+        cls := dudect_next_class(d_mba)
+        if cls < 0 { break }
+        // Compare near-match (1-bit LSB diff) vs far-mismatch (all bits diff); zero harness branching inside timed region
+        probe_v := if cls == 0 { 0x123456789ABCDEF1 } else { 0x0000000000000000 }
+        mut ok_mba := false
+        t0 := dudect_rdtsc()
+        mut k := 0
+        while k < 8 {
+            ok_mba = shield_mba_verify_eq(sealed_val, 0x778899AABBCCDDEE, probe_v)
+            k += 1
+        }
+        t1 := dudect_rdtsc()
+        if ok_mba { sink += 1 }
+        dudect_record(mut d_mba, cls, t1 -% t0)
+    }
+    res_mba := dudect_analyze(d_mba, 6.0, 5)
+    dudect_free(move d_mba)
+    _ := sec_assert_no_timing_leak(mut rep, res_mba, "std::shield::shield_mba_verify_eq", "MBA constant-time tag verify")
+
+    // 4. Greybox Fuzzing (Crash/OOB/Overflow freedom across URL, HTTP, JSON, WebSocket, HTML, CSS, TOML, CSV)
+    mut fz := fuzz_new(9201, 800, 256)
+    fuzz_add_seed(mut fz, "GET /api/v1?x=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    fuzz_add_seed(mut fz, "https://example.com:443/path?k=v#h")
+    fuzz_add_seed(mut fz, "{\"a\":\"b\",\"n\":42}")
+    fuzz_add_seed(mut fz, "<div id=\"x\">hi</div>")
+    fuzz_load_default_dict(mut fz)
+    while fuzz_next(mut fz) {
+        s := fuzz_cur_str(fz)
+        r1 := _fuzz_url_rc(s)
+        r2 := _fuzz_http_rc(s)
+        _ := json_get_i64(s, "n") or -1
+        _ := json_get_str(s, "a") or ""
+        r3 := _fuzz_html_rc(s)
+        _ := css_parse_stylesheet(s)
+        td := toml_parse(s)
+        toml_free(move td)
+        ct := csv_parse(s)
+        csv_free(move ct)
+        wb := buf_new(str_len(s) + 8)
+        if str_len(s) > 0 { buf_push_str(wb, s) }
+        r4 := _fuzz_ws_rc(wb, 256)
+        buf_free(move wb)
+        _ := fuzz_feedback_i64(mut fz, r1 ^ (r2 << 8) ^ (r3 << 16) ^ (r4 << 24))
+    }
+    _ := sec_assert(
+        mut rep, fuzz_iters(fz) == 800 and fuzz_unique_features(fz) >= 2,
+        SEC_SEV_MEDIUM(), "CWE-682", "std::sec_fuzz::SecFuzzer",
+        "Greybox multi-parser fuzz campaign did not complete expected iterations",
+        f"iters={fuzz_iters(fz)} features={fuzz_unique_features(fz)}",
+        "Expected 800 crash-free iterations with >= 2 feedback features", ""
+    )
+    fuzz_free(move fz)
+
+    // 5. Stateful Model-Checking Fuzzer (`SecSeqFuzzer`) on `DynMap` (500 op sequences vs shadow oracle)
+    mut sf_dm := seq_fuzz_new(9301, 4, 32, 16, 500)
+    mut dm_ok := true
+    mut dm_err := ""
+    while seq_fuzz_next(mut sf_dm) {
+        mut dm := dmap_new(8)
+        pres := ibuf_new(16)
+        vals := ibuf_new(16)
+        mut k := 0
+        while k < 16 { ibuf_push(pres, 0); ibuf_push(vals, 0); k += 1 }
+        mut slen := 0
+        n_ops := seq_fuzz_len(sf_dm)
+        mut si := 0
+        while si < n_ops {
+            op := seq_fuzz_op(sf_dm, si)
+            key := seq_fuzz_arg1(sf_dm, si)
+            val := seq_fuzz_arg2(sf_dm, si) + 100
+            if op == 0 {
+                dmap_put(mut dm, key, val)
+                if ibuf_get(pres, key) == 0 { slen += 1 }
+                ibuf_set(pres, key, 1); ibuf_set(vals, key, val)
+            } else if op == 1 {
+                if dmap_remove(mut dm, key) != (ibuf_get(pres, key) == 1) { dm_ok = false; dm_err = "remove mismatch"; break }
+                if ibuf_get(pres, key) == 1 { ibuf_set(pres, key, 0); slen -= 1 }
+            } else if op == 2 {
+                exp_has := ibuf_get(pres, key) == 1
+                exp_v := if exp_has { ibuf_get(vals, key) } else { -1 }
+                if dmap_contains(dm, key) != exp_has or dmap_get(dm, key, -1) != exp_v { dm_ok = false; dm_err = "get mismatch"; break }
+            } else {
+                if dmap_len(dm) != slen { dm_ok = false; dm_err = "len mismatch"; break }
+            }
+            si += 1
+        }
+        buf_free(move pres)
+        buf_free(move vals)
+        dmap_free(move dm)
+        if not dm_ok { break }
+    }
+    seq_fuzz_free(move sf_dm)
+    _ := sec_assert(mut rep, dm_ok, SEC_SEV_HIGH(), "CWE-682", "std::ds::DynMap", "Stateful DynMap model divergence", dm_err, "Exact parity with shadow map", dm_err)
+
+    // 6. Regex ReDoS Complexity Scaling Gate
+    mut cx_re := complexity_new(500)
+    mut rlen := 32
+    while rlen <= 256 {
+        txt := corpus_gen_repeat("a", rlen, "!")
+        mut tr := 0
+        while tr < 3 {
+            t0 := clock_ns()
+            _ := regex_is_match(".*.*.*.*.*.*.*.*X", txt)
+            t1 := clock_ns()
+            complexity_record(mut cx_re, rlen, t1 - t0)
+            tr += 1
+        }
+        rlen = rlen * 2
+    }
+    res_re := complexity_analyze(cx_re, 1.85, 2.50, 100000)
+    complexity_free(move cx_re)
+    _ := sec_assert_no_dos(mut rep, res_re, "std::regex::regex_is_match", "ReDoS pattern scaling")
+
+    if sink == -9999999999 { println("sink") }
+    return sec_report_finish(move rep)
+}

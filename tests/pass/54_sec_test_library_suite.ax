@@ -1,0 +1,654 @@
+// Deep Security Testing Library Self-Verification Suite (`tests/pass/54_sec_test_library_suite.ax`)
+// Proves True-Positive detection AND Zero-False-Positive accuracy across all `std::sec_test` engines:
+//   1. Greybox 64KB-bitmap coverage fuzzer + Zeller `ddmin` string & `i64` binary-search minimizers
+//   2. Dudect Welch's t-test timing side-channel detector (catches early-exit leak, passes `ct_eq_str`)
+//   3. Algorithmic complexity / ReDoS oracle (catches O(N^2) blowup, passes O(N) radix sort)
+//   4. ASan-lite Redzone Canary Guard (catches 1-byte underflow, 1-byte overflow, double-free, leaks)
+//   5. Subprocess crash (`AXON_SEC_TRAP` 101) & timeout (`TIMEOUT`) isolation, negative `axc check` (`E0502`/`E0503`/`E0201`),
+//      and 3-way differential build verification (`avx2` vs `scalar` vs `--shield`)
+//   6. Structured English Markdown & JSON report generation
+
+use std::str
+use std::algo
+use std::crypto
+use std::fs
+use std::sys
+use std::sec_test
+
+// Planted 4-stage greybox state-machine target: returns true ONLY when input contains "AXON"
+// and reports progressive branch coverage edges to `fz` so greybox fuzzing solves it rapidly.
+fn _planted_parser_bug(mut fz: SecFuzzer, s: str) -> bool {
+    n := str_len(s)
+    mut i := 0
+    mut prev := 10
+    while i < n {
+        b := str_byte(s, i)
+        if b == 65 { // 'A'
+            _ := fuzz_trace_edge(mut fz, prev, 101)
+            prev = 101
+            if i + 1 < n and str_byte(s, i + 1) == 88 { // 'X'
+                _ := fuzz_trace_edge(mut fz, prev, 202)
+                prev = 202
+                if i + 2 < n and str_byte(s, i + 2) == 79 { // 'O'
+                    _ := fuzz_trace_edge(mut fz, prev, 303)
+                    prev = 303
+                    if i + 3 < n and str_byte(s, i + 3) == 78 { // 'N'
+                        _ := fuzz_trace_edge(mut fz, prev, 404)
+                        return true
+                    }
+                }
+            }
+        }
+        i += 1
+    }
+    return false
+}
+
+// Intentional leaky early-exit string comparison (vulnerable to CWE-208 timing side-channel)
+fn _leaky_early_exit_eq(a: str, b: str) -> bool {
+    la := str_len(a)
+    lb := str_len(b)
+    if la != lb { return false }
+    mut i := 0
+    while i < la {
+        if str_byte(a, i) != str_byte(b, i) { return false }
+        i += 1
+    }
+    return true
+}
+
+// Intentional O(N^2) quadratic hotspot for complexity oracle True-Positive test
+fn _quadratic_work(n: i64) -> i64 {
+    mut acc := 0
+    mut i := 0
+    while i < n {
+        mut j := 0
+        while j < n {
+            acc = acc +% ((i ^ j) & 7)
+            j += 1
+        }
+        i += 1
+    }
+    return acc
+}
+
+// Reads 8-byte LE integer from `s` at `off` (helper for REDQUEEN CmpLog 2^184 breakthrough test)
+fn _read_le64_str(s: str, off: i64) -> i64 {
+    mut v := 0
+    mut i := 7
+    while i >= 0 {
+        v = (v << 8) | (str_byte(s, off + i) & 255)
+        i -= 1
+    }
+    return v
+}
+
+// Impossible 2^184 guard: requires exact 64-bit magic `0x1122334455667788` + exact 15B string `"UNLOCK_VAULT_99"`.
+// Unsolvable by blind fuzzing; solved in < 10 iterations by REDQUEEN CmpLog I2S!
+fn _redqueen_vault_target(mut fz: SecFuzzer, s: str) -> bool {
+    if str_len(s) < 23 { return false }
+    got_magic := _read_le64_str(s, 0)
+    expected_magic := 0x1122334455667788
+    fuzz_cmplog_i64(mut fz, got_magic, expected_magic)
+    if got_magic != expected_magic { return false }
+    _ := fuzz_trace_edge(mut fz, 900, 901)
+
+    got_cmd := str_slice(s, 8, 23)
+    fuzz_cmplog_str(mut fz, got_cmd, "UNLOCK_VAULT_99")
+    if not str_eq(got_cmd, "UNLOCK_VAULT_99") { return false }
+    _ := fuzz_trace_edge(mut fz, 901, 902)
+    return true
+}
+
+// Planted 3-step stateful sequence bug: fails ONLY if op0(slot=2) -> op1(slot=2) -> op2(any) occurs in order!
+fn _stateful_bug_eval(ops: IntBuf) -> bool {
+    n_ops := ibuf_len(ops) / 3
+    mut st := 0 // 0=init, 1=created slot2, 2=deleted slot2, 3=compacted -> BUG!
+    mut i := 0
+    while i < n_ops {
+        op := ibuf_get(ops, i * 3)
+        a1 := ibuf_get(ops, i * 3 + 1)
+        if op == 0 and a1 == 2 and st == 0 { st = 1 }
+        else if op == 1 and a1 == 2 and st == 1 { st = 2 }
+        else if op == 2 and st == 2 { return true }
+        i += 1
+    }
+    return false
+}
+
+fn main() -> i32 {
+    mut rep := sec_report_new("std::sec_test Self-Verification Suite")
+
+    // --- 1. Greybox Coverage Fuzzer + Zeller ddmin Shrinker + i64 Shrinker ---
+    mut fz := fuzz_new(202601, 20000, 64)
+    fuzz_add_seed(mut fz, "hello_world")
+    fuzz_add_dict(mut fz, "A")
+    fuzz_add_dict(mut fz, "X")
+    fuzz_add_dict(mut fz, "O")
+    fuzz_add_dict(mut fz, "N")
+    mut found_trigger := false
+    mut trigger_payload := ""
+    while fuzz_next(mut fz) {
+        cur := fuzz_cur_str(fz)
+        if _planted_parser_bug(mut fz, cur) {
+            found_trigger = true
+            trigger_payload = cur
+            break
+        }
+    }
+    _ := sec_assert(
+        mut rep, found_trigger, SEC_SEV_HIGH(), "CWE-682", "std::sec_fuzz::SecFuzzer",
+        "Greybox fuzzer failed to discover 4-byte coverage-guided trigger",
+        f"found={found_trigger} iters={fuzz_iters(fz)} unique_bits={fuzz_unique_features(fz)}",
+        "Fuzzer must discover 'AXON' via 64KB coverage bitmap feedback within 20,000 iterations",
+        f"corpus_len={fuzz_corpus_len(fz)}"
+    )
+    _ := sec_assert(
+        mut rep, fuzz_unique_features(fz) >= 4, SEC_SEV_MEDIUM(), "CWE-682", "std::sec_fuzz::fuzz_trace_edge",
+        "Coverage bitmap did not track distinct branch edges",
+        f"unique_bits={fuzz_unique_features(fz)}",
+        "Expected >= 4 distinct coverage bits",
+        ""
+    )
+    fuzz_free(move fz)
+
+    // ddmin shrinker on noisy wrapper around "AXON" -> must shrink to exact 4-byte "AXON"
+    noisy := "zzzzzzzzzzzz_noise_prefix_AXON_noise_suffix_999999999999"
+    mut sh_s := shrink_str_new(noisy, 512)
+    while shrink_str_next(mut sh_s) {
+        cand := shrink_str_candidate(sh_s)
+        shrink_str_report(mut sh_s, str_contains(cand, "AXON"))
+    }
+    min_s := shrink_str_result(sh_s)
+    shrink_str_free(move sh_s)
+    _ := sec_assert_eq_str(mut rep, min_s, "AXON", "CWE-682", "std::sec_fuzz::ShrinkStr", "Zeller ddmin failed to minimize failing string to exact 4-byte core")
+
+    // i64 binary-search shrinker: predicate `x >= 137 or x <= -137` starting from -987654 -> must shrink to 137
+    mut sh_i := shrink_i64_new(-987654)
+    while shrink_i64_next(mut sh_i) {
+        c := shrink_i64_candidate(sh_i)
+        shrink_i64_report(mut sh_i, c >= 137 or c <= -137)
+    }
+    min_i := shrink_i64_result(sh_i)
+    _ := sec_assert_eq_i64(mut rep, min_i, 137, "CWE-682", "std::sec_fuzz::ShrinkI64", "Binary-search i64 shrinker failed to find minimal counterexample 137")
+
+    // --- 2. Dudect Statistical Timing Side-Channel Oracle (CWE-208) ---
+    secret512 := corpus_gen_repeat("A", 512)
+    mismatch_first := "B" + corpus_gen_repeat("A", 511)
+    mismatch_last := corpus_gen_repeat("A", 511) + "B"
+
+    // 2a. True Positive: leaky early-exit compare MUST be flagged as TIMING_LEAK!
+    mut d_leak := dudect_new(777, 1500)
+    mut sink_acc := 0
+    while true {
+        cls := dudect_next_class(d_leak)
+        if cls < 0 { break }
+        probe := if cls == 0 { mismatch_first } else { mismatch_last }
+        t0 := dudect_rdtsc()
+        mut r := 0
+        mut k := 0
+        while k < 8 {
+            if _leaky_early_exit_eq(secret512, probe) { r += 1 }
+            k += 1
+        }
+        t1 := dudect_rdtsc()
+        sink_acc = sink_acc +% r
+        dudect_record(mut d_leak, cls, t1 -% t0)
+    }
+    res_leak := dudect_analyze(d_leak, 4.5, 5)
+    dudect_free(move d_leak)
+    _ := sec_assert(
+        mut rep, res_leak.leaked, SEC_SEV_HIGH(), "CWE-208", "std::sec_oracle::DudectCtx",
+        "Dudect failed to detect intentional early-exit timing leak",
+        res_leak.summary,
+        "Expected |t| > 4.5 and leaked == true for early-exit byte compare on 512B strings",
+        res_leak.summary
+    )
+
+    // 2b. Zero False Positive: `std::crypto::ct_eq_str` MUST pass as constant-time!
+    mut d_ct := dudect_new(888, 1500)
+    while true {
+        cls := dudect_next_class(d_ct)
+        if cls < 0 { break }
+        probe := if cls == 0 { mismatch_first } else { mismatch_last }
+        t0 := dudect_rdtsc()
+        mut r := 0
+        mut k := 0
+        while k < 4 {
+            if ct_eq_str(secret512, probe) { r += 1 }
+            k += 1
+        }
+        t1 := dudect_rdtsc()
+        sink_acc = sink_acc +% r
+        dudect_record(mut d_ct, cls, t1 -% t0)
+    }
+    res_ct := dudect_analyze(d_ct, 6.0, 5)
+    dudect_free(move d_ct)
+    _ := sec_assert_no_timing_leak(mut rep, res_ct, "std::crypto::ct_eq_str", "512-byte constant-time equality")
+
+    // --- 3. Algorithmic Complexity / ReDoS Scaling Oracle (CWE-400 / CWE-1333) ---
+    // 3a. True Positive: O(N^2) loop MUST be flagged!
+    mut cx_bad := complexity_new(2000)
+    mut sz := 400
+    while sz <= 3200 {
+        mut tr := 0
+        while tr < 3 {
+            t0 := clock_ns()
+            sink_acc = sink_acc +% _quadratic_work(sz)
+            t1 := clock_ns()
+            complexity_record(mut cx_bad, sz, t1 - t0)
+            tr += 1
+        }
+        sz = sz * 2
+    }
+    res_cx_bad := complexity_analyze(cx_bad, 1.55, 2.35, 50000)
+    complexity_free(move cx_bad)
+    _ := sec_assert(
+        mut rep, res_cx_bad.is_dos_risk and res_cx_bad.max_exponent >= 1.60,
+        SEC_SEV_HIGH(), "CWE-400", "std::sec_oracle::ComplexityCtx",
+        "Complexity oracle failed to detect intentional O(N^2) blowup",
+        res_cx_bad.summary,
+        "Expected is_dos_risk == true and alpha >= 1.60",
+        res_cx_bad.summary
+    )
+
+    // 3b. Zero False Positive: O(N) LSD radix sort (`sort_i64`) MUST pass!
+    mut cx_ok := complexity_new(2000)
+    mut rsz := 2000
+    while rsz <= 16000 {
+        mut tr := 0
+        while tr < 3 {
+            arr := ibuf_new(rsz + 4)
+            mut i := 0
+            while i < rsz {
+                ibuf_push(arr, (rsz - i) *% 2654435761)
+                i += 1
+            }
+            t0 := clock_ns()
+            sort_i64(arr)
+            t1 := clock_ns()
+            complexity_record(mut cx_ok, rsz, t1 - t0)
+            buf_free(move arr)
+            tr += 1
+        }
+        rsz = rsz * 2
+    }
+    res_cx_ok := complexity_analyze(cx_ok, 1.55, 2.35, 50000)
+    complexity_free(move cx_ok)
+    _ := sec_assert_no_dos(mut rep, res_cx_ok, "std::algo::sort_i64", "LSD Radix Sort scaling")
+
+    // --- 4. ASan-lite Redzone Canary Guard (CWE-120 / CWE-415 / CWE-401) ---
+    // 4a. Clean lifecycle
+    mut rz_ok := rz_guard_new(111)
+    p_ok := rz_alloc(mut rz_ok, 64)
+    unsafe { ptr_write_u8(p_ok, 0, 42); ptr_write_u8(p_ok, 63, 99) }
+    _ := sec_assert_eq_i64(mut rep, rz_check_ptr(rz_ok, p_ok), RZ_OK(), "CWE-120", "std::sec_oracle::RedzoneGuard", "Clean guarded allocation should pass redzone check")
+    _ := sec_assert_eq_i64(mut rep, rz_free(mut rz_ok, p_ok), RZ_OK(), "CWE-120", "std::sec_oracle::RedzoneGuard", "Clean guarded free should return RZ_OK")
+    rr_clean := rz_verify_all(rz_ok)
+    _ := sec_assert_mem_clean(mut rep, rr_clean, "std::sec_oracle::RedzoneGuard", "clean alloc/free lifecycle")
+    rz_guard_destroy(move rz_ok)
+
+    // 4b. True Positives: 1-byte underflow, 1-byte overflow, double-free, and memory leak!
+    mut rz_bad := rz_guard_new(222)
+    p_uf := rz_alloc(mut rz_bad, 32)
+    p_of := rz_alloc(mut rz_bad, 32)
+    p_lk := rz_alloc(mut rz_bad, 48)
+    unsafe {
+        ptr_write_u8(p_uf - 1, 0, 0)  // 1-byte head underflow!
+        ptr_write_u8(p_of + 32, 0, 0) // 1-byte tail overflow!
+    }
+    _ := sec_assert_eq_i64(mut rep, rz_check_ptr(rz_bad, p_uf), RZ_HEAD_UNDERFLOW(), "CWE-120", "std::sec_oracle::rz_check_ptr", "Must catch 1-byte heap head underflow")
+    _ := sec_assert_eq_i64(mut rep, rz_check_ptr(rz_bad, p_of), RZ_TAIL_OVERFLOW(), "CWE-120", "std::sec_oracle::rz_check_ptr", "Must catch 1-byte heap tail overflow")
+    _ := sec_assert_eq_i64(mut rep, rz_free(mut rz_bad, p_uf), RZ_HEAD_UNDERFLOW(), "CWE-120", "std::sec_oracle::rz_free", "Free must report head underflow")
+    _ := sec_assert_eq_i64(mut rep, rz_free(mut rz_bad, p_uf), RZ_DOUBLE_FREE(), "CWE-415", "std::sec_oracle::rz_free", "Second free must be blocked as RZ_DOUBLE_FREE")
+    _ := sec_assert_eq_i64(mut rep, rz_free(mut rz_bad, p_of), RZ_TAIL_OVERFLOW(), "CWE-120", "std::sec_oracle::rz_free", "Free must report tail overflow")
+    rr_bad := rz_verify_all(rz_bad)
+    _ := sec_assert(
+        mut rep, (not rr_bad.is_clean) and rr_bad.active_leaks == 1 and rr_bad.leaked_bytes == 48 and rr_bad.underflows == 1 and rr_bad.overflows == 1 and rr_bad.double_frees == 1,
+        SEC_SEV_CRITICAL(), "CWE-120", "std::sec_oracle::rz_verify_all",
+        "RedzoneGuard summary counts did not match exact planted violations",
+        rr_bad.summary,
+        "Expected leaks=1(48B) underflows=1 overflows=1 double_frees=1",
+        rr_bad.summary
+    )
+    _ := p_lk
+    rz_guard_destroy(move rz_bad)
+
+    // --- 5. Negative Compiler Security Checks, Process Crash/Timeout Isolation & Differential Build ---
+    axc_bin := ".\\bin\\axc.exe"
+    if sys_fs_exists(axc_bin) {
+        // 5a. Negative security checks: E0502 (taint), E0503 (unsafe), E0201 (use-after-move)
+        c_e502 := sec_check_must_fail(axc_bin, "fn run_t(x: tainted[str]) { _ := os_exec(x) }\nfn main() -> i32 { return 0 }\n", "E0502")
+        _ := sec_assert_check_fails(mut rep, c_e502, "compiler::sema_effects", "Taint sink rejection (E0502)")
+
+        c_e503 := sec_check_must_fail(axc_bin, "fn main() -> i32 { p := mem_alloc_aligned(16); mem_free_aligned(p); return 0 }\n", "E0503")
+        _ := sec_assert_check_fails(mut rep, c_e503, "compiler::sema_effects", "Unsafe boundary rejection (E0503)")
+
+        c_e201 := sec_check_must_fail(axc_bin, "fn main() -> i32 { b := buf_new(8); buf_free(move b); return buf_len(b) as i32 }\n", "E0201")
+        _ := sec_assert_check_fails(mut rep, c_e201, "compiler::sema_perceus", "Use-after-move rejection (E0201)")
+
+        // 5b. Isolated crash trap detection (exit 101 AXON_SEC_TRAP)
+        tmp_trap_ax := ".axon_sec_selftest_trap.ax"
+        tmp_trap_exe := ".axon_sec_selftest_trap.exe"
+        _ := fs_write_text(tmp_trap_ax, "fn main() -> i32 { b := buf_new(4); _ := buf_get(b, 999); buf_free(move b); return 0 }\n")
+        bt := sec_exec_timeout(f"{axc_bin} build {tmp_trap_ax} -o {tmp_trap_exe}", 8000)
+        if bt.exit_code == 0 {
+            rt := sec_exec_timeout(tmp_trap_exe, 4000)
+            _ := sec_assert(
+                mut rep, rt.is_sec_trap and rt.exit_code == 101 and str_eq(rt.signal_name, "AXON_SEC_TRAP"),
+                SEC_SEV_HIGH(), "CWE-125", "std::sec_oracle::sec_exec_timeout",
+                "Failed to classify OOB security trap (exit 101)",
+                f"rc={rt.exit_code} sig={rt.signal_name} trap={rt.is_sec_trap}",
+                "Expected exit_code=101, is_sec_trap=true, signal_name='AXON_SEC_TRAP'",
+                sec_escape_str(rt.output, 160)
+            )
+        }
+        _ := sys_fs_remove(tmp_trap_ax)
+        _ := sys_fs_remove(tmp_trap_exe)
+
+        // 5c. Isolated infinite-loop timeout detection (`TIMEOUT`)
+        tmp_hang_ax := ".axon_sec_selftest_hang.ax"
+        tmp_hang_exe := ".axon_sec_selftest_hang.exe"
+        _ := fs_write_text(tmp_hang_ax, "fn main() -> i32 { mut x := 0; while x >= 0 { x = x +% 1 }; return 0 }\n")
+        bh := sec_exec_timeout(f"{axc_bin} build {tmp_hang_ax} -o {tmp_hang_exe}", 8000)
+        if bh.exit_code == 0 {
+            rh := sec_exec_timeout(tmp_hang_exe, 250)
+            _ := sec_assert(
+                mut rep, rh.timed_out and str_eq(rh.signal_name, "TIMEOUT"),
+                SEC_SEV_HIGH(), "CWE-835", "std::sec_oracle::sec_exec_timeout",
+                "Failed to kill and classify infinite loop as TIMEOUT",
+                f"rc={rh.exit_code} sig={rh.signal_name} timed_out={rh.timed_out} elapsed={rh.elapsed_ms}ms",
+                "Expected timed_out=true and signal_name='TIMEOUT'",
+                ""
+            )
+        }
+        _ := sys_fs_remove(tmp_hang_ax)
+        _ := sys_fs_remove(tmp_hang_exe)
+
+        // 5d. 3-way Differential Build & Run (`avx2` vs `scalar` vs `--shield`)
+        tmp_diff_ax := ".axon_sec_selftest_diff.ax"
+        _ := fs_write_text(tmp_diff_ax, "fn main() -> i32 { mut s := 0; for i in 0..1000 { s = s +% (i *% 7 + 3) }; println(f\"SUM={s}\"); return 0 }\n")
+        dr := sec_diff_build_run(axc_bin, tmp_diff_ax, 10000)
+        _ := sys_fs_remove(tmp_diff_ax)
+        _ := sec_assert_diff_build(mut rep, dr, "compiler::diff_avx2_scalar_shield", "3-way SIMD/Shield differential build")
+    }
+
+    // --- 6. Structured Report Exporters (Markdown + JSON) ---
+    mut demo := sec_report_new("DemoReport")
+    sec_finding_detailed(
+        mut demo, SEC_SEV_CRITICAL(), "CWE-918", "CORPUS", "std::url::url_str_is_public_http",
+        "Synthetic SSRF check", "returned true", "must return false", "seed=1 hex=61", "block private IP"
+    )
+    md := sec_report_to_markdown(demo)
+    js := sec_report_to_json(demo)
+    sec_report_free(move demo)
+    _ := sec_assert(
+        mut rep, str_contains(md, "CWE-918") and str_contains(md, "Recommended Patch") and str_contains(js, "\"severity\":\"CRITICAL\""),
+        SEC_SEV_LOW(), "CWE-682", "std::sec_test::SecReport",
+        "Report exporters missing required English patch fields",
+        f"md_len={str_len(md)} js_len={str_len(js)}",
+        "Markdown & JSON must contain CWE, Severity, and Recommended Patch fields",
+        ""
+    )
+
+    // --- 7. Breakthrough Proofs: REDQUEEN CmpLog I2S (2^184), Stateful Sequence Fuzzer + ddmin, Grammar & SAST ---
+    // 7a. REDQUEEN CmpLog cracks 64-bit magic + 15-byte string (2^184 space!) in < 50 iterations with ZERO dictionary!
+    mut fz_rq := fuzz_new(7001, 500, 64)
+    fuzz_add_seed(mut fz_rq, "00000000abcdefghijklmno")
+    mut rq_cracked := false
+    while fuzz_next(mut fz_rq) {
+        if _redqueen_vault_target(mut fz_rq, fuzz_cur_str(fz_rq)) {
+            rq_cracked = true
+            break
+        }
+    }
+    _ := sec_assert(
+        mut rep, rq_cracked and fuzz_iters(fz_rq) <= 50 and fuzz_i2s_applied(fz_rq) >= 2,
+        SEC_SEV_CRITICAL(), "CWE-682", "std::sec_fuzz::REDQUEEN_CmpLog",
+        "REDQUEEN CmpLog I2S failed to crack 64-bit magic + 15-byte command rapidly",
+        f"cracked={rq_cracked} iters={fuzz_iters(fz_rq)} i2s_applied={fuzz_i2s_applied(fz_rq)}",
+        "Must crack 2^184 magic+string guard in <= 50 iterations via CmpLog I2S", ""
+    )
+    fuzz_free(move fz_rq)
+
+    // 7b. Stateful Operation-Sequence Fuzzer + Sequence ddmin Minimizer -> shrinks to exact 3 ops!
+    mut sf := seq_fuzz_new(7002, 4, 24, 4, 2000)
+    mut seq_found := false
+    mut failing_seq := ibuf_new(0)
+    while seq_fuzz_next(mut sf) {
+        if _stateful_bug_eval(sf.cur_ops) {
+            seq_found = true
+            buf_free(move failing_seq)
+            failing_seq = seq_fuzz_clone_ops(sf)
+            break
+        }
+    }
+    seq_fuzz_free(move sf)
+    mut min_seq_len := 999
+    if seq_found {
+        mut sh_q := shrink_seq_new(failing_seq, 256)
+        while shrink_seq_next(mut sh_q) {
+            shrink_seq_report(mut sh_q, _stateful_bug_eval(sh_q.cand))
+        }
+        min_seq_len = shrink_seq_result_len(sh_q)
+        shrink_seq_free(move sh_q)
+    }
+    buf_free(move failing_seq)
+    _ := sec_assert(
+        mut rep, seq_found and min_seq_len == 3,
+        SEC_SEV_HIGH(), "CWE-682", "std::sec_fuzz::SecSeqFuzzer",
+        "Stateful sequence fuzzer / ShrinkSeq failed to isolate minimal 3-op bug",
+        f"found={seq_found} min_seq_len={min_seq_len}",
+        "Must discover stateful sequence bug and ddmin-shrink it to exact 3 operations", ""
+    )
+
+    // 7c. Structure-Aware Grammar Synthesizers (`gram_url`, `gram_http_req`, `gram_json`, `gram_binary_frame`)
+    mut gg := gen_new(7003)
+    mut g_ok := true
+    mut gi := 0
+    while gi < 20 {
+        if not str_contains(gram_url(gg), "://") { g_ok = false }
+        if not str_contains(gram_http_req(gg), "HTTP/") { g_ok = false }
+        if not str_starts_with(gram_json(gg, 2), "{") { g_ok = false }
+        bf := gram_binary_frame(gg, 0x46554747, 64)
+        if buf_len(bf) < 10 { g_ok = false }
+        buf_free(move bf)
+        gi += 1
+    }
+    gen_free(move gg)
+    _ := sec_assert(mut rep, g_ok, SEC_SEV_MEDIUM(), "CWE-682", "std::sec_fuzz::Grammar", "Structure-aware grammar synthesizer produced malformed outer framing", "g_ok=false", "g_ok=true", "")
+
+    // 7d. Pure-Axon SAST Vulnerability Hunter (True Positive on 7 planted rules + 0 False Positives on clean code)
+    vuln_src := "fn bad(u: str, ct: str, secret: str, raw: str, auth: str, h: str) {\n"
+        + "    b := buf_new(64)\n"
+        + "    buf_push_str(b, u)\n"
+        + "    exp_val := json_get_i64(raw, \"exp\") or -1\n"
+        + "    if exp_val >= 0 { return }\n"
+        + "    if str_eq(secret, u) { return }\n"
+        + "    p := mem_alloc_aligned(64)\n"
+        + "    ptr_write_u8(p, 0, 1)\n"
+        + "    _ := \"Content-Type: \" + ct\n"
+        + "    if str_eq(h, \"[::1]\") { return }\n"
+        + "    _ := str_find(raw, \"\\n\\n\", 0)\n"
+        + "}\n"
+    mut sr_bad := sast_results_new()
+    sast_scan_source("planted_vuln.ax", vuln_src, mut sr_bad)
+    sast_bad_cnt := sr_bad.count
+    sast_results_free(move sr_bad)
+    _ := sec_assert(
+        mut rep, sast_bad_cnt >= 7, SEC_SEV_HIGH(), "CWE-693", "std::sec_sast::sast_scan_source",
+        "SAST vulnerability hunter missed planted Axon vulnerability patterns",
+        f"detected={sast_bad_cnt} findings", "Expected >= 7 findings across AX-SAST-001/002/003/004/007/009/010", ""
+    )
+
+    clean_src := "fn good(u: str, ct: str, secret: str, n: i64) {\n"
+        + "    // Commented buf_new(64) and str_eq(secret, u) must be ignored!\n"
+        + "    if n <= 0 or n > 1000 { return }\n"
+        + "    b := buf_new(str_len(u) + 32)\n"
+        + "    buf_push_str(b, u)\n"
+        + "    if ct_eq_str(secret, u) { return }\n"
+        + "    hist := mem_alloc_aligned(2048 * 8 + 64)\n"
+        + "    tmp := mem_alloc_aligned(n * 8 + 64)\n"
+        + "    if hist == 0 or tmp == 0 { return }\n"
+        + "    ptr_write_u8(hist, 0, 1)\n"
+        + "    if http_is_safe_header_val(ct) { _ := \"Content-Type: \" + ct }\n"
+        + "    mem_free_aligned(hist); mem_free_aligned(tmp)\n"
+        + "}\n"
+    mut sr_ok := sast_results_new()
+    sast_scan_source("planted_clean.ax", clean_src, mut sr_ok)
+    sast_ok_cnt := sr_ok.count
+    sast_results_free(move sr_ok)
+    _ := sec_assert_eq_i64(mut rep, sast_ok_cnt, 0, "CWE-682", "std::sec_sast::sast_scan_source", "SAST v2 emitted false positives on bounded/null-checked clean code")
+
+    // --- 8. Bug Hunter v3.0 Breakthrough Proofs ---
+    // 8a. SAST v2 new rules (AX-SAST-011..016: f64->i64, shift, div0, CLI flag, early-return leak, weak PRNG)
+    vuln_v3 := "fn bad_v3(v: f64, sh: i64, d: i64, prof: str) -> i64 {\n"
+        + "    x := (v * 100.0 + 0.5) as i64\n"
+        + "    y := 1 << sh\n"
+        + "    z := 100 / d\n"
+        + "    cmd := f\"--user-data-dir=\\\"{prof}\\\"\"\n"
+        + "    p := mem_alloc_aligned(64)\n"
+        + "    if p == 0 { return 0 }\n"
+        + "    if z == 0 { return -1 }\n"
+        + "    mem_free_aligned(p)\n"
+        + "    auth_token := rng_next_u64(r)\n"
+        + "    return x + y + z\n"
+        + "}\n"
+    mut sr_v3 := sast_results_new()
+    sast_scan_source("planted_v3.ax", vuln_v3, mut sr_v3)
+    v3_hits := sr_v3.count
+    sast_results_free(move sr_v3)
+    _ := sec_assert(
+        mut rep, v3_hits >= 6, SEC_SEV_HIGH(), "CWE-693", "std::sec_sast::v2_rules",
+        "SAST v2 missed one or more new rules (AX-SAST-011..016)",
+        f"detected={v3_hits} hits", "Expected >= 6 hits across AX-SAST-011..016", ""
+    )
+
+    // 8b. SARIF 2.1.0 Exporter with file:line physicalLocation & confidence tags
+    mut sarif_rep := sec_report_new("SarifTest")
+    sec_finding_with_conf(
+        mut sarif_rep, SEC_SEV_CRITICAL(), SEC_CONF_PROVEN(), "CWE-918", "META", "std/url.ax:205",
+        "SSRF bypass", "returned true", "must return false", "http://[::ffff:7f00:1]/", "parse 128-bit IPv6"
+    )
+    sarif_str := sec_report_to_sarif(sarif_rep)
+    sec_report_free(move sarif_rep)
+    _ := sec_assert(
+        mut rep, str_contains(sarif_str, "\"version\":\"2.1.0\"") and str_contains(sarif_str, "\"startLine\":205") and str_contains(sarif_str, "\"confidence\":\"PROVEN_DYNAMIC\""),
+        SEC_SEV_LOW(), "CWE-682", "std::sec_test::sec_report_to_sarif",
+        "SARIF 2.1.0 output missing version/startLine/confidence fields",
+        sec_escape_str(sarif_str, 160), "Valid SARIF 2.1.0 with startLine=205 and PROVEN_DYNAMIC", ""
+    )
+
+    // 8c. Metamorphic Security Oracle (`std::sec_meta`): proves bypass on naive SSRF filter!
+    meta_urls := meta_url_variants("127.0.0.1", "/admin")
+    base_rej := true // naive filter blocks literal "127.0.0.1"
+    mut meta_bypasses := 0
+    mut mi2 := 0
+    while mi2 < svec_len(meta_urls) {
+        u := svec_get(meta_urls, mi2)
+        // Naive filter ONLY checks literal substring "127.0.0.1"
+        var_rej := str_contains(u, "127.0.0.1")
+        if meta_is_bypass(base_rej, var_rej) { meta_bypasses += 1 }
+        mi2 += 1
+    }
+    svec_free(move meta_urls)
+    _ := sec_assert(
+        mut rep, meta_bypasses >= 8, SEC_SEV_HIGH(), "CWE-436", "std::sec_meta::meta_url_variants",
+        "Metamorphic oracle failed to detect bypasses against naive literal SSRF filter",
+        f"bypasses={meta_bypasses}", "Expected >= 8 metamorphic SSRF bypasses", ""
+    )
+
+    // 8d. XOR-Involution CmpLog & Directed Distance Schedule (`fuzz_cmplog_xor`, `fuzz_report_distance`)
+    mut fz_xor := fuzz_new(8001, 100, 32)
+    fuzz_add_seed(mut fz_xor, "12345678")
+    mut xor_cracked := false
+    xor_mask := 0x5A5A5A5A5A5A5A5A
+    xor_goal := 0x123456789ABCDEF0
+    while fuzz_next(mut fz_xor) {
+        cur := fuzz_cur_str(fz_xor)
+        if str_len(cur) >= 8 {
+            w := _read_le64_str(cur, 0)
+            xw := w ^ xor_mask
+            fuzz_cmplog_xor(mut fz_xor, w, xw, xor_goal)
+            _ := fuzz_report_distance(mut fz_xor, if xw == xor_goal { 0 } else { 5 })
+            if xw == xor_goal { xor_cracked = true; break }
+        }
+    }
+    _ := sec_assert(
+        mut rep, xor_cracked and fuzz_iters(fz_xor) <= 20 and fuzz_min_distance(fz_xor) == 0,
+        SEC_SEV_HIGH(), "CWE-682", "std::sec_fuzz::fuzz_cmplog_xor",
+        "XOR-involution CmpLog / Directed distance failed to crack 64-bit XOR mask in <= 20 iters",
+        f"cracked={xor_cracked} iters={fuzz_iters(fz_xor)} min_dist={fuzz_min_distance(fz_xor)}",
+        "Must solve unknown 64-bit XOR mask in <= 20 iterations", ""
+    )
+    fuzz_free(move fz_xor)
+
+    // 8e. Crash Vault & Backtrace Signature Deduplicator (`SecCrashVault`)
+    mut cv := sec_vault_new("", false)
+    o_dup := ProcOutcome(exit_code = 101, timed_out = false, crashed = true, is_sec_trap = true, signal_name = "AXON_SEC_TRAP", elapsed_ms = 5, output = "[AXON SECURITY]\nStack backtrace:\n  #0  parse_hdr\n  #1  decode_pkt\n  #2  main\n")
+    o_new := ProcOutcome(exit_code = 101, timed_out = false, crashed = true, is_sec_trap = true, signal_name = "AXON_SEC_TRAP", elapsed_ms = 5, output = "[AXON SECURITY]\nStack backtrace:\n  #0  other_fn\n  #1  main\n")
+    _ := sec_vault_record_crash(mut cv, o_dup, "aaaaaaaaaa")
+    _ := sec_vault_record_crash(mut cv, o_dup, "bbbbbbbb")
+    _ := sec_vault_record_crash(mut cv, o_dup, "cccc")
+    _ := sec_vault_record_crash(mut cv, o_new, "dddd")
+    _ := sec_assert(
+        mut rep, sec_vault_total_count(cv) == 4 and sec_vault_unique_count(cv) == 2,
+        SEC_SEV_MEDIUM(), "CWE-682", "std::sec_oracle::SecCrashVault",
+        "Crash Vault failed to deduplicate crashes by PIE stack backtrace",
+        f"total={sec_vault_total_count(cv)} unique={sec_vault_unique_count(cv)}",
+        "Expected total=4 and unique=2", ""
+    )
+    sec_vault_free(move cv)
+
+    // 8f. Zero-Edit Auto-Instrumenter (`std::sec_instr`) + Security Mutation Testing (`std::sec_mutate`)
+    if sys_fs_exists(axc_bin) {
+        // Unmodified target function with ZERO fuzz_* hooks — auto-instrumenter must inject CmpLog + edges and crack it!
+        raw_tgt := "use std::str\nuse std::sec_test\nfn check_secret_gate(s: str) -> bool {\n    if str_eq(s, \"AUTO_INSTR_999\") {\n        return true\n    }\n    return false\n}\n"
+        ins := sec_instr_source(raw_tgt, "check_secret_gate", 5)
+        driver := ins.code + "\nfn main() -> i32 {\n    mut fz := fuzz_new(99, 64, 32)\n    fuzz_add_seed(mut fz, \"hello\")\n    while fuzz_next(mut fz) {\n        if check_secret_gate(mut fz, fuzz_cur_str(fz)) { fuzz_free(move fz); println(\"CRACKED_AUTO\"); return 0 }\n    }\n    fuzz_free(move fz)\n    return 1\n}\n"
+        tmp_ins := ".axon_sec_selftest_instr.ax"
+        tmp_ins_exe := ".axon_sec_selftest_instr.exe"
+        _ := fs_write_text(tmp_ins, driver)
+        b_ins := sec_exec_timeout(f"{axc_bin} build {tmp_ins} -o {tmp_ins_exe}", 8000)
+        mut ins_ok := false
+        mut ins_out := b_ins.output
+        if b_ins.exit_code == 0 {
+            r_ins := sec_exec_timeout(tmp_ins_exe, 4000)
+            ins_ok = r_ins.exit_code == 0 and str_contains(r_ins.output, "CRACKED_AUTO")
+            ins_out = r_ins.output
+        }
+        _ := sys_fs_remove(tmp_ins)
+        _ := sys_fs_remove(tmp_ins_exe)
+        _ := sec_assert(
+            mut rep, ins.found_fn and ins.edges_injected >= 1 and ins.cmplogs_injected >= 1 and ins_ok,
+            SEC_SEV_HIGH(), "CWE-682", "std::sec_instr::sec_instr_source",
+            "Zero-edit auto-instrumenter failed to instrument & crack unmodified target",
+            f"edges={ins.edges_injected} cmplogs={ins.cmplogs_injected} ins_ok={ins_ok}",
+            "Must inject probes and crack AUTO_INSTR_999 automatically", sec_escape_str(ins_out, 160)
+        )
+
+        // Security Mutation Testing: strong test kills 100% of mutants; weak test lets mutant survive!
+        strong_src := "fn is_safe_port(p: i64) -> bool {\n    if p <= 0 { return false }\n    if p > 65535 { return false }\n    return true\n}\nfn main() -> i32 {\n    if is_safe_port(0) { return 1 }\n    if not is_safe_port(1) { return 2 }\n    if not is_safe_port(65535) { return 3 }\n    if is_safe_port(65536) { return 4 }\n    return 0\n}\n"
+        mr_strong := sec_mutate_source(axc_bin, strong_src, 4, 6000)
+        _ := sec_assert(
+            mut rep, mr_strong.baseline_passed and mr_strong.killed >= 2 and mr_strong.survived == 0,
+            SEC_SEV_MEDIUM(), "CWE-682", "std::sec_mutate::sec_mutate_source",
+            "Security mutation tester failed to kill all mutants on strong boundary test",
+            mr_strong.summary, "Expected killed >= 2 and survived == 0", mr_strong.summary
+        )
+        mutation_report_free(move mr_strong)
+
+        weak_src := "fn is_safe_port(p: i64) -> bool {\n    if p <= 0 { return false }\n    if p > 65535 { return false }\n    return true\n}\nfn main() -> i32 {\n    if not is_safe_port(80) { return 1 }\n    return 0\n}\n"
+        mr_weak := sec_mutate_source(axc_bin, weak_src, 3, 6000)
+        _ := sec_assert(
+            mut rep, mr_weak.baseline_passed and mr_weak.survived >= 1,
+            SEC_SEV_MEDIUM(), "CWE-682", "std::sec_mutate::sec_mutate_source",
+            "Security mutation tester failed to detect weak test coverage (survived mutant)",
+            mr_weak.summary, "Expected survived >= 1 on weak test", mr_weak.summary
+        )
+        mutation_report_free(move mr_weak)
+    }
+
+    if sink_acc == -9999999999 { println("sink") }
+    return sec_report_finish(move rep)
+}
