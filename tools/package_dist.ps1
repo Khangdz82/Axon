@@ -5,7 +5,7 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = (Get-Item -LiteralPath $PSScriptRoot).Parent.FullName
 $DistDir = Join-Path $ProjectRoot "dist"
 $TempStage = Join-Path $DistDir "stage_axon_$Target"
-$ZipOut = Join-Path $DistDir "axon-v1.0.0-$Target.zip"
+$ZipOut = Join-Path $DistDir "axon-v1.2.0-$Target.zip"
 
 New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
 Remove-Item -LiteralPath $TempStage -Recurse -Force -ErrorAction SilentlyContinue
@@ -25,7 +25,7 @@ try {
     Copy-Item -LiteralPath $SrcBin -Destination (Join-Path $TempStage "bin\$DstBinName") -Force
     Copy-Item -Path (Join-Path $ProjectRoot "std\*.ax") -Destination (Join-Path $TempStage "std") -Force
 
-    foreach ($extra in @("AXON_LLM_SPEC.md", "axon_mcp.json", "install.ps1", "install.sh")) {
+    foreach ($extra in @("LICENSE", "README.md", "AXON_LLM_SPEC.md", "axon_mcp.json", "install.ps1", "install.sh")) {
         $p = Join-Path $ProjectRoot $extra
         if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination $TempStage -Force }
     }

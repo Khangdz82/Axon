@@ -6,16 +6,16 @@
 
 ## 1. Golden Project Invariants
 
-1. **100% Pure Axon Self-Hosting:** Every compiler pass ([`compiler_ax/*.ax`](file:///c:/Users/Admin/Downloads/Languague/compiler_ax) — **`19` files, `40,878` LOC**) and standard library module ([`std/*.ax`](file:///c:/Users/Admin/Downloads/Languague/std) — **`115` files, `48,817` LOC**) is written in pure `.ax` with zero C/C++/Rust/LLVM/Python runtime or build dependencies and **zero build/run temp garbage** (`0` `.o`/`.obj`/`target/` or leaked `.axon_run_*` files).
+1. **100% Pure Axon Self-Hosting:** Every compiler pass ([`compiler_ax/`](compiler_ax/) — **`19` files, `43,219` LOC**) and standard library module ([`std/`](std/) — **`143` files, `81,151` LOC**) is written in pure `.ax` with zero C/C++/Rust/LLVM/Python runtime or build dependencies and **zero build/run temp garbage** (`0` `.o`/`.obj`/`target/` or leaked `.axon_run_*` files).
 2. **Deterministic 3-Stage Bootstrap Gate:** Any edit to `compiler_ax/*.ax` MUST pass:
    ```powershell
    .\bin\axc.exe build compiler_ax/main.ax -o axc_s1.exe
    .\axc_s1.exe build compiler_ax/main.ax -o axc_s2.exe
    .\axc_s2.exe build compiler_ax/main.ax -o axc_s3.exe
    ```
-   - Verified `SHA256(axc_s2.exe) == SHA256(axc_s3.exe) == 129366ABCC3124DFBC09D3794916178F5000B6A9C3B2792902BE5380A2E52300` (`2,639,872` bytes `win-x64`).
-   - Cross-compiled outputs: `bin/axc-linux-x64` (`2,591,032` bytes), `bin/axc-macos-arm64` (`1,474,624` bytes).
-3. **Full Regression Gate:** **`77/77`** [`tests/pass/*.ax`](file:///c:/Users/Admin/Downloads/Languague/tests/pass) + **`37/37`** [`tests/fail_compile/*.ax`](file:///c:/Users/Admin/Downloads/Languague/tests/fail_compile) + `--shield` / `--simd=scalar` / `-O3` / `-Os` / `wasm32` WASI suites must pass before promoting changes.
+   - Verified `SHA256(axc_s2.exe) == SHA256(axc_s3.exe) == D80317DD8B4C1B4F20C7A422263D9FABB3B2FC4F885145E7AACC870CDE208E3A` (`2,657,280` bytes `win-x64`).
+   - Cross-compiled outputs: `bin/axc-linux-x64` (`2,610,728` bytes), `bin/axc-macos-arm64` (`1,491,008` bytes).
+3. **Full Regression Gate:** **`85/85`** [`tests/pass/*.ax`](tests/pass/) + **`42/42`** [`tests/fail_compile/*.ax`](tests/fail_compile/) + `--shield` / `--simd=scalar` / `-O3` / `-Os` / `wasm32` WASI suites must pass before promoting changes.
 
 ---
 

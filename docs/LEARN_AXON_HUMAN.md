@@ -273,7 +273,7 @@ fn main() -> i32 {
 
 Build crisp `< 12 MB` RAM native desktop apps using Direct2D Hardware Acceleration (`Photon-D2D v2`) with **zero Electron/WebView bloat**:
 - Supports Flexbox, Grid, `border-radius`, `linear-gradient(...)`, multi-layer `box-shadow`, `:hover`, `:focus`, `:active`, smooth 60 FPS mouse-wheel inertia, live `<input>` editing, and embedded `<script>` JS (`let`/`const`, `if`/`else`, `while`, `setText`, `getValue`, `addClass`, `removeClass`, `toggleClass`).
-- Run [`examples/antigravity_ui.ax`](file:///c:/Users/Admin/Downloads/Languague/examples/antigravity_ui.ax) (`.\bin\axc.exe run examples/antigravity_ui.ax`) for a complete showcase dashboard!
+- Run [`examples/antigravity_ui.ax`](../examples/antigravity_ui.ax) (`.\bin\axc.exe run examples/antigravity_ui.ax`) for a complete showcase dashboard!
 
 ---
 
