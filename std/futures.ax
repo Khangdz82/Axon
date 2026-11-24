@@ -1,0 +1,316 @@
+// Axon Standard Library: Zero-GIL Multi-Core ThreadPoolExecutor & Futures (`std/futures.ax`)
+// 100% Pure Axon replacement for Python's `concurrent.futures` (`ThreadPoolExecutor`, `Future`).
+// Uses persistent OS worker threads (`std::threading`), kernel condition-variable dispatch,
+// atomic refcounted `Future` blocks (zero UAF / zero leak even on early drop or cancel),
+// and zero-overhead indirect Axon function execution (`fn_addr` + `fn_call1`).
+
+use std::ffi
+use std::os
+use std::threading
+
+// Future status constants
+fn future_status_pending() -> i64   { return 0 }
+fn future_status_running() -> i64   { return 1 }
+fn future_status_done() -> i64      { return 2 }
+fn future_status_cancelled() -> i64 { return 3 }
+
+// `fnode` contiguous 192B layout:
+//   [0..64)  header i64s: [0]=status, [1]=result, [2]=fn_ptr, [3]=arg, [4]=refcount
+//   [64..128) OS Mutex storage (`SRWLOCK` / `pthread_mutex_t`)
+//   [128..192) OS CondVar storage (`CONDITION_VARIABLE` / `pthread_cond_t`)
+struct Future {
+    node: i64
+    api: ThreadApi
+}
+
+fn _future_init_sync(fnode: i64, api: ThreadApi) -> bool {
+    mu_ptr := fnode + 64
+    cv_ptr := fnode + 128
+    if api.is_win {
+        if api.fn_mu_init != 0 { _ := ffi_call1(api.fn_mu_init, mu_ptr) }
+        if api.fn_cv_init != 0 { _ := ffi_call1(api.fn_cv_init, cv_ptr) }
+        return true
+    }
+    r1 := ffi_sext32(ffi_call2(api.fn_mu_init, mu_ptr, 0))
+    if r1 != 0 { return false }
+    r2 := ffi_sext32(ffi_call2(api.fn_cv_init, cv_ptr, 0))
+    if r2 != 0 {
+        if api.fn_mu_destroy != 0 { _ := ffi_call1(api.fn_mu_destroy, mu_ptr) }
+        return false
+    }
+    return true
+}
+
+fn _future_release(fnode: i64, api: ThreadApi) {
+    if fnode == 0 { return }
+    prev := unsafe { atomic_add_i64(fnode, 4, -1) }
+    if prev == 1 {
+        if not api.is_win {
+            if api.fn_cv_destroy != 0 { _ := ffi_call1(api.fn_cv_destroy, fnode + 128) }
+            if api.fn_mu_destroy != 0 { _ := ffi_call1(api.fn_mu_destroy, fnode + 64) }
+        }
+        ffi_free(fnode)
+    }
+}
+
+fn future_done(f: Future) -> bool {
+    if f.node == 0 { return true }
+    st := unsafe { atomic_load_i64(f.node, 0) }
+    return st == future_status_done() or st == future_status_cancelled()
+}
+
+fn future_running(f: Future) -> bool {
+    if f.node == 0 { return false }
+    return unsafe { atomic_load_i64(f.node, 0) } == future_status_running()
+}
+
+fn future_cancelled(f: Future) -> bool {
+    if f.node == 0 { return false }
+    return unsafe { atomic_load_i64(f.node, 0) } == future_status_cancelled()
+}
+
+fn future_cancel(f: Future) -> bool {
+    if f.node == 0 { return false }
+    mu := Mutex(ptr = f.node + 64, api = f.api)
+    cv := CondVar(ptr = f.node + 128, api = f.api)
+    mutex_lock(mu)
+    st := unsafe { atomic_load_i64(f.node, 0) }
+    if st != future_status_pending() {
+        mutex_unlock(mu)
+        return false
+    }
+    unsafe { atomic_store_rel_i64(f.node, 0, future_status_cancelled()) }
+    cond_notify_all(cv)
+    mutex_unlock(mu)
+    return true
+}
+
+fn future_result(f: Future, timeout_ms: i64 = -1) -> i64 ! i64 {
+    if f.node == 0 { return err(-1) }
+    st0 := unsafe { atomic_load_i64(f.node, 0) }
+    if st0 == future_status_done() { return ok(ffi_read_i64(f.node, 1)) }
+    if st0 == future_status_cancelled() { return err(-3) }
+
+    mu := Mutex(ptr = f.node + 64, api = f.api)
+    cv := CondVar(ptr = f.node + 128, api = f.api)
+    mutex_lock(mu)
+    if timeout_ms < 0 {
+        while true {
+            st := unsafe { atomic_load_i64(f.node, 0) }
+            if st == future_status_done() or st == future_status_cancelled() { break }
+            _ := cond_wait(cv, mu)
+        }
+    } else {
+        deadline := clock_ns() + timeout_ms * 1000000
+        while true {
+            st := unsafe { atomic_load_i64(f.node, 0) }
+            if st == future_status_done() or st == future_status_cancelled() { break }
+            rem_ns := deadline - clock_ns()
+            if rem_ns <= 0 {
+                mutex_unlock(mu)
+                return err(-110)
+            }
+            mut rem_ms := (rem_ns + 999999) / 1000000
+            if rem_ms < 1 { rem_ms = 1 }
+            _ := cond_wait_timeout(cv, mu, rem_ms)
+        }
+    }
+    final_st := unsafe { atomic_load_i64(f.node, 0) }
+    val := ffi_read_i64(f.node, 1)
+    mutex_unlock(mu)
+    if final_st == future_status_cancelled() { return err(-3) }
+    return ok(val)
+}
+
+fn future_free(move f: Future) {
+    _future_release(f.node, f.api)
+}
+
+// --- Persistent Multi-Core `ThreadPool` (`concurrent.futures.ThreadPoolExecutor`) ---
+// `box_ptr` (64B shared by all worker threads):
+//   [0]=mu_ptr, [1]=not_empty_ptr, [2]=not_full_ptr, [3]=all_done_ptr, [4]=queue_meta, [5]=shutdown_flag
+struct ThreadPool {
+    max_workers: i64
+    queue: ThreadQueue
+    box_ptr: i64
+    threads_mem: i64
+    spawned: i64
+    is_shutdown: i64
+    api: ThreadApi
+}
+
+fn _pool_worker_loop(box_ptr: i64) -> i64 {
+    if box_ptr == 0 { return 0 }
+    api := thread_init() or return 0
+    q := ThreadQueue(
+        mu = Mutex(ptr = ffi_read_i64(box_ptr, 0), api = api),
+        not_empty = CondVar(ptr = ffi_read_i64(box_ptr, 1), api = api),
+        not_full = CondVar(ptr = ffi_read_i64(box_ptr, 2), api = api),
+        all_done = CondVar(ptr = ffi_read_i64(box_ptr, 3), api = api),
+        meta = ffi_read_i64(box_ptr, 4)
+    )
+    while true {
+        fnode := tqueue_get(q, -1) or -1
+        if fnode <= 0 { break }
+        mu := Mutex(ptr = fnode + 64, api = api)
+        cv := CondVar(ptr = fnode + 128, api = api)
+        mutex_lock(mu)
+        st := unsafe { atomic_load_i64(fnode, 0) }
+        if st == future_status_cancelled() {
+            mutex_unlock(mu)
+            tqueue_task_done(q)
+            _future_release(fnode, api)
+            continue
+        }
+        unsafe { atomic_store_rel_i64(fnode, 0, future_status_running()) }
+        fn_ptr := ffi_read_i64(fnode, 2)
+        arg := ffi_read_i64(fnode, 3)
+        mutex_unlock(mu)
+
+        res := unsafe { fn_call1(fn_ptr, arg) }
+
+        mutex_lock(mu)
+        ffi_write_i64(fnode, 1, res)
+        unsafe { atomic_store_rel_i64(fnode, 0, future_status_done()) }
+        cond_notify_all(cv)
+        mutex_unlock(mu)
+
+        tqueue_task_done(q)
+        _future_release(fnode, api)
+    }
+    return 0
+}
+
+fn pool_new(max_workers: i64 = 0) -> ThreadPool ! i64 {
+    api := thread_init() or return
+    mut w := max_workers
+    if w <= 0 { w = thread_cpu_count() }
+    if w < 1 { w = 1 }
+    if w > 128 { w = 128 }
+    q := tqueue_new(0) or return
+    box_ptr := ffi_alloc(64)
+    threads_mem := ffi_alloc(w * 24 + 64)
+    if box_ptr == 0 or threads_mem == 0 {
+        if box_ptr != 0 { ffi_free(box_ptr) }
+        if threads_mem != 0 { ffi_free(threads_mem) }
+        tqueue_free(move q)
+        return err(-3)
+    }
+    ffi_write_i64(box_ptr, 0, q.mu.ptr)
+    ffi_write_i64(box_ptr, 1, q.not_empty.ptr)
+    ffi_write_i64(box_ptr, 2, q.not_full.ptr)
+    ffi_write_i64(box_ptr, 3, q.all_done.ptr)
+    ffi_write_i64(box_ptr, 4, q.meta)
+    ffi_write_i64(box_ptr, 5, 0)
+
+    worker_fn := fn_addr(_pool_worker_loop)
+    mut spawned := 0
+    mut i := 0
+    while i < w {
+        th := thread_spawn(worker_fn, box_ptr) or Thread(handle = 0, ctx = 0, tid = 0, joined = 1, api = api)
+        if th.joined != 0 { break }
+        ffi_write_i64(threads_mem, spawned * 3, th.handle)
+        ffi_write_i64(threads_mem, spawned * 3 + 1, th.ctx)
+        ffi_write_i64(threads_mem, spawned * 3 + 2, th.tid)
+        spawned += 1
+        i += 1
+    }
+    if spawned == 0 {
+        ffi_free(box_ptr)
+        ffi_free(threads_mem)
+        tqueue_free(move q)
+        return err(-5)
+    }
+    return ok(ThreadPool(
+        max_workers = spawned,
+        queue = q,
+        box_ptr = box_ptr,
+        threads_mem = threads_mem,
+        spawned = spawned,
+        is_shutdown = 0,
+        api = api
+    ))
+}
+
+fn pool_submit(p: ThreadPool, fn_ptr: i64, arg: i64) -> Future ! i64 {
+    if p.is_shutdown != 0 or p.box_ptr == 0 or fn_ptr == 0 { return err(-1) }
+    if unsafe { atomic_load_i64(p.box_ptr, 5) } != 0 { return err(-2) }
+    fnode := ffi_alloc(192)
+    if fnode == 0 { return err(-3) }
+    if not _future_init_sync(fnode, p.api) {
+        ffi_free(fnode)
+        return err(-4)
+    }
+    ffi_write_i64(fnode, 0, future_status_pending())
+    ffi_write_i64(fnode, 1, 0)
+    ffi_write_i64(fnode, 2, fn_ptr)
+    ffi_write_i64(fnode, 3, arg)
+    ffi_write_i64(fnode, 4, 2) // 1 for caller + 1 for worker
+    if not tqueue_put(p.queue, fnode, -1) {
+        // Queue was closed concurrently: drop both refs cleanly
+        ffi_write_i64(fnode, 4, 1)
+        _future_release(fnode, p.api)
+        return err(-2)
+    }
+    return ok(Future(node = fnode, api = p.api))
+}
+
+// Parallel `executor.map(fn, items)` preserving exact input order.
+fn pool_map_i64(p: ThreadPool, fn_ptr: i64, items: IntBuf) -> IntBuf ! i64 {
+    n := ibuf_len(items)
+    if n <= 0 { return ok(ibuf_new(1)) }
+    fnodes := ibuf_new(n + 4)
+    mut i := 0
+    while i < n {
+        fut := pool_submit(p, fn_ptr, ibuf_get(items, i)) or Future(node = 0, api = p.api)
+        if fut.node == 0 {
+            mut j := 0
+            while j < ibuf_len(fnodes) {
+                _future_release(ibuf_get(fnodes, j), p.api)
+                j += 1
+            }
+            buf_free(move fnodes)
+            return err(-2)
+        }
+        ibuf_push(fnodes, fut.node)
+        i += 1
+    }
+    out := ibuf_new(n + 4)
+    i = 0
+    while i < n {
+        f := Future(node = ibuf_get(fnodes, i), api = p.api)
+        v := future_result(f, -1) or 0
+        ibuf_push(out, v)
+        future_free(move f)
+        i += 1
+    }
+    buf_free(move fnodes)
+    return ok(out)
+}
+
+fn pool_shutdown(mut p: ThreadPool, wait: bool = true) {
+    if p.is_shutdown != 0 { return }
+    p.is_shutdown = 1
+    if p.box_ptr != 0 {
+        unsafe { atomic_store_rel_i64(p.box_ptr, 5, 1) }
+    }
+    if wait {
+        tqueue_join(p.queue)
+    }
+    tqueue_close(p.queue)
+    mut i := 0
+    while i < p.spawned {
+        mut th := Thread(
+            handle = ffi_read_i64(p.threads_mem, i * 3),
+            ctx = ffi_read_i64(p.threads_mem, i * 3 + 1),
+            tid = ffi_read_i64(p.threads_mem, i * 3 + 2),
+            joined = 0,
+            api = p.api
+        )
+        _ := thread_join(mut th) or 0
+        i += 1
+    }
+    if p.threads_mem != 0 { ffi_free(p.threads_mem); p.threads_mem = 0 }
+    if p.box_ptr != 0 { ffi_free(p.box_ptr); p.box_ptr = 0 }
+    tqueue_free(move p.queue)
+}

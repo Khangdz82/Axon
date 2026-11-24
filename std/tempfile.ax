@@ -1,0 +1,156 @@
+// Axon Standard Library: Secure Temporary Files & Directories (`std/tempfile.ax`)
+// 100% Pure Axon replacement for Python's `tempfile` module (`gettempdir`, `mkstemp`, `mkdtemp`).
+// Security:
+//   - 96-bit OS CSPRNG random names via `std::secrets` (never predictable PID/timestamp!)
+//   - Atomic exclusive creation (`CreateFileW(..., CREATE_NEW)` / `CreateDirectoryW` on Win32 UTF-16LE,
+//     `open(..., O_CREAT|O_EXCL, 0600)` / `mkdir(..., 0700)` on POSIX) -> immune to CWE-377 TOCTOU races!
+//   - Full Unicode/UTF-16LE path support on Windows.
+
+use std::ffi
+use std::os
+use std::str
+use std::sys
+use std::path
+use std::secrets
+use std::shutil
+
+fn _tmp_has_sep_or_nul(s: str) -> bool {
+    n := str_len(s)
+    mut i := 0
+    while i < n {
+        b := str_byte(s, i)
+        if b == 0 or b == 47 or b == 92 { return true }
+        i += 1
+    }
+    return false
+}
+
+// Python `tempfile.gettempdir()` (UTF-16LE `GetTempPathW` on Windows; `$TMPDIR`/`/tmp` on Unix)
+fn tempfile_gettempdir() -> str {
+    k32 := ffi_open_one("kernel32.dll")
+    if k32 != 0 {
+        f_gtp := ffi_sym(k32, "GetTempPathW")
+        if f_gtp != 0 {
+            buf := ffi_alloc(2048)
+            if buf != 0 {
+                n := ffi_call2(f_gtp, 1020, buf) & 0xFFFFFFFF
+                mut out := ""
+                if n > 0 and n < 1020 {
+                    out = ffi_read_wstr(buf, n)
+                }
+                ffi_free(buf)
+                if str_len(out) > 0 {
+                    mut ln := str_len(out)
+                    while ln > 1 and (str_byte(out, ln - 1) == 92 or str_byte(out, ln - 1) == 47) {
+                        if ln == 3 and str_byte(out, 1) == 58 { break }
+                        ln -= 1
+                    }
+                    return str_slice(out, 0, ln)
+                }
+            }
+        }
+        t1 := sys_env_get("TEMP")
+        if str_len(t1) > 0 { return t1 }
+        t2 := sys_env_get("TMP")
+        if str_len(t2) > 0 { return t2 }
+        return "."
+    }
+    td := sys_env_get("TMPDIR")
+    if str_len(td) > 0 { return td }
+    return "/tmp"
+}
+
+fn _tmp_create_file_exclusive(full_path: str) -> bool {
+    k32 := ffi_open_one("kernel32.dll")
+    if k32 != 0 {
+        f_cf := ffi_sym(k32, "CreateFileW")
+        f_cl := ffi_sym(k32, "CloseHandle")
+        if f_cf == 0 or f_cl == 0 { return false }
+        wp := ffi_wstr(full_path)
+        if wp == 0 { return false }
+        // GENERIC_READ|GENERIC_WRITE = 0xC0000000, share=0, CREATE_NEW=1, FILE_ATTRIBUTE_NORMAL=0x80
+        h := ffi_call7(f_cf, wp, 0xC0000000, 0, 0, 1, 0x80, 0)
+        ffi_free(wp)
+        if h == -1 or (h & 0xFFFFFFFF) == 0xFFFFFFFF or h == 0 { return false }
+        _ := ffi_call1(f_cl, h)
+        return true
+    }
+    libc := ffi_open("", "libc.so.6", "libSystem.B.dylib")
+    if libc == 0 { return false }
+    f_open := ffi_sym(libc, "open")
+    f_close := ffi_sym(libc, "close")
+    if f_open == 0 or f_close == 0 { return false }
+    cp := ffi_cstr(full_path)
+    if cp == 0 { return false }
+    // Linux x86_64: O_RDWR=2 | O_CREAT=0x40 | O_EXCL=0x80 = 0xC2; mode 0600 = 384
+    fd := ffi_sext32(ffi_call3(f_open, cp, 0xC2, 384))
+    ffi_free(cp)
+    if fd < 0 { return false }
+    _ := ffi_call1(f_close, fd)
+    return true
+}
+
+fn _tmp_create_dir_exclusive(full_path: str) -> bool {
+    k32 := ffi_open_one("kernel32.dll")
+    if k32 != 0 {
+        f_cd := ffi_sym(k32, "CreateDirectoryW")
+        if f_cd == 0 { return false }
+        wp := ffi_wstr(full_path)
+        if wp == 0 { return false }
+        rc := ffi_sext32(ffi_call2(f_cd, wp, 0))
+        ffi_free(wp)
+        return rc != 0
+    }
+    libc := ffi_open("", "libc.so.6", "libSystem.B.dylib")
+    if libc == 0 { return false }
+    f_mk := ffi_sym(libc, "mkdir")
+    if f_mk == 0 { return false }
+    cp := ffi_cstr(full_path)
+    if cp == 0 { return false }
+    // mode 0700 = 448
+    rc := ffi_sext32(ffi_call2(f_mk, cp, 448))
+    ffi_free(cp)
+    return rc == 0
+}
+
+// Python `tempfile.mkstemp(suffix, prefix, dir)` — atomically creates a unique empty temp file and returns its path.
+fn tempfile_mkstemp(prefix: str = "axtmp_", suffix: str = "", dir: str = "") -> str ! i64 {
+    if _tmp_has_sep_or_nul(prefix) or _tmp_has_sep_or_nul(suffix) { return err(-400) }
+    base := if str_len(dir) > 0 { dir } else { tempfile_gettempdir() }
+    mut attempt := 0
+    while attempt < 32 {
+        tok := secrets_token_hex(12) or return err(-500)
+        cand := path_join(base, prefix + tok + suffix)
+        if _tmp_create_file_exclusive(cand) {
+            return ok(cand)
+        }
+        attempt += 1
+    }
+    return err(-17)
+}
+
+// Python `tempfile.mkdtemp(suffix, prefix, dir)` — atomically creates a unique private temp directory and returns its path.
+fn tempfile_mkdtemp(prefix: str = "axdir_", suffix: str = "", dir: str = "") -> str ! i64 {
+    if _tmp_has_sep_or_nul(prefix) or _tmp_has_sep_or_nul(suffix) { return err(-400) }
+    base := if str_len(dir) > 0 { dir } else { tempfile_gettempdir() }
+    mut attempt := 0
+    while attempt < 32 {
+        tok := secrets_token_hex(12) or return err(-500)
+        cand := path_join(base, prefix + tok + suffix)
+        if _tmp_create_dir_exclusive(cand) {
+            return ok(cand)
+        }
+        attempt += 1
+    }
+    return err(-17)
+}
+
+// Creates a unique temp file via `mkstemp` and populates it with `content` (UTF-16LE safe).
+fn tempfile_write_temp(content: str, prefix: str = "axtmp_", suffix: str = "", dir: str = "") -> str ! i64 {
+    p := tempfile_mkstemp(prefix, suffix, dir) or return
+    if not shutil_write_text(p, content) {
+        _ := sys_fs_remove(p)
+        return err(-5)
+    }
+    return ok(p)
+}
