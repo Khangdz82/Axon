@@ -60,7 +60,31 @@ fn _req_has_ctl(s: str) -> bool {
     mut i := 0
     while i < n {
         b := str_byte(s, i)
-        if b == 13 or b == 10 or b == 0 { return true }
+        if (b < 32 and b != 9) or b == 127 { return true }
+        i += 1
+    }
+    return false
+}
+
+fn _req_valid_hdr_name(s: str) -> bool {
+    n := str_len(s)
+    if n == 0 or n > 256 { return false }
+    mut i := 0
+    while i < n {
+        b := str_byte(s, i)
+        ok_ch := (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or (b >= 48 and b <= 57) or b == 45 or b == 95 or b == 46 or b == 33 or b == 35 or b == 36 or b == 37 or b == 38 or b == 39 or b == 42 or b == 43 or b == 94 or b == 96 or b == 124 or b == 126
+        if not ok_ch { return false }
+        i += 1
+    }
+    return true
+}
+
+fn _req_has_quote_or_ctl(s: str) -> bool {
+    n := str_len(s)
+    mut i := 0
+    while i < n {
+        b := str_byte(s, i)
+        if b < 32 or b == 127 or b == 34 or b == 92 { return true }
         i += 1
     }
     return false
@@ -97,13 +121,13 @@ fn requests_multipart_build(fields: StrMap, file_field: str, filename: str, cont
     while i < nk {
         k := svec_get(keys, i)
         v := smap_get_str(fields, k, "")
-        if not _req_has_ctl(k) {
+        if not _req_has_quote_or_ctl(k) {
             svec_push(mut parts, "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + k + "\"\r\n\r\n" + v + "\r\n")
         }
         i += 1
     }
     svec_free(move keys)
-    if str_len(file_field) > 0 and not _req_has_ctl(file_field) and not _req_has_ctl(filename) {
+    if str_len(file_field) > 0 and not _req_has_quote_or_ctl(file_field) and not _req_has_quote_or_ctl(filename) {
         ct := if str_len(content_type) > 0 and not _req_has_ctl(content_type) { content_type } else { "application/octet-stream" }
         svec_push(mut parts, "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + file_field + "\"; filename=\"" + filename + "\"\r\nContent-Type: " + ct + "\r\n\r\n")
         svec_push(mut parts, file_bytes)
@@ -152,7 +176,7 @@ fn session_new(allow_private: bool = false, timeout_ms: i64 = 15000) -> Requests
 }
 
 fn session_set_header(mut s: RequestsSession, name: str, val: str) -> bool {
-    if _req_has_ctl(name) or _req_has_ctl(val) { return false }
+    if not _req_valid_hdr_name(name) or _req_has_ctl(val) { return false }
     smap_set_str(mut s.default_headers, name, val)
     return true
 }
@@ -175,7 +199,8 @@ fn session_set_retries(mut s: RequestsSession, max_retries: i64, backoff_ms: i64
 
 fn session_set_cookie(mut s: RequestsSession, host: str, name: str, val: str, path: str = "/", secure: bool = false) {
     if str_len(host) == 0 or str_len(name) == 0 { return }
-    if _req_has_ctl(name) or _req_has_ctl(val) { return }
+    if _req_has_ctl(host) or _req_has_ctl(path) or _req_has_ctl(name) or _req_has_ctl(val) { return }
+    if str_find_byte(host, 124, 0) >= 0 or str_find_byte(path, 124, 0) >= 0 or str_find_byte(name, 124, 0) >= 0 { return }
     k := str_to_lower(host) + "|" + path + "|" + name
     v := (if secure { "1|" } else { "0|" }) + val
     smap_set_str(mut s.cookies, k, v)
@@ -205,7 +230,7 @@ fn _session_build_cookie_header(s: RequestsSession, host: str, path: str, is_htt
                 cpath := str_slice(k, p1 + 1, p2)
                 cname := str_slice(k, p2 + 1, str_len(k))
                 host_ok := str_eq(lhost, chost) or (str_ends_with(lhost, "." + chost))
-                path_ok := str_len(cpath) == 0 or str_starts_with(path, cpath)
+                path_ok := str_len(cpath) == 0 or str_eq(cpath, "/") or str_eq(path, cpath) or (str_starts_with(path, cpath) and (str_ends_with(cpath, "/") or (str_len(path) > str_len(cpath) and str_byte(path, str_len(cpath)) == 47)))
                 if host_ok and path_ok {
                     raw := smap_get_str(s.cookies, k, "")
                     if str_len(raw) >= 2 {
@@ -256,8 +281,8 @@ fn _session_store_set_cookie(mut s: RequestsSession, req_host: str, line_val: st
                 else if str_eq(ak, "domain") and str_len(av) > 0 {
                     mut d := str_to_lower(av)
                     if str_starts_with(d, ".") { d = str_slice(d, 1, str_len(d)) }
-                    // Prevent cross-domain cookie setting (RFC 6265 domain-match check)
-                    if str_eq(chost, d) or str_ends_with(chost, "." + d) { chost = d }
+                    // Prevent cross-domain & single-label TLD supercookie setting (RFC 6265)
+                    if str_contains(d, ".") and (str_eq(chost, d) or str_ends_with(chost, "." + d)) { chost = d }
                 }
             }
         }
@@ -269,6 +294,7 @@ fn _session_store_set_cookie(mut s: RequestsSession, req_host: str, line_val: st
 // --- Connection Pool Helpers ---
 fn _pool_take_socket(s: RequestsSession, host: str, port: i64) -> Socket ! i64 {
     if s.closed or s.pool_mem == 0 { return err(-1) }
+    sapi := sock_init() or return err(-1)
     now := clock_ns()
     mutex_lock(s.pool_mu)
     mut found_fd := -1
@@ -281,7 +307,7 @@ fn _pool_take_socket(s: RequestsSession, host: str, port: i64) -> Socket ! i64 {
             ts := ffi_read_i64(s.pool_mem, i * 4 + 3)
             // Evict idle sockets older than 60s
             if now - ts > 60000000000 {
-                mut dead := socket_from_fd(fd) or Socket(fd = -1, family = 2, stype = 1, is_open = false, api = sock_init() or return err(-1))
+                mut dead := Socket(fd = fd, family = 2, stype = 1, is_open = true, api = sapi)
                 socket_close(mut dead)
                 if hp != 0 { ffi_free(hp) }
                 ffi_write_i64(s.pool_mem, i * 4, -1)
@@ -345,15 +371,25 @@ fn session_close(mut s: RequestsSession) {
     if s.closed { return }
     s.closed = true
     if s.pool_mem != 0 {
+        mut has_api := true
+        sapi := sock_init() or SockApi(
+            lib = 0, is_win = false, fn_socket = 0, fn_bind = 0, fn_listen = 0,
+            fn_accept = 0, fn_connect = 0, fn_send = 0, fn_recv = 0, fn_sendto = 0,
+            fn_recvfrom = 0, fn_setsockopt = 0, fn_getsockopt = 0, fn_getsockname = 0,
+            fn_getpeername = 0, fn_shutdown = 0, fn_close = 0, fn_getaddrinfo = 0,
+            fn_freeaddrinfo = 0, fn_gethostname = 0, fn_poll = 0, fn_ioctlsocket = 0, fn_fcntl = 0
+        )
+        if sapi.lib == 0 { has_api = false }
         mutex_lock(s.pool_mu)
         mut i := 0
         while i < 16 {
             fd := ffi_read_i64(s.pool_mem, i * 4)
             hp := ffi_read_i64(s.pool_mem, i * 4 + 2)
             if fd >= 0 {
-                sock_r := socket_from_fd(fd) or Socket(fd = -1, family = 2, stype = 1, is_open = false, api = sock_init() or return)
-                mut ds := sock_r
-                socket_close(mut ds)
+                if has_api {
+                    mut ds := Socket(fd = fd, family = 2, stype = 1, is_open = true, api = sapi)
+                    socket_close(mut ds)
+                }
                 ffi_write_i64(s.pool_mem, i * 4, -1)
             }
             if hp != 0 {
@@ -488,8 +524,9 @@ fn _req_http1_hop(
         hk := svec_get(hkeys, hi)
         hv := smap_get_str(hdrs, hk, "")
         lk := str_to_lower(hk)
-        if not (strip_auth and str_eq(lk, "authorization")) {
-            if not str_eq(lk, "host") and not str_eq(lk, "content-length") and not str_eq(lk, "connection") {
+        is_sensitive := str_eq(lk, "authorization") or str_eq(lk, "proxy-authorization") or str_eq(lk, "cookie")
+        if not (strip_auth and is_sensitive) {
+            if not str_eq(lk, "host") and not str_eq(lk, "content-length") and not str_eq(lk, "connection") and not str_eq(lk, "transfer-encoding") {
                 if str_eq(lk, "cookie") { has_cookie = true }
                 smap_set_str(mut seen_lower, lk, "1")
                 svec_push(mut req_parts, hk + ": " + hv + "\r\n")
@@ -506,8 +543,9 @@ fn _req_http1_hop(
         dk := svec_get(dkeys, di)
         dv := smap_get_str(s.default_headers, dk, "")
         ldk := str_to_lower(dk)
-        if not smap_has(seen_lower, ldk) and not (strip_auth and str_eq(ldk, "authorization")) {
-            if not str_eq(ldk, "host") and not str_eq(ldk, "content-length") and not str_eq(ldk, "connection") {
+        is_sens_d := str_eq(ldk, "authorization") or str_eq(ldk, "proxy-authorization") or str_eq(ldk, "cookie")
+        if not smap_has(seen_lower, ldk) and not (strip_auth and is_sens_d) {
+            if not str_eq(ldk, "host") and not str_eq(ldk, "content-length") and not str_eq(ldk, "connection") and not str_eq(ldk, "transfer-encoding") {
                 if str_eq(ldk, "cookie") { has_cookie = true }
                 svec_push(mut req_parts, dk + ": " + dv + "\r\n")
             }
@@ -544,7 +582,11 @@ fn _req_http1_hop(
     }
 
     // Read status line + headers using buffered `SockReader`
-    mut rdr := sock_reader_new(sock, 8192) or return err(-203)
+    mut rdr := sock_reader_new(sock, 8192) or SockReader(sock = sock, raw_buf = 0, buf_cap = 0, pos = 0, end = 0, eof = true)
+    if rdr.raw_buf == 0 {
+        socket_close(mut sock)
+        return err(-203)
+    }
     mut status_line := sock_reader_readline(mut rdr, 8192) or ""
     if str_len(status_line) == 0 and reused {
         // Server closed idle keep-alive right after send: reconnect once
@@ -556,7 +598,11 @@ fn _req_http1_hop(
         _ := socket_set_nodelay(sock, true)
         sent2 := socket_sendall_str(sock, wire) or -1
         if sent2 < 0 { socket_close(mut sock); return err(-202) }
-        rdr = sock_reader_new(sock, 8192) or return err(-203)
+        rdr = sock_reader_new(sock, 8192) or SockReader(sock = sock, raw_buf = 0, buf_cap = 0, pos = 0, end = 0, eof = true)
+        if rdr.raw_buf == 0 {
+            socket_close(mut sock)
+            return err(-203)
+        }
         status_line = sock_reader_readline(mut rdr, 8192) or ""
     }
     if str_len(status_line) < 12 {
@@ -577,6 +623,7 @@ fn _req_http1_hop(
     mut raw_hparts := svec_new(16, 512)
     svec_push(mut raw_hparts, status_line)
     mut content_len := -1
+    mut cl_conflict := false
     mut is_chunked := false
     mut conn_close := is_http10
     mut hcount := 0
@@ -591,7 +638,12 @@ fn _req_http1_hop(
             if str_eq(hk, "set-cookie") {
                 _session_store_set_cookie(mut s, u.host, hv)
             } else if str_eq(hk, "content-length") {
-                content_len = parse_i64(hv) or -1
+                pv := parse_i64(hv) or -1
+                if pv < 0 or (content_len >= 0 and pv != content_len) {
+                    cl_conflict = true
+                } else {
+                    content_len = pv
+                }
             } else if str_eq(hk, "transfer-encoding") {
                 if str_contains(str_to_lower(hv), "chunked") { is_chunked = true }
             } else if str_eq(hk, "connection") {
@@ -605,6 +657,12 @@ fn _req_http1_hop(
     }
     headers_raw := svec_join(raw_hparts, "\r\n")
     svec_free(move raw_hparts)
+    if cl_conflict {
+        sock_reader_free(move rdr)
+        socket_close(mut sock)
+        smap_free(move resp_hdrs)
+        return err(-203)
+    }
 
     // Read body according to RFC 9112 framing rules
     mut resp_body := ""
@@ -719,10 +777,13 @@ fn _req_https_hop(
         hk := svec_get(hkeys, i)
         hv := smap_get_str(hdrs, hk, "")
         lk := str_to_lower(hk)
-        if not (strip_auth and str_eq(lk, "authorization")) {
-            if str_eq(lk, "cookie") { has_cookie = true }
-            smap_set_str(mut seen_lower, lk, "1")
-            svec_push(mut hparts, hk + ": " + hv + "\r\n")
+        is_sens := str_eq(lk, "authorization") or str_eq(lk, "proxy-authorization") or str_eq(lk, "cookie")
+        if not (strip_auth and is_sens) {
+            if not str_eq(lk, "host") and not str_eq(lk, "content-length") and not str_eq(lk, "connection") and not str_eq(lk, "transfer-encoding") {
+                if str_eq(lk, "cookie") { has_cookie = true }
+                smap_set_str(mut seen_lower, lk, "1")
+                svec_push(mut hparts, hk + ": " + hv + "\r\n")
+            }
         }
         i += 1
     }
@@ -733,9 +794,12 @@ fn _req_https_hop(
         dk := svec_get(dkeys, i)
         dv := smap_get_str(s.default_headers, dk, "")
         ldk := str_to_lower(dk)
-        if not smap_has(seen_lower, ldk) and not (strip_auth and str_eq(ldk, "authorization")) {
-            if str_eq(ldk, "cookie") { has_cookie = true }
-            svec_push(mut hparts, dk + ": " + dv + "\r\n")
+        is_sens_d := str_eq(ldk, "authorization") or str_eq(ldk, "proxy-authorization") or str_eq(ldk, "cookie")
+        if not smap_has(seen_lower, ldk) and not (strip_auth and is_sens_d) {
+            if not str_eq(ldk, "host") and not str_eq(ldk, "content-length") and not str_eq(ldk, "connection") and not str_eq(ldk, "transfer-encoding") {
+                if str_eq(ldk, "cookie") { has_cookie = true }
+                svec_push(mut hparts, dk + ": " + dv + "\r\n")
+            }
         }
         i += 1
     }
@@ -750,7 +814,11 @@ fn _req_https_hop(
 
     wh := ffi_open_one("winhttp.dll")
     if wh == 0 {
-        r := https_request(method, u.host, u.port, target_path, hdr_block, body) or return err(-210)
+        mut unix_hdrs := hdr_block
+        if str_ends_with(unix_hdrs, "\r\n") {
+            unix_hdrs = str_slice(unix_hdrs, 0, str_len(unix_hdrs) - 2)
+        }
+        r := https_request(method, u.host, u.port, target_path, unix_hdrs, body) or return err(-210)
         rh := smap_new(8)
         return ok(RequestsResponse(
             ok_flag = (r.status >= 200 and r.status < 400),
@@ -916,7 +984,7 @@ fn session_request(
     while ei < svec_len(ek) {
         k := svec_get(ek, ei)
         v := smap_get_str(extra_headers, k, "")
-        if _req_has_ctl(k) or _req_has_ctl(v) {
+        if not _req_valid_hdr_name(k) or _req_has_ctl(v) {
             svec_free(move ek)
             return err(-400)
         }

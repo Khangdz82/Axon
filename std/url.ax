@@ -27,10 +27,24 @@ fn _url_has_ctl(s: str) -> bool {
     mut i := 0
     while i < n {
         b := str_byte(s, i)
-        if b <= 32 or b == 127 { return true }
+        if b <= 32 or b == 127 or b == 92 { return true }
         i += 1
     }
     return false
+}
+
+fn _url_parse_port_strict(pstr: str) -> i64 ! i64 {
+    pl := str_len(pstr)
+    if pl == 0 or pl > 5 { return err(400) }
+    mut i := 0
+    while i < pl {
+        b := str_byte(pstr, i)
+        if b < 48 or b > 57 { return err(400) }
+        i += 1
+    }
+    pv := parse_i64(pstr) or return err(400)
+    if pv <= 0 or pv > 65535 { return err(400) }
+    return ok(pv)
 }
 
 fn url_parse(raw: str) -> Url ! i64 {
@@ -76,6 +90,7 @@ fn url_parse(raw: str) -> Url ! i64 {
     if at_p >= 0 {
         userinfo = str_slice(auth, 0, at_p)
         hostport = str_slice(auth, at_p + 1, str_len(auth))
+        if str_find_byte(hostport, 64, 0) >= 0 { return err(400) }
     }
 
     mut host := ""
@@ -89,8 +104,7 @@ fn url_parse(raw: str) -> Url ! i64 {
         if rb + 1 < hp_len {
             if str_byte(hostport, rb + 1) != 58 { return err(400) }
             pstr := str_slice(hostport, rb + 2, hp_len)
-            pv := parse_i64(pstr) or return err(400)
-            if pv <= 0 or pv > 65535 { return err(400) }
+            pv := _url_parse_port_strict(pstr) or return err(400)
             port = pv
         }
     } else {
@@ -98,8 +112,7 @@ fn url_parse(raw: str) -> Url ! i64 {
         if col >= 0 {
             host = str_to_lower(str_slice(hostport, 0, col))
             pstr := str_slice(hostport, col + 1, hp_len)
-            pv := parse_i64(pstr) or return err(400)
-            if pv <= 0 or pv > 65535 { return err(400) }
+            pv := _url_parse_port_strict(pstr) or return err(400)
             port = pv
         } else {
             host = str_to_lower(hostport)
@@ -119,7 +132,8 @@ fn url_parse(raw: str) -> Url ! i64 {
 }
 
 fn url_build(u: Url) -> str {
-    out := buf_new(256)
+    need := str_len(u.scheme) + str_len(u.userinfo) + str_len(u.host) + str_len(u.path) + str_len(u.query) + str_len(u.fragment) + 32
+    out := buf_new(need)
     buf_push_str(out, u.scheme)
     buf_push_str(out, "://")
     if str_len(u.userinfo) > 0 {
@@ -214,21 +228,217 @@ fn url_query_get(query: str, key: str, default_val: str = "") -> str {
     return found
 }
 
+fn _url_hex_val(b: i64) -> i64 {
+    if b >= 48 and b <= 57 { return b - 48 }
+    if b >= 97 and b <= 102 { return 10 + (b - 97) }
+    if b >= 65 and b <= 70 { return 10 + (b - 65) }
+    return -1
+}
+
+fn _url_is_public_ipv4_octets(o0: i64, o1: i64, o2: i64, o3: i64) -> bool {
+    if o0 < 0 or o1 < 0 or o2 < 0 or o3 < 0 or o0 > 255 or o1 > 255 or o2 > 255 or o3 > 255 { return false }
+    if o0 == 0 or o0 == 10 or o0 == 127 { return false }
+    if o0 == 169 and o1 == 254 { return false } // AWS/GCP/Azure IMDS 169.254.169.254
+    if o0 == 192 and o1 == 168 { return false }
+    if o0 == 172 and o1 >= 16 and o1 <= 31 { return false }
+    if o0 == 100 and o1 >= 64 and o1 <= 127 { return false } // CGNAT
+    if o0 == 192 and o1 == 0 and (o2 == 0 or o2 == 2) { return false }
+    if o0 == 198 and (o1 == 18 or o1 == 19) { return false } // benchmark
+    if o0 == 198 and o1 == 51 and o2 == 100 { return false }
+    if o0 == 203 and o1 == 0 and o2 == 113 { return false }
+    if o0 >= 224 { return false } // multicast/reserved
+    return true
+}
+
+fn _url_parse_ipv4_strict(s: str, out_o: IntBuf) -> bool {
+    n := str_len(s)
+    if n < 7 or n > 15 { return false }
+    mut pos := 0
+    mut part := 0
+    while part < 4 {
+        mut val := 0
+        mut digits := 0
+        mut lead_zero := false
+        while pos < n {
+            b := str_byte(s, pos)
+            if b == 46 { break }
+            if b < 48 or b > 57 { return false }
+            if digits == 0 and b == 48 { lead_zero = true }
+            if digits > 0 and lead_zero { return false }
+            if digits >= 3 { return false }
+            val = val * 10 + (b - 48)
+            digits += 1
+            pos += 1
+        }
+        if digits == 0 or val > 255 { return false }
+        ibuf_push(out_o, val)
+        part += 1
+        if part < 4 {
+            if pos >= n or str_byte(s, pos) != 46 { return false }
+            pos += 1
+        }
+    }
+    return pos == n
+}
+
+fn _url_parse_ipv6_hextets(inner: str, out_h: IntBuf) -> bool {
+    n := str_len(inner)
+    if n < 2 or n > 45 { return false }
+    if str_find_byte(inner, 37, 0) >= 0 { return false } // reject zone IDs
+    left := ibuf_new(8)
+    right := ibuf_new(8)
+    mut seen_dd := false
+    mut pos := 0
+    if str_byte(inner, 0) == 58 {
+        if n < 2 or str_byte(inner, 1) != 58 {
+            buf_free(move left); buf_free(move right); return false
+        }
+        seen_dd = true
+        pos = 2
+    }
+    mut ok_p := true
+    while pos < n {
+        if str_byte(inner, pos) == 58 {
+            if seen_dd { ok_p = false; break }
+            seen_dd = true
+            pos += 1
+            if pos == n { break }
+            continue
+        }
+        // Find end of token (`:` or end)
+        mut end := pos
+        mut has_dot := false
+        while end < n and str_byte(inner, end) != 58 {
+            if str_byte(inner, end) == 46 { has_dot = true }
+            end += 1
+        }
+        tok := str_slice(inner, pos, end)
+        if has_dot {
+            if end != n { ok_p = false; break }
+            oct := ibuf_new(4)
+            v4ok := _url_parse_ipv4_strict(tok, oct)
+            if not v4ok {
+                buf_free(move oct); ok_p = false; break
+            }
+            hi16 := (ibuf_get(oct, 0) << 8) | ibuf_get(oct, 1)
+            lo16 := (ibuf_get(oct, 2) << 8) | ibuf_get(oct, 3)
+            buf_free(move oct)
+            if seen_dd {
+                if ibuf_len(right) + 2 > 8 { ok_p = false; break }
+                ibuf_push(right, hi16); ibuf_push(right, lo16)
+            } else {
+                if ibuf_len(left) + 2 > 8 { ok_p = false; break }
+                ibuf_push(left, hi16); ibuf_push(left, lo16)
+            }
+            pos = end
+            break
+        }
+        tl := str_len(tok)
+        if tl == 0 or tl > 4 { ok_p = false; break }
+        mut hv := 0
+        mut ti := 0
+        while ti < tl {
+            d := _url_hex_val(str_byte(tok, ti))
+            if d < 0 { ok_p = false; break }
+            hv = (hv << 4) | d
+            ti += 1
+        }
+        if not ok_p { break }
+        if seen_dd {
+            if ibuf_len(right) >= 8 { ok_p = false; break }
+            ibuf_push(right, hv)
+        } else {
+            if ibuf_len(left) >= 8 { ok_p = false; break }
+            ibuf_push(left, hv)
+        }
+        pos = end
+        if pos < n {
+            if str_byte(inner, pos) != 58 { ok_p = false; break }
+            pos += 1
+            if pos == n { ok_p = false; break } // trailing single `:`
+        }
+    }
+    if not ok_p {
+        buf_free(move left); buf_free(move right); return false
+    }
+    lc := ibuf_len(left)
+    rc := ibuf_len(right)
+    if seen_dd {
+        if lc + rc > 7 { buf_free(move left); buf_free(move right); return false }
+        mut i := 0
+        while i < lc { ibuf_push(out_h, ibuf_get(left, i)); i += 1 }
+        zeros := 8 - lc - rc
+        i = 0
+        while i < zeros { ibuf_push(out_h, 0); i += 1 }
+        i = 0
+        while i < rc { ibuf_push(out_h, ibuf_get(right, i)); i += 1 }
+    } else {
+        if lc != 8 { buf_free(move left); buf_free(move right); return false }
+        mut i := 0
+        while i < 8 { ibuf_push(out_h, ibuf_get(left, i)); i += 1 }
+    }
+    buf_free(move left); buf_free(move right)
+    return ibuf_len(out_h) == 8
+}
+
+fn _url_is_public_ipv6(bracketed: str) -> bool {
+    n := str_len(bracketed)
+    if n < 4 or str_byte(bracketed, 0) != 91 or str_byte(bracketed, n - 1) != 93 { return false }
+    inner := str_slice(bracketed, 1, n - 1)
+    h := ibuf_new(8)
+    ok_p := _url_parse_ipv6_hextets(inner, h)
+    if not ok_p { buf_free(move h); return false }
+    h0 := ibuf_get(h, 0); h1 := ibuf_get(h, 1); h2 := ibuf_get(h, 2); h3 := ibuf_get(h, 3)
+    h4 := ibuf_get(h, 4); h5 := ibuf_get(h, 5); h6 := ibuf_get(h, 6); h7 := ibuf_get(h, 7)
+    buf_free(move h)
+    // Unspecified `::` & Loopback `::1`
+    if h0 == 0 and h1 == 0 and h2 == 0 and h3 == 0 and h4 == 0 and h5 == 0 and h6 == 0 and (h7 == 0 or h7 == 1) {
+        return false
+    }
+    // IPv4-mapped `::ffff:0:0/96`, IPv4-compatible `::/96`, IPv4-translated `::ffff:0:0:0/96`
+    if h0 == 0 and h1 == 0 and h2 == 0 and h3 == 0 and h4 == 0 and (h5 == 0xFFFF or h5 == 0) {
+        return _url_is_public_ipv4_octets((h6 >> 8) & 255, h6 & 255, (h7 >> 8) & 255, h7 & 255)
+    }
+    if h0 == 0 and h1 == 0 and h2 == 0 and h3 == 0 and h4 == 0xFFFF and h5 == 0 {
+        return _url_is_public_ipv4_octets((h6 >> 8) & 255, h6 & 255, (h7 >> 8) & 255, h7 & 255)
+    }
+    // NAT64 well-known prefix `64:ff9b::/96` and local-use `64:ff9b:1::/48`
+    if h0 == 0x0064 and h1 == 0xFF9B and h2 == 0 and h3 == 0 and h4 == 0 and h5 == 0 {
+        return _url_is_public_ipv4_octets((h6 >> 8) & 255, h6 & 255, (h7 >> 8) & 255, h7 & 255)
+    }
+    if h0 == 0x0064 and h1 == 0xFF9B and h2 == 1 { return false }
+    // Discard `100::/64`
+    if h0 == 0x0100 and h1 == 0 and h2 == 0 and h3 == 0 { return false }
+    // ULA `fc00::/7`, Link-local `fe80::/10`, Site-local `fec0::/10`, Multicast `ff00::/8`
+    if (h0 & 0xFE00) == 0xFC00 { return false }
+    if (h0 & 0xFFC0) == 0xFE80 { return false }
+    if (h0 & 0xFFC0) == 0xFEC0 { return false }
+    if (h0 & 0xFF00) == 0xFF00 { return false }
+    // 6to4 `2002::/16` (embedded IPv4 in h1..h2)
+    if h0 == 0x2002 {
+        return _url_is_public_ipv4_octets((h1 >> 8) & 255, h1 & 255, (h2 >> 8) & 255, h2 & 255)
+    }
+    // Teredo `2001:0000::/32` & Documentation `2001:db8::/32`
+    if h0 == 0x2001 and (h1 == 0 or h1 == 0x0DB8) { return false }
+    return true
+}
+
 // Fail-closed SSRF guard: allows only public `http`/`https` hosts, blocking loopback, RFC1918, link-local & cloud metadata IPs.
 fn url_is_public_http(u: Url) -> bool {
     if not str_eq(u.scheme, "http") and not str_eq(u.scheme, "https") { return false }
-    h := str_to_lower(u.host)
-    hl := str_len(h)
+    mut h := str_to_lower(u.host)
+    mut hl := str_len(h)
+    if hl == 0 { return false }
+    if hl > 1 and str_byte(h, hl - 1) == 46 {
+        h = str_slice(h, 0, hl - 1)
+        hl -= 1
+    }
     if hl == 0 { return false }
     if str_eq(h, "localhost") or str_ends_with(h, ".localhost") or str_ends_with(h, ".local") or str_ends_with(h, ".internal") {
         return false
     }
     if str_byte(h, 0) == 91 {
-        // Block IPv6 loopback `[::1]`, unspecified `[::]`, unique-local `[fc..]`/`[fd..]`, link-local `[fe80..]`
-        if str_eq(h, "[::1]") or str_eq(h, "[::]") or str_starts_with(h, "[fc") or str_starts_with(h, "[fd") or str_starts_with(h, "[fe80") or str_contains(h, "ffff:127.") or str_contains(h, "ffff:169.254.") or str_contains(h, "ffff:10.") {
-            return false
-        }
-        return true
+        return _url_is_public_ipv6(h)
     }
     // Check IPv4 dotted-quad & block octal/hex dotted bypasses (`0177.0.0.1`, `0x7f.0.0.1`)
     ranges := str_split_ranges(h, 46)
@@ -255,13 +465,7 @@ fn url_is_public_http(u: Url) -> bool {
         o3 := parse_i64(s3) or -1
         buf_free(move ranges)
         if o0 >= 0 and o1 >= 0 and o2 >= 0 and o3 >= 0 and o0 <= 255 and o1 <= 255 and o2 <= 255 and o3 <= 255 {
-            if o0 == 0 or o0 == 10 or o0 == 127 { return false }
-            if o0 == 169 and o1 == 254 { return false } // AWS/GCP/Azure IMDS 169.254.169.254!
-            if o0 == 192 and o1 == 168 { return false }
-            if o0 == 172 and o1 >= 16 and o1 <= 31 { return false }
-            if o0 == 100 and o1 >= 64 and o1 <= 127 { return false } // CGNAT
-            if o0 >= 224 { return false } // multicast/reserved
-            return true
+            return _url_is_public_ipv4_octets(o0, o1, o2, o3)
         }
         // Reject malformed numeric-ending 4-label hosts like `127.0.0.999` (`inet_aton` TLD must never be all digits!)
         b_last := str_byte(s3, 0)

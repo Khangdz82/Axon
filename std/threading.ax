@@ -196,19 +196,13 @@ fn thread_join(mut t: Thread) -> i64 ! i64 {
     if t.joined != 0 or t.ctx == 0 { return err(-2) }
     if t.api.is_win {
         wr := ffi_call2(t.api.fn_join, t.handle, 0xFFFFFFFF) & 0xFFFFFFFF
-        _ := ffi_call1(t.api.fn_close, t.handle)
         if wr != 0 {
-            ffi_free(t.ctx)
-            t.ctx = 0
-            t.joined = 1
             return err(-6)
         }
+        _ := ffi_call1(t.api.fn_close, t.handle)
     } else {
         rc := ffi_sext32(ffi_call2(t.api.fn_join, t.handle, 0))
         if rc != 0 {
-            ffi_free(t.ctx)
-            t.ctx = 0
-            t.joined = 1
             return err(-6)
         }
     }
@@ -222,16 +216,15 @@ fn thread_join(mut t: Thread) -> i64 ! i64 {
 fn thread_join_timeout(mut t: Thread, timeout_ms: i64) -> i64 ! i64 {
     if t.joined != 0 or t.ctx == 0 { return err(-2) }
     if timeout_ms < 0 { return thread_join(mut t) }
+    mut tms := timeout_ms
+    if tms > 86400000 { tms = 86400000 }
     if t.api.is_win {
-        wr := ffi_call2(t.api.fn_join, t.handle, timeout_ms) & 0xFFFFFFFF
+        wr := ffi_call2(t.api.fn_join, t.handle, tms) & 0xFFFFFFFF
         if wr == 258 { return err(-110) }
-        _ := ffi_call1(t.api.fn_close, t.handle)
         if wr != 0 {
-            ffi_free(t.ctx)
-            t.ctx = 0
-            t.joined = 1
             return err(-6)
         }
+        _ := ffi_call1(t.api.fn_close, t.handle)
         ret := ffi_read_i64(t.ctx, 2)
         ffi_free(t.ctx)
         t.ctx = 0
@@ -240,7 +233,7 @@ fn thread_join_timeout(mut t: Thread, timeout_ms: i64) -> i64 ! i64 {
     }
 
     // POSIX timed wait on atomic done_flag, then reclaim via pthread_join
-    deadline_ns := clock_ns() + timeout_ms * 1000000
+    deadline_ns := clock_ns() + tms * 1000000
     mut spins := 0
     while unsafe { atomic_load_i64(t.ctx, 3) } == 0 {
         if clock_ns() >= deadline_ns { return err(-110) }
@@ -316,10 +309,16 @@ fn rlock_new() -> RLock ! i64 {
     return ok(RLock(mu = mu, state = st))
 }
 
+fn _rlock_tid(api: ThreadApi) -> i64 {
+    if api.fn_self == 0 { return 0 }
+    if api.is_win { return ffi_call0(api.fn_self) & 0xFFFFFFFF }
+    return ffi_call0(api.fn_self)
+}
+
 fn rlock_acquire(r: RLock) {
     if r.state == 0 { return }
-    tid := thread_current_id()
-    if unsafe { atomic_load_i64(r.state, 0) } == tid {
+    tid := _rlock_tid(r.mu.api)
+    if tid != 0 and unsafe { atomic_load_i64(r.state, 0) } == tid {
         cur := ffi_read_i64(r.state, 1)
         ffi_write_i64(r.state, 1, cur + 1)
         return
@@ -331,8 +330,8 @@ fn rlock_acquire(r: RLock) {
 
 fn rlock_try_acquire(r: RLock) -> bool {
     if r.state == 0 { return false }
-    tid := thread_current_id()
-    if unsafe { atomic_load_i64(r.state, 0) } == tid {
+    tid := _rlock_tid(r.mu.api)
+    if tid != 0 and unsafe { atomic_load_i64(r.state, 0) } == tid {
         cur := ffi_read_i64(r.state, 1)
         ffi_write_i64(r.state, 1, cur + 1)
         return true
@@ -345,8 +344,8 @@ fn rlock_try_acquire(r: RLock) -> bool {
 
 fn rlock_release(r: RLock) -> bool {
     if r.state == 0 { return false }
-    tid := thread_current_id()
-    if unsafe { atomic_load_i64(r.state, 0) } != tid { return false }
+    tid := _rlock_tid(r.mu.api)
+    if tid == 0 or unsafe { atomic_load_i64(r.state, 0) } != tid { return false }
     cur := ffi_read_i64(r.state, 1) - 1
     ffi_write_i64(r.state, 1, cur)
     if cur <= 0 {
@@ -392,17 +391,22 @@ fn cond_wait(cv: CondVar, mu: Mutex) -> bool {
 fn cond_wait_timeout(cv: CondVar, mu: Mutex, timeout_ms: i64) -> bool {
     if cv.ptr == 0 or mu.ptr == 0 { return false }
     if timeout_ms < 0 { return cond_wait(cv, mu) }
+    mut tms := timeout_ms
+    if tms > 86400000 { tms = 86400000 }
     if cv.api.is_win {
-        return ffi_sext32(ffi_call4(cv.api.fn_cv_timedwait, cv.ptr, mu.ptr, timeout_ms, 0)) != 0
+        return ffi_sext32(ffi_call4(cv.api.fn_cv_timedwait, cv.ptr, mu.ptr, tms, 0)) != 0
     }
     if cv.api.fn_clock_gettime == 0 { return false }
     ts := ffi_alloc(16)
     if ts == 0 { return false }
     // CLOCK_REALTIME = 0 on Linux & macOS
-    _ := ffi_call2(cv.api.fn_clock_gettime, 0, ts)
+    if ffi_sext32(ffi_call2(cv.api.fn_clock_gettime, 0, ts)) != 0 {
+        ffi_free(ts)
+        return false
+    }
     sec := ffi_read_i64(ts, 0)
-    nsec := ffi_read_i64(ts, 1) + (timeout_ms % 1000) * 1000000
-    add_sec := (timeout_ms / 1000) + (nsec / 1000000000)
+    nsec := ffi_read_i64(ts, 1) + (tms % 1000) * 1000000
+    add_sec := (tms / 1000) + (nsec / 1000000000)
     ffi_write_i64(ts, 0, sec + add_sec)
     ffi_write_i64(ts, 1, nsec % 1000000000)
     rc := ffi_sext32(ffi_call3(cv.api.fn_cv_timedwait, cv.ptr, mu.ptr, ts))
@@ -479,7 +483,9 @@ fn event_wait(e: Event, timeout_ms: i64 = -1) -> bool {
         mutex_unlock(e.mu)
         return true
     }
-    deadline := clock_ns() + timeout_ms * 1000000
+    mut tms := timeout_ms
+    if tms > 86400000 { tms = 86400000 }
+    deadline := clock_ns() + tms * 1000000
     while unsafe { atomic_load_i64(e.state, 0) } == 0 {
         rem_ns := deadline - clock_ns()
         if rem_ns <= 0 {
@@ -542,7 +548,9 @@ fn sem_acquire(s: Semaphore, timeout_ms: i64 = -1) -> bool {
         mutex_unlock(s.mu)
         return true
     }
-    deadline := clock_ns() + timeout_ms * 1000000
+    mut tms := timeout_ms
+    if tms > 86400000 { tms = 86400000 }
+    deadline := clock_ns() + tms * 1000000
     while ffi_read_i64(s.state, 0) <= 0 {
         rem_ns := deadline - clock_ns()
         if rem_ns <= 0 {
@@ -685,7 +693,7 @@ fn tls_new() -> ThreadLocal ! i64 {
     kbox := ffi_alloc(16)
     if kbox == 0 { return err(-3) }
     rc := ffi_sext32(ffi_call2(api.fn_tls_alloc, kbox, 0))
-    k := ffi_read_u32_le(kbox, 0)
+    k := ffi_read_i64(kbox, 0)
     ffi_free(kbox)
     if rc != 0 { return err(-10) }
     return ok(ThreadLocal(slot = k, api = api))
@@ -726,9 +734,10 @@ fn tqueue_new(maxsize: i64 = 0) -> ThreadQueue ! i64 {
     nf := cond_new() or return
     ad := cond_new() or return
     meta := ffi_alloc(128)
-    mut init_cap := maxsize
-    if init_cap <= 0 { init_cap = 64 }
-    if init_cap > 16777216 { init_cap = 16777216 }
+    mut ms := maxsize
+    if ms < 0 { ms = 0 }
+    if ms > 16777216 { ms = 16777216 }
+    mut init_cap := if ms == 0 { 64 } else { ms }
     data := ffi_alloc(init_cap * 8 + 64)
     if meta == 0 or data == 0 {
         if meta != 0 { ffi_free(meta) }
@@ -743,7 +752,7 @@ fn tqueue_new(maxsize: i64 = 0) -> ThreadQueue ! i64 {
     ffi_write_i64(meta, 1, 0)
     ffi_write_i64(meta, 2, 0)
     ffi_write_i64(meta, 3, init_cap)
-    ffi_write_i64(meta, 4, maxsize)
+    ffi_write_i64(meta, 4, ms)
     ffi_write_i64(meta, 5, 0)
     ffi_write_i64(meta, 6, 0)
     ffi_write_i64(meta, 7, data)
@@ -784,7 +793,9 @@ fn tqueue_put(q: ThreadQueue, item: i64, timeout_ms: i64 = -1) -> bool {
                 _ := cond_wait(q.not_full, q.mu)
             }
         } else {
-            deadline := clock_ns() + timeout_ms * 1000000
+            mut tms := timeout_ms
+            if tms > 86400000 { tms = 86400000 }
+            deadline := clock_ns() + tms * 1000000
             while ffi_read_i64(q.meta, 2) >= maxsize and ffi_read_i64(q.meta, 6) == 0 {
                 rem_ns := deadline - clock_ns()
                 if rem_ns <= 0 {
@@ -835,7 +846,9 @@ fn tqueue_get(q: ThreadQueue, timeout_ms: i64 = -1) -> i64 ! i64 {
             _ := cond_wait(q.not_empty, q.mu)
         }
     } else {
-        deadline := clock_ns() + timeout_ms * 1000000
+        mut tms := timeout_ms
+        if tms > 86400000 { tms = 86400000 }
+        deadline := clock_ns() + tms * 1000000
         while ffi_read_i64(q.meta, 2) <= 0 and ffi_read_i64(q.meta, 6) == 0 {
             rem_ns := deadline - clock_ns()
             if rem_ns <= 0 {
