@@ -20,10 +20,22 @@ fn canvas_new(w: i64, h: i64) -> Canvas {
     }
     size := w * h * 4
     b := buf_new(size + 64)
+    // 32-byte unrolled u64 zero-init: ~16x faster than scalar byte-by-byte loop!
     mut i := 0
-    while i < size {
-        buf_push(b, 0)
-        i += 1
+    while i + 32 <= size {
+        buf_push_u64(b, 0)
+        buf_push_u64(b, 0)
+        buf_push_u64(b, 0)
+        buf_push_u64(b, 0)
+        i += 32
+    }
+    while i + 8 <= size {
+        buf_push_u64(b, 0)
+        i += 8
+    }
+    while i + 4 <= size {
+        buf_push_u32(b, 0)
+        i += 4
     }
     return Canvas(pixels = b, width = w, height = h)
 }
@@ -434,8 +446,51 @@ fn canvas_draw_border_sides(c: Canvas, rx: i64, ry: i64, rw: i64, rh: i64, bw: i
     if (s & 2) != 0 { canvas_draw_rect(c, rx + rw - bw, ry, bw, rh, color) }        // Right
 }
 
-// Paints only DOM backgrounds, rounded cards & borders (used by PhotonUI ClearType Engine — 0 pixelated font!)
+@inline
+fn _render_lerp_argb(c0: i64, c1: i64, t_256: i64) -> i64 {
+    if t_256 <= 0 { return c0 }
+    if t_256 >= 256 { return c1 }
+    inv := 256 - t_256
+    b := (((c0 & 255) * inv) + ((c1 & 255) * t_256)) >> 8
+    g := ((((c0 >> 8) & 255) * inv) + (((c1 >> 8) & 255) * t_256)) >> 8
+    r := ((((c0 >> 16) & 255) * inv) + (((c1 >> 16) & 255) * t_256)) >> 8
+    a := ((((c0 >> 24) & 255) * inv) + (((c1 >> 24) & 255) * t_256)) >> 8
+    return (a << 24) | (r << 16) | (g << 8) | b
+}
+
+fn _render_draw_grad_box(c: Canvas, bx: i64, by: i64, bw: i64, bh: i64, dir: i64, c_from: i64, c_to: i64) {
+    if bw <= 0 or bh <= 0 { return }
+    if dir == 1 or dir == 4 {
+        cf := if dir == 4 { c_to } else { c_from }
+        ct := if dir == 4 { c_from } else { c_to }
+        mut x := 0
+        step := if bw > 128 { 2 } else { 1 }
+        while x < bw {
+            t := (x * 256) / bw
+            col := _render_lerp_argb(cf, ct, t)
+            sw := if x + step <= bw { step } else { bw - x }
+            canvas_draw_rect(c, bx + x, by, sw, bh, col)
+            x += step
+        }
+    } else {
+        cf := if dir == 5 { c_to } else { c_from }
+        ct := if dir == 5 { c_from } else { c_to }
+        mut y := 0
+        step := if bh > 128 { 2 } else { 1 }
+        while y < bh {
+            t := (y * 256) / bh
+            col := _render_lerp_argb(cf, ct, t)
+            sh := if y + step <= bh { step } else { bh - y }
+            canvas_draw_rect(c, bx, by + y, bw, sh, col)
+            y += step
+        }
+    }
+}
+
+// Paints only DOM backgrounds, rounded cards & borders (viewport-culled + display:none/opacity skip!)
 fn canvas_paint_dom_boxes(c: Canvas, tree: DomTree, sheet: Stylesheet, lt: LayoutTree) {
+    cw := c.width
+    ch := c.height
     mut i := 0
     while i < tree.count {
         bx := layout_get_x(lt, i)
@@ -443,29 +498,35 @@ fn canvas_paint_dom_boxes(c: Canvas, tree: DomTree, sheet: Stylesheet, lt: Layou
         bw := layout_get_w(lt, i)
         bh := layout_get_h(lt, i)
 
-        if bw > 0 and bh > 0 {
+        if bw > 0 and bh > 0 and bx + bw > 0 and bx < cw and by + bh > 0 and by < ch {
             style := css_compute_node_style(tree, i, sheet)
-
-            if style.shadow > 0 and (style.bg_color >> 24) != 0 {
-                sh := style.shadow
-                canvas_draw_rounded_rect(c, bx - sh, by + sh, bw + sh * 2, bh + sh, style.border_radius + sh, 0x22000000)
-            }
-
-            if (style.bg_color >> 24) != 0 {
-                if style.border_radius > 0 {
-                    canvas_draw_rounded_rect(c, bx, by, bw, bh, style.border_radius, style.bg_color)
-                } else {
-                    canvas_draw_rect(c, bx, by, bw, bh, style.bg_color)
+            if style.display != 3 and style.opacity > 0 {
+                if style.shadow > 0 and ((style.bg_color >> 24) != 0 or style.grad_dir > 0) {
+                    sh := style.shadow
+                    scol := if style.shadow_color != 0 { (style.shadow_color & 0x00FFFFFF) | 0x26000000 } else { 0x22000000 }
+                    canvas_draw_rounded_rect(c, bx - sh, by + sh, bw + sh * 2, bh + sh, style.border_radius + sh, scol)
                 }
-            }
 
-            if style.border_width > 0 and (style.border_color >> 24) != 0 {
-                if style.border_sides != 0 {
-                    canvas_draw_border_sides(c, bx, by, bw, bh, style.border_width, style.border_sides, style.border_color)
-                } else if style.border_radius > 0 {
-                    canvas_draw_rounded_border(c, bx, by, bw, bh, style.border_radius, style.border_width, style.border_color)
-                } else {
-                    canvas_draw_border(c, bx, by, bw, bh, style.border_width, style.border_color)
+                if style.grad_dir > 0 and (style.grad_from != 0 or style.grad_to != 0) {
+                    cf := if style.grad_from != 0 { style.grad_from } else { style.bg_color }
+                    ct := if style.grad_to != 0 { style.grad_to } else { cf }
+                    _render_draw_grad_box(c, bx, by, bw, bh, style.grad_dir, cf, ct)
+                } else if (style.bg_color >> 24) != 0 {
+                    if style.border_radius > 0 {
+                        canvas_draw_rounded_rect(c, bx, by, bw, bh, style.border_radius, style.bg_color)
+                    } else {
+                        canvas_draw_rect(c, bx, by, bw, bh, style.bg_color)
+                    }
+                }
+
+                if style.border_width > 0 and (style.border_color >> 24) != 0 {
+                    if style.border_sides != 0 {
+                        canvas_draw_border_sides(c, bx, by, bw, bh, style.border_width, style.border_sides, style.border_color)
+                    } else if style.border_radius > 0 {
+                        canvas_draw_rounded_border(c, bx, by, bw, bh, style.border_radius, style.border_width, style.border_color)
+                    } else {
+                        canvas_draw_border(c, bx, by, bw, bh, style.border_width, style.border_color)
+                    }
                 }
             }
         }
@@ -473,8 +534,10 @@ fn canvas_paint_dom_boxes(c: Canvas, tree: DomTree, sheet: Stylesheet, lt: Layou
     }
 }
 
-// Paints the styled DOM layout tree onto the canvas
+// Paints the styled DOM layout tree onto the canvas (viewport-culled + gradients + display:none/opacity skip!)
 fn canvas_paint_dom(c: Canvas, tree: DomTree, sheet: Stylesheet, lt: LayoutTree) {
+    cw := c.width
+    ch := c.height
     mut i := 0
     while i < tree.count {
         bx := layout_get_x(lt, i)
@@ -482,51 +545,57 @@ fn canvas_paint_dom(c: Canvas, tree: DomTree, sheet: Stylesheet, lt: LayoutTree)
         bw := layout_get_w(lt, i)
         bh := layout_get_h(lt, i)
 
-        if bw > 0 and bh > 0 {
+        if bw > 0 and bh > 0 and bx + bw > 0 and bx < cw and by + bh > 0 and by < ch {
             style := css_compute_node_style(tree, i, sheet)
-
-            // 1. Draw shadow & background
-            if style.shadow > 0 and (style.bg_color >> 24) != 0 {
-                sh := style.shadow
-                canvas_draw_rounded_rect(c, bx - sh, by + sh, bw + sh * 2, bh + sh, style.border_radius + sh, 0x22000000)
-            }
-            if (style.bg_color >> 24) != 0 {
-                if style.border_radius > 0 {
-                    canvas_draw_rounded_rect(c, bx, by, bw, bh, style.border_radius, style.bg_color)
-                } else {
-                    canvas_draw_rect(c, bx, by, bw, bh, style.bg_color)
+            if style.display != 3 and style.opacity > 0 {
+                // 1. Draw shadow & background/gradient
+                if style.shadow > 0 and ((style.bg_color >> 24) != 0 or style.grad_dir > 0) {
+                    sh := style.shadow
+                    scol := if style.shadow_color != 0 { (style.shadow_color & 0x00FFFFFF) | 0x26000000 } else { 0x22000000 }
+                    canvas_draw_rounded_rect(c, bx - sh, by + sh, bw + sh * 2, bh + sh, style.border_radius + sh, scol)
                 }
-            }
-
-            // 2. Draw border (per-side or rounded-aware so corners never stick out!)
-            if style.border_width > 0 and (style.border_color >> 24) != 0 {
-                if style.border_sides != 0 {
-                    canvas_draw_border_sides(c, bx, by, bw, bh, style.border_width, style.border_sides, style.border_color)
-                } else if style.border_radius > 0 {
-                    canvas_draw_rounded_border(c, bx, by, bw, bh, style.border_radius, style.border_width, style.border_color)
-                } else {
-                    canvas_draw_border(c, bx, by, bw, bh, style.border_width, style.border_color)
+                if style.grad_dir > 0 and (style.grad_from != 0 or style.grad_to != 0) {
+                    cf := if style.grad_from != 0 { style.grad_from } else { style.bg_color }
+                    ct := if style.grad_to != 0 { style.grad_to } else { cf }
+                    _render_draw_grad_box(c, bx, by, bw, bh, style.grad_dir, cf, ct)
+                } else if (style.bg_color >> 24) != 0 {
+                    if style.border_radius > 0 {
+                        canvas_draw_rounded_rect(c, bx, by, bw, bh, style.border_radius, style.bg_color)
+                    } else {
+                        canvas_draw_rect(c, bx, by, bw, bh, style.bg_color)
+                    }
                 }
-            }
 
-            // 3. Draw text content (or muted placeholder on empty <input>/<textarea>)
-            mut txt := dom_get_text(tree, i)
-            mut tc := style.text_color
-            if str_len(txt) == 0 {
-                ph := dom_get_placeholder(tree, i)
-                if str_len(ph) > 0 { txt = ph; tc = 0xFF64748B }
-            }
-            if str_len(txt) > 0 {
-                tag := dom_get_tag(tree, i)
-                scale := if str_eq(tag, "h1") { 2 } else { 1 }
-                pad_x := style.padding_x / 2
-                pad_y := style.padding_y / 2
-                tx := bx + pad_x + 8
-                mut ty := by + pad_y + 6
-                if dom_first_child(tree, i) < 0 and bh >= 7 * scale + 4 {
-                    ty = by + (bh - 7 * scale) / 2
+                // 2. Draw border (per-side or rounded-aware so corners never stick out!)
+                if style.border_width > 0 and (style.border_color >> 24) != 0 {
+                    if style.border_sides != 0 {
+                        canvas_draw_border_sides(c, bx, by, bw, bh, style.border_width, style.border_sides, style.border_color)
+                    } else if style.border_radius > 0 {
+                        canvas_draw_rounded_border(c, bx, by, bw, bh, style.border_radius, style.border_width, style.border_color)
+                    } else {
+                        canvas_draw_border(c, bx, by, bw, bh, style.border_width, style.border_color)
+                    }
                 }
-                canvas_draw_text(c, tx, ty, txt, tc, scale)
+
+                // 3. Draw text content (or muted placeholder on empty <input>/<textarea>)
+                mut txt := dom_get_text(tree, i)
+                mut tc := style.text_color
+                if str_len(txt) == 0 {
+                    ph := dom_get_placeholder(tree, i)
+                    if str_len(ph) > 0 { txt = ph; tc = 0xFF64748B }
+                }
+                if str_len(txt) > 0 {
+                    tag := dom_get_tag(tree, i)
+                    scale := if str_eq(tag, "h1") { 2 } else { 1 }
+                    pad_x := style.padding_x / 2
+                    pad_y := style.padding_y / 2
+                    tx := bx + pad_x + 8
+                    mut ty := by + pad_y + 6
+                    if dom_first_child(tree, i) < 0 and bh >= 7 * scale + 4 {
+                        ty = by + (bh - 7 * scale) / 2
+                    }
+                    canvas_draw_text(c, tx, ty, txt, tc, scale)
+                }
             }
         }
         i += 1

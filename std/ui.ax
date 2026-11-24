@@ -30,6 +30,44 @@ struct UiApp {
     node_scrolls: IntBuf
     focused_idx: i64
     is_ready: bool
+    doc_height: i64
+}
+
+fn _ui_compute_doc_height(app: UiApp) -> i64 {
+    mut max_bot := app.height
+    mut i := 0
+    while i < app.tree.count {
+        bot := layout_get_y(app.layout, i) + layout_get_h(app.layout, i)
+        if bot > max_bot { max_bot = bot }
+        i += 1
+    }
+    return max_bot
+}
+
+fn _ui_relayout(mut app: UiApp) {
+    new_lt := layout_compute(app.tree, app.sheet, app.width, app.height)
+    layout_tree_free(move app.layout)
+    app.layout = new_lt
+    app.doc_height = _ui_compute_doc_height(app)
+}
+
+fn _ui_ensure_canvas(mut app: UiApp) {
+    if app.canvas.width == app.width and app.canvas.height == app.height and buf_len(app.canvas.pixels) >= app.width * app.height * 4 {
+        return
+    }
+    new_c := canvas_new(app.width, app.height)
+    canvas_free(move app.canvas)
+    app.canvas = new_c
+}
+
+fn ui_app_free(move app: UiApp) {
+    dom_tree_free(move app.tree)
+    css_stylesheet_free(move app.sheet)
+    layout_tree_free(move app.layout)
+    canvas_free(move app.canvas)
+    js_state_free(move app.state)
+    signal_graph_free(move app.signals)
+    buf_free(move app.node_scrolls)
 }
 
 fn ui_app_new(title: str, w: i64, h: i64) -> UiApp {
@@ -38,7 +76,8 @@ fn ui_app_new(title: str, w: i64, h: i64) -> UiApp {
     mut sheet := css_parse_stylesheet("")
     sheet.viewport_w = w
     lt := layout_compute(tree, sheet, w, h)
-    canv := canvas_new(w, h)
+    // Lazy CPU Canvas: saves ~4 MB RAM immediately when running hardware Photon-D2D!
+    canv := Canvas(pixels = buf_new(1), width = 0, height = 0)
     st := js_state_new()
     sig := signal_graph_new()
 
@@ -58,13 +97,15 @@ fn ui_app_new(title: str, w: i64, h: i64) -> UiApp {
         scroll_y = 0,
         node_scrolls = map_new(64),
         focused_idx = -1,
-        is_ready = false
+        is_ready = false,
+        doc_height = h
     )
 }
 
 fn ui_set_html(mut app: UiApp, html_code: str) -> bool {
     app.html_src = html_code
     parsed := html_parse(html_code) or return false
+    dom_tree_free(move app.tree)
     app.tree = parsed
     if str_len(parsed.extracted_css) > 0 {
         if str_len(app.css_src) > 0 {
@@ -72,13 +113,16 @@ fn ui_set_html(mut app: UiApp, html_code: str) -> bool {
         } else {
             app.css_src = parsed.extracted_css
         }
-        app.sheet = css_parse_stylesheet(app.css_src)
+        new_sheet := css_parse_stylesheet(app.css_src)
+        css_stylesheet_free(move app.sheet)
+        app.sheet = new_sheet
         app.sheet.viewport_w = app.width
     }
     if str_len(parsed.extracted_js) > 0 {
         _ := js_eval_script(mut app.tree, mut app.state, parsed.extracted_js)
     }
-    app.layout = layout_compute(app.tree, app.sheet, app.width, app.height)
+    _ui_relayout(mut app)
+    signal_clear_bindings(mut app.signals)
     signal_compile_template(mut app.signals, app.tree)
     app.is_ready = true
     return true
@@ -86,10 +130,12 @@ fn ui_set_html(mut app: UiApp, html_code: str) -> bool {
 
 fn ui_set_css(mut app: UiApp, css_code: str) {
     app.css_src = css_code
-    app.sheet = css_parse_stylesheet(css_code)
+    new_sheet := css_parse_stylesheet(css_code)
+    css_stylesheet_free(move app.sheet)
+    app.sheet = new_sheet
     app.sheet.viewport_w = app.width
     if app.is_ready {
-        app.layout = layout_compute(app.tree, app.sheet, app.width, app.height)
+        _ui_relayout(mut app)
     }
 }
 
@@ -119,11 +165,13 @@ fn ui_app_from_file(title: str, w: i64, h: i64, html_path: str) -> UiApp ! i64 {
 fn ui_render(mut app: UiApp) -> Canvas {
     if not app.is_ready {
         parsed := html_parse(app.html_src) or dom_tree_new(app.html_src)
+        dom_tree_free(move app.tree)
         app.tree = parsed
-        app.layout = layout_compute(app.tree, app.sheet, app.width, app.height)
+        _ui_relayout(mut app)
         app.is_ready = true
     }
 
+    _ui_ensure_canvas(mut app)
     // Default dark slate background (Tailwind slate-900)
     canvas_clear(app.canvas, 0xFF0F172A)
     canvas_paint_dom(app.canvas, app.tree, app.sheet, app.layout)
@@ -148,19 +196,21 @@ fn ui_node_content_height(app: UiApp, node_idx: i64) -> i64 {
     return max_bot - top_y
 }
 
-fn _ui_hit_test_rec(app: UiApp, node_idx: i64, px: i64, py: i64, acc_scroll_y: i64, depth: i64 = 0) -> i64 {
+fn _ui_hit_test_rec(app: UiApp, node_idx: i64, px: i64, py: i64, acc_scroll_y: i64, p_style: ComputedStyle, has_p: bool, depth: i64 = 0) -> i64 {
     if depth >= 64 or node_idx < 0 or node_idx >= app.tree.count { return -1 }
-    bx := layout_get_x(app.layout, node_idx)
-    by := layout_get_y(app.layout, node_idx)
+    if dom_node_type(app.tree, node_idx) == 0 { return -1 }
     bw := layout_get_w(app.layout, node_idx)
     bh := layout_get_h(app.layout, node_idx)
-    st := css_compute_node_style(app.tree, node_idx, app.sheet)
+    if bw <= 0 and bh <= 0 { return -1 }
+    bx := layout_get_x(app.layout, node_idx)
+    by := layout_get_y(app.layout, node_idx)
+    st := css_compute_node_style_inherited(app.tree, node_idx, app.sheet, p_style, has_p, false, false, false)
     if st.display == 3 { return -1 }
 
     eff_y := if st.position == 2 { by } else { by - acc_scroll_y }
     inside := bw > 0 and bh > 0 and px >= bx and px < bx + bw and py >= eff_y and py < eff_y + bh
 
-    // If container clips overflow and point is outside, skip its subtree
+    // If container clips overflow and point is outside, skip its entire subtree in O(1)!
     if (st.overflow_hidden or st.overflow_scroll) and not inside {
         return -1
     }
@@ -169,11 +219,29 @@ fn _ui_hit_test_rec(app: UiApp, node_idx: i64, px: i64, py: i64, acc_scroll_y: i
     own_scroll := if st.overflow_scroll { ui_node_scroll_y(app, node_idx) } else { 0 }
     child_scroll := if st.position == 2 { own_scroll } else { acc_scroll_y + own_scroll }
 
+    // 2-pass z-index hit-testing: normal flow first, then z_index > 0 overlays on top!
+    mut has_elev := false
     mut ch := dom_first_child(app.tree, node_idx)
     while ch >= 0 {
-        sub := _ui_hit_test_rec(app, ch, px, py, child_scroll, depth + 1)
-        if sub >= 0 { hit = sub }
+        cs := css_compute_node_style_inherited(app.tree, ch, app.sheet, st, true, false, false, false)
+        if cs.z_index > 0 {
+            has_elev = true
+        } else {
+            sub := _ui_hit_test_rec(app, ch, px, py, child_scroll, st, true, depth + 1)
+            if sub >= 0 { hit = sub }
+        }
         ch = dom_next_sibling(app.tree, ch)
+    }
+    if has_elev {
+        ch = dom_first_child(app.tree, node_idx)
+        while ch >= 0 {
+            cs := css_compute_node_style_inherited(app.tree, ch, app.sheet, st, true, false, false, false)
+            if cs.z_index > 0 {
+                sub := _ui_hit_test_rec(app, ch, px, py, child_scroll, st, true, depth + 1)
+                if sub >= 0 { hit = sub }
+            }
+            ch = dom_next_sibling(app.tree, ch)
+        }
     }
     return hit
 }
@@ -182,9 +250,10 @@ fn _ui_hit_test_rec(app: UiApp, node_idx: i64, px: i64, py: i64, acc_scroll_y: i
 fn ui_hit_test(app: UiApp, px: i64, py: i64) -> i64 {
     if app.tree.root_idx < 0 { return -1 }
     mut hit := -1
+    root_p := style_default()
     mut r := app.tree.root_idx
     while r >= 0 {
-        sub := _ui_hit_test_rec(app, r, px, py, app.scroll_y)
+        sub := _ui_hit_test_rec(app, r, px, py, app.scroll_y, root_p, false, 0)
         if sub >= 0 { hit = sub }
         r = dom_next_sibling(app.tree, r)
     }
@@ -197,15 +266,19 @@ fn ui_hit_test_id(app: UiApp, px: i64, py: i64) -> str {
     return dom_get_id(app.tree, node_idx)
 }
 
-// Dispatches mouse click event with standard DOM bubbling, focus management for <input>/<textarea>, and JS onclick
-fn ui_dispatch_click(mut app: UiApp, px: i64, py: i64) -> str {
-    node_idx := ui_hit_test(app, px, py)
+// Fast-path click dispatch when caller already computed hit-test `node_idx` (zero redundant hit-test!)
+fn ui_dispatch_click_node(mut app: UiApp, node_idx: i64) -> str {
     if node_idx < 0 {
         app.focused_idx = -1
         return ""
     }
     tag := dom_get_tag(app.tree, node_idx)
-    if str_eq_ignore_case(tag, "input") or str_eq_ignore_case(tag, "textarea") {
+    is_chk := str_eq_ignore_case(tag, "input") and str_eq(dom_get_placeholder(app.tree, node_idx), "__type:checkbox")
+    if is_chk {
+        cur_v := dom_get_text(app.tree, node_idx)
+        dom_set_text(mut app.tree, node_idx, if str_eq(cur_v, "1") { "0" } else { "1" })
+        app.focused_idx = -1
+    } else if str_eq_ignore_case(tag, "input") or str_eq_ignore_case(tag, "textarea") {
         app.focused_idx = node_idx
     } else {
         app.focused_idx = -1
@@ -234,23 +307,23 @@ fn ui_dispatch_click(mut app: UiApp, px: i64, py: i64) -> str {
     if str_len(clk) > 0 {
         did_mutate := js_eval_action(mut app.tree, app.state, clk)
         if did_mutate {
-            app.layout = layout_compute(app.tree, app.sheet, app.width, app.height)
+            _ui_relayout(mut app)
         }
     }
 
     return id
 }
 
-// Scroll document viewport vertically (`delta_y > 0` scrolls down), clamped to content height
+// Dispatches mouse click event with standard DOM bubbling, focus management for <input>/<textarea>, and JS onclick
+fn ui_dispatch_click(mut app: UiApp, px: i64, py: i64) -> str {
+    node_idx := ui_hit_test(app, px, py)
+    return ui_dispatch_click_node(mut app, node_idx)
+}
+
+// Scroll document viewport vertically (`delta_y > 0` scrolls down), O(1) via cached doc_height
 fn ui_scroll(mut app: UiApp, delta_y: i64) -> bool {
     if not app.is_ready or delta_y == 0 { return false }
-    mut max_bot := app.height
-    mut i := 0
-    while i < app.tree.count {
-        bot := layout_get_y(app.layout, i) + layout_get_h(app.layout, i)
-        if bot > max_bot { max_bot = bot }
-        i += 1
-    }
+    max_bot := if app.doc_height > app.height { app.doc_height } else { _ui_compute_doc_height(app) }
     max_scroll := max_bot - app.height
     mut next_y := app.scroll_y + delta_y
     if next_y < 0 { next_y = 0 }
@@ -304,13 +377,23 @@ fn ui_handle_char(mut app: UiApp, cp: i64) -> bool {
         dom_set_text(mut app.tree, app.focused_idx, str_slice(cur, 0, cut))
         return true
     }
-    if (cp == 13 or cp == 10) and str_eq_ignore_case(tag, "textarea") and n < 4095 {
-        out := buf_new(n + 4)
-        buf_push_str(out, cur)
-        buf_push(out, 10)
-        dom_set_text(mut app.tree, app.focused_idx, buf_to_owned_str(move out))
-        app.layout = layout_compute(app.tree, app.sheet, app.width, app.height)
-        return true
+    if cp == 13 or cp == 10 {
+        if str_eq_ignore_case(tag, "textarea") and n < 4095 {
+            out := buf_new(n + 4)
+            buf_push_str(out, cur)
+            buf_push(out, 10)
+            dom_set_text(mut app.tree, app.focused_idx, buf_to_owned_str(move out))
+            _ui_relayout(mut app)
+            return true
+        }
+        // Pressing Enter on <input> fires its `onsubmit` / `onenter` / `onclick` JS handler!
+        sub_act := dom_get_onclick(app.tree, app.focused_idx)
+        if str_len(sub_act) > 0 {
+            did_m := js_eval_action(mut app.tree, app.state, sub_act)
+            if did_m { _ui_relayout(mut app) }
+            return true
+        }
+        return false
     }
     if cp < 32 or cp == 127 or n >= 4096 { return false }
     out := buf_new(n + 8)
@@ -361,7 +444,7 @@ fn ui_handle_paste(mut app: UiApp, clip_text: str) -> bool {
     }
     dom_set_text(mut app.tree, app.focused_idx, buf_to_owned_str(move out))
     if allow_nl {
-        app.layout = layout_compute(app.tree, app.sheet, app.width, app.height)
+        _ui_relayout(mut app)
     }
     return true
 }
@@ -370,15 +453,39 @@ fn ui_handle_paste(mut app: UiApp, clip_text: str) -> bool {
 fn ui_set_inner_text(mut app: UiApp, elem_id: str, new_text: str) -> bool {
     ok := document_set_inner_text(mut app.tree, elem_id, new_text)
     if ok {
-        app.layout = layout_compute(app.tree, app.sheet, app.width, app.height)
+        _ui_relayout(mut app)
     }
     return ok
+}
+
+fn ui_set_inner_html(mut app: UiApp, elem_id: str, html_frag: str) -> bool {
+    ok := document_set_inner_html(mut app.tree, elem_id, html_frag)
+    if ok {
+        _ui_relayout(mut app)
+    }
+    return ok
+}
+
+fn ui_append_inner_html(mut app: UiApp, elem_id: str, html_frag: str) -> bool {
+    ok := document_append_inner_html(mut app.tree, elem_id, html_frag)
+    if ok {
+        _ui_relayout(mut app)
+    }
+    return ok
+}
+
+fn ui_eval_js(mut app: UiApp, js_code: str) -> bool {
+    did_m := js_eval_action(mut app.tree, app.state, js_code)
+    if did_m {
+        _ui_relayout(mut app)
+    }
+    return did_m
 }
 
 fn ui_toggle_class(mut app: UiApp, elem_id: str, cls_name: str) -> bool {
     ok := document_toggle_class(mut app.tree, elem_id, cls_name)
     if ok {
-        app.layout = layout_compute(app.tree, app.sheet, app.width, app.height)
+        _ui_relayout(mut app)
     }
     return ok
 }
@@ -510,6 +617,7 @@ fn ui_compile_signals(mut app: UiApp) -> i64 {
 
 // Surgically repaints only dirty canvas regions for updated signals (sub-microsecond)
 fn ui_patch_signals(mut app: UiApp) -> i64 {
+    _ui_ensure_canvas(mut app)
     return signal_patch_canvas(mut app.signals, app.canvas, app.tree, app.sheet, app.layout)
 }
 
@@ -517,6 +625,7 @@ fn ui_patch_signals(mut app: UiApp) -> i64 {
 fn ui_signal_update_and_patch(mut app: UiApp, name: str, val: i64) -> bool {
     changed := signal_set_int(mut app.signals, mut app.tree, name, val)
     if changed {
+        _ui_ensure_canvas(mut app)
         signal_patch_canvas(mut app.signals, app.canvas, app.tree, app.sheet, app.layout)
     }
     return changed
@@ -526,6 +635,7 @@ fn ui_signal_update_and_patch(mut app: UiApp, name: str, val: i64) -> bool {
 fn ui_signal_update_str_and_patch(mut app: UiApp, name: str, val: str) -> bool {
     changed := signal_set_str(mut app.signals, mut app.tree, name, val)
     if changed {
+        _ui_ensure_canvas(mut app)
         signal_patch_canvas(mut app.signals, app.canvas, app.tree, app.sheet, app.layout)
     }
     return changed
@@ -557,19 +667,21 @@ fn ui_virtual_list_visible(total_items: i64, scroll_top: i64, row_h: i64, viewpo
     return vis
 }
 
-// Generates HTML only for the visible window of a massive (100k+ row) list — O(visible) DOM nodes!
+// Generates HTML only for the visible window of a massive (100k+ row) list — O(visible) DOM nodes & O(visible) bytes!
 fn ui_virtual_list_html(id_prefix: str, total_items: i64, scroll_top: i64, row_h: i64, viewport_h: i64) -> str {
     first := ui_virtual_list_first(scroll_top, row_h)
     vis := ui_virtual_list_visible(total_items, scroll_top, row_h, viewport_h)
-    mut out := "<div class=\"flex flex-col p-2 bg-slate-900\">"
+    est_cap := 64 + vis * (96 + str_len(id_prefix))
+    out := buf_new(est_cap)
+    buf_push_str(out, "<div class=\"flex flex-col p-2 bg-slate-900\">")
     mut i := 0
     while i < vis {
         idx := first + i
-        out = out + f"<div id=\"{id_prefix}-{idx}\" class=\"p-2 bg-slate-800 rounded mb-1 text-white\">Row {idx}</div>"
+        buf_push_str(out, f"<div id=\"{id_prefix}-{idx}\" class=\"p-2 bg-slate-800 rounded mb-1 text-white\">Row {idx}</div>")
         i += 1
     }
-    out = out + "</div>"
-    return out
+    buf_push_str(out, "</div>")
+    return buf_to_owned_str(move out)
 }
 
 // 120Hz+ Physical Spring Solver (`@no_alloc` semi-implicit Euler: returns `(new_pos, new_vel)`)
