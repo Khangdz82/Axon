@@ -32,13 +32,23 @@ fn ffi_open(win_name: str, linux_name: str, mac_name: str) -> i64 {
     }
 }
 
+fn _ffi_has_nul(s: str) -> bool {
+    n := str_len(s)
+    mut i := 0
+    while i < n {
+        if str_byte(s, i) == 0 { return true }
+        i += 1
+    }
+    return false
+}
+
 fn ffi_open_one(lib_name: str) -> i64 {
-    if str_len(lib_name) == 0 { return 0 }
+    if str_len(lib_name) == 0 or _ffi_has_nul(lib_name) { return 0 }
     return unsafe { dll_load(lib_name) }
 }
 
 fn ffi_sym(lib: i64, name: str) -> i64 {
-    if lib == 0 or str_len(name) == 0 { return 0 }
+    if lib == 0 or str_len(name) == 0 or _ffi_has_nul(name) { return 0 }
     return unsafe { dll_sym(lib, name) }
 }
 
@@ -86,23 +96,134 @@ fn ffi_cstr(s: str) -> i64 {
     }
 }
 
-// Allocate NUL-terminated UTF-16LE wide string (`wchar_t*`) for Win32/WinHTTP APIs
+// Allocate NUL-terminated UTF-16LE wide string (`wchar_t*`) from UTF-8 Axon `str` (RFC-3629 exact, surrogate-pair safe)
 fn ffi_wstr(s: str) -> i64 {
     n := str_len(s)
     if n < 0 or n > 33554432 { return 0 }
     unsafe {
+        // UTF-16 code units never exceed UTF-8 byte count (`n`), +2 for NUL terminator
         p := mem_alloc_aligned((n + 2) * 2 + 8)
         if p == 0 { return 0 }
         mut i := 0
+        mut w := 0
         while i < n {
-            ptr_write_u8(p, i * 2, str_byte(s, i))
-            ptr_write_u8(p, i * 2 + 1, 0)
-            i += 1
+            b0 := str_byte(s, i) & 255
+            mut cp := 0xFFFD
+            if b0 < 0x80 {
+                cp = b0
+                i += 1
+            } else if (b0 & 0xE0) == 0xC0 and i + 1 < n {
+                b1 := str_byte(s, i + 1) & 255
+                if (b1 & 0xC0) == 0x80 {
+                    c := ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+                    if c >= 0x80 { cp = c }
+                    i += 2
+                } else {
+                    i += 1
+                }
+            } else if (b0 & 0xF0) == 0xE0 and i + 2 < n {
+                b1 := str_byte(s, i + 1) & 255
+                b2 := str_byte(s, i + 2) & 255
+                if (b1 & 0xC0) == 0x80 and (b2 & 0xC0) == 0x80 {
+                    c := ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+                    if c >= 0x800 and not (c >= 0xD800 and c <= 0xDFFF) { cp = c }
+                    i += 3
+                } else {
+                    i += 1
+                }
+            } else if (b0 & 0xF8) == 0xF0 and i + 3 < n {
+                b1 := str_byte(s, i + 1) & 255
+                b2 := str_byte(s, i + 2) & 255
+                b3 := str_byte(s, i + 3) & 255
+                if (b1 & 0xC0) == 0x80 and (b2 & 0xC0) == 0x80 and (b3 & 0xC0) == 0x80 {
+                    c := ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
+                    if c >= 0x10000 and c <= 0x10FFFF { cp = c }
+                    i += 4
+                } else {
+                    i += 1
+                }
+            } else {
+                i += 1
+            }
+
+            if cp <= 0xFFFF {
+                ptr_write_u8(p, w * 2, cp & 255)
+                ptr_write_u8(p, w * 2 + 1, (cp >> 8) & 255)
+                w += 1
+            } else {
+                u := cp - 0x10000
+                hi := 0xD800 | ((u >> 10) & 0x3FF)
+                lo := 0xDC00 | (u & 0x3FF)
+                ptr_write_u8(p, w * 2, hi & 255)
+                ptr_write_u8(p, w * 2 + 1, (hi >> 8) & 255)
+                ptr_write_u8(p, (w + 1) * 2, lo & 255)
+                ptr_write_u8(p, (w + 1) * 2 + 1, (lo >> 8) & 255)
+                w += 2
+            }
         }
-        ptr_write_u8(p, n * 2, 0)
-        ptr_write_u8(p, n * 2 + 1, 0)
+        ptr_write_u8(p, w * 2, 0)
+        ptr_write_u8(p, w * 2 + 1, 0)
         return p
     }
+}
+
+// Count UTF-16LE code units in NUL-terminated wide string up to `max_wchars`
+fn ffi_wstr_len(ptr: i64, max_wchars: i64 = 65536) -> i64 {
+    if ptr == 0 or max_wchars <= 0 { return 0 }
+    unsafe {
+        mut n := 0
+        while n < max_wchars {
+            lo := ptr_read_u8(ptr, n * 2)
+            hi := ptr_read_u8(ptr, n * 2 + 1)
+            if lo == 0 and hi == 0 { break }
+            n += 1
+        }
+        return n
+    }
+}
+
+// Decode NUL-terminated UTF-16LE wide string (`wchar_t*`) into UTF-8 Axon `str` (surrogate-pair safe)
+fn ffi_read_wstr(ptr: i64, max_wchars: i64 = 65536) -> str {
+    if ptr == 0 or max_wchars <= 0 { return "" }
+    wlen := ffi_wstr_len(ptr, max_wchars)
+    if wlen <= 0 { return "" }
+    out := buf_new(wlen * 3 + 8)
+    unsafe {
+        mut i := 0
+        while i < wlen {
+            u0 := ptr_read_u8(ptr, i * 2) | (ptr_read_u8(ptr, i * 2 + 1) << 8)
+            mut cp := u0
+            if u0 >= 0xD800 and u0 <= 0xDBFF and i + 1 < wlen {
+                u1 := ptr_read_u8(ptr, (i + 1) * 2) | (ptr_read_u8(ptr, (i + 1) * 2 + 1) << 8)
+                if u1 >= 0xDC00 and u1 <= 0xDFFF {
+                    cp = 0x10000 + (((u0 - 0xD800) << 10) | (u1 - 0xDC00))
+                    i += 1
+                } else {
+                    cp = 0xFFFD
+                }
+            } else if u0 >= 0xD800 and u0 <= 0xDFFF {
+                cp = 0xFFFD
+            }
+
+            if cp < 0x80 {
+                buf_push(out, cp)
+            } else if cp < 0x800 {
+                buf_push(out, 0xC0 | (cp >> 6))
+                buf_push(out, 0x80 | (cp & 0x3F))
+            } else if cp < 0x10000 {
+                buf_push(out, 0xE0 | (cp >> 12))
+                buf_push(out, 0x80 | ((cp >> 6) & 0x3F))
+                buf_push(out, 0x80 | (cp & 0x3F))
+            } else {
+                buf_push(out, 0xF0 | (cp >> 18))
+                buf_push(out, 0x80 | ((cp >> 12) & 0x3F))
+                buf_push(out, 0x80 | ((cp >> 6) & 0x3F))
+                buf_push(out, 0x80 | (cp & 0x3F))
+            }
+            i += 1
+        }
+    }
+    return buf_to_owned_str(move out)
 }
 
 // Read NUL-terminated C string (`char*`) safely up to `max_len` bytes into an Axon `str`
@@ -154,19 +275,19 @@ fn ffi_bytes_to_ptr(b: ByteBuf) -> i64 {
     }
 }
 
-// Raw byte/int memory helpers (little-endian & big-endian)
+// Raw byte/int memory helpers (little-endian & big-endian) with null & negative-offset guards
 fn ffi_read_u8(ptr: i64, off: i64) -> i64 {
-    if ptr == 0 { return 0 }
+    if ptr == 0 or off < 0 { return 0 }
     return unsafe { ptr_read_u8(ptr, off) }
 }
 
 fn ffi_write_u8(ptr: i64, off: i64, v: i64) {
-    if ptr == 0 { return }
+    if ptr == 0 or off < 0 { return }
     unsafe { ptr_write_u8(ptr, off, v & 255) }
 }
 
 fn ffi_write_u16_le(ptr: i64, off: i64, v: i64) {
-    if ptr == 0 { return }
+    if ptr == 0 or off < 0 { return }
     unsafe {
         ptr_write_u8(ptr, off, v & 255)
         ptr_write_u8(ptr, off + 1, (v >> 8) & 255)
@@ -174,7 +295,7 @@ fn ffi_write_u16_le(ptr: i64, off: i64, v: i64) {
 }
 
 fn ffi_write_u16_be(ptr: i64, off: i64, v: i64) {
-    if ptr == 0 { return }
+    if ptr == 0 or off < 0 { return }
     unsafe {
         ptr_write_u8(ptr, off, (v >> 8) & 255)
         ptr_write_u8(ptr, off + 1, v & 255)
@@ -182,17 +303,17 @@ fn ffi_write_u16_be(ptr: i64, off: i64, v: i64) {
 }
 
 fn ffi_read_u16_le(ptr: i64, off: i64) -> i64 {
-    if ptr == 0 { return 0 }
+    if ptr == 0 or off < 0 { return 0 }
     unsafe { return ptr_read_u8(ptr, off) | (ptr_read_u8(ptr, off + 1) << 8) }
 }
 
 fn ffi_read_u16_be(ptr: i64, off: i64) -> i64 {
-    if ptr == 0 { return 0 }
+    if ptr == 0 or off < 0 { return 0 }
     unsafe { return (ptr_read_u8(ptr, off) << 8) | ptr_read_u8(ptr, off + 1) }
 }
 
 fn ffi_write_u32_le(ptr: i64, off: i64, v: i64) {
-    if ptr == 0 { return }
+    if ptr == 0 or off < 0 { return }
     unsafe {
         ptr_write_u8(ptr, off, v & 255)
         ptr_write_u8(ptr, off + 1, (v >> 8) & 255)
@@ -202,7 +323,7 @@ fn ffi_write_u32_le(ptr: i64, off: i64, v: i64) {
 }
 
 fn ffi_write_u32_be(ptr: i64, off: i64, v: i64) {
-    if ptr == 0 { return }
+    if ptr == 0 or off < 0 { return }
     unsafe {
         ptr_write_u8(ptr, off, (v >> 24) & 255)
         ptr_write_u8(ptr, off + 1, (v >> 16) & 255)
@@ -212,26 +333,26 @@ fn ffi_write_u32_be(ptr: i64, off: i64, v: i64) {
 }
 
 fn ffi_read_u32_le(ptr: i64, off: i64) -> i64 {
-    if ptr == 0 { return 0 }
+    if ptr == 0 or off < 0 { return 0 }
     unsafe {
         return ptr_read_u8(ptr, off) | (ptr_read_u8(ptr, off + 1) << 8) | (ptr_read_u8(ptr, off + 2) << 16) | (ptr_read_u8(ptr, off + 3) << 24)
     }
 }
 
 fn ffi_read_u32_be(ptr: i64, off: i64) -> i64 {
-    if ptr == 0 { return 0 }
+    if ptr == 0 or off < 0 { return 0 }
     unsafe {
         return (ptr_read_u8(ptr, off) << 24) | (ptr_read_u8(ptr, off + 1) << 16) | (ptr_read_u8(ptr, off + 2) << 8) | ptr_read_u8(ptr, off + 3)
     }
 }
 
 fn ffi_read_i64(ptr: i64, idx: i64) -> i64 {
-    if ptr == 0 { return 0 }
+    if ptr == 0 or idx < 0 { return 0 }
     return unsafe { ptr_read_i64(ptr, idx) }
 }
 
 fn ffi_write_i64(ptr: i64, idx: i64, v: i64) {
-    if ptr == 0 { return }
+    if ptr == 0 or idx < 0 { return }
     unsafe { ptr_write_i64(ptr, idx, v) }
 }
 

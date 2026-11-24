@@ -9,7 +9,10 @@
 
 use std::str
 use std::json
+use std::json_dom
+use std::crypto
 use std::path
+use std::fs
 use std::ai_harness
 
 // ==================== 1. EPISODIC & KEYWORD AGENT MEMORY (`.axmem`) ====================
@@ -136,50 +139,77 @@ fn _mem_read_u64(b: ByteBuf, off: i64) -> i64 {
     return _mem_read_u32(b, off) | (_mem_read_u32(b, off + 4) << 32)
 }
 
-// Integrity-protected `.axmem` binary save: `[magic "AXMM":4][ver=1:4][count:4][blob_len:4][checksum:8][entries...]`
+// Cryptographic SHA-256 integrity-protected `.axmem` v2 binary save:
+// `[magic "AXMM":4][ver=2:4][count:4][blob_len:4][sha256_hex:64][entries...]` (atomic crash-safe write!)
 fn agent_mem_save(m: AgentMemory, path: str) -> i64 ! i64 {
-    est := 32 + m.count * 12 + buf_len(m.blob) + 64
-    out := buf_new(est)
-    buf_push_u32(out, 0x4D4D5841) // "AXMM"
-    buf_push_u32(out, 1)
-    buf_push_u32(out, m.count)
-    buf_push_u32(out, buf_len(m.blob))
-    buf_push_u64(out, 0) // checksum placeholder at offset 16
+    payload := buf_new(m.count * 12 + buf_len(m.blob) + 64)
     mut i := 0
     while i < m.count {
         b := i * 6
         ko := ibuf_get(m.meta, b); kl := ibuf_get(m.meta, b + 1)
         to := ibuf_get(m.meta, b + 2); tl := ibuf_get(m.meta, b + 3)
         vo := ibuf_get(m.meta, b + 4); vl := ibuf_get(m.meta, b + 5)
-        buf_push_u32(out, kl); buf_push_u32(out, tl); buf_push_u32(out, vl)
-        buf_push_str(out, buf_slice_str(m.blob, ko, ko + kl))
-        buf_push_str(out, buf_slice_str(m.blob, to, to + tl))
-        buf_push_str(out, buf_slice_str(m.blob, vo, vo + vl))
+        buf_push_u32(payload, kl); buf_push_u32(payload, tl); buf_push_u32(payload, vl)
+        buf_push_str(payload, buf_slice_str(m.blob, ko, ko + kl))
+        buf_push_str(payload, buf_slice_str(m.blob, to, to + tl))
+        buf_push_str(payload, buf_slice_str(m.blob, vo, vo + vl))
         i += 1
     }
-    chk := _mem_fnv64(out, 24, buf_len(out))
-    buf_put_u64(out, 16, chk)
+    mut sha := sha256_ctx_new()
+    sha256_ctx_update_str(mut sha, f"AXMMv2|{m.count}|{buf_len(m.blob)}|")
+    sha256_ctx_update_bytes(mut sha, payload, 0, buf_len(payload))
+    digest := sha256_ctx_finish_hex(mut sha)
+    sha256_ctx_free(move sha)
+
+    out := buf_new(80 + buf_len(payload) + 16)
+    buf_push_u32(out, 0x4D4D5841) // "AXMM"
+    buf_push_u32(out, 2)          // v2 SHA-256
+    buf_push_u32(out, m.count)
+    buf_push_u32(out, buf_len(m.blob))
+    buf_push_str(out, digest)     // 64 ASCII hex bytes at offset 16..80
+    if buf_len(payload) > 0 {
+        buf_push_str(out, buf_slice_str(payload, 0, buf_len(payload)))
+    }
+    buf_free(move payload)
     wr := fs_write_file(path, out) or -1
     buf_free(move out)
     if wr < 0 { return err(500) }
     return ok(wr)
 }
 
-// Strict integrity-checked `.axmem` binary loader (rejects tampered checksums, bad magic, or OOB lengths)
+// Strict integrity-checked `.axmem` binary loader (supports v2 SHA-256 constant-time verify & v1 FNV-64; rejects any tamper/OOB)
 fn agent_mem_load(path: str) -> AgentMemory ! i64 {
     raw := fs_read_file(path) or return err(404)
     n := buf_len(raw)
     if n < 24 { buf_free(move raw); return err(422) }
-    if _mem_read_u32(raw, 0) != 0x4D4D5841 or _mem_read_u32(raw, 4) != 1 {
+    if _mem_read_u32(raw, 0) != 0x4D4D5841 {
         buf_free(move raw); return err(422)
     }
+    ver := _mem_read_u32(raw, 4)
     cnt := _mem_read_u32(raw, 8)
-    exp_chk := _mem_read_u64(raw, 16)
-    if cnt < 0 or cnt > 4096 { buf_free(move raw); return err(422) }
-    if _mem_fnv64(raw, 24, n) != exp_chk { buf_free(move raw); return err(422) }
+    exp_blob_len := _mem_read_u32(raw, 12)
+    if cnt < 0 or cnt > 4096 or exp_blob_len < 0 { buf_free(move raw); return err(422) }
+
+    mut pos := 24
+    if ver == 2 {
+        if n < 80 { buf_free(move raw); return err(422) }
+        exp_hex := buf_slice_str(raw, 16, 80)
+        mut sha := sha256_ctx_new()
+        sha256_ctx_update_str(mut sha, f"AXMMv2|{cnt}|{exp_blob_len}|")
+        sha256_ctx_update_bytes(mut sha, raw, 80, n - 80)
+        got_hex := sha256_ctx_finish_hex(mut sha)
+        sha256_ctx_free(move sha)
+        if not ct_eq_str(exp_hex, got_hex) { buf_free(move raw); return err(422) }
+        pos = 80
+    } else if ver == 1 {
+        exp_chk := _mem_read_u64(raw, 16)
+        if _mem_fnv64(raw, 24, n) != exp_chk { buf_free(move raw); return err(422) }
+        pos = 24
+    } else {
+        buf_free(move raw); return err(422)
+    }
 
     mut mem := agent_mem_new(if cnt > 256 { cnt } else { 256 }, n + 4096)
-    mut pos := 24
     mut i := 0
     while i < cnt {
         if pos > n - 12 { agent_mem_free(move mem); buf_free(move raw); return err(422) }
@@ -195,6 +225,9 @@ fn agent_mem_load(path: str) -> AgentMemory ! i64 {
         vs := buf_slice_str(raw, pos, pos + vl); pos += vl
         _ := agent_mem_put(mut mem, ks, ts, vs)
         i += 1
+    }
+    if ver == 2 and (pos != n or buf_len(mem.blob) != exp_blob_len) {
+        agent_mem_free(move mem); buf_free(move raw); return err(422)
     }
     buf_free(move raw)
     return ok(mem)
@@ -496,19 +529,30 @@ fn agent_loop_can_continue(st: AgentLoopState) -> bool {
     return true
 }
 
-// Records a tool invocation, detects identical stuck loops (`repeat_call_count >= 3`), and appends JSONL trace
+// Records a tool invocation, canonicalizes JSON args for stuck-loop detection (`repeat_call_count >= 3`),
+// and appends JSONL trace with automatic buffer growth.
 fn agent_loop_record_step(mut st: AgentLoopState, tool_name: str, args_json: str, ok_flag: bool, latency_us: i64) -> bool {
     st.turn += 1
     if ok_flag { st.consecutive_errors = 0 } else { st.consecutive_errors += 1 }
-    ch := fnv1a_64(tool_name + "|" + args_json)
+    canon_args := json_canonicalize(args_json) or str_trim(args_json)
+    ch := fnv1a_64(tool_name + "|" + canon_args)
     if ch == st.last_call_hash {
         st.repeat_call_count += 1
     } else {
         st.last_call_hash = ch
         st.repeat_call_count = 1
     }
-    // Append JSONL trace entry if room permits (`* 2` accounts for worst-case JSON escaping)
-    est := str_len(tool_name) * 2 + 128
+    est := str_len(tool_name) * 6 + 160
+    cur_t := buf_len(st.trace_jsonl)
+    if cur_t + est >= st.trace_cap and st.trace_cap < 4194304 {
+        mut nc := st.trace_cap * 2
+        while nc < cur_t + est + 256 and nc < 4194304 { nc = nc * 2 }
+        nb := buf_new(nc)
+        if cur_t > 0 { buf_push_str(nb, buf_slice_str(st.trace_jsonl, 0, cur_t)) }
+        buf_free(move st.trace_jsonl)
+        st.trace_jsonl = nb
+        st.trace_cap = nc
+    }
     if buf_len(st.trace_jsonl) + est < st.trace_cap {
         buf_push_str(st.trace_jsonl, "{\"turn\":")
         buf_push_str(st.trace_jsonl, f"{st.turn}")

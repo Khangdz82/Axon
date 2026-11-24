@@ -1,0 +1,613 @@
+// Axon Standard Library — Native High-Speed AI Coding Agent Toolkit (`std/agent_toolkit.ax`)
+// 100% Pure Axon replacement for Code Mode `toolkit.py` + `core_ax/code_mode_core.ax` (Zero Python!):
+//   - 8-byte SWAR binary NUL skipper & SWAR literal substring search (`tk_grep`)
+//   - Single-compile reused regex search across codebases (`regex_compile_flags` + `regex_find_compiled`)
+//   - Fast line-sliced file reading (`tk_read`), atomic safe editing (`tk_edit`, `tk_multi_edit`) + unified diffs
+//   - UTF-16LE `tk_glob`, `tk_ls`, `tk_tree`, timeout-safe `tk_sh`, SSRF-safe `tk_fetch`
+//   - Batched JSON Code-Mode pipeline executor (`tk_exec_batch_json`) — execute N agent ops in ONE native call!
+
+use std::ffi
+use std::str
+use std::ds
+use std::path
+use std::fs
+use std::shutil
+use std::glob
+use std::regex
+use std::difflib
+use std::subprocess
+use std::fetch
+use std::json
+use std::json_dom
+use std::ai_harness
+
+// ==================== 1. 8-BYTE SWAR BINARY & SUBSTRING KERNELS ====================
+
+@no_alloc
+fn _tk_lower_b(b: i64) -> i64 {
+    if b >= 65 and b <= 90 { return b + 32 }
+    return b
+}
+
+// 8-byte SWAR NUL-byte check on first 4KB (skips binary files in nanoseconds)
+fn _tk_is_binary(raw: str) -> bool {
+    unsafe {
+        n := str_len(raw)
+        lim := if n > 4096 { 4096 } else { n }
+        p := raw as i64
+        ones := 0x0101010101010101
+        highs := -9187201950435737472 // 0x8080808080808080
+        mut i := 0
+        while i + 8 <= lim {
+            w := ptr_read_i64(p + i, 0)
+            if ((w -% ones) & (w ^ -1) & highs) != 0 { return true }
+            i += 8
+        }
+        while i < lim {
+            if ptr_read_u8(p, i) == 0 { return true }
+            i += 1
+        }
+        return false
+    }
+}
+
+// 8-byte SWAR literal substring search (case-sensitive fastpath + case-insensitive)
+fn _tk_find_swar(hay: str, start: i64, pat: str, ignore_case: bool) -> i64 {
+    unsafe {
+        hlen := str_len(hay)
+        plen := str_len(pat)
+        if plen <= 0 or start < 0 or start + plen > hlen { return -1 }
+        hp := hay as i64
+        pp := pat as i64
+        p0 := ptr_read_u8(pp, 0)
+        limit := hlen - plen
+        mut i := start
+        if not ignore_case {
+            ones := 0x0101010101010101
+            highs := -9187201950435737472
+            bmask := p0 *% ones
+            while i + 8 <= limit + 1 {
+                w := ptr_read_i64(hp + i, 0)
+                x := w ^ bmask
+                if ((x -% ones) & (x ^ -1) & highs) != 0 {
+                    mut k := 0
+                    while k < 8 and i + k <= limit {
+                        if ptr_read_u8(hp, i + k) == p0 {
+                            mut j := 1
+                            while j < plen {
+                                if ptr_read_u8(hp, i + k + j) != ptr_read_u8(pp, j) { break }
+                                j += 1
+                            }
+                            if j == plen { return i + k }
+                        }
+                        k += 1
+                    }
+                }
+                i += 8
+            }
+            while i <= limit {
+                if ptr_read_u8(hp, i) == p0 {
+                    mut j := 1
+                    while j < plen {
+                        if ptr_read_u8(hp, i + j) != ptr_read_u8(pp, j) { break }
+                        j += 1
+                    }
+                    if j == plen { return i }
+                }
+                i += 1
+            }
+        } else {
+            p0l := _tk_lower_b(p0)
+            while i <= limit {
+                if _tk_lower_b(ptr_read_u8(hp, i)) == p0l {
+                    mut j := 1
+                    while j < plen {
+                        if _tk_lower_b(ptr_read_u8(hp, i + j)) != _tk_lower_b(ptr_read_u8(pp, j)) { break }
+                        j += 1
+                    }
+                    if j == plen { return i }
+                }
+                i += 1
+            }
+        }
+        return -1
+    }
+}
+
+fn _tk_is_literal_pat(pat: str, use_regex: bool) -> bool {
+    if str_len(pat) == 0 { return false }
+    if not use_regex { return true }
+    n := str_len(pat)
+    mut i := 0
+    while i < n {
+        b := str_byte(pat, i)
+        if b == 92 or b == 46 or b == 94 or b == 36 or b == 42 or b == 43 or b == 63 or b == 123 or b == 125 or b == 91 or b == 93 or b == 124 or b == 40 or b == 41 {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// ==================== 2. FILES & ATOMIC EDITS (`read`, `write`, `edit`, `multi_edit`) ====================
+
+// Fast line-sliced file reader (`1-based` inclusive `start_line..end_line`, `end_line == 0` means EOF)
+fn tk_read(path: str, start_line: i64 = 1, end_line: i64 = 0, numbered: bool = false, max_chars: i64 = 50000) -> str ! i64 {
+    if start_line < 1 { return err(400) }
+    if end_line > 0 and end_line < start_line { return err(400) }
+    target := shutil_abspath(path)
+    st := shutil_stat(target)
+    if not st.exists or not st.is_file { return err(404) }
+    if st.size > 67108864 { return err(413) } // 64 MB safety cap
+    raw := shutil_read_text(target, 67108864) or return err(404)
+
+    if start_line == 1 and end_line == 0 and not numbered {
+        return ok(harness_truncate_middle(raw, max_chars))
+    }
+
+    n := str_len(raw)
+    mut parts := svec_new(64, 4096)
+    mut line_no := 1
+    mut i := 0
+    while i < n {
+        if end_line > 0 and line_no > end_line { break }
+        mut nl := str_find_byte(raw, 10, i)
+        if nl < 0 { nl = n }
+        if line_no >= start_line {
+            mut lend := nl
+            if lend > i and str_byte(raw, lend - 1) == 13 { lend -= 1 }
+            line := str_slice(raw, i, lend)
+            if numbered {
+                svec_push(mut parts, f"{line_no}: {line}")
+            } else {
+                svec_push(mut parts, line)
+            }
+        }
+        line_no += 1
+        if nl >= n { break }
+        i = nl + 1
+    }
+    joined := svec_join(parts, "\n")
+    svec_free(move parts)
+    return ok(harness_truncate_middle(joined, max_chars))
+}
+
+// Safe atomic file write (auto-creates parent dirs)
+fn tk_write(path: str, content: str, create_dirs: bool = true, append: bool = false) -> str ! i64 {
+    target := shutil_abspath(path)
+    if create_dirs {
+        par := path_dirname(target)
+        if str_len(par) > 0 and not str_eq(par, ".") {
+            _ := shutil_mkdir_all(par)
+        }
+    }
+    if append {
+        if not fs_append_text(target, content) { return err(500) }
+    } else {
+        if not shutil_atomic_write(target, content) { return err(500) }
+    }
+    n := str_len(content)
+    mut lines := 0
+    if n > 0 {
+        mut i := 0
+        while i < n {
+            if str_byte(content, i) == 10 { lines += 1 }
+            i += 1
+        }
+        if str_byte(content, n - 1) != 10 { lines += 1 }
+    }
+    ob := buf_new(str_len(target) * 2 + 128)
+    json_begin_obj(ob)
+    json_kv_str(ob, "path", target)
+    json_kv_i64(ob, "bytes", n)
+    json_kv_i64(ob, "lines", lines)
+    json_kv_str(ob, "mode", if append { "append" } else { "write" })
+    json_end_obj(ob)
+    return ok(buf_to_owned_str(move ob))
+}
+
+fn _tk_apply_edit_mem(src: str, old_s: str, new_s: str, replace_all: bool, expected_count: i64) -> (i64, str, i64) {
+    olen := str_len(old_s)
+    if olen == 0 { return (400, "", 0) }
+    mut count := 0
+    mut p := 0
+    while true {
+        f := str_find(src, old_s, p)
+        if f < 0 { break }
+        count += 1
+        p = f + olen
+    }
+    if count == 0 { return (404, "", 0) }
+    if expected_count >= 0 {
+        if count != expected_count { return (409, "", count) }
+        return (0, str_replace(src, old_s, new_s), count)
+    }
+    if count > 1 and not replace_all { return (409, "", count) }
+    return (0, str_replace(src, old_s, new_s), count)
+}
+
+// Safe exact-match file edit (rejects missing=404 or ambiguous=409, writes atomically, optional unified diff)
+fn tk_edit(path: str, old_s: str, new_s: str, replace_all: bool = false, expected_count: i64 = -1, show_diff: bool = false) -> str ! i64 {
+    target := shutil_abspath(path)
+    before := shutil_read_text(target, 33554432) or return err(404)
+    (ec, after, repls) := _tk_apply_edit_mem(before, old_s, new_s, replace_all, expected_count)
+    if ec != 0 { return err(ec) }
+    if not shutil_atomic_write(target, after) { return err(500) }
+    if show_diff {
+        bn := path_basename(target)
+        return ok(diff_unified(before, after, "a/" + bn, "b/" + bn, 3))
+    }
+    return ok(f"OK: {repls} replacement(s) in {target}")
+}
+
+// Atomic multi-edit from JSON array `[{"old":"...","new":"...","replace_all":false}]` (all-or-nothing!)
+fn tk_multi_edit(path: str, edits_json: str, show_diff: bool = false) -> str ! i64 {
+    target := shutil_abspath(path)
+    before := shutil_read_text(target, 33554432) or return err(404)
+    doc := jdoc_parse(edits_json) or return err(400)
+    if jdoc_type(doc, doc.root) != JVAL_ARRAY() {
+        jdoc_free(move doc)
+        return err(400)
+    }
+    mut cur_text := before
+    mut total_repls := 0
+    mut edit_cnt := 0
+    mut item := jdoc_first_child(doc, doc.root)
+    while item >= 0 {
+        if jdoc_type(doc, item) != JVAL_OBJECT() {
+            jdoc_free(move doc)
+            return err(400)
+        }
+        o_id := jdoc_obj_get(doc, item, "old")
+        n_id := jdoc_obj_get(doc, item, "new")
+        if o_id < 0 or n_id < 0 or jdoc_type(doc, o_id) != JVAL_STR() or jdoc_type(doc, n_id) != JVAL_STR() {
+            jdoc_free(move doc)
+            return err(400)
+        }
+        old_s := jdoc_as_str(doc, o_id, "")
+        new_s := jdoc_as_str(doc, n_id, "")
+        ra_id := jdoc_obj_get(doc, item, "replace_all")
+        ec_id := jdoc_obj_get(doc, item, "expected_count")
+        ra := if ra_id >= 0 { jdoc_as_bool(doc, ra_id, false) } else { false }
+        exp_c := if ec_id >= 0 and jdoc_type(doc, ec_id) == JVAL_INT() { jdoc_as_i64(doc, ec_id, -1) } else { -1 }
+
+        (err_c, next_txt, rcnt) := _tk_apply_edit_mem(cur_text, old_s, new_s, ra, exp_c)
+        if err_c != 0 {
+            jdoc_free(move doc)
+            return err(err_c)
+        }
+        cur_text = next_txt
+        total_repls += rcnt
+        edit_cnt += 1
+        item = jdoc_next_sib(doc, item)
+    }
+    jdoc_free(move doc)
+    if not shutil_atomic_write(target, cur_text) { return err(500) }
+    if show_diff {
+        bn := path_basename(target)
+        return ok(diff_unified(before, cur_text, "a/" + bn, "b/" + bn, 3))
+    }
+    return ok(f"OK: {edit_cnt} edit(s), {total_repls} replacement(s) in {target}")
+}
+
+// ==================== 3. HIGH-SPEED CODEBASE SEARCH (`tk_glob`, `tk_grep`, `tk_ls`, `tk_tree`) ====================
+
+fn tk_glob(pattern: str, root: str = ".", include_hidden: bool = false, limit: i64 = 1000) -> StrVec {
+    return glob_find(pattern, root, include_hidden, limit)
+}
+
+fn tk_tree(root: str = ".", max_depth: i64 = 3, include_hidden: bool = false, limit: i64 = 300) -> str {
+    return glob_tree(root, max_depth, include_hidden, limit)
+}
+
+// Compact directory listing (`ls`) with file sizes and directory markers
+fn tk_ls(root: str = ".", include_hidden: bool = false, limit: i64 = 500) -> str {
+    base := shutil_abspath(root)
+    entries := fs_list_dir(base)
+    svec_sort(entries)
+    n := svec_len(entries)
+    mut out := svec_new(32, 1024)
+    mut cnt := 0
+    mut i := 0
+    while i < n and cnt < limit {
+        nm := svec_get(entries, i)
+        if include_hidden or str_byte(nm, 0) != 46 {
+            full := path_join(base, nm)
+            st := shutil_stat(full)
+            if st.is_dir {
+                if not glob_is_default_ignore(nm) {
+                    svec_push(mut out, f"{nm}/")
+                    cnt += 1
+                }
+            } else {
+                svec_push(mut out, f"{nm} ({st.size} B)")
+                cnt += 1
+            }
+        }
+        i += 1
+    }
+    svec_free(move entries)
+    res := svec_join(out, "\n")
+    svec_free(move out)
+    return res
+}
+
+// SWAR literal / compiled-regex codebase grep (skips binary files & ignored dirs, supports context & files_only!)
+fn tk_grep(
+    pattern: str,
+    root: str = ".",
+    glob_filter: str = "",
+    ignore_case: bool = false,
+    use_regex: bool = true,
+    context: i64 = 0,
+    max_results: i64 = 200,
+    files_only: bool = false,
+    include_hidden: bool = false
+) -> str {
+    if str_len(pattern) == 0 or max_results <= 0 { return "" }
+    is_lit := _tk_is_literal_pat(pattern, use_regex)
+    rx := if not is_lit {
+        regex_compile_flags(pattern, ignore_case) or Regex(code = ibuf_new(0), has_start_anchor = false, has_end_anchor = false, ignore_case = ignore_case)
+    } else {
+        Regex(code = ibuf_new(0), has_start_anchor = false, has_end_anchor = false, ignore_case = ignore_case)
+    }
+    if not is_lit and ibuf_len(rx.code) == 0 {
+        regex_free(move rx)
+        return "[grep error: invalid regex pattern]"
+    }
+
+    base := shutil_abspath(root)
+    st_root := shutil_stat(base)
+    mut candidates := svec_new(64, 4096)
+    mut is_single_file := false
+    if st_root.is_file {
+        is_single_file = true
+        svec_push(mut candidates, path_basename(base))
+    } else if st_root.is_dir {
+        walked := glob_walk(base, include_hidden, true, "", 100000, 64)
+        wn := svec_len(walked)
+        mut wi := 0
+        while wi < wn {
+            rel := svec_get(walked, wi)
+            if str_len(glob_filter) == 0 or glob_match(rel, glob_filter, false) {
+                svec_push(mut candidates, rel)
+            }
+            wi += 1
+        }
+        svec_free(move walked)
+    }
+
+    mut out := svec_new(64, 4096)
+    mut hits := 0
+    nc := svec_len(candidates)
+    mut ci := 0
+    while ci < nc and hits < max_results {
+        rel := svec_get(candidates, ci)
+        full := if is_single_file { base } else { path_join(base, rel) }
+        fst := shutil_stat(full)
+        if fst.is_file and fst.size > 0 and fst.size <= 33554432 {
+            raw := shutil_read_text(full, 33554432) or ""
+            if str_len(raw) > 0 and not _tk_is_binary(raw) {
+                // Whole-file SWAR pre-filter for literal patterns (skips non-matching files with 0 line splitting!)
+                mut file_may_match := true
+                if is_lit {
+                    file_may_match = _tk_find_swar(raw, 0, pattern, ignore_case) >= 0
+                }
+                if file_may_match {
+                    if files_only {
+                        mut hit_f := is_lit
+                        if not hit_f { hit_f = regex_is_match_compiled(rx, raw) }
+                        if hit_f {
+                            svec_push(mut out, rel)
+                            hits += 1
+                        }
+                    } else if context <= 0 {
+                        // Zero-allocation line scan
+                        rn := str_len(raw)
+                        mut pos := 0
+                        mut lno := 1
+                        while pos < rn and hits < max_results {
+                            mut nl := str_find_byte(raw, 10, pos)
+                            if nl < 0 { nl = rn }
+                            mut lend := nl
+                            if lend > pos and str_byte(raw, lend - 1) == 13 { lend -= 1 }
+                            line := str_slice(raw, pos, lend)
+                            matched := if is_lit {
+                                _tk_find_swar(line, 0, pattern, ignore_case) >= 0
+                            } else {
+                                regex_is_match_compiled(rx, line)
+                            }
+                            if matched {
+                                svec_push(mut out, f"{rel}:{lno}: {line}")
+                                hits += 1
+                            }
+                            lno += 1
+                            if nl >= rn { break }
+                            pos = nl + 1
+                        }
+                    } else {
+                        // Context-aware match output
+                        lines := fs_read_lines(full) or svec_new(1, 16)
+                        nl := svec_len(lines)
+                        mut li := 0
+                        while li < nl and hits < max_results {
+                            line := svec_get(lines, li)
+                            matched := if is_lit {
+                                _tk_find_swar(line, 0, pattern, ignore_case) >= 0
+                            } else {
+                                regex_is_match_compiled(rx, line)
+                            }
+                            if matched {
+                                mut cs := li - context
+                                if cs < 0 { cs = 0 }
+                                mut ce := li + context
+                                if ce >= nl { ce = nl - 1 }
+                                mut cj := cs
+                                while cj <= ce {
+                                    sep := if cj == li { ":" } else { "-" }
+                                    svec_push(mut out, f"{rel}{sep}{cj + 1}{sep} " + svec_get(lines, cj))
+                                    cj += 1
+                                }
+                                hits += 1
+                            }
+                            li += 1
+                        }
+                        svec_free(move lines)
+                    }
+                }
+            }
+        }
+        ci += 1
+    }
+
+    svec_free(move candidates)
+    regex_free(move rx)
+    res := svec_join(out, "\n")
+    svec_free(move out)
+    return res
+}
+
+// ==================== 4. SHELL, HTTP & CODE-MODE BATCH PIPELINE EXECUTOR ====================
+
+fn tk_sh(cmd: str, cwd: str = "", timeout_ms: i64 = 30000) -> SubprocResult {
+    return subproc_run_shell(cmd, cwd, timeout_ms, 4194304)
+}
+
+fn tk_fetch(url: str, method: str = "GET", headers: str = "", body: str = "", timeout_ms: i64 = 30000, allow_private: bool = false) -> FetchResponse ! i64 {
+    return fetch_request(url, method, headers, body, timeout_ms, allow_private, 8388608)
+}
+
+fn _tk_json_result_item(idx: i64, op: str, ok_f: bool, output: str) -> str {
+    eb := buf_new(str_len(op) * 2 + str_len(output) * 6 + 96)
+    json_begin_obj(eb)
+    json_kv_i64(eb, "step", idx)
+    json_kv_str(eb, "op", op)
+    json_kv_bool(eb, "ok", ok_f)
+    json_kv_str(eb, "out", output)
+    json_end_obj(eb)
+    return buf_to_owned_str(move eb)
+}
+
+// CODE-MODE BATCH PIPELINE EXECUTOR:
+// Runs a JSON array of jailed workspace operations (`read`, `glob`, `grep`, `ls`, `tree`, `write`, `edit`)
+// in a single native call with O(N) secret redaction and token-saving truncation!
+fn tk_exec_batch_json(workspace_root: str, pipeline_json: str, read_only: bool = false, redact_secrets: bool = true, max_step_chars: i64 = 8000) -> str {
+    doc := jdoc_parse(pipeline_json) or return "[{\"step\":0,\"op\":\"parse\",\"ok\":false,\"out\":\"Invalid pipeline JSON\"}]"
+    if jdoc_type(doc, doc.root) != JVAL_ARRAY() {
+        jdoc_free(move doc)
+        return "[{\"step\":0,\"op\":\"parse\",\"ok\":false,\"out\":\"Pipeline must be a JSON array\"}]"
+    }
+    root_abs := shutil_abspath(workspace_root)
+    mut items := svec_new(16, 2048)
+    mut step := 0
+    mut cur := jdoc_first_child(doc, doc.root)
+    while cur >= 0 and step < 64 {
+        op_id := jdoc_obj_get(doc, cur, "op")
+        op := if op_id >= 0 { jdoc_as_str(doc, op_id, "") } else { "" }
+        mut ok_f := false
+        mut out_s := ""
+
+        if str_eq(op, "read") {
+            p_id := jdoc_obj_get(doc, cur, "path")
+            sl_id := jdoc_obj_get(doc, cur, "start_line")
+            el_id := jdoc_obj_get(doc, cur, "end_line")
+            nm_id := jdoc_obj_get(doc, cur, "numbered")
+            rel := if p_id >= 0 { jdoc_as_str(doc, p_id, "") } else { "" }
+            full := path_join_safe(root_abs, rel) or ""
+            if str_len(full) == 0 {
+                out_s = "Forbidden path outside workspace"
+            } else {
+                sl := if sl_id >= 0 { jdoc_as_i64(doc, sl_id, 1) } else { 1 }
+                el := if el_id >= 0 { jdoc_as_i64(doc, el_id, 0) } else { 0 }
+                num := if nm_id >= 0 { jdoc_as_bool(doc, nm_id, false) } else { false }
+                txt := tk_read(full, sl, el, num, max_step_chars) or "__TK_ERR__"
+                if str_eq(txt, "__TK_ERR__") { out_s = "File read failed" }
+                else { ok_f = true; out_s = txt }
+            }
+        } else if str_eq(op, "glob") {
+            pat_id := jdoc_obj_get(doc, cur, "pattern")
+            lim_id := jdoc_obj_get(doc, cur, "limit")
+            pat := if pat_id >= 0 { jdoc_as_str(doc, pat_id, "**/*") } else { "**/*" }
+            lim := if lim_id >= 0 { jdoc_as_i64(doc, lim_id, 200) } else { 200 }
+            res := tk_glob(pat, root_abs, false, lim)
+            out_s = svec_join(res, "\n")
+            svec_free(move res)
+            ok_f = true
+        } else if str_eq(op, "grep") {
+            pat_id := jdoc_obj_get(doc, cur, "pattern")
+            gf_id  := jdoc_obj_get(doc, cur, "glob_filter")
+            ic_id  := jdoc_obj_get(doc, cur, "ignore_case")
+            rx_id  := jdoc_obj_get(doc, cur, "regex")
+            mr_id  := jdoc_obj_get(doc, cur, "max_results")
+            fo_id  := jdoc_obj_get(doc, cur, "files_only")
+            pat := if pat_id >= 0 { jdoc_as_str(doc, pat_id, "") } else { "" }
+            gf  := if gf_id >= 0 { jdoc_as_str(doc, gf_id, "") } else { "" }
+            ic  := if ic_id >= 0 { jdoc_as_bool(doc, ic_id, false) } else { false }
+            urx := if rx_id >= 0 { jdoc_as_bool(doc, rx_id, true) } else { true }
+            mr  := if mr_id >= 0 { jdoc_as_i64(doc, mr_id, 100) } else { 100 }
+            fo  := if fo_id >= 0 { jdoc_as_bool(doc, fo_id, false) } else { false }
+            out_s = tk_grep(pat, root_abs, gf, ic, urx, 0, mr, fo, false)
+            ok_f = true
+        } else if str_eq(op, "tree") {
+            md_id := jdoc_obj_get(doc, cur, "max_depth")
+            md := if md_id >= 0 { jdoc_as_i64(doc, md_id, 3) } else { 3 }
+            out_s = tk_tree(root_abs, md, false, 200)
+            ok_f = true
+        } else if str_eq(op, "ls") {
+            p_id := jdoc_obj_get(doc, cur, "path")
+            rel := if p_id >= 0 { jdoc_as_str(doc, p_id, "") } else { "" }
+            mut dir := root_abs
+            if str_len(rel) > 0 and not str_eq(rel, ".") {
+                dir = path_join_safe(root_abs, rel) or ""
+            }
+            if str_len(dir) == 0 { out_s = "Forbidden path outside workspace" }
+            else { out_s = tk_ls(dir, false, 200); ok_f = true }
+        } else if str_eq(op, "write") {
+            if read_only { out_s = "Sandbox is read-only" }
+            else {
+                p_id := jdoc_obj_get(doc, cur, "path")
+                c_id := jdoc_obj_get(doc, cur, "content")
+                rel := if p_id >= 0 { jdoc_as_str(doc, p_id, "") } else { "" }
+                cnt := if c_id >= 0 { jdoc_as_str(doc, c_id, "") } else { "" }
+                full := path_join_safe(root_abs, rel) or ""
+                if str_len(full) == 0 { out_s = "Forbidden path outside workspace" }
+                else {
+                    r := tk_write(full, cnt, true, false) or "__TK_ERR__"
+                    if str_eq(r, "__TK_ERR__") { out_s = "Write failed" }
+                    else { ok_f = true; out_s = r }
+                }
+            }
+        } else if str_eq(op, "edit") {
+            if read_only { out_s = "Sandbox is read-only" }
+            else {
+                p_id := jdoc_obj_get(doc, cur, "path")
+                o_id := jdoc_obj_get(doc, cur, "old")
+                n_id := jdoc_obj_get(doc, cur, "new")
+                d_id := jdoc_obj_get(doc, cur, "show_diff")
+                rel := if p_id >= 0 { jdoc_as_str(doc, p_id, "") } else { "" }
+                old_s := if o_id >= 0 { jdoc_as_str(doc, o_id, "") } else { "" }
+                new_s := if n_id >= 0 { jdoc_as_str(doc, n_id, "") } else { "" }
+                sdiff := if d_id >= 0 { jdoc_as_bool(doc, d_id, false) } else { false }
+                full := path_join_safe(root_abs, rel) or ""
+                if str_len(full) == 0 { out_s = "Forbidden path outside workspace" }
+                else {
+                    r := tk_edit(full, old_s, new_s, false, -1, sdiff) or "__TK_ERR__"
+                    if str_eq(r, "__TK_ERR__") { out_s = "Edit failed (missing or ambiguous target)" }
+                    else { ok_f = true; out_s = r }
+                }
+            }
+        } else {
+            out_s = f"Unknown op: {op}"
+        }
+
+        if redact_secrets { out_s = harness_redact_secrets(out_s) }
+        out_s = harness_truncate_middle(out_s, max_step_chars)
+        svec_push(mut items, _tk_json_result_item(step, op, ok_f, out_s))
+        step += 1
+        cur = jdoc_next_sib(doc, cur)
+    }
+    jdoc_free(move doc)
+    joined := "[" + svec_join(items, ",") + "]"
+    svec_free(move items)
+    return joined
+}

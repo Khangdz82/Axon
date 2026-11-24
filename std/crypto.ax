@@ -288,3 +288,138 @@ fn hmac_sha256_str(key: str, msg: str) -> str {
     buf_free(move outer)
     return res
 }
+
+// Constant-time HMAC-SHA256 verification (CWE-208 safe)
+fn hmac_sha256_verify(key: str, msg: str, expected_hex: str) -> bool {
+    got := hmac_sha256_str(key, msg)
+    return ct_eq_str(got, expected_hex)
+}
+
+// Streaming SHA-256 context (`hashlib.sha256()` equivalent) — processes arbitrary streams in 64-byte blocks
+struct Sha256Ctx {
+    h: IntBuf
+    k: IntBuf
+    w: IntBuf
+    block: ByteBuf
+    total_bytes: i64
+}
+
+fn sha256_ctx_new() -> Sha256Ctx {
+    h := ibuf_new(8)
+    ibuf_push(h, 0x6a09e667); ibuf_push(h, 0xbb67ae85)
+    ibuf_push(h, 0x3c6ef372); ibuf_push(h, 0xa54ff53a)
+    ibuf_push(h, 0x510e527f); ibuf_push(h, 0x9b05688c)
+    ibuf_push(h, 0x1f83d9ab); ibuf_push(h, 0x5be0cd19)
+    k := sha256_init_k()
+    w := ibuf_new(64)
+    mut wi := 0
+    while wi < 64 { ibuf_push(w, 0); wi += 1 }
+    blk := buf_new(64)
+    return Sha256Ctx(h = h, k = k, w = w, block = blk, total_bytes = 0)
+}
+
+fn sha256_ctx_free(move ctx: Sha256Ctx) {
+    buf_free(move ctx.h)
+    buf_free(move ctx.k)
+    buf_free(move ctx.w)
+    buf_free(move ctx.block)
+}
+
+fn _sha256_compress_block(ctx: Sha256Ctx) {
+    mut t := 0
+    while t < 16 {
+        bo := t * 4
+        word := (buf_get(ctx.block, bo) << 24) | (buf_get(ctx.block, bo + 1) << 16) | (buf_get(ctx.block, bo + 2) << 8) | buf_get(ctx.block, bo + 3)
+        ibuf_set(ctx.w, t, word)
+        t += 1
+    }
+    while t < 64 {
+        w15 := ibuf_get(ctx.w, t - 15)
+        w2 := ibuf_get(ctx.w, t - 2)
+        s0 := sha256_rotr32(w15, 7) ^ sha256_rotr32(w15, 18) ^ ((w15 & 0xFFFFFFFF) >> 3)
+        s1 := sha256_rotr32(w2, 17) ^ sha256_rotr32(w2, 19) ^ ((w2 & 0xFFFFFFFF) >> 10)
+        wt := (ibuf_get(ctx.w, t - 16) + s0 + ibuf_get(ctx.w, t - 7) + s1) & 0xFFFFFFFF
+        ibuf_set(ctx.w, t, wt)
+        t += 1
+    }
+    mut a := ibuf_get(ctx.h, 0); mut b := ibuf_get(ctx.h, 1); mut c := ibuf_get(ctx.h, 2); mut d := ibuf_get(ctx.h, 3)
+    mut e := ibuf_get(ctx.h, 4); mut f := ibuf_get(ctx.h, 5); mut g := ibuf_get(ctx.h, 6); mut hv := ibuf_get(ctx.h, 7)
+    t = 0
+    while t < 64 {
+        s1 := sha256_rotr32(e, 6) ^ sha256_rotr32(e, 11) ^ sha256_rotr32(e, 25)
+        ch := (e & f) ^ ((e ^ 0xFFFFFFFF) & g)
+        temp1 := (hv + s1 + ch + ibuf_get(ctx.k, t) + ibuf_get(ctx.w, t)) & 0xFFFFFFFF
+        s0 := sha256_rotr32(a, 2) ^ sha256_rotr32(a, 13) ^ sha256_rotr32(a, 22)
+        maj := (a & b) ^ (a & c) ^ (b & c)
+        temp2 := (s0 + maj) & 0xFFFFFFFF
+        hv = g; g = f; f = e; e = (d + temp1) & 0xFFFFFFFF
+        d = c; c = b; b = a; a = (temp1 + temp2) & 0xFFFFFFFF
+        t += 1
+    }
+    ibuf_set(ctx.h, 0, (ibuf_get(ctx.h, 0) + a) & 0xFFFFFFFF)
+    ibuf_set(ctx.h, 1, (ibuf_get(ctx.h, 1) + b) & 0xFFFFFFFF)
+    ibuf_set(ctx.h, 2, (ibuf_get(ctx.h, 2) + c) & 0xFFFFFFFF)
+    ibuf_set(ctx.h, 3, (ibuf_get(ctx.h, 3) + d) & 0xFFFFFFFF)
+    ibuf_set(ctx.h, 4, (ibuf_get(ctx.h, 4) + e) & 0xFFFFFFFF)
+    ibuf_set(ctx.h, 5, (ibuf_get(ctx.h, 5) + f) & 0xFFFFFFFF)
+    ibuf_set(ctx.h, 6, (ibuf_get(ctx.h, 6) + g) & 0xFFFFFFFF)
+    ibuf_set(ctx.h, 7, (ibuf_get(ctx.h, 7) + hv) & 0xFFFFFFFF)
+}
+
+fn sha256_ctx_update_str(mut ctx: Sha256Ctx, s: str) {
+    n := str_len(s)
+    mut i := 0
+    while i < n {
+        buf_push(ctx.block, str_byte(s, i))
+        ctx.total_bytes += 1
+        if buf_len(ctx.block) == 64 {
+            _sha256_compress_block(ctx)
+            buf_truncate(ctx.block, 0)
+        }
+        i += 1
+    }
+}
+
+fn sha256_ctx_update_bytes(mut ctx: Sha256Ctx, data: ByteBuf, start: i64 = 0, count: i64 = -1) {
+    bl := buf_len(data)
+    mut s := if start < 0 { 0 } else { start }
+    mut end := if count < 0 { bl } else { s + count }
+    if end > bl { end = bl }
+    while s < end {
+        buf_push(ctx.block, buf_get(data, s))
+        ctx.total_bytes += 1
+        if buf_len(ctx.block) == 64 {
+            _sha256_compress_block(ctx)
+            buf_truncate(ctx.block, 0)
+        }
+        s += 1
+    }
+}
+
+fn sha256_ctx_finish_hex(mut ctx: Sha256Ctx) -> str {
+    bit_len := ctx.total_bytes * 8
+    buf_push(ctx.block, 0x80)
+    if buf_len(ctx.block) > 56 {
+        while buf_len(ctx.block) < 64 { buf_push(ctx.block, 0) }
+        _sha256_compress_block(ctx)
+        buf_truncate(ctx.block, 0)
+    }
+    while buf_len(ctx.block) < 56 { buf_push(ctx.block, 0) }
+    mut sh := 56
+    while sh >= 0 {
+        buf_push(ctx.block, (bit_len >> sh) & 255)
+        sh -= 8
+    }
+    _sha256_compress_block(ctx)
+    buf_truncate(ctx.block, 0)
+
+    out := buf_new(64)
+    mut i := 0
+    while i < 8 {
+        sha256_hex_append(out, ibuf_get(ctx.h, i))
+        i += 1
+    }
+    res := "" + buf_slice_str(out, 0, 64)
+    buf_free(move out)
+    return res
+}

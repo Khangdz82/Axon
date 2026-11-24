@@ -1,0 +1,619 @@
+// Axon Standard Library — Full RFC-8259 Zero-GC JSON DOM Parser & Canonical Serializer (`std/json_dom.ax`)
+// 100% Pure Axon replacement for Python's `json.loads` / `json.dumps(sort_keys=..., indent=...)`:
+//   - Flat Perceus-owned arena (zero GC, O(1) free via `jdoc_free(move doc)`)
+//   - Strict RFC-8259 compliance: unescapes `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, `\uXXXX` + UTF-16 surrogates,
+//     rejects unescaped control chars `< 0x20`, leading zeros (`01`), trailing commas, trailing garbage, and >128 depth (DoS guard)
+//   - Full object/array iteration, JSON Pointer (`jdoc_path(doc, "/choices/0/message/content")`),
+//     and canonical sorted-key / pretty-printed serializer (`jdoc_stringify`).
+
+use std::os
+use std::str
+use std::json
+use std::ds
+
+// JSON Value Type Tags:
+// 0 = null, 1 = bool, 2 = int (i64), 3 = float (raw text), 4 = string, 5 = array, 6 = object
+fn JVAL_NULL() -> i64   { return 0 }
+fn JVAL_BOOL() -> i64   { return 1 }
+fn JVAL_INT() -> i64    { return 2 }
+fn JVAL_FLOAT() -> i64  { return 3 }
+fn JVAL_STR() -> i64    { return 4 }
+fn JVAL_ARRAY() -> i64  { return 5 }
+fn JVAL_OBJECT() -> i64 { return 6 }
+
+// Node stride = 8 ints:
+//   [0]=type, [1]=val_a, [2]=val_b, [3]=first_child, [4]=last_child, [5]=next_sib, [6]=key_off, [7]=key_len
+struct JsonDoc {
+    nodes: IntBuf
+    nodes_cap: i64
+    node_count: i64
+    strings: ByteBuf
+    str_cap: i64
+    root: i64
+}
+
+fn jdoc_free(move d: JsonDoc) {
+    buf_free(move d.nodes)
+    buf_free(move d.strings)
+}
+
+fn _jdoc_ensure_nodes(mut d: JsonDoc, need: i64) -> bool {
+    if (d.node_count + need) * 8 <= d.nodes_cap { return true }
+    mut nc := d.nodes_cap * 2
+    while nc < (d.node_count + need) * 8 { nc = nc * 2 }
+    if nc > 33554432 { return false }
+    nb := ibuf_new(nc)
+    cur := ibuf_len(d.nodes)
+    mut i := 0
+    while i < cur { ibuf_push(nb, ibuf_get(d.nodes, i)); i += 1 }
+    buf_free(move d.nodes)
+    d.nodes = nb
+    d.nodes_cap = nc
+    return true
+}
+
+fn _jdoc_ensure_str(mut d: JsonDoc, add: i64) -> bool {
+    cur := buf_len(d.strings)
+    if cur + add + 16 <= d.str_cap { return true }
+    mut nc := d.str_cap * 2
+    while nc < cur + add + 64 { nc = nc * 2 }
+    if nc > 67108864 { return false }
+    nb := buf_new(nc)
+    if cur > 0 { buf_push_str(nb, buf_slice_str(d.strings, 0, cur)) }
+    buf_free(move d.strings)
+    d.strings = nb
+    d.str_cap = nc
+    return true
+}
+
+fn _jdoc_alloc_node(mut d: JsonDoc, ty: i64, a: i64, b: i64) -> i64 {
+    if not _jdoc_ensure_nodes(mut d, 1) { return -1 }
+    id := d.node_count
+    ibuf_push(d.nodes, ty)
+    ibuf_push(d.nodes, a)
+    ibuf_push(d.nodes, b)
+    ibuf_push(d.nodes, -1) // first_child
+    ibuf_push(d.nodes, -1) // last_child
+    ibuf_push(d.nodes, -1) // next_sib
+    ibuf_push(d.nodes, -1) // key_off
+    ibuf_push(d.nodes, 0)  // key_len
+    d.node_count += 1
+    return id
+}
+
+fn _jdoc_append_child(d: JsonDoc, parent: i64, child: i64) {
+    pb := parent * 8
+    last := ibuf_get(d.nodes, pb + 4)
+    if last < 0 {
+        ibuf_set(d.nodes, pb + 3, child)
+        ibuf_set(d.nodes, pb + 4, child)
+    } else {
+        ibuf_set(d.nodes, last * 8 + 5, child)
+        ibuf_set(d.nodes, pb + 4, child)
+    }
+    ibuf_set(d.nodes, pb + 1, ibuf_get(d.nodes, pb + 1) + 1)
+}
+
+fn _jdoc_push_str_pool(mut d: JsonDoc, s: str) -> i64 {
+    sl := str_len(s)
+    if sl <= 0 { return buf_len(d.strings) }
+    if not _jdoc_ensure_str(mut d, sl) { return -1 }
+    off := buf_len(d.strings)
+    buf_push_str(d.strings, s)
+    return off
+}
+
+fn _jdoc_skip_ws(src: str, n: i64, pos: i64) -> i64 {
+    mut i := pos
+    while i < n {
+        b := str_byte(src, i)
+        if b == 32 or b == 9 or b == 10 or b == 13 { i += 1 }
+        else { break }
+    }
+    return i
+}
+
+fn _jdoc_unescape_ok(raw: str) -> (bool, str) {
+    un := json_unescape(raw) or return (false, "")
+    return (true, un)
+}
+
+// Parses a JSON string token starting at `"`; `st[0]=pos`, `st[1]=err_code`
+fn _jdoc_parse_string_span(src: str, n: i64, mut d: JsonDoc, st: IntBuf) -> (i64, i64) {
+    mut i := ibuf_get(st, 0)
+    if i >= n or str_byte(src, i) != 34 {
+        ibuf_set(st, 1, 400)
+        return (-1, 0)
+    }
+    i += 1
+    start := i
+    mut has_esc := false
+    while i < n {
+        b := str_byte(src, i)
+        if b < 32 {
+            ibuf_set(st, 1, 400)
+            return (-1, 0)
+        }
+        if b == 92 {
+            has_esc = true
+            if i + 1 >= n { ibuf_set(st, 1, 400); return (-1, 0) }
+            i += 2
+        } else if b == 34 {
+            raw := str_slice(src, start, i)
+            ibuf_set(st, 0, i + 1)
+            if not has_esc {
+                off := _jdoc_push_str_pool(mut d, raw)
+                if off < 0 { ibuf_set(st, 1, 413); return (-1, 0) }
+                return (off, str_len(raw))
+            }
+            (ok_u, un) := _jdoc_unescape_ok(raw)
+            if not ok_u { ibuf_set(st, 1, 400); return (-1, 0) }
+            off := _jdoc_push_str_pool(mut d, un)
+            if off < 0 { ibuf_set(st, 1, 413); return (-1, 0) }
+            return (off, str_len(un))
+        } else {
+            i += 1
+        }
+    }
+    ibuf_set(st, 1, 400)
+    return (-1, 0)
+}
+
+fn _jdoc_parse_number(src: str, n: i64, mut d: JsonDoc, st: IntBuf) -> i64 {
+    mut i := ibuf_get(st, 0)
+    start := i
+    mut is_neg := false
+    if i < n and str_byte(src, i) == 45 {
+        is_neg = true
+        i += 1
+    }
+    if i >= n { ibuf_set(st, 1, 400); return -1 }
+    b0 := str_byte(src, i)
+    if b0 < 48 or b0 > 57 { ibuf_set(st, 1, 400); return -1 }
+    if b0 == 48 {
+        i += 1
+        if i < n {
+            bn := str_byte(src, i)
+            if bn >= 48 and bn <= 57 {
+                // RFC-8259 forbids leading zeros like `01`
+                ibuf_set(st, 1, 400)
+                return -1
+            }
+        }
+    } else {
+        while i < n and str_byte(src, i) >= 48 and str_byte(src, i) <= 57 { i += 1 }
+    }
+    mut is_float := false
+    if i < n and str_byte(src, i) == 46 {
+        is_float = true
+        i += 1
+        if i >= n or str_byte(src, i) < 48 or str_byte(src, i) > 57 {
+            ibuf_set(st, 1, 400)
+            return -1
+        }
+        while i < n and str_byte(src, i) >= 48 and str_byte(src, i) <= 57 { i += 1 }
+    }
+    if i < n and (str_byte(src, i) == 101 or str_byte(src, i) == 69) {
+        is_float = true
+        i += 1
+        if i < n and (str_byte(src, i) == 43 or str_byte(src, i) == 45) { i += 1 }
+        if i >= n or str_byte(src, i) < 48 or str_byte(src, i) > 57 {
+            ibuf_set(st, 1, 400)
+            return -1
+        }
+        while i < n and str_byte(src, i) >= 48 and str_byte(src, i) <= 57 { i += 1 }
+    }
+    ibuf_set(st, 0, i)
+    num_str := str_slice(src, start, i)
+    if not is_float {
+        // Parse exact signed 64-bit integer; if > i64 range, preserve accurately as FLOAT/raw token
+        mut k := if is_neg { start + 1 } else { start }
+        mut acc := 0
+        mut overflow := false
+        while k < i {
+            dig := str_byte(src, k) - 48
+            if acc < -922337203685477580 { overflow = true; break }
+            if acc == -922337203685477580 {
+                if is_neg and dig > 8 { overflow = true; break }
+                if not is_neg and dig > 7 { overflow = true; break }
+            }
+            acc = acc * 10 - dig
+            k += 1
+        }
+        if not overflow {
+            val := if is_neg { acc } else { 0 - acc }
+            off := _jdoc_push_str_pool(mut d, num_str)
+            if off < 0 { ibuf_set(st, 1, 413); return -1 }
+            return _jdoc_alloc_node(mut d, JVAL_INT(), val, off)
+        }
+    }
+    off := _jdoc_push_str_pool(mut d, num_str)
+    if off < 0 { ibuf_set(st, 1, 413); return -1 }
+    return _jdoc_alloc_node(mut d, JVAL_FLOAT(), off, str_len(num_str))
+}
+
+fn _jdoc_parse_val(src: str, n: i64, mut d: JsonDoc, st: IntBuf, depth: i64) -> i64 {
+    if depth > 128 {
+        ibuf_set(st, 1, 413) // Max nesting depth exceeded (DoS guard)
+        return -1
+    }
+    pos := _jdoc_skip_ws(src, n, ibuf_get(st, 0))
+    ibuf_set(st, 0, pos)
+    if pos >= n { ibuf_set(st, 1, 400); return -1 }
+    c := str_byte(src, pos)
+
+    if c == 34 { // string
+        (off, ln) := _jdoc_parse_string_span(src, n, mut d, st)
+        if ibuf_get(st, 1) != 0 { return -1 }
+        return _jdoc_alloc_node(mut d, JVAL_STR(), off, ln)
+    }
+    if c == 123 { // object '{'
+        ibuf_set(st, 0, pos + 1)
+        obj_id := _jdoc_alloc_node(mut d, JVAL_OBJECT(), 0, 0)
+        if obj_id < 0 { ibuf_set(st, 1, 413); return -1 }
+        mut p := _jdoc_skip_ws(src, n, ibuf_get(st, 0))
+        if p < n and str_byte(src, p) == 125 {
+            ibuf_set(st, 0, p + 1)
+            return obj_id
+        }
+        while true {
+            p = _jdoc_skip_ws(src, n, ibuf_get(st, 0))
+            ibuf_set(st, 0, p)
+            if p >= n or str_byte(src, p) != 34 { ibuf_set(st, 1, 400); return -1 }
+            (koff, klen) := _jdoc_parse_string_span(src, n, mut d, st)
+            if ibuf_get(st, 1) != 0 { return -1 }
+            p = _jdoc_skip_ws(src, n, ibuf_get(st, 0))
+            if p >= n or str_byte(src, p) != 58 { ibuf_set(st, 1, 400); return -1 }
+            ibuf_set(st, 0, p + 1)
+            val_id := _jdoc_parse_val(src, n, mut d, st, depth + 1)
+            if ibuf_get(st, 1) != 0 or val_id < 0 { return -1 }
+            ibuf_set(d.nodes, val_id * 8 + 6, koff)
+            ibuf_set(d.nodes, val_id * 8 + 7, klen)
+            _jdoc_append_child(d, obj_id, val_id)
+            p = _jdoc_skip_ws(src, n, ibuf_get(st, 0))
+            if p >= n { ibuf_set(st, 1, 400); return -1 }
+            sep := str_byte(src, p)
+            if sep == 125 {
+                ibuf_set(st, 0, p + 1)
+                return obj_id
+            }
+            if sep != 44 { ibuf_set(st, 1, 400); return -1 }
+            ibuf_set(st, 0, p + 1)
+        }
+    }
+    if c == 91 { // array '['
+        ibuf_set(st, 0, pos + 1)
+        arr_id := _jdoc_alloc_node(mut d, JVAL_ARRAY(), 0, 0)
+        if arr_id < 0 { ibuf_set(st, 1, 413); return -1 }
+        mut p := _jdoc_skip_ws(src, n, ibuf_get(st, 0))
+        if p < n and str_byte(src, p) == 93 {
+            ibuf_set(st, 0, p + 1)
+            return arr_id
+        }
+        while true {
+            elem_id := _jdoc_parse_val(src, n, mut d, st, depth + 1)
+            if ibuf_get(st, 1) != 0 or elem_id < 0 { return -1 }
+            _jdoc_append_child(d, arr_id, elem_id)
+            p = _jdoc_skip_ws(src, n, ibuf_get(st, 0))
+            if p >= n { ibuf_set(st, 1, 400); return -1 }
+            sep := str_byte(src, p)
+            if sep == 93 {
+                ibuf_set(st, 0, p + 1)
+                return arr_id
+            }
+            if sep != 44 { ibuf_set(st, 1, 400); return -1 }
+            ibuf_set(st, 0, p + 1)
+        }
+    }
+    if c == 116 { // true
+        if pos + 4 <= n and str_eq(str_slice(src, pos, pos + 4), "true") {
+            ibuf_set(st, 0, pos + 4)
+            return _jdoc_alloc_node(mut d, JVAL_BOOL(), 1, 0)
+        }
+        ibuf_set(st, 1, 400); return -1
+    }
+    if c == 102 { // false
+        if pos + 5 <= n and str_eq(str_slice(src, pos, pos + 5), "false") {
+            ibuf_set(st, 0, pos + 5)
+            return _jdoc_alloc_node(mut d, JVAL_BOOL(), 0, 0)
+        }
+        ibuf_set(st, 1, 400); return -1
+    }
+    if c == 110 { // null
+        if pos + 4 <= n and str_eq(str_slice(src, pos, pos + 4), "null") {
+            ibuf_set(st, 0, pos + 4)
+            return _jdoc_alloc_node(mut d, JVAL_NULL(), 0, 0)
+        }
+        ibuf_set(st, 1, 400); return -1
+    }
+    if c == 45 or (c >= 48 and c <= 57) {
+        return _jdoc_parse_number(src, n, mut d, st)
+    }
+    ibuf_set(st, 1, 400)
+    return -1
+}
+
+// Full RFC-8259 JSON parser (Python `json.loads` equivalent). Rejects trailing non-whitespace garbage!
+fn jdoc_parse(src: str) -> JsonDoc ! i64 {
+    n := str_len(src)
+    if n == 0 or n > 33554432 { return err(400) }
+    mut init_nodes := (n / 8) * 8 + 64
+    if init_nodes < 128 { init_nodes = 128 }
+    if init_nodes > 65536 { init_nodes = 65536 }
+    mut init_str := n + 64
+    if init_str > 65536 { init_str = 65536 }
+    mut doc := JsonDoc(
+        nodes = ibuf_new(init_nodes),
+        nodes_cap = init_nodes,
+        node_count = 0,
+        strings = buf_new(init_str),
+        str_cap = init_str,
+        root = -1
+    )
+    st := ibuf_new(4)
+    ibuf_push(st, 0) // pos
+    ibuf_push(st, 0) // err
+    root := _jdoc_parse_val(src, n, mut doc, st, 0)
+    err_c := ibuf_get(st, 1)
+    end_pos := _jdoc_skip_ws(src, n, ibuf_get(st, 0))
+    buf_free(move st)
+    if err_c != 0 or root < 0 or end_pos != n {
+        jdoc_free(move doc)
+        return err(if err_c != 0 { err_c } else { 400 })
+    }
+    doc.root = root
+    return ok(doc)
+}
+
+// ==================== DOM ACCESSORS & NAVIGATION ====================
+
+fn jdoc_type(d: JsonDoc, nid: i64) -> i64 {
+    if nid < 0 or nid >= d.node_count { return -1 }
+    return ibuf_get(d.nodes, nid * 8)
+}
+
+fn jdoc_is_null(d: JsonDoc, nid: i64) -> bool {
+    return jdoc_type(d, nid) == JVAL_NULL()
+}
+
+fn jdoc_as_bool(d: JsonDoc, nid: i64, default_val: bool = false) -> bool {
+    if jdoc_type(d, nid) != JVAL_BOOL() { return default_val }
+    return ibuf_get(d.nodes, nid * 8 + 1) != 0
+}
+
+fn jdoc_as_i64(d: JsonDoc, nid: i64, default_val: i64 = 0) -> i64 {
+    if jdoc_type(d, nid) != JVAL_INT() { return default_val }
+    return ibuf_get(d.nodes, nid * 8 + 1)
+}
+
+fn jdoc_as_str(d: JsonDoc, nid: i64, default_val: str = "") -> str {
+    ty := jdoc_type(d, nid)
+    if ty != JVAL_STR() and ty != JVAL_FLOAT() { return default_val }
+    off := ibuf_get(d.nodes, nid * 8 + 1)
+    ln := ibuf_get(d.nodes, nid * 8 + 2)
+    if ln <= 0 { return "" }
+    return buf_slice_str(d.strings, off, off + ln)
+}
+
+fn jdoc_len(d: JsonDoc, nid: i64) -> i64 {
+    ty := jdoc_type(d, nid)
+    if ty != JVAL_ARRAY() and ty != JVAL_OBJECT() { return 0 }
+    return ibuf_get(d.nodes, nid * 8 + 1)
+}
+
+fn jdoc_first_child(d: JsonDoc, nid: i64) -> i64 {
+    if nid < 0 or nid >= d.node_count { return -1 }
+    return ibuf_get(d.nodes, nid * 8 + 3)
+}
+
+fn jdoc_next_sib(d: JsonDoc, nid: i64) -> i64 {
+    if nid < 0 or nid >= d.node_count { return -1 }
+    return ibuf_get(d.nodes, nid * 8 + 5)
+}
+
+fn jdoc_key(d: JsonDoc, child_nid: i64) -> str {
+    if child_nid < 0 or child_nid >= d.node_count { return "" }
+    ko := ibuf_get(d.nodes, child_nid * 8 + 6)
+    kl := ibuf_get(d.nodes, child_nid * 8 + 7)
+    if ko < 0 or kl <= 0 { return "" }
+    return buf_slice_str(d.strings, ko, ko + kl)
+}
+
+// Array element by 0-based index (returns node id or -1)
+fn jdoc_arr_get(d: JsonDoc, arr_nid: i64, idx: i64) -> i64 {
+    if jdoc_type(d, arr_nid) != JVAL_ARRAY() or idx < 0 { return -1 }
+    mut cur := ibuf_get(d.nodes, arr_nid * 8 + 3)
+    mut i := 0
+    while cur >= 0 {
+        if i == idx { return cur }
+        cur = ibuf_get(d.nodes, cur * 8 + 5)
+        i += 1
+    }
+    return -1
+}
+
+// Object member by exact key (returns last matching child node id per RFC-8259 / Python json.loads, or -1)
+fn jdoc_obj_get(d: JsonDoc, obj_nid: i64, key: str) -> i64 {
+    if jdoc_type(d, obj_nid) != JVAL_OBJECT() { return -1 }
+    klen := str_len(key)
+    mut cur := ibuf_get(d.nodes, obj_nid * 8 + 3)
+    mut found := -1
+    while cur >= 0 {
+        ckl := ibuf_get(d.nodes, cur * 8 + 7)
+        if ckl == klen {
+            if klen == 0 {
+                found = cur
+            } else {
+                cko := ibuf_get(d.nodes, cur * 8 + 6)
+                if str_eq(buf_slice_str(d.strings, cko, cko + ckl), key) {
+                    found = cur
+                }
+            }
+        }
+        cur = ibuf_get(d.nodes, cur * 8 + 5)
+    }
+    return found
+}
+
+// RFC-6901 JSON Pointer navigation: e.g. `jdoc_path(doc, "/choices/0/message/tool_calls/0/function/name")`
+fn jdoc_path(d: JsonDoc, ptr: str) -> i64 {
+    n := str_len(ptr)
+    if n == 0 { return d.root }
+    mut cur := d.root
+    mut i := if str_byte(ptr, 0) == 47 { 1 } else { 0 }
+    while i <= n and cur >= 0 {
+        mut sl := str_find_byte(ptr, 47, i)
+        if sl < 0 { sl = n }
+        raw_seg := str_slice(ptr, i, sl)
+        // RFC-6901 unescape ~1 -> / and ~0 -> ~
+        seg := str_replace(str_replace(raw_seg, "~1", "/"), "~0", "~")
+        ty := jdoc_type(d, cur)
+        if ty == JVAL_OBJECT() {
+            cur = jdoc_obj_get(d, cur, seg)
+        } else if ty == JVAL_ARRAY() {
+            idx := parse_i64(seg) or return -1
+            cur = jdoc_arr_get(d, cur, idx)
+        } else {
+            return -1
+        }
+        if sl >= n { break }
+        i = sl + 1
+    }
+    return cur
+}
+
+// ==================== CANONICAL & PRETTY SERIALIZER (`json.dumps`) ====================
+
+fn _jser_ensure(mut out: ByteBuf, mut cap: i64, add: i64) -> (ByteBuf, i64) {
+    cur := buf_len(out)
+    if cur + add + 16 <= cap { return (out, cap) }
+    mut nc := cap * 2
+    while nc < cur + add + 64 { nc = nc * 2 }
+    nb := buf_new(nc)
+    if cur > 0 { buf_push_str(nb, buf_slice_str(out, 0, cur)) }
+    buf_free(move out)
+    return (nb, nc)
+}
+
+fn _jser_emit(d: JsonDoc, nid: i64, sort_keys: bool, indent: i64, depth: i64, mut out_box: StrVec) {
+    // Accumulate fragments into StrVec (auto-growing arena, zero fixed-buffer truncation!)
+    ty := jdoc_type(d, nid)
+    if ty == JVAL_NULL() {
+        svec_push(mut out_box, "null")
+        return
+    }
+    if ty == JVAL_BOOL() {
+        svec_push(mut out_box, if ibuf_get(d.nodes, nid * 8 + 1) != 0 { "true" } else { "false" })
+        return
+    }
+    if ty == JVAL_INT() {
+        svec_push(mut out_box, str_from_i64(ibuf_get(d.nodes, nid * 8 + 1)))
+        return
+    }
+    if ty == JVAL_FLOAT() {
+        svec_push(mut out_box, jdoc_as_str(d, nid, "0"))
+        return
+    }
+    if ty == JVAL_STR() {
+        sv := jdoc_as_str(d, nid, "")
+        eb := buf_new(str_len(sv) * 6 + 8)
+        buf_push(eb, 34)
+        json_push_escaped(eb, sv)
+        buf_push(eb, 34)
+        svec_push(mut out_box, buf_to_owned_str(move eb))
+        return
+    }
+    if ty == JVAL_ARRAY() {
+        cnt := ibuf_get(d.nodes, nid * 8 + 1)
+        if cnt == 0 { svec_push(mut out_box, "[]"); return }
+        svec_push(mut out_box, "[")
+        mut cur := ibuf_get(d.nodes, nid * 8 + 3)
+        mut idx := 0
+        while cur >= 0 {
+            if idx > 0 { svec_push(mut out_box, ",") }
+            if indent > 0 {
+                svec_push(mut out_box, "\n")
+                svec_push(mut out_box, str_repeat(" ", (depth + 1) * indent))
+            }
+            _jser_emit(d, cur, sort_keys, indent, depth + 1, mut out_box)
+            cur = ibuf_get(d.nodes, cur * 8 + 5)
+            idx += 1
+        }
+        if indent > 0 {
+            svec_push(mut out_box, "\n")
+            svec_push(mut out_box, str_repeat(" ", depth * indent))
+        }
+        svec_push(mut out_box, "]")
+        return
+    }
+    if ty == JVAL_OBJECT() {
+        cnt := ibuf_get(d.nodes, nid * 8 + 1)
+        if cnt == 0 { svec_push(mut out_box, "{}"); return }
+        // Collect child node IDs; if sort_keys, deduplicate (last wins) & sort lexicographically by key!
+        mut ids := ibuf_new(cnt + 4)
+        mut cur := ibuf_get(d.nodes, nid * 8 + 3)
+        while cur >= 0 {
+            ibuf_push(ids, cur)
+            cur = ibuf_get(d.nodes, cur * 8 + 5)
+        }
+        n_ids := ibuf_len(ids)
+        if sort_keys and n_ids > 1 {
+            // Deterministic insertion/shell sort on child indices by key string
+            mut i := 1
+            while i < n_ids {
+                val_id := ibuf_get(ids, i)
+                val_k := jdoc_key(d, val_id)
+                mut j := i - 1
+                while j >= 0 and str_cmp(jdoc_key(d, ibuf_get(ids, j)), val_k) > 0 {
+                    ibuf_set(ids, j + 1, ibuf_get(ids, j))
+                    j -= 1
+                }
+                ibuf_set(ids, j + 1, val_id)
+                i += 1
+            }
+        }
+        svec_push(mut out_box, "{")
+        mut i := 0
+        while i < n_ids {
+            cid := ibuf_get(ids, i)
+            if i > 0 { svec_push(mut out_box, ",") }
+            if indent > 0 {
+                svec_push(mut out_box, "\n")
+                svec_push(mut out_box, str_repeat(" ", (depth + 1) * indent))
+            }
+            ck := jdoc_key(d, cid)
+            kb := buf_new(str_len(ck) * 6 + 8)
+            buf_push(kb, 34)
+            json_push_escaped(kb, ck)
+            buf_push_str(kb, if indent > 0 { "\": " } else { "\":" })
+            svec_push(mut out_box, buf_to_owned_str(move kb))
+            _jser_emit(d, cid, sort_keys, indent, depth + 1, mut out_box)
+            i += 1
+        }
+        buf_free(move ids)
+        if indent > 0 {
+            svec_push(mut out_box, "\n")
+            svec_push(mut out_box, str_repeat(" ", depth * indent))
+        }
+        svec_push(mut out_box, "}")
+    }
+}
+
+// Equivalent to Python `json.dumps(obj, sort_keys=..., indent=...)`
+fn jdoc_stringify(d: JsonDoc, nid: i64 = -1, sort_keys: bool = false, indent: i64 = 0) -> str {
+    target := if nid < 0 { d.root } else { nid }
+    if target < 0 or target >= d.node_count { return "null" }
+    mut parts := svec_new(32, 512)
+    _jser_emit(d, target, sort_keys, indent, 0, mut parts)
+    res := svec_join(parts, "")
+    svec_free(move parts)
+    return res
+}
+
+// Canonicalizes any JSON string (sorted keys, zero extra whitespace) for deterministic hashing / stuck-loop detection
+fn json_canonicalize(raw_json: str) -> str ! i64 {
+    doc := jdoc_parse(raw_json) or return
+    canon := jdoc_stringify(doc, -1, true, 0)
+    jdoc_free(move doc)
+    return ok(canon)
+}
