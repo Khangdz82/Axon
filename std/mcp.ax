@@ -84,19 +84,284 @@ fn mbuf_push_str(mut mb: McpBuf, s: str) {
 }
 
 fn mbuf_push_i64(mut mb: McpBuf, val: i64) {
-    mbuf_push_str(mut mb, str_from_i64(val))
+    if _mbuf_ensure(mut mb, 24) {
+        buf_append_i64(mb.b, val)
+    }
 }
 
 fn mbuf_push_json_escaped(mut mb: McpBuf, s: str) {
     n := str_len(s)
+    if n <= 0 { return }
+    unsafe {
+        sp := s as i64
+        mut dirty := false
+        mut i := 0
+        while i < n {
+            c := ptr_read_u8(sp + i, 0)
+            if c < 32 or c == 34 or c == 92 {
+                dirty = true
+                break
+            }
+            i += 1
+        }
+        if not dirty {
+            if _mbuf_ensure(mut mb, n) {
+                buf_push_str(mb.b, s)
+            }
+            return
+        }
+    }
     if not _mbuf_ensure(mut mb, n * 6 + 4) { return }
     json_push_escaped(mb.b, s)
 }
 
 fn mbuf_push_json_str(mut mb: McpBuf, s: str) {
+    n := str_len(s)
+    if n <= 0 {
+        if _mbuf_ensure(mut mb, 2) { buf_push_str(mb.b, "\"\"") }
+        return
+    }
+    unsafe {
+        sp := s as i64
+        mut dirty := false
+        mut i := 0
+        while i < n {
+            c := ptr_read_u8(sp + i, 0)
+            if c < 32 or c == 34 or c == 92 {
+                dirty = true
+                break
+            }
+            i += 1
+        }
+        if not dirty {
+            if _mbuf_ensure(mut mb, n + 2) {
+                buf_push(mb.b, 34)
+                buf_push_str(mb.b, s)
+                buf_push(mb.b, 34)
+            }
+            return
+        }
+    }
     mbuf_push(mut mb, 34)
     mbuf_push_json_escaped(mut mb, s)
     mbuf_push(mut mb, 34)
+}
+
+// Zero-allocation ASCII/pointer helpers shared across `std::mcp` and `std::mcp_python`.
+fn _mcp_sw(s: str, prefix: str) -> bool {
+    plen := str_len(prefix)
+    if plen == 0 { return true }
+    if str_len(s) < plen { return false }
+    unsafe {
+        sp := s as i64
+        pp := prefix as i64
+        mut i := 0
+        while i < plen {
+            if ptr_read_u8(sp + i, 0) != ptr_read_u8(pp + i, 0) { return false }
+            i += 1
+        }
+        return true
+    }
+}
+
+fn _mcp_ew(s: str, suffix: str) -> bool {
+    suflen := str_len(suffix)
+    if suflen == 0 { return true }
+    slen := str_len(s)
+    if slen < suflen { return false }
+    unsafe {
+        sp := (s as i64) + (slen - suflen)
+        qp := suffix as i64
+        mut i := 0
+        while i < suflen {
+            if ptr_read_u8(sp + i, 0) != ptr_read_u8(qp + i, 0) { return false }
+            i += 1
+        }
+        return true
+    }
+}
+
+fn _mcp_find_b(s: str, target: i64, start: i64 = 0) -> i64 {
+    n := str_len(s)
+    mut i := if start < 0 { 0 } else { start }
+    unsafe {
+        sp := s as i64
+        lo8 := 0x0101010101010101
+        hi8 := -9187201950435737472
+        pat := (target & 255) *% lo8
+        while i + 8 <= n {
+            x := ptr_read_i64(sp + i, 0) ^ pat
+            if ((x -% lo8) & (-1 ^ x) & hi8) != 0 {
+                mut k := 0
+                while k < 8 {
+                    if ptr_read_u8(sp + i + k, 0) == target { return i + k }
+                    k += 1
+                }
+            }
+            i += 8
+        }
+        while i < n {
+            if ptr_read_u8(sp + i, 0) == target { return i }
+            i += 1
+        }
+    }
+    return -1
+}
+
+fn _mcp_find(hay: str, needle: str, start: i64 = 0) -> i64 {
+    hlen := str_len(hay)
+    nlen := str_len(needle)
+    mut s := if start < 0 { 0 } else { start }
+    if nlen == 0 { return if s <= hlen { s } else { -1 } }
+    if nlen > hlen or s > hlen - nlen { return -1 }
+    unsafe {
+        hp := hay as i64
+        np := needle as i64
+        first := ptr_read_u8(np, 0)
+        limit := hlen - nlen
+        lo8 := 0x0101010101010101
+        hi8 := -9187201950435737472
+        pat := first *% lo8
+        while s <= limit and s + 8 <= hlen {
+            x := ptr_read_i64(hp + s, 0) ^ pat
+            if ((x -% lo8) & (-1 ^ x) & hi8) != 0 {
+                mut k := 0
+                while k < 8 and s + k <= limit {
+                    if ptr_read_u8(hp + s + k, 0) == first {
+                        mut j := 1
+                        while j < nlen {
+                            if ptr_read_u8(hp + s + k + j, 0) != ptr_read_u8(np + j, 0) { break }
+                            j += 1
+                        }
+                        if j == nlen { return s + k }
+                    }
+                    k += 1
+                }
+            }
+            s += 8
+        }
+        while s <= limit {
+            if ptr_read_u8(hp + s, 0) == first {
+                mut j := 1
+                while j < nlen {
+                    if ptr_read_u8(hp + s + j, 0) != ptr_read_u8(np + j, 0) { break }
+                    j += 1
+                }
+                if j == nlen { return s }
+            }
+            s += 1
+        }
+    }
+    return -1
+}
+
+fn _mcp_icase_eq(a: str, b_low: str) -> bool {
+    n := str_len(b_low)
+    if str_len(a) != n { return false }
+    unsafe {
+        ap := a as i64
+        bp := b_low as i64
+        mut i := 0
+        while i < n {
+            mut ca := ptr_read_u8(ap + i, 0)
+            if ca >= 65 and ca <= 90 { ca += 32 }
+            if ca != ptr_read_u8(bp + i, 0) { return false }
+            i += 1
+        }
+    }
+    return true
+}
+
+fn _mcp_icase_sw(a: str, b_low: str) -> bool {
+    n := str_len(b_low)
+    if str_len(a) < n { return false }
+    unsafe {
+        ap := a as i64
+        bp := b_low as i64
+        mut i := 0
+        while i < n {
+            mut ca := ptr_read_u8(ap + i, 0)
+            if ca >= 65 and ca <= 90 { ca += 32 }
+            if ca != ptr_read_u8(bp + i, 0) { return false }
+            i += 1
+        }
+    }
+    return true
+}
+
+fn _mcp_icase_pos(hay: str, needle_low: str) -> i64 {
+    nlen := str_len(needle_low)
+    if nlen == 0 { return 0 }
+    hlen := str_len(hay)
+    if nlen > hlen { return -1 }
+    unsafe {
+        hp := hay as i64
+        np := needle_low as i64
+        c0 := ptr_read_u8(np, 0)
+        c0_alt := if c0 >= 97 and c0 <= 122 { c0 - 32 } else { c0 }
+        limit := hlen - nlen
+        lo8 := 0x0101010101010101
+        hi8 := -9187201950435737472
+        pat0 := c0 *% lo8
+        pat1 := c0_alt *% lo8
+        mut i := 0
+        while i <= limit and i + 8 <= hlen {
+            w := ptr_read_i64(hp + i, 0)
+            x0 := w ^ pat0
+            mut hit8 := (x0 -% lo8) & (-1 ^ x0) & hi8
+            if c0_alt != c0 {
+                x1 := w ^ pat1
+                hit8 = hit8 | ((x1 -% lo8) & (-1 ^ x1) & hi8)
+            }
+            if hit8 != 0 {
+                mut k := 0
+                while k < 8 and i + k <= limit {
+                    mut ca := ptr_read_u8(hp + i + k, 0)
+                    if ca >= 65 and ca <= 90 { ca += 32 }
+                    if ca == c0 {
+                        mut j := 1
+                        while j < nlen {
+                            mut cb := ptr_read_u8(hp + i + k + j, 0)
+                            if cb >= 65 and cb <= 90 { cb += 32 }
+                            if cb != ptr_read_u8(np + j, 0) { break }
+                            j += 1
+                        }
+                        if j == nlen { return i + k }
+                    }
+                    k += 1
+                }
+            }
+            i += 8
+        }
+        while i <= limit {
+            mut ca := ptr_read_u8(hp + i, 0)
+            if ca >= 65 and ca <= 90 { ca += 32 }
+            if ca == c0 {
+                mut j := 1
+                while j < nlen {
+                    mut cb := ptr_read_u8(hp + i + j, 0)
+                    if cb >= 65 and cb <= 90 { cb += 32 }
+                    if cb != ptr_read_u8(np + j, 0) { break }
+                    j += 1
+                }
+                if j == nlen { return i }
+            }
+            i += 1
+        }
+    }
+    return -1
+}
+
+fn _mcp_icase_find(hay: str, needle_low: str) -> bool {
+    return _mcp_icase_pos(hay, needle_low) >= 0
+}
+
+fn _mcp_icase_score_name(nm: str, q: str, qlow: str, qlen: i64) -> i64 {
+    pos := _mcp_icase_pos(nm, qlow)
+    if pos < 0 { return 0 }
+    if pos > 0 { return 55 }
+    if str_len(nm) > qlen { return 70 }
+    return if str_eq(nm, q) { 100 } else { 90 }
 }
 
 fn mbuf_as_str(mb: McpBuf) -> str {
@@ -119,23 +384,30 @@ fn mcp_json_escape(s: str) -> str {
 
 fn _mcp_skip_ws(s: str, start: i64, end: i64) -> i64 {
     mut i := start
-    while i < end {
-        b := str_byte(s, i)
-        if b == 32 or b == 9 or b == 10 or b == 13 { i += 1 } else { break }
+    if i < 0 { i = 0 }
+    unsafe {
+        sp := s as i64
+        while i < end {
+            b := ptr_read_u8(sp + i, 0)
+            if b == 32 or b == 9 or b == 10 or b == 13 { i += 1 } else { break }
+        }
     }
     return i
 }
 
 fn _mcp_scan_json_string_end(s: str, q_pos: i64, end: i64) -> i64 {
     mut i := q_pos + 1
-    while i < end {
-        b := str_byte(s, i)
-        if b == 92 {
-            i += 2
-        } else if b == 34 {
-            return i + 1
-        } else {
-            i += 1
+    unsafe {
+        sp := s as i64
+        while i < end {
+            b := ptr_read_u8(sp + i, 0)
+            if b == 92 {
+                i += 2
+            } else if b == 34 {
+                return i + 1
+            } else {
+                i += 1
+            }
         }
     }
     return end
@@ -143,38 +415,47 @@ fn _mcp_scan_json_string_end(s: str, q_pos: i64, end: i64) -> i64 {
 
 fn _mcp_scan_json_value_end(s: str, start: i64, end: i64) -> i64 {
     if start >= end { return start }
-    b0 := str_byte(s, start)
-    if b0 == 34 { return _mcp_scan_json_string_end(s, start, end) }
-    if b0 == 123 or b0 == 91 {
-        mut i := start
-        mut depth := 0
-        while i < end {
-            c := str_byte(s, i)
-            if c == 34 {
-                i = _mcp_scan_json_string_end(s, i, end)
-            } else if c == 123 or c == 91 {
-                depth += 1
-                if depth > 64 { return end }
-                i += 1
-            } else if c == 125 or c == 93 {
-                depth -= 1
-                i += 1
-                if depth <= 0 { return i }
-            } else {
-                i += 1
+    unsafe {
+        sp := s as i64
+        b0 := ptr_read_u8(sp + start, 0)
+        if b0 == 34 { return _mcp_scan_json_string_end(s, start, end) }
+        if b0 == 123 or b0 == 91 {
+            mut i := start
+            mut depth := 0
+            while i < end {
+                c := ptr_read_u8(sp + i, 0)
+                if c == 34 {
+                    i += 1
+                    while i < end {
+                        bc := ptr_read_u8(sp + i, 0)
+                        if bc == 92 { i += 2 }
+                        else if bc == 34 { i += 1; break }
+                        else { i += 1 }
+                    }
+                } else if c == 123 or c == 91 {
+                    depth += 1
+                    if depth > 64 { return end }
+                    i += 1
+                } else if c == 125 or c == 93 {
+                    depth -= 1
+                    i += 1
+                    if depth <= 0 { return i }
+                } else {
+                    i += 1
+                }
             }
+            return end
         }
-        return end
-    }
-    mut i := start
-    while i < end {
-        c := str_byte(s, i)
-        if c == 44 or c == 125 or c == 93 or c == 32 or c == 9 or c == 10 or c == 13 {
-            break
+        mut i := start
+        while i < end {
+            c := ptr_read_u8(sp + i, 0)
+            if c == 44 or c == 125 or c == 93 or c == 32 or c == 9 or c == 10 or c == 13 {
+                break
+            }
+            i += 1
         }
-        i += 1
+        return i
     }
-    return i
 }
 
 fn _mcp_hex_nibble(b: i64) -> i64 {
@@ -184,7 +465,38 @@ fn _mcp_hex_nibble(b: i64) -> i64 {
     return -1
 }
 
+fn _mcp_slice_eq_lit(s: str, s0: i64, s1: i64, lit: str) -> bool {
+    ln := s1 - s0
+    if ln != str_len(lit) { return false }
+    if s0 < 0 or s1 > str_len(s) { return false }
+    unsafe {
+        sp := (s as i64) + s0
+        lp := lit as i64
+        mut i := 0
+        while i < ln {
+            if ptr_read_u8(sp + i, 0) != ptr_read_u8(lp + i, 0) { return false }
+            i += 1
+        }
+        return true
+    }
+}
+
 fn _mcp_unescape_json_slice(s: str, start: i64, end: i64) -> str {
+    if start < 0 or end <= start or end > str_len(s) { return "" }
+    unsafe {
+        sp := s as i64
+        mut clean := true
+        mut scan := start
+        while scan < end {
+            b := ptr_read_u8(sp + scan, 0)
+            if b == 92 or b == 0 {
+                clean = false
+                break
+            }
+            scan += 1
+        }
+        if clean { return str_slice(s, start, end) }
+    }
     mut mb := mbuf_new((end - start) + 8)
     mut i := start
     while i < end {
@@ -235,30 +547,49 @@ fn _mcp_unescape_json_slice(s: str, start: i64, end: i64) -> str {
     return mbuf_finish(move mb)
 }
 
-// Locates depth-1 `"key": <val>` inside JSON object `obj_json`. Returns `(val_start, val_end)` or `(-1, -1)`.
-fn _mcp_json_find_depth1(obj_json: str, key: str) -> (i64, i64) {
-    n := str_len(obj_json)
-    mut i := _mcp_skip_ws(obj_json, 0, n)
-    if i >= n or str_byte(obj_json, i) != 123 { return (-1, -1) }
+// Locates depth-1 `"key": <val>` inside JSON object `obj_json` within `[base_s, base_e)`.
+fn _mcp_json_find_depth1_span(obj_json: str, base_s: i64, base_e: i64, key: str) -> (i64, i64) {
+    mut i := _mcp_skip_ws(obj_json, base_s, base_e)
+    if i >= base_e or str_byte(obj_json, i) != 123 { return (-1, -1) }
     i += 1
-    while i < n {
-        i = _mcp_skip_ws(obj_json, i, n)
-        if i >= n or str_byte(obj_json, i) == 125 { break }
-        if str_byte(obj_json, i) == 44 { i += 1; continue }
-        if str_byte(obj_json, i) != 34 { break }
-        kend := _mcp_scan_json_string_end(obj_json, i, n)
-        if kend <= i + 1 or str_byte(obj_json, kend - 1) != 34 { break }
-        kraw := _mcp_unescape_json_slice(obj_json, i + 1, kend - 1)
-        i = _mcp_skip_ws(obj_json, kend, n)
-        if i >= n or str_byte(obj_json, i) != 58 { break }
-        i = _mcp_skip_ws(obj_json, i + 1, n)
-        vend := _mcp_scan_json_value_end(obj_json, i, n)
-        if str_eq(kraw, key) {
-            return (i, vend)
+    klen := str_len(key)
+    unsafe {
+        sp := obj_json as i64
+        while i < base_e {
+            i = _mcp_skip_ws(obj_json, i, base_e)
+            if i >= base_e or ptr_read_u8(sp + i, 0) == 125 { break }
+            if ptr_read_u8(sp + i, 0) == 44 { i += 1; continue }
+            if ptr_read_u8(sp + i, 0) != 34 { break }
+            kend := _mcp_scan_json_string_end(obj_json, i, base_e)
+            if kend <= i + 1 or ptr_read_u8(sp + kend - 1, 0) != 34 { break }
+            ks := i + 1
+            ke := kend - 1
+            mut is_k := false
+            mut has_bs := false
+            mut sc := ks
+            while sc < ke {
+                if ptr_read_u8(sp + sc, 0) == 92 { has_bs = true; break }
+                sc += 1
+            }
+            if not has_bs {
+                if ke - ks == klen { is_k = _mcp_slice_eq_lit(obj_json, ks, ke, key) }
+            } else {
+                is_k = str_eq(_mcp_unescape_json_slice(obj_json, ks, ke), key)
+            }
+            i = _mcp_skip_ws(obj_json, kend, base_e)
+            if i >= base_e or ptr_read_u8(sp + i, 0) != 58 { break }
+            i = _mcp_skip_ws(obj_json, i + 1, base_e)
+            vend := _mcp_scan_json_value_end(obj_json, i, base_e)
+            if is_k { return (i, vend) }
+            i = vend
         }
-        i = vend
     }
     return (-1, -1)
+}
+
+// Locates depth-1 `"key": <val>` inside JSON object `obj_json`. Returns `(val_start, val_end)` or `(-1, -1)`.
+fn _mcp_json_find_depth1(obj_json: str, key: str) -> (i64, i64) {
+    return _mcp_json_find_depth1_span(obj_json, 0, str_len(obj_json), key)
 }
 
 fn mcp_json_has(obj_json: str, key: str) -> bool {
@@ -605,23 +936,31 @@ fn mcp_result_finish(move r: McpToolResult) -> str {
     return mbuf_finish(move out)
 }
 
+fn _mcp_tool_text_envelope(text: str, structured_json: str, is_err: bool) -> str {
+    slen := str_len(structured_json)
+    mut out := mbuf_new(str_len(text) + slen + 96)
+    mbuf_push_str(mut out, "{\"content\":[{\"type\":\"text\",\"text\":")
+    mbuf_push_json_str(mut out, text)
+    mbuf_push(mut out, 125)
+    mbuf_push(mut out, 93)
+    if slen > 0 {
+        mbuf_push_str(mut out, ",\"structuredContent\":")
+        mbuf_push_str(mut out, structured_json)
+    }
+    mbuf_push_str(mut out, if is_err { ",\"isError\":true}" } else { ",\"isError\":false}" })
+    return mbuf_finish(move out)
+}
+
 fn mcp_tool_ok_text(text: str) -> str {
-    mut r := mcp_result_new(false)
-    mcp_result_add_text(mut r, text)
-    return mcp_result_finish(move r)
+    return _mcp_tool_text_envelope(text, "", false)
 }
 
 fn mcp_tool_err_text(msg: str) -> str {
-    mut r := mcp_result_new(true)
-    mcp_result_add_text(mut r, msg)
-    return mcp_result_finish(move r)
+    return _mcp_tool_text_envelope(msg, "", true)
 }
 
 fn mcp_tool_ok_json(text: str, structured_json: str) -> str {
-    mut r := mcp_result_new(false)
-    mcp_result_add_text(mut r, text)
-    mcp_result_set_structured(mut r, structured_json)
-    return mcp_result_finish(move r)
+    return _mcp_tool_text_envelope(text, structured_json, false)
 }
 
 fn mcp_resource_text_result(uri: str, mime_type: str, text: str) -> str {
@@ -912,6 +1251,15 @@ struct McpServer {
     res_overrides: StrMap
     subs: StrMap
     completions: StrMap
+    // Pre-serialized MCP list/initialize response cache
+    list_gen: i64
+    cached_gen: i64
+    cached_tools_res: str
+    cached_res_res: str
+    cached_tpl_res: str
+    cached_prm_res: str
+    cached_init_proto: str
+    cached_init_res: str
 }
 
 fn mcp_server_new(name: str, version: str = "1.0.0", instructions: str = "") -> McpServer {
@@ -947,7 +1295,15 @@ fn mcp_server_new(name: str, version: str = "1.0.0", instructions: str = "") -> 
         prm_index = smap_new(16),
         res_overrides = smap_new(16),
         subs = smap_new(16),
-        completions = smap_new(16)
+        completions = smap_new(16),
+        list_gen = 1,
+        cached_gen = 0,
+        cached_tools_res = "",
+        cached_res_res = "",
+        cached_tpl_res = "",
+        cached_prm_res = "",
+        cached_init_proto = "",
+        cached_init_res = ""
     )
 }
 
@@ -981,11 +1337,14 @@ fn mcp_server_free(move srv: McpServer) {
 
 fn mcp_server_set_instructions(mut srv: McpServer, instructions: str) {
     srv.instructions = instructions
+    srv.list_gen += 1
+    srv.cached_init_res = ""
 }
 
 fn mcp_server_set_page_size(mut srv: McpServer, page_size: i64) {
     if page_size >= 1 and page_size <= 500 {
         srv.page_size = page_size
+        srv.list_gen += 1
     }
 }
 
@@ -1014,6 +1373,7 @@ fn mcp_add_tool_ex(mut srv: McpServer, name: str, title: str, desc: str, input_s
     svec_push(mut srv.tool_out_schemas, output_schema_json)
     svec_push(mut srv.tool_annos, annotations_json)
     smap_set_i64(mut srv.tool_index, name, idx)
+    srv.list_gen += 1
     return true
 }
 
@@ -1035,6 +1395,7 @@ fn mcp_add_resource(mut srv: McpServer, uri: str, name: str, desc: str = "", mim
     svec_push(mut srv.res_texts, static_text)
     dvec_push(mut srv.res_is_static, if is_static { 1 } else { 0 })
     smap_set_i64(mut srv.res_index, uri, idx)
+    srv.list_gen += 1
     return true
 }
 
@@ -1060,6 +1421,7 @@ fn mcp_add_resource_template(mut srv: McpServer, uri_template: str, name: str, d
     svec_push(mut srv.tpl_names, if str_len(name) > 0 { name } else { uri_template })
     svec_push(mut srv.tpl_descs, desc)
     svec_push(mut srv.tpl_mimes, if str_len(mime_type) > 0 { mime_type } else { "text/plain" })
+    srv.list_gen += 1
     return true
 }
 
@@ -1070,6 +1432,7 @@ fn mcp_add_prompt(mut srv: McpServer, name: str, desc: str = "", args_json_array
     svec_push(mut srv.prm_descs, desc)
     svec_push(mut srv.prm_args, if str_len(args_json_array) > 0 { args_json_array } else { "[]" })
     smap_set_i64(mut srv.prm_index, name, idx)
+    srv.list_gen += 1
     return true
 }
 
@@ -1101,36 +1464,169 @@ struct McpRequest {
     cursor: str
 }
 
+fn _mcp_decode_json_str_span(s: str, vs: i64, ve: i64, default_val: str) -> str {
+    if vs < 0 or ve - vs < 2 { return default_val }
+    unsafe {
+        sp := s as i64
+        if ptr_read_u8(sp + vs, 0) != 34 or ptr_read_u8(sp + ve - 1, 0) != 34 {
+            return default_val
+        }
+    }
+    return _mcp_unescape_json_slice(s, vs + 1, ve - 1)
+}
+
 fn mcp_parse_request(raw_json: str) -> McpRequest {
     n := str_len(raw_json)
     mut i := _mcp_skip_ws(raw_json, 0, n)
     if i >= n or str_byte(raw_json, i) != 123 {
         return McpRequest(valid = false, is_notification = false, raw_id = "null", method = "", params_json = "", tool_name = "", args_json = "{}", resource_uri = "", prompt_name = "", cursor = "")
     }
-    raw_id := mcp_json_get_raw_id(raw_json)
+    i += 1
+    mut id_s := -1
+    mut id_e := -1
+    mut m_s := -1
+    mut m_e := -1
+    mut p_s := -1
+    mut p_e := -1
+
+    // Single-pass top-level JSON-RPC scan
+    unsafe {
+        sp := raw_json as i64
+        while i < n {
+            i = _mcp_skip_ws(raw_json, i, n)
+            if i >= n { break }
+            cb := ptr_read_u8(sp + i, 0)
+            if cb == 125 { break }
+            if cb == 44 { i += 1; continue }
+            if cb != 34 { break }
+            kend := _mcp_scan_json_string_end(raw_json, i, n)
+            if kend <= i + 1 or ptr_read_u8(sp + kend - 1, 0) != 34 { break }
+            ks := i + 1
+            ke := kend - 1
+            klen := ke - ks
+            mut has_bs := false
+            mut sc := ks
+            while sc < ke {
+                if ptr_read_u8(sp + sc, 0) == 92 { has_bs = true; break }
+                sc += 1
+            }
+            mut tag := 0 // 1=id, 2=method, 3=params
+            if not has_bs {
+                if klen == 2 and ptr_read_u8(sp + ks, 0) == 105 and ptr_read_u8(sp + ks + 1, 0) == 100 { tag = 1 }
+                else if klen == 6 and _mcp_slice_eq_lit(raw_json, ks, ke, "method") { tag = 2 }
+                else if klen == 6 and _mcp_slice_eq_lit(raw_json, ks, ke, "params") { tag = 3 }
+            } else {
+                uk := _mcp_unescape_json_slice(raw_json, ks, ke)
+                if str_eq(uk, "id") { tag = 1 }
+                else if str_eq(uk, "method") { tag = 2 }
+                else if str_eq(uk, "params") { tag = 3 }
+            }
+            i = _mcp_skip_ws(raw_json, kend, n)
+            if i >= n or ptr_read_u8(sp + i, 0) != 58 { break }
+            i = _mcp_skip_ws(raw_json, i + 1, n)
+            vend := _mcp_scan_json_value_end(raw_json, i, n)
+            if tag == 1 and id_s < 0 { id_s = i; id_e = vend }
+            else if tag == 2 and m_s < 0 { m_s = i; m_e = vend }
+            else if tag == 3 and p_s < 0 { p_s = i; p_e = vend }
+            i = vend
+        }
+    }
+
+    mut raw_id := ""
+    if id_s >= 0 and id_e > id_s {
+        tok := str_slice(raw_json, id_s, id_e)
+        tlen := str_len(tok)
+        if str_eq(tok, "null") {
+            raw_id = "null"
+        } else if tlen >= 2 and str_byte(tok, 0) == 34 and str_byte(tok, tlen - 1) == 34 and tlen <= 260 {
+            raw_id = tok
+        } else {
+            // Check integer token validity cleanly
+            _p := parse_i64(tok) or -9223372036854775807
+            raw_id = if _p == -9223372036854775807 and not str_eq(tok, "-9223372036854775807") { "null" } else { tok }
+        }
+    }
     is_notif := str_len(raw_id) == 0
-    method := mcp_json_get_str(raw_json, "method", "")
+    method := _mcp_decode_json_str_span(raw_json, m_s, m_e, "")
     if str_len(method) == 0 {
         return McpRequest(valid = false, is_notification = is_notif, raw_id = if is_notif { "null" } else { raw_id }, method = "", params_json = "", tool_name = "", args_json = "{}", resource_uri = "", prompt_name = "", cursor = "")
     }
-    mut params_json := mcp_json_get_raw(raw_json, "params")
-    if str_len(params_json) == 0 { params_json = "{}" }
+
+    mut params_json := "{}"
     mut tool_name := ""
     mut args_json := "{}"
     mut resource_uri := ""
     mut prompt_name := ""
-    cursor := mcp_json_get_str(params_json, "cursor", "")
+    mut cursor := ""
 
-    if str_eq(method, "tools/call") {
-        tool_name = mcp_json_get_str(params_json, "name", "")
-        raw_a := mcp_json_get_raw(params_json, "arguments")
-        if str_len(raw_a) > 0 and str_byte(raw_a, 0) == 123 { args_json = raw_a }
-    } else if str_eq(method, "resources/read") or str_eq(method, "resources/subscribe") or str_eq(method, "resources/unsubscribe") {
-        resource_uri = mcp_json_get_str(params_json, "uri", "")
-    } else if str_eq(method, "prompts/get") {
-        prompt_name = mcp_json_get_str(params_json, "name", "")
-        raw_a := mcp_json_get_raw(params_json, "arguments")
-        if str_len(raw_a) > 0 and str_byte(raw_a, 0) == 123 { args_json = raw_a }
+    if p_s >= 0 and p_e > p_s {
+        params_json = str_slice(raw_json, p_s, p_e)
+        if str_byte(params_json, 0) == 123 {
+            // Single-pass scan over `params`
+            mut cur_s := -1
+            mut cur_e := -1
+            mut nm_s := -1
+            mut nm_e := -1
+            mut uri_s := -1
+            mut uri_e := -1
+            mut arg_s := -1
+            mut arg_e := -1
+            unsafe {
+                sp := raw_json as i64
+                mut j := _mcp_skip_ws(raw_json, p_s + 1, p_e)
+                while j < p_e {
+                    j = _mcp_skip_ws(raw_json, j, p_e)
+                    if j >= p_e { break }
+                    cb := ptr_read_u8(sp + j, 0)
+                    if cb == 125 { break }
+                    if cb == 44 { j += 1; continue }
+                    if cb != 34 { break }
+                    kend := _mcp_scan_json_string_end(raw_json, j, p_e)
+                    if kend <= j + 1 or ptr_read_u8(sp + kend - 1, 0) != 34 { break }
+                    ks := j + 1
+                    ke := kend - 1
+                    klen := ke - ks
+                    mut ptag := 0 // 1=cursor, 2=name, 3=uri, 4=arguments
+                    mut has_bs := false
+                    mut sc := ks
+                    while sc < ke {
+                        if ptr_read_u8(sp + sc, 0) == 92 { has_bs = true; break }
+                        sc += 1
+                    }
+                    if not has_bs {
+                        if klen == 6 and _mcp_slice_eq_lit(raw_json, ks, ke, "cursor") { ptag = 1 }
+                        else if klen == 4 and _mcp_slice_eq_lit(raw_json, ks, ke, "name") { ptag = 2 }
+                        else if klen == 3 and ptr_read_u8(sp + ks, 0) == 117 and ptr_read_u8(sp + ks + 1, 0) == 114 and ptr_read_u8(sp + ks + 2, 0) == 105 { ptag = 3 }
+                        else if klen == 9 and _mcp_slice_eq_lit(raw_json, ks, ke, "arguments") { ptag = 4 }
+                    } else {
+                        uk := _mcp_unescape_json_slice(raw_json, ks, ke)
+                        if str_eq(uk, "cursor") { ptag = 1 }
+                        else if str_eq(uk, "name") { ptag = 2 }
+                        else if str_eq(uk, "uri") { ptag = 3 }
+                        else if str_eq(uk, "arguments") { ptag = 4 }
+                    }
+                    j = _mcp_skip_ws(raw_json, kend, p_e)
+                    if j >= p_e or ptr_read_u8(sp + j, 0) != 58 { break }
+                    j = _mcp_skip_ws(raw_json, j + 1, p_e)
+                    vend := _mcp_scan_json_value_end(raw_json, j, p_e)
+                    if ptag == 1 and cur_s < 0 { cur_s = j; cur_e = vend }
+                    else if ptag == 2 and nm_s < 0 { nm_s = j; nm_e = vend }
+                    else if ptag == 3 and uri_s < 0 { uri_s = j; uri_e = vend }
+                    else if ptag == 4 and arg_s < 0 { arg_s = j; arg_e = vend }
+                    j = vend
+                }
+            }
+            if cur_s >= 0 { cursor = _mcp_decode_json_str_span(raw_json, cur_s, cur_e, "") }
+            if str_eq(method, "tools/call") {
+                if nm_s >= 0 { tool_name = _mcp_decode_json_str_span(raw_json, nm_s, nm_e, "") }
+                if arg_s >= 0 and arg_e > arg_s and str_byte(raw_json, arg_s) == 123 { args_json = str_slice(raw_json, arg_s, arg_e) }
+            } else if str_eq(method, "resources/read") or str_eq(method, "resources/subscribe") or str_eq(method, "resources/unsubscribe") {
+                if uri_s >= 0 { resource_uri = _mcp_decode_json_str_span(raw_json, uri_s, uri_e, "") }
+            } else if str_eq(method, "prompts/get") {
+                if nm_s >= 0 { prompt_name = _mcp_decode_json_str_span(raw_json, nm_s, nm_e, "") }
+                if arg_s >= 0 and arg_e > arg_s and str_byte(raw_json, arg_s) == 123 { args_json = str_slice(raw_json, arg_s, arg_e) }
+            }
+        }
     }
 
     return McpRequest(
@@ -1212,8 +1708,9 @@ fn _mcp_list_tools_result(srv: McpServer, cursor: str) -> str ! i64 {
     }
     mbuf_push(mut out, 93)
     if end < total {
-        mbuf_push_str(mut out, ",\"nextCursor\":")
-        mbuf_push_json_str(mut out, str_from_i64(end))
+        mbuf_push_str(mut out, ",\"nextCursor\":\"")
+        mbuf_push_i64(mut out, end)
+        mbuf_push(mut out, 34)
     }
     mbuf_push(mut out, 125)
     return ok(mbuf_finish(move out))
@@ -1246,8 +1743,9 @@ fn _mcp_list_resources_result(srv: McpServer, cursor: str) -> str ! i64 {
     }
     mbuf_push(mut out, 93)
     if end < total {
-        mbuf_push_str(mut out, ",\"nextCursor\":")
-        mbuf_push_json_str(mut out, str_from_i64(end))
+        mbuf_push_str(mut out, ",\"nextCursor\":\"")
+        mbuf_push_i64(mut out, end)
+        mbuf_push(mut out, 34)
     }
     mbuf_push(mut out, 125)
     return ok(mbuf_finish(move out))
@@ -1280,8 +1778,9 @@ fn _mcp_list_templates_result(srv: McpServer, cursor: str) -> str ! i64 {
     }
     mbuf_push(mut out, 93)
     if end < total {
-        mbuf_push_str(mut out, ",\"nextCursor\":")
-        mbuf_push_json_str(mut out, str_from_i64(end))
+        mbuf_push_str(mut out, ",\"nextCursor\":\"")
+        mbuf_push_i64(mut out, end)
+        mbuf_push(mut out, 34)
     }
     mbuf_push(mut out, 125)
     return ok(mbuf_finish(move out))
@@ -1312,8 +1811,9 @@ fn _mcp_list_prompts_result(srv: McpServer, cursor: str) -> str ! i64 {
     }
     mbuf_push(mut out, 93)
     if end < total {
-        mbuf_push_str(mut out, ",\"nextCursor\":")
-        mbuf_push_json_str(mut out, str_from_i64(end))
+        mbuf_push_str(mut out, ",\"nextCursor\":\"")
+        mbuf_push_i64(mut out, end)
+        mbuf_push(mut out, 34)
     }
     mbuf_push(mut out, 125)
     return ok(mbuf_finish(move out))
@@ -1341,7 +1841,7 @@ fn _mcp_completion_result(srv: McpServer, params_json: str) -> str {
         mut i := 0
         while i < rc and count < 100 {
             cand := str_trim(str_split_at(csv, ranges, i))
-            if str_len(cand) > 0 and (str_len(prefix) == 0 or str_starts_with(cand, prefix)) {
+            if str_len(cand) > 0 and (str_len(prefix) == 0 or _mcp_sw(cand, prefix)) {
                 if count > 0 { mbuf_push(mut vals, 44) }
                 mbuf_push_json_str(mut vals, cand)
                 count += 1
@@ -1356,6 +1856,16 @@ fn _mcp_completion_result(srv: McpServer, params_json: str) -> str {
     return mbuf_finish(move vals)
 }
 
+fn _mcp_sync_list_cache(mut srv: McpServer) {
+    if srv.cached_gen != srv.list_gen {
+        srv.cached_tools_res = ""
+        srv.cached_res_res = ""
+        srv.cached_tpl_res = ""
+        srv.cached_prm_res = ""
+        srv.cached_gen = srv.list_gen
+    }
+}
+
 // Handles built-in MCP protocol messages (`initialize`, `ping`, `*/list`, static `resources/read`,
 // `logging/setLevel`, `completion/complete`, notifications, and unknown methods).
 // Returns `(true, response_json_or_empty)` if handled, or `(false, "")` for dynamic `tools/call`,
@@ -1364,7 +1874,7 @@ fn mcp_handle_builtin(mut srv: McpServer, req: McpRequest) -> (bool, str) {
     if not req.valid {
         return (true, mcp_err_resp(req.raw_id, mcp_err_invalid_request(), "Invalid JSON-RPC 2.0 request"))
     }
-    if str_starts_with(req.method, "notifications/") or req.is_notification {
+    if _mcp_sw(req.method, "notifications/") or req.is_notification {
         if str_eq(req.method, "notifications/initialized") {
             srv.initialized = true
         }
@@ -1372,24 +1882,56 @@ fn mcp_handle_builtin(mut srv: McpServer, req: McpRequest) -> (bool, str) {
     }
     if str_eq(req.method, "initialize") {
         cproto := mcp_json_get_str(req.params_json, "protocolVersion", srv.protocol_version)
-        return (true, mcp_ok_resp(req.raw_id, _mcp_build_initialize_result(srv, cproto)))
+        if str_len(srv.cached_init_res) == 0 or not str_eq(srv.cached_init_proto, cproto) {
+            srv.cached_init_res = _mcp_build_initialize_result(srv, cproto)
+            srv.cached_init_proto = cproto
+        }
+        return (true, mcp_ok_resp(req.raw_id, srv.cached_init_res))
     }
     if str_eq(req.method, "ping") {
         return (true, mcp_ok_resp(req.raw_id, "{}"))
     }
     if str_eq(req.method, "tools/list") {
+        if str_len(req.cursor) == 0 {
+            _mcp_sync_list_cache(mut srv)
+            if str_len(srv.cached_tools_res) == 0 {
+                srv.cached_tools_res = _mcp_list_tools_result(srv, "") or return (true, mcp_err_resp(req.raw_id, mcp_err_invalid_params(), "Invalid pagination cursor"))
+            }
+            return (true, mcp_ok_resp(req.raw_id, srv.cached_tools_res))
+        }
         res := _mcp_list_tools_result(srv, req.cursor) or return (true, mcp_err_resp(req.raw_id, mcp_err_invalid_params(), "Invalid pagination cursor"))
         return (true, mcp_ok_resp(req.raw_id, res))
     }
     if str_eq(req.method, "resources/list") {
+        if str_len(req.cursor) == 0 {
+            _mcp_sync_list_cache(mut srv)
+            if str_len(srv.cached_res_res) == 0 {
+                srv.cached_res_res = _mcp_list_resources_result(srv, "") or return (true, mcp_err_resp(req.raw_id, mcp_err_invalid_params(), "Invalid pagination cursor"))
+            }
+            return (true, mcp_ok_resp(req.raw_id, srv.cached_res_res))
+        }
         res := _mcp_list_resources_result(srv, req.cursor) or return (true, mcp_err_resp(req.raw_id, mcp_err_invalid_params(), "Invalid pagination cursor"))
         return (true, mcp_ok_resp(req.raw_id, res))
     }
     if str_eq(req.method, "resources/templates/list") {
+        if str_len(req.cursor) == 0 {
+            _mcp_sync_list_cache(mut srv)
+            if str_len(srv.cached_tpl_res) == 0 {
+                srv.cached_tpl_res = _mcp_list_templates_result(srv, "") or return (true, mcp_err_resp(req.raw_id, mcp_err_invalid_params(), "Invalid pagination cursor"))
+            }
+            return (true, mcp_ok_resp(req.raw_id, srv.cached_tpl_res))
+        }
         res := _mcp_list_templates_result(srv, req.cursor) or return (true, mcp_err_resp(req.raw_id, mcp_err_invalid_params(), "Invalid pagination cursor"))
         return (true, mcp_ok_resp(req.raw_id, res))
     }
     if str_eq(req.method, "prompts/list") {
+        if str_len(req.cursor) == 0 {
+            _mcp_sync_list_cache(mut srv)
+            if str_len(srv.cached_prm_res) == 0 {
+                srv.cached_prm_res = _mcp_list_prompts_result(srv, "") or return (true, mcp_err_resp(req.raw_id, mcp_err_invalid_params(), "Invalid pagination cursor"))
+            }
+            return (true, mcp_ok_resp(req.raw_id, srv.cached_prm_res))
+        }
         res := _mcp_list_prompts_result(srv, req.cursor) or return (true, mcp_err_resp(req.raw_id, mcp_err_invalid_params(), "Invalid pagination cursor"))
         return (true, mcp_ok_resp(req.raw_id, res))
     }
