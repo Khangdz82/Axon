@@ -124,6 +124,16 @@ struct JsStateStore {
     str_meta: IntBuf // slot 0 = count; then 3 ints per entry: [khash, off, len (-1 = deleted)]
 }
 
+fn js_state_free(move store: JsStateStore) {
+    buf_free(move store.map)
+    buf_free(move store.fn_names)
+    buf_free(move store.fn_bodies)
+    buf_free(move store.fn_params)
+    buf_free(move store.fn_meta)
+    buf_free(move store.str_pool)
+    buf_free(move store.str_meta)
+}
+
 fn js_state_new() -> JsStateStore {
     sm := ibuf_new(784) // slot 0 + up to 256 string vars * 3
     ibuf_push(sm, 0)
@@ -199,21 +209,35 @@ fn js_find_fn_params(store: JsStateStore, name: str) -> str {
 fn js_state_set_str(store: JsStateStore, key: str, val: str) {
     kh := fnv1a_64(key)
     vl := str_len(val)
-    if buf_len(store.str_pool) + vl >= 32700 { return }
-    off := buf_len(store.str_pool)
-    if vl > 0 { buf_push_str(store.str_pool, val) }
     cnt := ibuf_get(store.str_meta, 0)
     mut i := 0
     while i < cnt {
         b := 1 + i * 3
         if ibuf_get(store.str_meta, b) == kh {
+            old_off := ibuf_get(store.str_meta, b + 1)
+            old_len := ibuf_get(store.str_meta, b + 2)
+            // Reuse existing slot in-place when new string fits (eliminates 32KB pool exhaustion!)
+            if old_len >= 0 and vl <= old_len {
+                mut k := 0
+                while k < vl {
+                    buf_set(store.str_pool, old_off + k, str_byte(val, k))
+                    k += 1
+                }
+                ibuf_set(store.str_meta, b + 2, vl)
+                return
+            }
+            if buf_len(store.str_pool) + vl >= 32700 { return }
+            off := buf_len(store.str_pool)
+            if vl > 0 { buf_push_str(store.str_pool, val) }
             ibuf_set(store.str_meta, b + 1, off)
             ibuf_set(store.str_meta, b + 2, vl)
             return
         }
         i += 1
     }
-    if cnt >= 256 { return }
+    if cnt >= 256 or buf_len(store.str_pool) + vl >= 32700 { return }
+    off := buf_len(store.str_pool)
+    if vl > 0 { buf_push_str(store.str_pool, val) }
     ibuf_push(store.str_meta, kh)
     ibuf_push(store.str_meta, off)
     ibuf_push(store.str_meta, vl)
@@ -765,11 +789,47 @@ fn _js_apply_member_op(mut tree: DomTree, store: JsStateStore, elem_id: str, act
             else if str_eq(raw_prop, "borderRadius") { css_p = "border-radius" }
             else if str_eq(raw_prop, "fontWeight") { css_p = "font-weight" }
             else if str_eq(raw_prop, "textAlign") { css_p = "text-align" }
+            else if str_eq(raw_prop, "boxShadow") { css_p = "box-shadow" }
+            else if str_eq(raw_prop, "zIndex") { css_p = "z-index" }
+            else if str_eq(raw_prop, "lineHeight") { css_p = "line-height" }
+            else if str_eq(raw_prop, "minWidth") { css_p = "min-width" }
+            else if str_eq(raw_prop, "maxWidth") { css_p = "max-width" }
+            else if str_eq(raw_prop, "minHeight") { css_p = "min-height" }
+            else if str_eq(raw_prop, "maxHeight") { css_p = "max-height" }
+            else if str_eq(raw_prop, "backdropFilter") { css_p = "backdrop-filter" }
             idx := dom_find_by_id(tree, elem_id)
             if idx >= 0 and str_len(css_p) > 0 and _js_is_safe_css_val(css_p) {
                 cur_s := dom_get_style(tree, idx)
-                next_s := if str_len(cur_s) > 0 { cur_s + "; " + css_p + ": " + val } else { css_p + ": " + val }
-                return document_set_style(mut tree, elem_id, next_s)
+                // Deduplicate existing property so repeated `.style.color = ...` never grows unboundedly!
+                cn := str_len(cur_s)
+                if cn == 0 {
+                    dom_set_style(mut tree, idx, css_p + ": " + val)
+                } else {
+                    out := buf_new(cn + str_len(css_p) + str_len(val) + 16)
+                    mut sp := 0
+                    mut any_s := false
+                    while sp < cn {
+                        mut semi := str_find_byte(cur_s, 59, sp)
+                        if semi < 0 { semi = cn }
+                        decl := str_trim(str_slice(cur_s, sp, semi))
+                        col := str_find_byte(decl, 58, 0)
+                        if col > 0 {
+                            dp := str_trim(str_slice(decl, 0, col))
+                            if not str_eq(dp, css_p) {
+                                if any_s { buf_push_str(out, "; ") }
+                                buf_push_str(out, decl)
+                                any_s = true
+                            }
+                        }
+                        sp = semi + 1
+                    }
+                    if any_s { buf_push_str(out, "; ") }
+                    buf_push_str(out, css_p)
+                    buf_push_str(out, ": ")
+                    buf_push_str(out, val)
+                    dom_set_style(mut tree, idx, buf_to_owned_str(move out))
+                }
+                return true
             }
         }
     }
