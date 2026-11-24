@@ -1,0 +1,297 @@
+// Comprehensive End-to-End & Hostile Test Suite (`tests/pass/54_mcp_and_python_library.ax`)
+// Covers:
+//   1. `std::mcp` JSON-RPC 2.0 scoped parser (nested keys, escapes, \uXXXX, batches, notification vs null id)
+//   2. `McpSchema` builder, `McpToolResult` builders, RFC-6570 URI templates (`{var}` & `{+var}`)
+//   3. `McpServer` full lifecycle, pagination, static resource updates, subscriptions, logging, completions
+//   4. `McpClient` request construction & response extraction, Streamable HTTP + SSE + Origin DNS-rebinding guard
+//   5. `std::mcp_python` deep Python `.py`/`.pyi`/`METADATA`/`pyproject.toml` indexing, Google/NumPy/Sphinx docstrings,
+//      `inspect.signature` params (`/`, `*`, `*args`, `**kwargs`), Type Hint -> JSON Schema (`Annotated`, `Enum`, `BaseModel`, `Literal`),
+//      FastMCP decorator extraction, class hierarchy, cross-module references, Axon stub generator & 10-tool `PyMcpServer`.
+
+use std::str
+use std::ds
+use std::fs
+use std::path
+use std::sys
+use std::mcp
+use std::mcp_python
+
+fn fail_54(code: i64) {
+    println(f"FAIL_54 code={code}")
+    assert(false)
+}
+
+fn test_mcp_json_and_schema() {
+    // Scoped depth-1 parser must NOT confuse outer `"name"` with nested `"name"`
+    doc := "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"method\":\"tools/call\",\"params\":{\"name\":\"outer_tool\",\"arguments\":{\"name\":\"inner_arg\",\"msg\":\"line1\\n\\\"q\\\" \\u0041\",\"count\":42,\"ok\":true,\"tags\":[\"alpha\",\"beta\"]}}}"
+    if not str_eq(mcp_json_get_str(doc, "method", ""), "tools/call") { fail_54(101) }
+    if not str_eq(mcp_json_get_raw_id(doc), "\"req-1\"") { fail_54(102) }
+    params := mcp_json_get_raw(doc, "params")
+    if not str_eq(mcp_json_get_str(params, "name", ""), "outer_tool") { fail_54(103) }
+    args := mcp_json_get_raw(params, "arguments")
+    if not str_eq(mcp_json_get_str(args, "name", ""), "inner_arg") { fail_54(104) }
+    if not str_eq(mcp_json_get_str(args, "msg", ""), "line1\n\"q\" A") { fail_54(105) }
+    if mcp_json_get_i64(args, "count", 0) != 42 { fail_54(106) }
+    if not mcp_json_get_bool(args, "ok", false) { fail_54(107) }
+    tags := mcp_json_get_str_array(args, "tags")
+    if svec_len(tags) != 2 or not str_eq(svec_get(tags, 0), "alpha") or not str_eq(svec_get(tags, 1), "beta") { fail_54(108) }
+    svec_free(move tags)
+
+    // Notification (`id` absent) vs explicit `"id": null`
+    if str_len(mcp_json_get_raw_id("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")) != 0 { fail_54(109) }
+    if not str_eq(mcp_json_get_raw_id("{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\"}"), "null") { fail_54(110) }
+
+    // JSON Schema builder
+    mut sc := mcp_schema_new(false)
+    mcp_schema_add_str(mut sc, "query", "Search query", true, "", false)
+    mcp_schema_add_int(mut sc, "limit", "Max rows", false, 10, true, 1, 100, true)
+    mut modes := svec_new(4, 32)
+    svec_push(mut modes, "fast"); svec_push(mut modes, "deep")
+    mcp_schema_add_enum(mut sc, "mode", "Execution mode", modes, false, "fast", true)
+    svec_free(move modes)
+    mcp_schema_add_bool(mut sc, "strict", "Strict match", false, false, true)
+    mcp_schema_add_str_array(mut sc, "filters", "Optional filters", false)
+    schema_json := mcp_schema_finish(move sc)
+    if not str_contains(schema_json, "\"required\":[\"query\"]") { fail_54(111) }
+    if not str_contains(schema_json, "\"minimum\":1,\"maximum\":100") { fail_54(112) }
+    if not str_contains(schema_json, "\"enum\":[\"fast\",\"deep\"]") { fail_54(113) }
+
+    // Multi-content tool result builder
+    mut res := mcp_result_new(false)
+    mcp_result_add_text(mut res, "done")
+    mcp_result_add_resource_link(mut res, "pylib://pkg/mod", "mod", "Module source", "text/x-python")
+    mcp_result_set_structured(mut res, "{\"ok\":true}")
+    res_json := mcp_result_finish(move res)
+    if not str_contains(res_json, "\"structuredContent\":{\"ok\":true}") { fail_54(114) }
+    if not str_contains(res_json, "\"type\":\"resource_link\"") { fail_54(115) }
+}
+
+fn test_mcp_uri_templates_and_server_protocol() {
+    tpl := "pylib://{package}/module/{module}"
+    if not mcp_uri_match(tpl, "pylib://requests/module/requests.api") { fail_54(201) }
+    if mcp_uri_match(tpl, "pylib://requests/other/requests.api") { fail_54(202) }
+    if mcp_uri_match(tpl, "pylib://requests/module/a/b") { fail_54(203) } // single-seg `{module}` rejects '/'
+    if not str_eq(mcp_uri_param(tpl, "pylib://requests/module/requests.api", "package", ""), "requests") { fail_54(204) }
+    if not str_eq(mcp_uri_param(tpl, "pylib://requests/module/requests.api", "module", ""), "requests.api") { fail_54(205) }
+
+    // `{+path}` matches across '/'
+    ftpl := "file:///{+path}"
+    if not mcp_uri_match(ftpl, "file:///src/pkg/mod.py") { fail_54(206) }
+    if not str_eq(mcp_uri_param(ftpl, "file:///src/pkg/mod.py", "path", ""), "src/pkg/mod.py") { fail_54(207) }
+
+    // McpServer lifecycle + pagination + static resources + completions + logging
+    mut srv := mcp_server_new("demo-mcp", "1.2.3", "Demo instructions")
+    mcp_server_set_page_size(mut srv, 2)
+    _ := mcp_add_tool(mut srv, "t1", "Tool 1", "{\"type\":\"object\"}")
+    _ := mcp_add_tool(mut srv, "t2", "Tool 2", "{\"type\":\"object\"}")
+    _ := mcp_add_tool(mut srv, "t3", "Tool 3", "{\"type\":\"object\"}")
+    _ := mcp_add_resource(mut srv, "config://app", "app_cfg", "App config", "application/json", "{\"v\":1}", true)
+    _ := mcp_add_prompt(mut srv, "review", "Review code", "[]")
+    mcp_register_completion(mut srv, "ref/prompt:review", "lang", "python, axon, rust")
+
+    mut cli := mcp_client_new("test-cli", "0.1.0")
+    init_req := mcp_parse_request(mcp_client_req_initialize(mut cli))
+    (h1, r1) := mcp_handle_builtin(mut srv, init_req)
+    if not h1 or not mcp_client_resp_ok(r1) or not str_contains(r1, "\"name\":\"demo-mcp\"") { fail_54(208) }
+
+    (h_notif, r_notif) := mcp_handle_builtin(mut srv, mcp_parse_request(mcp_client_notif_initialized()))
+    if not h_notif or str_len(r_notif) != 0 or not srv.initialized { fail_54(209) }
+
+    // Page 1 (`t1`, `t2` + `nextCursor: "2"`)
+    (_, lt1) := mcp_handle_builtin(mut srv, mcp_parse_request(mcp_client_req_tools_list(mut cli, "")))
+    names1 := mcp_client_extract_tool_names(lt1)
+    if svec_len(names1) != 2 or not str_eq(svec_get(names1, 0), "t1") { fail_54(210) }
+    svec_free(move names1)
+    next_c := mcp_json_get_str(mcp_client_resp_result(lt1), "nextCursor", "")
+    if not str_eq(next_c, "2") { fail_54(211) }
+
+    // Page 2 (`t3`, no `nextCursor`)
+    (_, lt2) := mcp_handle_builtin(mut srv, mcp_parse_request(mcp_client_req_tools_list(mut cli, next_c)))
+    names2 := mcp_client_extract_tool_names(lt2)
+    if svec_len(names2) != 1 or not str_eq(svec_get(names2, 0), "t3") { fail_54(212) }
+    svec_free(move names2)
+
+    // Static resource read & override update
+    (_, rr1) := mcp_handle_builtin(mut srv, mcp_parse_request(mcp_client_req_resource_read(mut cli, "config://app")))
+    if not str_contains(rr1, "\\\"v\\\":1") { fail_54(213) }
+    if not mcp_update_resource_text(mut srv, "config://app", "{\"v\":2}") { fail_54(214) }
+    (_, rr2) := mcp_handle_builtin(mut srv, mcp_parse_request(mcp_client_req_resource_read(mut cli, "config://app")))
+    if not str_contains(rr2, "\\\"v\\\":2") { fail_54(215) }
+
+    // Subscriptions & logging
+    (_, sub_r) := mcp_handle_builtin(mut srv, mcp_parse_request("{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"config://app\"}}"))
+    if not mcp_client_resp_ok(sub_r) or not mcp_is_subscribed(srv, "config://app") { fail_54(216) }
+    (_, log_r) := mcp_handle_builtin(mut srv, mcp_parse_request("{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"logging/setLevel\",\"params\":{\"level\":\"warning\"}}"))
+    if not mcp_client_resp_ok(log_r) or mcp_should_log(srv, "info") or not mcp_should_log(srv, "error") { fail_54(217) }
+
+    // Completion filtering
+    (_, comp_r) := mcp_handle_builtin(mut srv, mcp_parse_request("{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"completion/complete\",\"params\":{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"review\"},\"argument\":{\"name\":\"lang\",\"value\":\"py\"}}}"))
+    if not str_contains(comp_r, "\"python\"") or str_contains(comp_r, "\"axon\"") { fail_54(218) }
+
+    // Unknown tool & unknown method error codes
+    (_, bad_t) := mcp_handle_builtin(mut srv, mcp_parse_request(mcp_client_req_tool_call(mut cli, "nope", "{}")))
+    if mcp_client_resp_ok(bad_t) or not str_contains(bad_t, "-32602") { fail_54(219) }
+    (_, bad_m) := mcp_handle_builtin(mut srv, mcp_parse_request("{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"unknown/op\"}"))
+    if mcp_client_resp_ok(bad_m) or not str_contains(bad_m, "-32601") { fail_54(220) }
+
+    mcp_server_free(move srv)
+}
+
+fn _write_python_fixture(root: str) {
+    pkg_dir := path_join(root, "sample_pylib")
+    sub_dir := path_join(pkg_dir, "sub")
+    dist_dir := path_join(root, "sample_pylib-2.4.0.dist-info")
+    _ := fs_mkdir_all(sub_dir)
+    _ := fs_mkdir_all(dist_dir)
+
+    pyp := "[project]\nname = \"sample_pylib\"\nversion = \"2.4.0\"\ndescription = \"Sample Python library for MCP introspection\"\nrequires-python = \">=3.10\"\ndependencies = [\n  \"pydantic>=2.0\",\n  \"httpx>=0.27\",\n]\n"
+    _ := fs_write_text(path_join(root, "pyproject.toml"), pyp)
+
+    meta := "Metadata-Version: 2.1\nName: sample_pylib\nVersion: 2.4.0\nSummary: Sample Python library for MCP introspection\nAuthor: Axon Test\nLicense: MIT\nRequires-Python: >=3.10\nRequires-Dist: pydantic>=2.0\nRequires-Dist: httpx>=0.27\n\nLong description body\n"
+    _ := fs_write_text(path_join(dist_dir, "METADATA"), meta)
+
+    init_py := "\"\"\"Sample Python package root.\"\"\"\n\nfrom .models import SearchMode, SearchConfig\nfrom .server import search_items, AsyncClient\n\n__version__ = \"2.4.0\"\n__all__ = [\n    \"SearchMode\",\n    \"SearchConfig\",\n    \"search_items\",\n    \"AsyncClient\",\n]\n"
+    _ := fs_write_text(path_join(pkg_dir, "__init__.py"), init_py)
+
+    models_py := "\"\"\"Data models and enums.\"\"\"\n\nfrom dataclasses import dataclass\nfrom enum import Enum\nfrom typing import Annotated, Literal\nfrom pydantic import BaseModel, Field\n\n\nclass SearchMode(Enum):\n    \"\"\"Supported search modes.\"\"\"\n    FAST = \"fast\"\n    DEEP = \"deep\"\n\n\nclass BaseRecord(BaseModel):\n    id: int  # Unique identifier\n\n\n@dataclass(frozen=True)\nclass SearchConfig(BaseRecord):\n    \"\"\"Immutable search configuration.\"\"\"\n    query: str\n    max_hits: int = 20\n    tags: list[str] = []\n\n    def is_large(self) -> bool:\n        return self.max_hits > 50\n"
+    _ := fs_write_text(path_join(pkg_dir, "models.py"), models_py)
+
+    server_py := "\"\"\"MCP tools and async client.\"\"\"\n\nfrom typing import Annotated, Literal, Optional\nfrom .models import SearchMode, SearchConfig\n\nDEFAULT_TIMEOUT: int = 30\n\n@mcp.tool(\n    name=\"search_items\",\n    description=\"Search indexed records with ranking\"\n)\ndef search_items(\n    query: Annotated[str, Field(description=\"Search text\", min_length=2)],\n    /,\n    limit: Annotated[int, Field(description=\"Max results\", ge=1, le=100)] = 10,\n    *,\n    mode: Literal[\"fast\", \"accurate\"] = \"fast\",\n    config: Optional[SearchConfig] = None,\n    **extra: str,\n) -> dict[str, list[str]]:\n    \"\"\"Search items in library.\n\n    Args:\n        query: Text query string.\n        mode: Ranking mode.\n\n    Returns:\n        Matching items keyed by category.\n\n    Raises:\n        ValueError: When query is blank.\n    \"\"\"\n    sample = \"\"\"\ndef fake_inside_string(x: int) -> None:\n    pass\n\"\"\"\n    return {\"items\": [query]}\n\n\n@mcp.resource(\"repo://{owner}/{repo}\", mime_type=\"application/json\")\ndef read_repo(owner: str, repo: str) -> str:\n    \"\"\"Read repository metadata.\"\"\"\n    return \"{}\"\n\n\n@mcp.prompt(description=\"Analyze Python function\")\ndef analyze_fn(symbol: str) -> str:\n    return symbol\n\n\nclass AsyncClient:\n    \"\"\"Async API client.\"\"\"\n\n    async def fetch(\n        self,\n        url: str,\n        retries: int = 3,\n    ) -> bytes | None:\n        \"\"\"Fetch payload.\n\n        Parameters\n        ----------\n        url : str\n            Target URL to fetch.\n        retries : int\n            Retry attempts.\n        \"\"\"\n        return None\n\n    def close(self) -> None:\n        \"\"\"Close transport.\n\n        :param self: client instance\n        :return: nothing\n        \"\"\"\n        pass\n"
+    _ := fs_write_text(path_join(pkg_dir, "server.py"), server_py)
+
+    sub_init := "\"\"\"Subpackage init.\"\"\"\n"
+    _ := fs_write_text(path_join(sub_dir, "__init__.py"), sub_init)
+
+    stub_pyi := "\"\"\"Compiled extension type stub.\"\"\"\n\ndef fast_hash(data: bytes, seed: int = 0) -> int:\n    ...\n"
+    _ := fs_write_text(path_join(sub_dir, "native_ext.pyi"), stub_pyi)
+}
+
+fn test_python_deep_introspection_and_mcp_server() {
+    nonce := (clock_ns() ^ cpu_rdtsc()) & 0x7FFFFFFF
+    root := path_join(fs_temp_dir(), f"axon_mcp_py_test_{sys_pid()}_{nonce}")
+    _write_python_fixture(root)
+
+    mut pm := py_mcp_server_new("pylib-test-mcp", "1.0.0")
+    files_indexed := py_mcp_add_dir(mut pm, path_join(root, "sample_pylib"), "sample_pylib", 200)
+    if files_indexed < 5 { fail_54(301) }
+
+    // 1. Initialize & list all 10 tools + resources + templates + prompts
+    init_r := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\"}}")
+    if not str_contains(init_r, "\"serverInfo\":{\"name\":\"pylib-test-mcp\"") { fail_54(302) }
+    tools_r := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}")
+    tnames := mcp_client_extract_tool_names(tools_r)
+    if svec_len(tnames) != 10 { fail_54(303) }
+    if not svec_contains(tnames, "py_get_symbol") or not svec_contains(tnames, "py_generate_axon_stub") { fail_54(304) }
+    svec_free(move tnames)
+
+    // 2. Packages & modules (including .pyi stub + METADATA version 2.4.0)
+    pkgs_r := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"py_list_packages\",\"arguments\":{}}}")
+    pkgs_txt := mcp_client_extract_tool_text(pkgs_r)
+    if not str_contains(pkgs_txt, "\"version\":\"2.4.0\"") { fail_54(305) }
+
+    mods_r := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"py_list_modules\",\"arguments\":{\"package\":\"sample_pylib\"}}}")
+    mods_txt := mcp_client_extract_tool_text(mods_r)
+    if not str_contains(mods_txt, "\"sample_pylib.sub.native_ext\"") or not str_contains(mods_txt, "\"isStub\":true") { fail_54(306) }
+
+    // 3. Inspect module: verify __all__, imports, constants, and fake_inside_string NOT parsed!
+    ins_r := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"py_inspect_module\",\"arguments\":{\"module\":\"sample_pylib.server\"}}}")
+    ins_txt := mcp_client_extract_tool_text(ins_r)
+    if str_contains(ins_txt, "fake_inside_string") { fail_54(307) }
+    if not str_contains(ins_txt, "\"DEFAULT_TIMEOUT\"") or not str_contains(ins_txt, "\"AsyncClient\"") { fail_54(308) }
+
+    init_ins := py_inspect_module_json(pm.idx, "sample_pylib", false)
+    if not str_contains(init_ins, "SearchMode,SearchConfig,search_items,AsyncClient") { fail_54(309) }
+
+    // 4. Deep symbol inspection: positional-only `/`, kw-only `*`, **kwargs, Google docstrings, Annotated JSON Schema!
+    sym_r := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"py_get_symbol\",\"arguments\":{\"symbol\":\"sample_pylib.server.search_items\",\"include_source\":true}}}")
+    sym_txt := mcp_client_extract_tool_text(sym_r)
+    if not str_contains(sym_txt, "\"POSITIONAL_ONLY\"") or not str_contains(sym_txt, "\"KEYWORD_ONLY\"") or not str_contains(sym_txt, "\"VAR_KEYWORD\"") { fail_54(310) }
+    if not str_contains(sym_txt, "\"Text query string.\"") or not str_contains(sym_txt, "\"Matching items keyed by category.\"") { fail_54(311) }
+    if not str_contains(sym_txt, "\"minimum\":1,\"maximum\":100") or not str_contains(sym_txt, "\"minLength\":2") { fail_54(312) }
+    if not str_contains(sym_txt, "\"enum\":[\"fast\",\"accurate\"]") { fail_54(313) }
+    if not str_contains(sym_txt, "\"additionalProperties\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}") { fail_54(314) }
+    if not str_contains(sym_txt, "@mcp.tool(") { fail_54(315) }
+
+    // 5. NumPy docstring on async method `AsyncClient.fetch` + union `bytes | None`
+    fetch_txt := py_get_symbol_json(pm.idx, "sample_pylib.server.AsyncClient.fetch", true)
+    if not str_contains(fetch_txt, "\"isAsync\":true") { fail_54(316) }
+    if not str_contains(fetch_txt, "\"Target URL to fetch.\"") { fail_54(317) }
+    if not str_contains(fetch_txt, "\"anyOf\":[{\"type\":\"string\",\"format\":\"byte\"},{\"type\":\"null\"}]") { fail_54(318) }
+
+    // 6. Type Hint resolution of indexed Enum & dataclass
+    enum_sc := py_type_to_json_schema_indexed(pm.idx, "SearchMode", "Search mode", "", false, 0)
+    if not str_contains(enum_sc, "\"enum\":[\"fast\",\"deep\"]") { fail_54(319) }
+    dc_sc := py_type_to_json_schema_indexed(pm.idx, "SearchConfig", "", "", false, 0)
+    if not str_contains(dc_sc, "\"max_hits\":{\"type\":\"integer\"") or not str_contains(dc_sc, "\"required\":[\"query\"]") { fail_54(320) }
+
+    // 7. Search symbols, class hierarchy & cross-module references
+    srch_r := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"py_search_symbols\",\"arguments\":{\"query\":\"SearchConfig\",\"kind\":\"dataclass\"}}}")
+    srch_txt := mcp_client_extract_tool_text(srch_r)
+    if not str_contains(srch_txt, "\"sample_pylib.models.SearchConfig\"") { fail_54(321) }
+
+    hier_r := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"py_get_class_hierarchy\",\"arguments\":{\"class_name\":\"SearchConfig\"}}}")
+    hier_txt := mcp_client_extract_tool_text(hier_r)
+    if not str_contains(hier_txt, "\"qname\":\"sample_pylib.models.BaseRecord\"") or not str_contains(hier_txt, "\"is_large\"") { fail_54(322) }
+
+    refs_r := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"py_find_references\",\"arguments\":{\"symbol\":\"SearchConfig\"}}}")
+    refs_txt := mcp_client_extract_tool_text(refs_r)
+    if not str_contains(refs_txt, "\"sample_pylib\"") or not str_contains(refs_txt, "\"sample_pylib.server\"") { fail_54(323) }
+
+    // 8. Source line reader (`py_get_source`)
+    src_r := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"py_get_source\",\"arguments\":{\"module\":\"sample_pylib.sub.native_ext\",\"start_line\":1,\"end_line\":5,\"numbered\":true}}}")
+    src_txt := mcp_client_extract_tool_text(src_r)
+    if not str_contains(src_txt, "3: def fast_hash(") { fail_54(324) }
+
+    // 9. FastMCP manifest extraction & Axon MCP stub generation
+    man_r := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"py_generate_mcp_manifest\",\"arguments\":{\"target\":\"sample_pylib.server\",\"only_decorated\":true}}}")
+    man_txt := mcp_client_extract_tool_text(man_r)
+    if not str_contains(man_txt, "\"uriTemplate\":\"repo://{owner}/{repo}\"") or not str_contains(man_txt, "\"name\":\"analyze_fn\"") { fail_54(325) }
+
+    stub_r := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"py_generate_axon_stub\",\"arguments\":{\"target\":\"sample_pylib.server\",\"only_decorated\":true}}}")
+    stub_txt := mcp_client_extract_tool_text(stub_r)
+    if not str_contains(stub_txt, "use std::mcp") or not str_contains(stub_txt, "mcp_add_tool(mut srv, \"search_items\"") { fail_54(326) }
+
+    // 10. MCP Resources & Templates & Prompts over `PyMcpServer`
+    r_mod := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"resources/read\",\"params\":{\"uri\":\"pylib://sample_pylib/module/sample_pylib.sub.native_ext\"}}")
+    if not str_contains(r_mod, "def fast_hash") { fail_54(327) }
+    r_meta := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"resources/read\",\"params\":{\"uri\":\"pylib://sample_pylib/metadata\"}}")
+    if not str_contains(r_meta, "2.4.0") or not str_contains(r_meta, "MIT") { fail_54(328) }
+    p_res := py_mcp_handle_line(mut pm, "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"prompts/get\",\"params\":{\"name\":\"explain_python_api\",\"arguments\":{\"symbol\":\"sample_pylib.server.search_items\"}}}")
+    if not str_contains(p_res, "Search items in library") { fail_54(329) }
+
+    // 11. HTTP / SSE / Batch / Origin Security (DNS-rebinding guard)
+    bad_orig := py_mcp_handle_http(mut pm, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nOrigin: https://evil.attacker.com\r\nContent-Length: 2\r\n\r\n{}")
+    if not str_starts_with(bad_orig, "HTTP/1.1 403") { fail_54(330) }
+
+    batch_body := "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"},{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}]"
+    good_batch := py_mcp_handle_http(mut pm, f"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nOrigin: http://localhost:3000\r\nContent-Type: application/json\r\nContent-Length: {str_len(batch_body)}\r\n\r\n{batch_body}")
+    if not str_starts_with(good_batch, "HTTP/1.1 200") or not str_contains(good_batch, "Mcp-Session-Id:") or not str_contains(good_batch, "[{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}]") { fail_54(331) }
+
+    sse_resp := py_mcp_handle_http(mut pm, "GET /sse HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n")
+    if not str_starts_with(sse_resp, "HTTP/1.1 200") or not str_contains(sse_resp, "event: endpoint") { fail_54(332) }
+
+    // 10b. Re-export resolution through `__init__.py` (`sample_pylib.search_items` & `sample_pylib.SearchConfig`)
+    reexp_fn := py_get_symbol_json(pm.idx, "sample_pylib.search_items", false)
+    if not str_contains(reexp_fn, "\"qname\":\"sample_pylib.server.search_items\"") { fail_54(333) }
+    reexp_cls := py_get_class_hierarchy_json(pm.idx, "sample_pylib.SearchConfig")
+    if not str_contains(reexp_cls, "\"class\":\"sample_pylib.models.SearchConfig\"") { fail_54(334) }
+
+    py_mcp_server_free(move pm)
+
+    // Clean up temporary fixture files
+    _ := sys_fs_remove(path_join(root, "sample_pylib/sub/native_ext.pyi"))
+    _ := sys_fs_remove(path_join(root, "sample_pylib/sub/__init__.py"))
+    _ := sys_fs_remove(path_join(root, "sample_pylib/models.py"))
+    _ := sys_fs_remove(path_join(root, "sample_pylib/server.py"))
+    _ := sys_fs_remove(path_join(root, "sample_pylib/__init__.py"))
+    _ := sys_fs_remove(path_join(root, "sample_pylib-2.4.0.dist-info/METADATA"))
+    _ := sys_fs_remove(path_join(root, "pyproject.toml"))
+}
+
+fn main() -> i32 {
+    test_mcp_json_and_schema()
+    test_mcp_uri_templates_and_server_protocol()
+    test_python_deep_introspection_and_mcp_server()
+    println("  [54] std::mcp + std::mcp_python (JSON-RPC 2.0, FastMCP, AST/Inspect/Docstring/Schema, HTTP/SSE) verified")
+    return 0
+}
