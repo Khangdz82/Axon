@@ -1405,16 +1405,18 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
                 }
                 mc_b3(c, 0x4C, 0x89, 0xD8)             // MOV RAX, R11
                 mc_b1(c, 0xC3)                         // RET
-                // Cold multithreaded spinlock path
+                // Cold multithreaded TTAS spinlock path
                 mc_patch_jcc8(c, jnz_mt, buf_len(c))
                 sp_a := buf_len(c)
+                mc_b4(c, 0x41, 0x83, 0x3A, 0x00)       // CMP DWORD PTR [R10], 0
+                jz_try_a := mc_jcc8(c, 0x74)
+                mc_b2(c, 0xF3, 0x90)                   // PAUSE
+                jmp_spa := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_spa, sp_a)
+                mc_patch_jcc8(c, jz_try_a, buf_len(c))
                 mc_b1(c, 0xBA); mc_u32(c, 1)           // MOV EDX, 1
                 mc_b3(c, 0x41, 0x87, 0x12)             // XCHG [R10], EDX
                 mc_b2(c, 0x85, 0xD2)                   // TEST EDX, EDX
-                jz_la := mc_jcc8(c, 0x74)
-                mc_b2(c, 0xF3, 0x90)                   // PAUSE
-                jmp_spa := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_spa, sp_a)
-                mc_patch_jcc8(c, jz_la, buf_len(c))
+                jnz_retry_a := mc_jcc8(c, 0x75); mc_patch_jcc8(c, jnz_retry_a, sp_a)
                 mc_b4(c, 0x4F, 0x8B, 0x1C, 0xC2)       // MOV R11, [R10 + R8*8]
                 mc_b3(c, 0x4D, 0x85, 0xDB)             // TEST R11, R11
                 jz_miss_mt := mc_jcc8(c, 0x74)
@@ -1488,7 +1490,9 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
                 mc_b1(c, 0xC3)
             } else if osm == 2 or osm == 3 {
                 mc_b2(c, 0x56, 0x57) // preserve RSI, RDI
-                mc_b3(c, 0x48, 0x89, 0xCE) // RSI = size
+                mc_b4(c, 0x48, 0x83, 0xC1, 0x40) // ADD RCX, 64 (reserve metadata header)
+                js_mmap_ovf := mc_jcc8(c, 0x78)  // guard signed wraparound
+                mc_b3(c, 0x48, 0x89, 0xCE) // RSI = size + 64
                 mc_b2(c, 0x31, 0xFF)       // RDI = NULL
                 mc_b1(c, 0xBA); mc_u32(c, 3) // PROT_READ | PROT_WRITE
                 mc_b3(c, 0x49, 0xC7, 0xC2)
@@ -1500,9 +1504,20 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
                 mc_b2(c, 0x0F, 0x05)
                 // Normalize Linux/macOS `-errno` (`-4095..-1`) to NULL (`0`)
                 mc_b2(c, 0x48, 0x3D); mc_u32(c, 0xFFFFF000) // CMP RAX, -4096
-                jb_mok := mc_jcc8(c, 0x72)
+                jae_mfail := mc_jcc8(c, 0x73)
+                mc_b3(c, 0x48, 0x85, 0xC0) // TEST RAX, RAX
+                jz_mfail := mc_jcc8(c, 0x74)
+                // Store `[RAX+48] = mapped_len`, `[RAX+40] = 1 (live)`, return `RAX + 64`
+                mc_b4(c, 0x48, 0x89, 0x70, 0x30) // MOV [RAX + 48], RSI
+                mc_b4(c, 0x48, 0xC7, 0x40, 0x28); mc_u32(c, 1) // MOV QWORD PTR [RAX + 40], 1
+                mc_b4(c, 0x48, 0x83, 0xC0, 0x40) // ADD RAX, 64
+                mc_b2(c, 0x5F, 0x5E)
+                mc_b1(c, 0xC3)
+                mfail_off := buf_len(c)
+                mc_patch_jcc8(c, js_mmap_ovf, mfail_off)
+                mc_patch_jcc8(c, jae_mfail, mfail_off)
+                mc_patch_jcc8(c, jz_mfail, mfail_off)
                 mc_b2(c, 0x31, 0xC0) // XOR EAX, EAX
-                mc_patch_jcc8(c, jb_mok, buf_len(c))
                 mc_b2(c, 0x5F, 0x5E)
                 mc_b1(c, 0xC3)
             } else {
@@ -1535,18 +1550,27 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
         if osm <= 1 {
             mc_b3(c, 0xF6, 0xC1, 0x3F)       // TEST CL, 63 (verify 64B alignment)
             jnz_bad := mc_jcc32(c, 0x85)
-            // Double-free guard: require `[RCX - 24] == 1`, then immediately clear to 0
+            cg_lea_rax_data(cg, data_off_slab_lock())
+            mc_b3(c, 0x49, 0x89, 0xC2)       // MOV R10, RAX
+            // Double-free guard: fast check in ST mode, atomic XCHG in MT mode
+            mc_b4(c, 0x41, 0x80, 0x7A, 0x04); mc_b1(c, 0x00) // CMP BYTE PTR [R10 + 4], 0
+            jnz_df_mt := mc_jcc8(c, 0x75)
             mc_b4(c, 0x48, 0x83, 0x79, 0xE8); mc_b1(c, 0x01) // CMP QWORD PTR [RCX - 24], 1
             jne_df := mc_jcc32(c, 0x85)
             mc_b4(c, 0x48, 0xC7, 0x41, 0xE8); mc_u32(c, 0) // MOV QWORD PTR [RCX - 24], 0
+            jmp_df_ok := mc_jcc8(c, 0xEB)
+            mc_patch_jcc8(c, jnz_df_mt, buf_len(c))
+            mc_b2(c, 0x31, 0xC0)             // XOR EAX, EAX
+            mc_b4(c, 0x48, 0x87, 0x41, 0xE8) // XCHG [RCX - 24], RAX (implicit LOCK)
+            mc_b4(c, 0x48, 0x83, 0xF8, 0x01) // CMP RAX, 1
+            jne_df_mt := mc_jcc32(c, 0x85)
+            mc_patch_jcc8(c, jmp_df_ok, buf_len(c))
             // Return slab-sized blocks (`1 <= tag <= 8`) to freelist (cap 64/class)
             mc_b4(c, 0x4C, 0x8B, 0x41, 0xF0) // MOV R8, [RCX - 16] (class_tag)
             mc_b3(c, 0x4D, 0x85, 0xC0)
             jz_osfree := mc_jcc8(c, 0x74)
             mc_b4(c, 0x49, 0x83, 0xF8, 0x08) // CMP R8, 8
             ja_osfree := mc_jcc8(c, 0x77)
-            cg_lea_rax_data(cg, data_off_slab_lock())
-            mc_b3(c, 0x49, 0x89, 0xC2)       // MOV R10, RAX
             mc_b4(c, 0x41, 0x80, 0x7A, 0x04); mc_b1(c, 0x00) // CMP BYTE PTR [R10 + 4], 0 (mt_active)
             jnz_mt_f := mc_jcc8(c, 0x75)
             // Single-threaded zero-atomic freelist push!
@@ -1557,16 +1581,18 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
             mc_b4(c, 0x4B, 0x89, 0x0C, 0xC2) // MOV [R10 + R8*8], RCX
             mc_b4(c, 0x4B, 0xFF, 0x44, 0xC2); mc_b1(c, 0x40) // INC QWORD PTR [R10 + R8*8 + 64]
             mc_b1(c, 0xC3)                   // RET
-            // Cold multithreaded spinlock path
+            // Cold multithreaded TTAS spinlock path
             mc_patch_jcc8(c, jnz_mt_f, buf_len(c))
             sp_f := buf_len(c)
+            mc_b4(c, 0x41, 0x83, 0x3A, 0x00) // CMP DWORD PTR [R10], 0
+            jz_try_f := mc_jcc8(c, 0x74)
+            mc_b2(c, 0xF3, 0x90)
+            jmp_spf := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_spf, sp_f)
+            mc_patch_jcc8(c, jz_try_f, buf_len(c))
             mc_b1(c, 0xBA); mc_u32(c, 1)
             mc_b3(c, 0x41, 0x87, 0x12)       // XCHG [R10], EDX
             mc_b2(c, 0x85, 0xD2)
-            jz_lf := mc_jcc8(c, 0x74)
-            mc_b2(c, 0xF3, 0x90)
-            jmp_spf := mc_jcc8(c, 0xEB); mc_patch_jcc8(c, jmp_spf, sp_f)
-            mc_patch_jcc8(c, jz_lf, buf_len(c))
+            jnz_retry_f := mc_jcc8(c, 0x75); mc_patch_jcc8(c, jnz_retry_f, sp_f)
             mc_b4(c, 0x4B, 0x83, 0x7C, 0xC2); mc_b2(c, 0x40, 0x40) // CMP QWORD PTR [R10 + R8*8 + 64], 64
             jae_full := mc_jcc8(c, 0x73)
             mc_b4(c, 0x4B, 0x8B, 0x14, 0xC2) // MOV RDX, [R10 + R8*8]
@@ -1600,6 +1626,23 @@ fn emit_v7_core_helpers_used(cg: CodegenCtx) {
             mc_b4(c, 0x48, 0x89, 0xEC, 0x5D)
             mc_patch_rel32(c, jnz_bad, buf_len(c))
             mc_patch_rel32(c, jne_df, buf_len(c))
+            mc_patch_rel32(c, jne_df_mt, buf_len(c))
+        } else if osm == 2 or osm == 3 {
+            mc_b3(c, 0xF6, 0xC1, 0x3F)       // TEST CL, 63 (verify 64B alignment)
+            jnz_ubad := mc_jcc8(c, 0x75)
+            mc_b2(c, 0x31, 0xC0)             // XOR EAX, EAX
+            mc_b4(c, 0x48, 0x87, 0x41, 0xE8) // XCHG [RCX - 24], RAX (atomic double-free guard)
+            mc_b4(c, 0x48, 0x83, 0xF8, 0x01) // CMP RAX, 1
+            jne_udf := mc_jcc8(c, 0x75)
+            mc_b2(c, 0x56, 0x57)             // preserve RSI, RDI
+            mc_b4(c, 0x48, 0x8B, 0x71, 0xF0) // MOV RSI, [RCX - 16] (mapped_len)
+            mc_b4(c, 0x48, 0x8D, 0x79, 0xC0) // LEA RDI, [RCX - 64] (base mmap ptr)
+            mc_b1(c, 0xB8)
+            if osm == 2 { mc_u32(c, 11) } else { mc_u32(c, 0x2000049) } // SYS_munmap
+            mc_b2(c, 0x0F, 0x05)
+            mc_b2(c, 0x5F, 0x5E)             // restore RDI, RSI
+            mc_patch_jcc8(c, jnz_ubad, buf_len(c))
+            mc_patch_jcc8(c, jne_udf, buf_len(c))
         }
         mc_patch_rel32(c, jz_fm, buf_len(c))
         mc_b1(c, 0xC3)
