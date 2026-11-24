@@ -1040,19 +1040,60 @@ fn _py_strip_typing_ns(t: str) -> str {
     return str_trim(s)
 }
 
-fn _py_extract_kw_str(expr: str, kw: str) -> str {
-    pat := kw + "="
-    mut pos := str_find(expr, pat, 0)
-    if pos < 0 {
-        pat2 := kw + " ="
-        pos = str_find(expr, pat2, 0)
-        if pos < 0 { return "" }
-        pos += str_len(pat2)
-    } else {
-        pos += str_len(pat)
+fn _py_is_strict_json_num(s: str) -> bool {
+    n := str_len(s)
+    if n == 0 or n > 64 { return false }
+    mut i := 0
+    if str_byte(s, i) == 45 {
+        i += 1
+        if i >= n { return false }
     }
+    d0 := str_byte(s, i)
+    if d0 < 48 or d0 > 57 { return false }
+    if d0 == 48 {
+        i += 1
+        if i < n and str_byte(s, i) >= 48 and str_byte(s, i) <= 57 { return false }
+    } else {
+        while i < n and str_byte(s, i) >= 48 and str_byte(s, i) <= 57 { i += 1 }
+    }
+    if i < n and str_byte(s, i) == 46 {
+        i += 1
+        if i >= n or str_byte(s, i) < 48 or str_byte(s, i) > 57 { return false }
+        while i < n and str_byte(s, i) >= 48 and str_byte(s, i) <= 57 { i += 1 }
+    }
+    if i < n and (str_byte(s, i) == 101 or str_byte(s, i) == 69) {
+        i += 1
+        if i < n and (str_byte(s, i) == 43 or str_byte(s, i) == 45) { i += 1 }
+        if i >= n or str_byte(s, i) < 48 or str_byte(s, i) > 57 { return false }
+        while i < n and str_byte(s, i) >= 48 and str_byte(s, i) <= 57 { i += 1 }
+    }
+    return i == n
+}
+
+fn _py_find_kw_assign(expr: str, kw: str) -> i64 {
     n := str_len(expr)
-    pos = _py_skip_ws(expr, pos, n);
+    klen := str_len(kw)
+    if klen == 0 or klen + 1 > n { return -1 }
+    mut from := 0
+    while from < n {
+        pos := str_find(expr, kw, from)
+        if pos < 0 { return -1 }
+        prev_ok := pos == 0 or not _py_is_ident_char(str_byte(expr, pos - 1))
+        if prev_ok {
+            mut p := _py_skip_ws(expr, pos + klen, n)
+            if p < n and str_byte(expr, p) == 61 and (p + 1 >= n or str_byte(expr, p + 1) != 61) {
+                return _py_skip_ws(expr, p + 1, n)
+            }
+        }
+        from = pos + klen
+    }
+    return -1
+}
+
+fn _py_extract_kw_str(expr: str, kw: str) -> str {
+    pos := _py_find_kw_assign(expr, kw)
+    if pos < 0 { return "" }
+    n := str_len(expr)
     (q, is_tr, oend) := _py_check_string_open(expr, pos, n)
     if q == 0 { return "" }
     (cend, closed) := _py_scan_string_body(expr, oend, n, q, is_tr)
@@ -1061,19 +1102,18 @@ fn _py_extract_kw_str(expr: str, kw: str) -> str {
 }
 
 fn _py_extract_kw_num(expr: str, kw: str) -> str {
-    pat := kw + "="
-    mut pos := str_find(expr, pat, 0)
+    pos := _py_find_kw_assign(expr, kw)
     if pos < 0 { return "" }
-    pos += str_len(pat)
     n := str_len(expr)
-    pos = _py_skip_ws(expr, pos, n)
     mut end := pos
     while end < n {
         b := str_byte(expr, end)
-        if (b >= 48 and b <= 57) or b == 45 or b == 46 { end += 1 } else { break }
+        if (b >= 48 and b <= 57) or b == 45 or b == 46 or b == 101 or b == 69 or b == 43 { end += 1 } else { break }
     }
     if end <= pos { return "" }
-    return str_slice(expr, pos, end)
+    cand := str_slice(expr, pos, end)
+    if not _py_is_strict_json_num(cand) { return "" }
+    return cand
 }
 
 fn _py_literal_item_to_json(lit: str) -> str {
@@ -1087,7 +1127,10 @@ fn _py_literal_item_to_json(lit: str) -> str {
         mbuf_push_json_str(mut mb, _py_unquote_literal(t))
         return mbuf_finish(move mb)
     }
-    return t
+    if _py_is_strict_json_num(t) { return t }
+    mut mb := mbuf_new(str_len(t) + 8)
+    mbuf_push_json_str(mut mb, t)
+    return mbuf_finish(move mb)
 }
 
 fn _py_find_class_by_name(idx: PyLibIndex, name: str) -> i64 {
@@ -1096,7 +1139,7 @@ fn _py_find_class_by_name(idx: PyLibIndex, name: str) -> i64 {
     return smap_get_i64(idx.cls_short_map, name, -1)
 }
 
-fn py_type_to_json_schema_indexed(idx: PyLibIndex, type_str: str, desc: str = "", default_val: str = "", has_default: bool = false, depth: i64 = 0) -> str {
+fn py_type_to_json_schema_indexed(idx: PyLibIndex, type_str: str, desc: str = "", default_val: str = "", has_default: bool = false, depth: i64 = 0, visited_cls: str = ",") -> str {
     if depth > 8 { return "{}" }
     mut raw := _py_strip_typing_ns(type_str)
     if str_len(raw) >= 2 {
@@ -1112,16 +1155,16 @@ fn py_type_to_json_schema_indexed(idx: PyLibIndex, type_str: str, desc: str = ""
     if str_len(ann_inner) > 0 {
         parts := _py_split_top_level(ann_inner, 44)
         if svec_len(parts) >= 1 {
-            eff_type = _py_strip_typing_ns(svec_get(parts, 0))
+            eff_type = "" + _py_strip_typing_ns(svec_get(parts, 0))
             mut pi := 1
             while pi < svec_len(parts) {
                 meta_s := svec_get(parts, pi)
                 if str_len(eff_desc) == 0 {
                     fdesc := _py_extract_kw_str(meta_s, "description")
-                    if str_len(fdesc) > 0 { eff_desc = fdesc }
+                    if str_len(fdesc) > 0 { eff_desc = "" + fdesc }
                     else {
                         (mq, _, _) := _py_check_string_open(meta_s, 0, str_len(meta_s))
-                        if mq != 0 { eff_desc = _py_unquote_literal(meta_s) }
+                        if mq != 0 { eff_desc = "" + _py_unquote_literal(meta_s) }
                     }
                 }
                 ge_v := _py_extract_kw_num(meta_s, "ge")
@@ -1158,7 +1201,7 @@ fn py_type_to_json_schema_indexed(idx: PyLibIndex, type_str: str, desc: str = ""
         mut ui := 0
         while ui < svec_len(pipe_parts) {
             if ui > 0 { mbuf_push(mut core, 44) }
-            mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, svec_get(pipe_parts, ui), "", "", false, depth + 1))
+            mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, svec_get(pipe_parts, ui), "", "", false, depth + 1, visited_cls))
             ui += 1
         }
         mbuf_push(mut core, 93)
@@ -1183,7 +1226,7 @@ fn py_type_to_json_schema_indexed(idx: PyLibIndex, type_str: str, desc: str = ""
 
         if str_len(opt_inner) > 0 {
             mbuf_push_str(mut core, "\"anyOf\":[")
-            mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, opt_inner, "", "", false, depth + 1))
+            mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, opt_inner, "", "", false, depth + 1, visited_cls))
             mbuf_push_str(mut core, ",{\"type\":\"null\"}]")
         } else if str_len(union_inner) > 0 {
             uparts := _py_split_top_level(union_inner, 44)
@@ -1191,7 +1234,7 @@ fn py_type_to_json_schema_indexed(idx: PyLibIndex, type_str: str, desc: str = ""
             mut ui := 0
             while ui < svec_len(uparts) {
                 if ui > 0 { mbuf_push(mut core, 44) }
-                mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, svec_get(uparts, ui), "", "", false, depth + 1))
+                mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, svec_get(uparts, ui), "", "", false, depth + 1, visited_cls))
                 ui += 1
             }
             mbuf_push(mut core, 93)
@@ -1209,16 +1252,16 @@ fn py_type_to_json_schema_indexed(idx: PyLibIndex, type_str: str, desc: str = ""
             svec_free(move lparts)
         } else if str_len(list_inner) > 0 {
             mbuf_push_str(mut core, "\"type\":\"array\",\"items\":")
-            mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, list_inner, "", "", false, depth + 1))
+            mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, list_inner, "", "", false, depth + 1, visited_cls))
         } else if str_len(set_inner) > 0 {
             mbuf_push_str(mut core, "\"type\":\"array\",\"uniqueItems\":true,\"items\":")
-            mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, set_inner, "", "", false, depth + 1))
+            mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, set_inner, "", "", false, depth + 1, visited_cls))
         } else if str_len(dict_inner) > 0 {
             dparts := _py_split_top_level(dict_inner, 44)
             mbuf_push_str(mut core, "\"type\":\"object\"")
             if svec_len(dparts) >= 2 {
                 mbuf_push_str(mut core, ",\"additionalProperties\":")
-                mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, svec_get(dparts, 1), "", "", false, depth + 1))
+                mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, svec_get(dparts, 1), "", "", false, depth + 1, visited_cls))
             }
             svec_free(move dparts)
         } else if str_len(tup_inner) > 0 {
@@ -1226,13 +1269,13 @@ fn py_type_to_json_schema_indexed(idx: PyLibIndex, type_str: str, desc: str = ""
             tcnt := svec_len(tparts)
             if tcnt == 2 and str_eq(svec_get(tparts, 1), "...") {
                 mbuf_push_str(mut core, "\"type\":\"array\",\"items\":")
-                mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, svec_get(tparts, 0), "", "", false, depth + 1))
+                mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, svec_get(tparts, 0), "", "", false, depth + 1, visited_cls))
             } else {
                 mbuf_push_str(mut core, "\"type\":\"array\",\"prefixItems\":[")
                 mut ti := 0
                 while ti < tcnt {
                     if ti > 0 { mbuf_push(mut core, 44) }
-                    mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, svec_get(tparts, ti), "", "", false, depth + 1))
+                    mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, svec_get(tparts, ti), "", "", false, depth + 1, visited_cls))
                     ti += 1
                 }
                 mbuf_push_str(mut core, f"],\"minItems\":{tcnt},\"maxItems\":{tcnt}")
@@ -1265,17 +1308,21 @@ fn py_type_to_json_schema_indexed(idx: PyLibIndex, type_str: str, desc: str = ""
         } else if str_eq(eff_type, "Any") or str_eq(eff_type, "object") or str_len(eff_type) == 0 {
             is_open_obj = true
         } else {
-            // Look up known class (`Enum`, `dataclass`, `pydantic_model`, `typed_dict`) in `idx`
+            // Look up known class (`Enum`, `dataclass`, `pydantic_model`, `typed_dict`) in `idx` with O(fields) linked-list & cycle guard!
             cidx := _py_find_class_by_name(idx, eff_type)
             if cidx >= 0 {
-                ckind := svec_get(idx.cls_kind, cidx)
-                vcnt := svec_len(idx.var_name)
-                if str_eq(ckind, "enum") {
-                    mbuf_push_str(mut core, "\"enum\":[")
-                    mut vi := 0
-                    mut ecnt := 0
-                    while vi < vcnt {
-                        if dvec_get(idx.var_cls_idx, vi, -1) == cidx {
+                ckey := f",{cidx},"
+                if str_contains(visited_cls, ckey) {
+                    mbuf_push_str(mut core, "\"type\":\"object\",\"title\":")
+                    mbuf_push_json_str(mut core, svec_get(idx.cls_name, cidx))
+                } else {
+                    next_vis := f"{visited_cls}{cidx},"
+                    ckind := svec_get(idx.cls_kind, cidx)
+                    if str_eq(ckind, "enum") {
+                        mbuf_push_str(mut core, "\"enum\":[")
+                        mut vi := dvec_get(idx.cls_var_head, cidx, -1)
+                        mut ecnt := 0
+                        while vi >= 0 {
                             if ecnt > 0 { mbuf_push(mut core, 44) }
                             dv := svec_get(idx.var_default, vi)
                             if str_len(dv) > 0 {
@@ -1284,18 +1331,16 @@ fn py_type_to_json_schema_indexed(idx: PyLibIndex, type_str: str, desc: str = ""
                                 mbuf_push_json_str(mut core, svec_get(idx.var_name, vi))
                             }
                             ecnt += 1
+                            vi = dvec_get(idx.var_next_cls, vi, -1)
                         }
-                        vi += 1
-                    }
-                    mbuf_push(mut core, 93)
-                } else if str_eq(ckind, "dataclass") or str_eq(ckind, "pydantic_model") or str_eq(ckind, "typed_dict") {
-                    mbuf_push_str(mut core, "\"type\":\"object\",\"properties\":{")
-                    mut req_b := mbuf_new(128)
-                    mut req_n := 0
-                    mut p_n := 0
-                    mut vi := 0
-                    while vi < vcnt {
-                        if dvec_get(idx.var_cls_idx, vi, -1) == cidx {
+                        mbuf_push(mut core, 93)
+                    } else if str_eq(ckind, "dataclass") or str_eq(ckind, "pydantic_model") or str_eq(ckind, "typed_dict") {
+                        mbuf_push_str(mut core, "\"type\":\"object\",\"properties\":{")
+                        mut req_b := mbuf_new(128)
+                        mut req_n := 0
+                        mut p_n := 0
+                        mut vi := dvec_get(idx.cls_var_head, cidx, -1)
+                        while vi >= 0 {
                             vname := svec_get(idx.var_name, vi)
                             vtype := svec_get(idx.var_type, vi)
                             vdef := svec_get(idx.var_default, vi)
@@ -1304,26 +1349,26 @@ fn py_type_to_json_schema_indexed(idx: PyLibIndex, type_str: str, desc: str = ""
                             if p_n > 0 { mbuf_push(mut core, 44) }
                             mbuf_push_json_str(mut core, vname)
                             mbuf_push(mut core, 58)
-                            mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, vtype, vdoc, vdef, has_d, depth + 1))
+                            mbuf_push_str(mut core, py_type_to_json_schema_indexed(idx, vtype, vdoc, vdef, has_d, depth + 1, next_vis))
                             p_n += 1
                             if str_len(vdef) == 0 {
                                 if req_n > 0 { mbuf_push(mut req_b, 44) }
                                 mbuf_push_json_str(mut req_b, vname)
                                 req_n += 1
                             }
+                            vi = dvec_get(idx.var_next_cls, vi, -1)
                         }
-                        vi += 1
+                        mbuf_push(mut core, 125)
+                        if req_n > 0 {
+                            mbuf_push_str(mut core, ",\"required\":[")
+                            mbuf_push_str(mut core, mbuf_as_str(req_b))
+                            mbuf_push(mut core, 93)
+                        }
+                        mbuf_free(move req_b)
+                    } else {
+                        mbuf_push_str(mut core, "\"type\":\"object\",\"title\":")
+                        mbuf_push_json_str(mut core, svec_get(idx.cls_name, cidx))
                     }
-                    mbuf_push(mut core, 125)
-                    if req_n > 0 {
-                        mbuf_push_str(mut core, ",\"required\":[")
-                        mbuf_push_str(mut core, mbuf_as_str(req_b))
-                        mbuf_push(mut core, 93)
-                    }
-                    mbuf_free(move req_b)
-                } else {
-                    mbuf_push_str(mut core, "\"type\":\"object\",\"title\":")
-                    mbuf_push_json_str(mut core, svec_get(idx.cls_name, cidx))
                 }
             } else {
                 mbuf_push_str(mut core, "\"type\":\"object\"")
@@ -1435,6 +1480,7 @@ fn _py_add_package_entry(mut idx: PyLibIndex, name: str, version: str, summary: 
     dvec_push(mut idx.pkg_mod_head, -1)
     dvec_push(mut idx.pkg_mod_tail, -1)
     smap_set_i64(mut idx.pkg_map, name, pidx)
+    idx.idx_gen += 1
     return pidx
 }
 
@@ -2607,6 +2653,15 @@ fn _py_winfs_open() -> _PyWinFs {
     if f1 == 0 or f2 == 0 or f3 == 0 or f4 == 0 or f5 == 0 or f6 == 0 {
         return _PyWinFs(ok = false, f_first = 0, f_next = 0, f_fclose = 0, f_create = 0, f_read = 0, f_close = 0, fdata = 0, rbuf = 0, rbuf_cap = 0, nread_ptr = 0)
     }
+    fd_p := ffi_alloc(384)
+    rb_p := ffi_alloc(262144)
+    nr_p := ffi_alloc(16)
+    if fd_p == 0 or rb_p == 0 or nr_p == 0 {
+        if fd_p != 0 { ffi_free(fd_p) }
+        if rb_p != 0 { ffi_free(rb_p) }
+        if nr_p != 0 { ffi_free(nr_p) }
+        return _PyWinFs(ok = false, f_first = 0, f_next = 0, f_fclose = 0, f_create = 0, f_read = 0, f_close = 0, fdata = 0, rbuf = 0, rbuf_cap = 0, nread_ptr = 0)
+    }
     return _PyWinFs(
         ok = true,
         f_first = f1,
@@ -2615,10 +2670,10 @@ fn _py_winfs_open() -> _PyWinFs {
         f_create = f4,
         f_read = f5,
         f_close = f6,
-        fdata = ffi_alloc(384),
-        rbuf = ffi_alloc(262144),
+        fdata = fd_p,
+        rbuf = rb_p,
         rbuf_cap = 262144,
-        nread_ptr = ffi_alloc(16)
+        nread_ptr = nr_p
     )
 }
 
@@ -2673,7 +2728,8 @@ fn _py_register_dir_metadata(mut idx: PyLibIndex, wf: _PyWinFs, dir_path: str, p
     // 1. Check `pyproject.toml` in `dir_path`
     pyp := path_join(dir_path, "pyproject.toml")
     if fs_is_file(pyp) {
-        txt := fs_read_text(pyp) or ""
+        pyp_sz := sys_fs_size(pyp)
+        txt := if pyp_sz > 0 and pyp_sz <= 1048576 { fs_read_text(pyp) or "" } else { "" }
         if str_len(txt) > 0 {
             mut td := toml_parse(txt)
             mut pname := toml_get_str(td, "project", "name", "")
@@ -2741,7 +2797,8 @@ fn _py_register_dir_metadata(mut idx: PyLibIndex, wf: _PyWinFs, dir_path: str, p
                 if str_eq(norm_en, norm_target) {
                     mpath := path_join(path_join(parent, en), "METADATA")
                     if fs_is_file(mpath) {
-                        mtxt := fs_read_text(mpath) or ""
+                        msz := sys_fs_size(mpath)
+                        mtxt := if msz > 0 and msz <= 1048576 { fs_read_text(mpath) or "" } else { "" }
                         if str_len(mtxt) > 0 {
                             (pn, pv, ps, pa, pl, rpy, rds) := _py_parse_dist_metadata(mtxt)
                             if str_len(pn) > 0 {
@@ -2777,7 +2834,8 @@ fn _py_has_win_reserved_seg(p: str) -> bool {
         while e < n and str_byte(p, e) != 47 and str_byte(p, e) != 92 { e += 1 }
         if e > s {
             mut stem_end := s
-            while stem_end < e and str_byte(p, stem_end) != 46 { stem_end += 1 }
+            while stem_end < e and str_byte(p, stem_end) != 46 and str_byte(p, stem_end) != 58 { stem_end += 1 }
+            while stem_end > s and str_byte(p, stem_end - 1) == 32 { stem_end -= 1 }
             seg := str_slice(p, s, stem_end)
             if str_eq_ignore_case(seg, "CON") or str_eq_ignore_case(seg, "PRN") or str_eq_ignore_case(seg, "AUX") or str_eq_ignore_case(seg, "NUL") {
                 return true
@@ -2799,14 +2857,25 @@ fn _py_is_safe_fs_input(p: str) -> bool {
     n := str_len(p)
     if n == 0 or n > 4096 { return false }
     if str_contains(p, "..") { return false }
-    // Block UNC network shares (`\\host\share`, `//host/share`) to prevent NTLM leaks on Windows
-    if n >= 2 and ((str_byte(p, 0) == 92 and str_byte(p, 1) == 92) or (str_byte(p, 0) == 47 and str_byte(p, 1) == 47)) {
-        return false
+    // Block UNC / device paths including mixed slashes (`\\`, `//`, `\/`, `/\`)
+    if n >= 2 {
+        c0 := str_byte(p, 0)
+        c1 := str_byte(p, 1)
+        if (c0 == 92 or c0 == 47) and (c1 == 92 or c1 == 47) {
+            return false
+        }
     }
     mut i := 0
     while i < n {
         b := str_byte(p, i)
-        if b == 0 or b < 32 { return false }
+        if b < 32 or b == 127 { return false }
+        if b == 58 { // ':' allowed only as Windows drive prefix `X:/` or `X:\` (blocks NTFS ADS & drive-relative `C:foo`)
+            if i != 1 or n < 3 { return false }
+            d := str_byte(p, 0)
+            is_alpha := (d >= 65 and d <= 90) or (d >= 97 and d <= 122)
+            c2 := str_byte(p, 2)
+            if not is_alpha or (c2 != 47 and c2 != 92) { return false }
+        }
         i += 1
     }
     return not _py_has_win_reserved_seg(p)
@@ -2815,6 +2884,7 @@ fn _py_is_safe_fs_input(p: str) -> bool {
 fn _py_is_safe_pkg_ident(pkg: str) -> bool {
     n := str_len(pkg)
     if n == 0 or n > 128 or str_contains(pkg, "..") { return false }
+    if str_byte(pkg, 0) == 46 or str_byte(pkg, n - 1) == 46 { return false }
     mut i := 0
     while i < n {
         b := str_byte(pkg, i)
@@ -2827,7 +2897,7 @@ fn _py_is_safe_pkg_ident(pkg: str) -> bool {
 }
 
 // Recursively indexes a `.py`/`.pyi` file or Python package directory (up to `max_files`, depth 12).
-// Rejects path traversal segments (`..`), UNC paths, and NUL/control bytes. Returns count of files indexed.
+// Rejects path traversal segments (`..`), UNC paths, NTFS ADS, symlinks/reparse points, and NUL/control bytes. Returns count of files indexed.
 fn py_index_add_dir(mut idx: PyLibIndex, root_path: str, pkg_name_hint: str = "", max_files: i64 = 1500) -> i64 {
     if not _py_is_safe_fs_input(root_path) { return 0 }
     norm_root := path_normalize(root_path)
@@ -2836,6 +2906,8 @@ fn py_index_add_dir(mut idx: PyLibIndex, root_path: str, pkg_name_hint: str = ""
     if fs_is_file(norm_root) {
         ext := path_ext(norm_root)
         if not str_eq(ext, ".py") and not str_eq(ext, ".pyi") { return 0 }
+        f_sz := sys_fs_size(norm_root)
+        if f_sz <= 0 or f_sz > 4194304 { return 0 }
         src := fs_read_text(norm_root) or return 0
         if str_len(src) > 4194304 { return 0 }
         stem := path_stem(norm_root)
@@ -2864,7 +2936,7 @@ fn py_index_add_dir(mut idx: PyLibIndex, root_path: str, pkg_name_hint: str = ""
             cand := path_join(src_dir, svec_get(sub_entries, si))
             if fs_is_dir(cand) and fs_is_file(path_join(cand, "__init__.py")) {
                 scan_root = cand
-                if str_len(pkg_name_hint) == 0 { pkg_name = svec_get(sub_entries, si) }
+                if str_len(pkg_name_hint) == 0 { pkg_name = "" + svec_get(sub_entries, si) }
                 break
             }
             si += 1
@@ -2900,7 +2972,7 @@ fn py_index_add_dir(mut idx: PyLibIndex, root_path: str, pkg_name_hint: str = ""
             if cpat != 0 {
                 h := ffi_call2(wf.f_first, cpat, wf.fdata)
                 ffi_free(cpat)
-                if h != -1 and h != 0xFFFFFFFFFFFFFFFF {
+                if h != -1 and h != 0 {
                     mut more := true
                     mut guard := 0
                     while more and guard < 100000 and indexed_cnt < max_files {
@@ -2908,31 +2980,36 @@ fn py_index_add_dir(mut idx: PyLibIndex, root_path: str, pkg_name_hint: str = ""
                         nlen := str_len(name)
                         if nlen > 0 and not str_eq(name, ".") and not str_eq(name, "..") and not _py_is_skipped_dir(name) and not str_contains(name, "..") and not _py_has_win_reserved_seg(name) {
                             attrs := _py_read_u32(wf.fdata, 0)
-                            full := path_join(cur_dir, name)
-                            if (attrs & 16) != 0 {
-                                sub_mod := if str_len(cur_mod) > 0 { cur_mod + "." + name } else { name }
-                                svec_push(mut q_dirs, full)
-                                svec_push(mut q_mods, sub_mod)
-                                dvec_push(mut q_depth, cur_dep + 1)
-                            } else if nlen > 3 and _mcp_ew(name, ".py") {
-                                fsize := (_py_read_u32(wf.fdata, 28) << 32) | _py_read_u32(wf.fdata, 32)
-                                if fsize > 0 and fsize <= 4194304 {
-                                    stem := str_slice(name, 0, nlen - 3)
-                                    mod_q := _py_derive_mod_qname(cur_mod, pkg_name, stem)
-                                    src := _py_winfs_read_file(mut wf, full, fsize)
-                                    if str_len(src) > 0 {
-                                        _ := py_index_add_source(mut idx, pkg_name, mod_q, full, src, false)
-                                        indexed_cnt += 1
+                            is_rep := (attrs & 0x400) != 0
+                            if not is_rep {
+                                full := path_join(cur_dir, name)
+                                if (attrs & 16) != 0 {
+                                    if svec_len(q_dirs) < 4096 {
+                                        sub_mod := if str_len(cur_mod) > 0 { cur_mod + "." + name } else { name }
+                                        svec_push(mut q_dirs, full)
+                                        svec_push(mut q_mods, sub_mod)
+                                        dvec_push(mut q_depth, cur_dep + 1)
                                     }
-                                }
-                            } else if nlen > 4 and _mcp_ew(name, ".pyi") {
-                                fsize := (_py_read_u32(wf.fdata, 28) << 32) | _py_read_u32(wf.fdata, 32)
-                                if fsize > 0 and fsize <= 4194304 {
-                                    stem := str_slice(name, 0, nlen - 4)
-                                    mod_q := _py_derive_mod_qname(cur_mod, pkg_name, stem)
-                                    svec_push(mut pyi_paths, full)
-                                    svec_push(mut pyi_mods, mod_q)
-                                    dvec_push(mut pyi_sizes, fsize)
+                                } else if nlen > 3 and _mcp_ew(name, ".py") {
+                                    fsize := (_py_read_u32(wf.fdata, 28) << 32) | _py_read_u32(wf.fdata, 32)
+                                    if fsize > 0 and fsize <= 4194304 {
+                                        stem := str_slice(name, 0, nlen - 3)
+                                        mod_q := _py_derive_mod_qname(cur_mod, pkg_name, stem)
+                                        src := _py_winfs_read_file(mut wf, full, fsize)
+                                        if str_len(src) > 0 {
+                                            _ := py_index_add_source(mut idx, pkg_name, mod_q, full, src, false)
+                                            indexed_cnt += 1
+                                        }
+                                    }
+                                } else if nlen > 4 and _mcp_ew(name, ".pyi") {
+                                    fsize := (_py_read_u32(wf.fdata, 28) << 32) | _py_read_u32(wf.fdata, 32)
+                                    if fsize > 0 and fsize <= 4194304 {
+                                        stem := str_slice(name, 0, nlen - 4)
+                                        mod_q := _py_derive_mod_qname(cur_mod, pkg_name, stem)
+                                        svec_push(mut pyi_paths, full)
+                                        svec_push(mut pyi_mods, mod_q)
+                                        dvec_push(mut pyi_sizes, fsize)
+                                    }
                                 }
                             }
                         }
@@ -2948,13 +3025,15 @@ fn py_index_add_dir(mut idx: PyLibIndex, root_path: str, pkg_name_hint: str = ""
             mut ii := 0
             while ii < icnt and indexed_cnt < max_files {
                 name := svec_get(items, ii)
-                if not _py_is_skipped_dir(name) {
+                if str_len(name) > 0 and not str_eq(name, ".") and not str_eq(name, "..") and not _py_is_skipped_dir(name) and not str_contains(name, "..") and not _py_has_win_reserved_seg(name) {
                     full := path_join(cur_dir, name)
                     if fs_is_dir(full) {
-                        sub_mod := if str_len(cur_mod) > 0 { cur_mod + "." + name } else { name }
-                        svec_push(mut q_dirs, full)
-                        svec_push(mut q_mods, sub_mod)
-                        dvec_push(mut q_depth, cur_dep + 1)
+                        if svec_len(q_dirs) < 4096 {
+                            sub_mod := if str_len(cur_mod) > 0 { cur_mod + "." + name } else { name }
+                            svec_push(mut q_dirs, full)
+                            svec_push(mut q_mods, sub_mod)
+                            dvec_push(mut q_depth, cur_dep + 1)
+                        }
                     } else if _mcp_ew(name, ".py") {
                         stem := path_stem(name)
                         mod_q := _py_derive_mod_qname(cur_mod, pkg_name, stem)
@@ -3012,7 +3091,7 @@ fn py_index_add_dir(mut idx: PyLibIndex, root_path: str, pkg_name_hint: str = ""
 fn _py_collect_env_site_dirs() -> StrVec {
     mut out := svec_new(16, 1024)
     venv := sys_env_get("VIRTUAL_ENV")
-    if str_len(venv) > 0 {
+    if _py_is_safe_fs_input(venv) {
         wsp := path_join(path_join(venv, "Lib"), "site-packages")
         if fs_is_dir(wsp) { svec_push(mut out, wsp) }
         ulib := path_join(venv, "lib")
@@ -3021,7 +3100,7 @@ fn _py_collect_env_site_dirs() -> StrVec {
             mut i := 0
             while i < svec_len(ents) {
                 en := svec_get(ents, i)
-                if str_starts_with(en, "python") {
+                if str_starts_with(en, "python") and not str_contains(en, "..") {
                     sp := path_join(path_join(ulib, en), "site-packages")
                     if fs_is_dir(sp) { svec_push(mut out, sp) }
                 }
@@ -3031,27 +3110,29 @@ fn _py_collect_env_site_dirs() -> StrVec {
         }
     }
     conda := sys_env_get("CONDA_PREFIX")
-    if str_len(conda) > 0 {
+    if _py_is_safe_fs_input(conda) {
         csp := path_join(path_join(conda, "Lib"), "site-packages")
         if fs_is_dir(csp) { svec_push(mut out, csp) }
     }
     cwd := sys_cwd()
-    if str_len(cwd) > 0 {
+    if _py_is_safe_fs_input(cwd) {
         c1 := path_join(path_join(path_join(cwd, ".venv"), "Lib"), "site-packages")
         if fs_is_dir(c1) { svec_push(mut out, c1) }
         c2 := path_join(path_join(path_join(cwd, "venv"), "Lib"), "site-packages")
         if fs_is_dir(c2) { svec_push(mut out, c2) }
     }
     local_app := sys_env_get("LOCALAPPDATA")
-    if str_len(local_app) > 0 {
+    if _py_is_safe_fs_input(local_app) {
         py_root := path_join(path_join(local_app, "Programs"), "Python")
         if fs_is_dir(py_root) {
             ents := fs_list_dir(py_root)
             mut i := 0
             while i < svec_len(ents) {
                 en := svec_get(ents, i)
-                sp := path_join(path_join(path_join(py_root, en), "Lib"), "site-packages")
-                if fs_is_dir(sp) { svec_push(mut out, sp) }
+                if not str_contains(en, "..") {
+                    sp := path_join(path_join(path_join(py_root, en), "Lib"), "site-packages")
+                    if fs_is_dir(sp) { svec_push(mut out, sp) }
+                }
                 i += 1
             }
             svec_free(move ents)
@@ -3059,12 +3140,12 @@ fn _py_collect_env_site_dirs() -> StrVec {
     }
     pypath := sys_env_get("PYTHONPATH")
     if str_len(pypath) > 0 {
-        // Split on ';' (Windows) cleanly
+        // Split on ';' (Windows) cleanly, validating each entry against UNC/traversal
         ranges := str_split_ranges(pypath, 59)
         mut i := 0
         while i < str_split_count(ranges) {
             seg := str_trim(str_split_at(pypath, ranges, i))
-            if str_len(seg) > 0 and fs_is_dir(seg) { svec_push(mut out, seg) }
+            if _py_is_safe_fs_input(seg) and fs_is_dir(seg) { svec_push(mut out, seg) }
             i += 1
         }
         buf_free(move ranges)
@@ -4589,7 +4670,7 @@ fn _py_mcp_dispatch_tool(mut pm: PyMcpServer, req: McpRequest) -> str {
     } else {
         res_payload = mcp_tool_ok_json(out_json, out_json)
     }
-    if can_cache {
+    if can_cache and str_len(res_payload) <= 65536 {
         if smap_len(pm.resp_cache) >= 1024 {
             smap_free(move pm.resp_cache)
             pm.resp_cache = smap_new(64)
@@ -4802,16 +4883,35 @@ fn py_mcp_handle_line(mut pm: PyMcpServer, raw_json: str) -> str {
     return _py_mcp_handle_single(mut pm, t)
 }
 
+fn _py_is_valid_session_id(sid: str) -> bool {
+    n := str_len(sid)
+    if n < 8 or n > 64 { return false }
+    mut i := 0
+    while i < n {
+        b := str_byte(sid, i)
+        ok_ch := (b >= 48 and b <= 57) or (b >= 97 and b <= 102) or (b >= 65 and b <= 70) or b == 45
+        if not ok_ch { return false }
+        i += 1
+    }
+    return true
+}
+
 fn py_mcp_handle_http(mut pm: PyMcpServer, raw_http_req: str) -> str {
     (pre_done, pre_resp) := mcp_http_preflight_check(raw_http_req)
     if pre_done { return pre_resp }
     req := http_parse_request(raw_http_req) or return http_json_response(400, "{\"error\":\"bad HTTP request\"}")
 
     mut sid := http_get_header(raw_http_req, "Mcp-Session-Id") or ""
-    if str_len(sid) > 128 or (str_len(sid) > 0 and not http_is_safe_header_val(sid)) {
-        return http_json_response(400, "{\"error\":\"invalid session id\"}")
+    if str_len(sid) > 0 {
+        if not _py_is_valid_session_id(sid) {
+            return http_json_response(400, "{\"error\":\"invalid session id\"}")
+        }
+        if not smap_has(pm.http.sessions, sid) {
+            return http_json_response(404, "{\"error\":\"unknown session id\"}")
+        }
+    } else {
+        sid = mcp_http_new_session(mut pm.http)
     }
-    if str_len(sid) == 0 { sid = mcp_http_new_session(mut pm.http) }
 
     if str_eq(req.method, "GET") and str_eq(req.path, "/sse") {
         return mcp_http_sse_init_resp(f"/messages?sessionId={sid}", sid)

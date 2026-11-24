@@ -46,10 +46,12 @@ struct McpBuf {
 }
 
 fn mbuf_new(init_cap: i64 = 1024, max_cap: i64 = 33554432) -> McpBuf {
+    mut mc := max_cap
+    if mc < 64 { mc = 64 }
+    if mc > 33554432 { mc = 33554432 }
     mut c := init_cap
     if c < 64 { c = 64 }
-    mut mc := max_cap
-    if mc < c { mc = c }
+    if c > mc { c = mc }
     return McpBuf(b = buf_new(c), cap = c, max_cap = mc)
 }
 
@@ -62,14 +64,18 @@ fn mbuf_len(mb: McpBuf) -> i64 {
 }
 
 fn _mbuf_ensure(mut mb: McpBuf, add: i64) -> bool {
+    if add < 0 { return false }
     cur := buf_len(mb.b)
-    if cur + add + 4 <= mb.cap { return true }
-    if cur + add + 4 > mb.max_cap { return false }
+    if mb.max_cap < 4 { return false }
+    if add > mb.max_cap - 4 or cur > mb.max_cap - 4 - add { return false }
+    need := cur + add + 4
+    if need <= mb.cap { return true }
     mut nc := mb.cap
-    while nc < cur + add + 16 and nc < mb.max_cap {
+    if nc < 64 { nc = 64 }
+    while nc < need + 12 and nc < mb.max_cap {
         if nc > mb.max_cap / 2 { nc = mb.max_cap } else { nc = nc * 2 }
     }
-    if cur + add + 4 > nc { return false }
+    if need > nc { return false }
     nb := buf_new(nc)
     if cur > 0 { buf_push_str(nb, buf_slice_str(mb.b, 0, cur)) }
     buf_free(move mb.b)
@@ -98,29 +104,38 @@ fn mbuf_push_i64(mut mb: McpBuf, val: i64) {
     }
 }
 
-fn mbuf_push_json_escaped(mut mb: McpBuf, s: str) {
+fn _mbuf_json_escaped_len(s: str) -> i64 {
     n := str_len(s)
-    if n <= 0 { return }
+    mut out := 0
     unsafe {
         sp := s as i64
-        mut dirty := false
         mut i := 0
         while i < n {
             c := ptr_read_u8(sp + i, 0)
-            if c < 32 or c == 34 or c == 92 {
-                dirty = true
-                break
+            if c == 34 or c == 92 or c == 8 or c == 9 or c == 10 or c == 12 or c == 13 {
+                out += 2
+            } else if c < 32 {
+                out += 6
+            } else {
+                out += 1
             }
             i += 1
         }
-        if not dirty {
-            if _mbuf_ensure(mut mb, n) {
-                buf_push_str(mb.b, s)
-            }
-            return
-        }
     }
-    if not _mbuf_ensure(mut mb, n * 6 + 4) { return }
+    return out
+}
+
+fn mbuf_push_json_escaped(mut mb: McpBuf, s: str) {
+    n := str_len(s)
+    if n <= 0 { return }
+    elen := _mbuf_json_escaped_len(s)
+    if elen == n {
+        if _mbuf_ensure(mut mb, n) {
+            buf_push_str(mb.b, s)
+        }
+        return
+    }
+    if not _mbuf_ensure(mut mb, elen) { return }
     json_push_escaped(mb.b, s)
 }
 
@@ -130,30 +145,19 @@ fn mbuf_push_json_str(mut mb: McpBuf, s: str) {
         if _mbuf_ensure(mut mb, 2) { buf_push_str(mb.b, "\"\"") }
         return
     }
-    unsafe {
-        sp := s as i64
-        mut dirty := false
-        mut i := 0
-        while i < n {
-            c := ptr_read_u8(sp + i, 0)
-            if c < 32 or c == 34 or c == 92 {
-                dirty = true
-                break
-            }
-            i += 1
+    elen := _mbuf_json_escaped_len(s)
+    if elen == n {
+        if _mbuf_ensure(mut mb, n + 2) {
+            buf_push(mb.b, 34)
+            buf_push_str(mb.b, s)
+            buf_push(mb.b, 34)
         }
-        if not dirty {
-            if _mbuf_ensure(mut mb, n + 2) {
-                buf_push(mb.b, 34)
-                buf_push_str(mb.b, s)
-                buf_push(mb.b, 34)
-            }
-            return
-        }
+        return
     }
-    mbuf_push(mut mb, 34)
-    mbuf_push_json_escaped(mut mb, s)
-    mbuf_push(mut mb, 34)
+    if not _mbuf_ensure(mut mb, elen + 2) { return }
+    buf_push(mb.b, 34)
+    json_push_escaped(mb.b, s)
+    buf_push(mb.b, 34)
 }
 
 // Zero-allocation ASCII/pointer helpers shared across `std::mcp` and `std::mcp_python`.
@@ -1548,11 +1552,55 @@ fn mcp_parse_request(raw_json: str) -> McpRequest {
         if str_eq(tok, "null") {
             raw_id = "null"
         } else if tlen >= 2 and str_byte(tok, 0) == 34 and str_byte(tok, tlen - 1) == 34 and tlen <= 260 {
-            raw_id = tok
+            // Strictly verify RFC-8259 JSON string token (no raw control bytes, properly closed quote, valid escapes)
+            mut str_ok := true
+            mut si := 1
+            while si < tlen - 1 {
+                sb := str_byte(tok, si)
+                if sb < 32 { str_ok = false; break }
+                if sb == 34 { str_ok = false; break }
+                if sb == 92 {
+                    if si + 1 >= tlen - 1 { str_ok = false; break }
+                    esc := str_byte(tok, si + 1)
+                    if esc == 117 {
+                        if si + 5 >= tlen - 1 { str_ok = false; break }
+                        si += 6
+                        continue
+                    }
+                    if not (esc == 34 or esc == 92 or esc == 47 or esc == 98 or esc == 102 or esc == 110 or esc == 114 or esc == 116) {
+                        str_ok = false; break
+                    }
+                    si += 2
+                    continue
+                }
+                si += 1
+            }
+            raw_id = if str_ok { tok } else { "null" }
         } else {
-            // Check integer token validity cleanly
-            _p := parse_i64(tok) or -9223372036854775807
-            raw_id = if _p == -9223372036854775807 and not str_eq(tok, "-9223372036854775807") { "null" } else { tok }
+            // Strictly verify RFC-8259 integer grammar (reject `+1`, `01`, whitespace, trailing junk)
+            mut int_ok := tlen >= 1 and tlen <= 20
+            mut ii := 0
+            if int_ok and str_byte(tok, 0) == 45 {
+                ii = 1
+                if tlen < 2 { int_ok = false }
+            }
+            if int_ok {
+                d0 := str_byte(tok, ii)
+                if d0 < 48 or d0 > 57 { int_ok = false }
+                else if d0 == 48 and ii + 1 < tlen { int_ok = false } // reject leading zero `01`
+                ii += 1
+                while int_ok and ii < tlen {
+                    d := str_byte(tok, ii)
+                    if d < 48 or d > 57 { int_ok = false; break }
+                    ii += 1
+                }
+            }
+            if int_ok {
+                _p := parse_i64(tok) or -9223372036854775807
+                raw_id = if _p == -9223372036854775807 and not str_eq(tok, "-9223372036854775807") { "null" } else { tok }
+            } else {
+                raw_id = "null"
+            }
         }
     }
     is_notif := str_len(raw_id) == 0
@@ -1948,6 +1996,9 @@ fn mcp_handle_builtin(mut srv: McpServer, req: McpRequest) -> (bool, str) {
         if str_len(req.resource_uri) == 0 {
             return (true, mcp_err_resp(req.raw_id, mcp_err_invalid_params(), "Missing resource uri"))
         }
+        if not smap_has(srv.subs, req.resource_uri) and smap_len(srv.subs) >= 1024 {
+            return (true, mcp_err_resp(req.raw_id, mcp_err_invalid_params(), "Subscription limit (1024) exceeded"))
+        }
         smap_set_i64(mut srv.subs, req.resource_uri, 1)
         return (true, mcp_ok_resp(req.raw_id, "{}"))
     }
@@ -2049,10 +2100,40 @@ fn mcp_is_allowed_origin(origin: str) -> bool {
 // Validates HTTP `Host` header to block DNS-rebinding attacks against localhost MCP servers.
 fn mcp_is_allowed_host(host_hdr: str) -> bool {
     h := str_trim(str_to_lower(host_hdr))
-    if str_len(h) == 0 { return true }
+    hn := str_len(h)
+    if hn == 0 or hn > 128 { return false }
+    mut i := 0
+    while i < hn {
+        b := str_byte(h, i)
+        if b <= 32 or b == 47 or b == 63 or b == 35 or b == 43 or b == 64 or b == 92 { return false }
+        i += 1
+    }
     u := url_parse("http://" + h) or return false
-    if str_len(u.userinfo) > 0 or not str_eq(u.path, "/") { return false }
+    if str_len(u.userinfo) > 0 or str_len(u.query) > 0 or str_len(u.fragment) > 0 or not str_eq(u.path, "/") { return false }
     return str_eq(u.host, "localhost") or str_eq(u.host, "127.0.0.1") or str_eq(u.host, "[::1]")
+}
+
+fn _mcp_count_header(raw_http_req: str, target_low: str) -> i64 {
+    hend := http_find_header_end(raw_http_req)
+    limit := if hend >= 0 { hend } else { str_len(raw_http_req) }
+    mut pos := str_find_byte(raw_http_req, 10, 0)
+    if pos < 0 or pos >= limit { return 0 }
+    pos += 1
+    mut cnt := 0
+    while pos < limit {
+        mut nl := str_find_byte(raw_http_req, 10, pos)
+        if nl < 0 or nl > limit { nl = limit }
+        mut lend := nl
+        if lend > pos and str_byte(raw_http_req, lend - 1) == 13 { lend -= 1 }
+        col := str_find_byte(raw_http_req, 58, pos)
+        if col > pos and col < lend {
+            hname := str_trim(str_slice(raw_http_req, pos, col))
+            if _mcp_icase_eq(hname, target_low) { cnt += 1 }
+        }
+        if nl >= limit { break }
+        pos = nl + 1
+    }
+    return cnt
 }
 
 struct McpHttpState {
@@ -2081,13 +2162,23 @@ fn mcp_http_new_session(mut st: McpHttpState) -> str {
 
 fn mcp_http_preflight_check(raw_http_req: str) -> (bool, str) {
     req := http_parse_request(raw_http_req) or return (true, http_json_response(400, "{\"error\":\"malformed HTTP request\"}"))
+    host_cnt := _mcp_count_header(raw_http_req, "host")
+    if host_cnt != 1 {
+        return (true, http_json_response(403, "{\"error\":\"missing or duplicate host\"}"))
+    }
     host_h := http_get_header(raw_http_req, "Host") or ""
     if not mcp_is_allowed_host(host_h) {
         return (true, http_json_response(403, "{\"error\":\"forbidden host\"}"))
     }
-    origin := http_get_header(raw_http_req, "Origin") or ""
-    if not mcp_is_allowed_origin(origin) {
-        return (true, http_json_response(403, "{\"error\":\"forbidden origin\"}"))
+    orig_cnt := _mcp_count_header(raw_http_req, "origin")
+    if orig_cnt > 1 {
+        return (true, http_json_response(403, "{\"error\":\"duplicate origin\"}"))
+    }
+    if orig_cnt == 1 {
+        origin := http_get_header(raw_http_req, "Origin") or ""
+        if str_len(str_trim(origin)) == 0 or not mcp_is_allowed_origin(origin) {
+            return (true, http_json_response(403, "{\"error\":\"forbidden origin\"}"))
+        }
     }
     te_h := http_get_header(raw_http_req, "Transfer-Encoding") or ""
     if str_len(str_trim(te_h)) > 0 {
@@ -2122,37 +2213,67 @@ fn mcp_http_sse_init_resp(endpoint_url: str, session_id: str) -> str {
     return http_build_response(200, "text/event-stream; charset=utf-8", ev, hdr)
 }
 
-// Reads full HTTP/1.1 request (headers + full Content-Length body) from TCP socket with timeout.
+// Reads full HTTP/1.1 request (headers + full Content-Length body) from TCP socket with wall-clock deadline & header cap.
 fn mcp_http_recv_request(sock: TcpStream, max_bytes: i64 = 4194304) -> str ! i64 {
+    mut lim := max_bytes
+    if lim < 1024 { lim = 1024 }
+    if lim > 33554432 { lim = 33554432 }
     _ := tcp_set_timeout_ms(sock, 15000)
-    mut acc := mbuf_new(8192, max_bytes)
+    deadline_ns := clock_ns() + 15000000000
+    mut acc := mbuf_new(8192, lim + 16)
     mut expected_total := -1
-    while mbuf_len(acc) < max_bytes {
+    while true {
+        if clock_ns() > deadline_ns {
+            mbuf_free(move acc)
+            return err(408)
+        }
         chunk := tcp_recv(sock, 8192) or buf_new(0)
         cl := buf_len(chunk)
         if cl <= 0 {
             buf_free(move chunk)
             break
         }
+        if mbuf_len(acc) + cl > lim {
+            buf_free(move chunk)
+            mbuf_free(move acc)
+            return err(413)
+        }
         mbuf_push_str(mut acc, buf_slice_str(chunk, 0, cl))
         buf_free(move chunk)
-        cur := mbuf_as_str(acc)
-        hend := http_find_header_end(cur)
-        if hend >= 0 {
+        if expected_total < 0 {
+            // Zero-copy view of accumulated header bytes (avoids O(N^2) heap copy per chunk!)
+            cur := buf_slice_str(acc.b, 0, buf_len(acc.b))
+            hend := http_find_header_end(cur)
+            if hend < 0 {
+                if mbuf_len(acc) > 65536 {
+                    mbuf_free(move acc)
+                    return err(431)
+                }
+                continue
+            }
+            if hend > 65536 {
+                mbuf_free(move acc)
+                return err(431)
+            }
             sep_len := if str_find(cur, "\r\n\r\n", 0) == hend { 4 } else { 2 }
             body_off := hend + sep_len
-            if expected_total < 0 {
-                cl_str := http_get_header(cur, "Content-Length") or "0"
-                cl_val := parse_i64(cl_str) or 0
-                if cl_val < 0 or body_off + cl_val > max_bytes {
-                    mbuf_free(move acc)
-                    return err(413)
-                }
-                expected_total = body_off + cl_val
+            if _mcp_count_header(cur, "content-length") > 1 {
+                mbuf_free(move acc)
+                return err(400)
             }
-            if mbuf_len(acc) >= expected_total {
-                break
+            cl_str := http_get_header(cur, "Content-Length") or ""
+            mut cl_val := 0
+            if str_len(cl_str) > 0 {
+                cl_val = parse_i64(cl_str) or -1
             }
+            if cl_val < 0 or cl_val > lim - body_off {
+                mbuf_free(move acc)
+                return err(413)
+            }
+            expected_total = body_off + cl_val
+        }
+        if expected_total >= 0 and mbuf_len(acc) >= expected_total {
+            break
         }
     }
     if mbuf_len(acc) == 0 {
@@ -2335,9 +2456,10 @@ fn mcp_client_extract_tool_names(resp_json: str) -> StrVec {
     return out
 }
 
-// Sends JSON-RPC payload over HTTP (`http://...`) or HTTPS (`https://...`) to an MCP endpoint.
-fn mcp_client_http_post(mut c: McpClient, url_str: str, json_rpc_req: str) -> str ! i64 {
+// Sends JSON-RPC payload over HTTP (`http://...`) or HTTPS (`https://...`) to an MCP endpoint (`allow_private = false` SSRF-safe default).
+fn mcp_client_http_post(mut c: McpClient, url_str: str, json_rpc_req: str, allow_private: bool = false) -> str ! i64 {
     u := url_parse(url_str) or return err(400)
+    if not allow_private and not url_is_public_http(u) { return err(403) }
     mut path := u.path
     if str_len(u.query) > 0 { path = path + "?" + u.query }
     if not http_is_safe_header_val(u.host) or not http_is_safe_header_val(path) { return err(400) }
@@ -2361,37 +2483,61 @@ fn mcp_client_http_post(mut c: McpClient, url_str: str, json_rpc_req: str) -> st
         tcp_close(sock)
         return err(502)
     }
-    mut resp_b := mbuf_new(8192, 4194304)
+    max_resp := 4194304
+    deadline_ns := clock_ns() + 15000000000
+    mut resp_b := mbuf_new(8192, max_resp + 16)
     mut expected_total := -1
-    while mbuf_len(resp_b) < 4194304 {
+    while true {
+        if clock_ns() > deadline_ns {
+            tcp_close(sock)
+            mbuf_free(move resp_b)
+            return err(504)
+        }
         ch := tcp_recv(sock, 8192) or buf_new(0)
         cl := buf_len(ch)
         if cl <= 0 { buf_free(move ch); break }
+        if mbuf_len(resp_b) + cl > max_resp {
+            buf_free(move ch)
+            tcp_close(sock)
+            mbuf_free(move resp_b)
+            return err(413)
+        }
         mbuf_push_str(mut resp_b, buf_slice_str(ch, 0, cl))
         buf_free(move ch)
-        cur := mbuf_as_str(resp_b)
-        hpos := http_find_header_end(cur)
-        if hpos >= 0 {
-            slen := if str_find(cur, "\r\n\r\n", 0) == hpos { 4 } else { 2 }
-            if expected_total < 0 {
-                cl_h := http_get_header(cur, "Content-Length") or ""
-                if str_len(cl_h) > 0 {
-                    cl_v := parse_i64(cl_h) or -1
-                    if cl_v >= 0 { expected_total = hpos + slen + cl_v }
+        if expected_total < 0 {
+            cur := buf_slice_str(resp_b.b, 0, buf_len(resp_b.b))
+            hpos := http_find_header_end(cur)
+            if hpos < 0 {
+                if mbuf_len(resp_b) > 65536 {
+                    tcp_close(sock)
+                    mbuf_free(move resp_b)
+                    return err(502)
                 }
+                continue
             }
-            if expected_total >= 0 and mbuf_len(resp_b) >= expected_total { break }
+            slen := if str_find(cur, "\r\n\r\n", 0) == hpos { 4 } else { 2 }
+            body_off := hpos + slen
+            cl_h := http_get_header(cur, "Content-Length") or ""
+            if str_len(cl_h) > 0 {
+                cl_v := parse_i64(cl_h) or -1
+                if cl_v < 0 or cl_v > max_resp - body_off {
+                    tcp_close(sock)
+                    mbuf_free(move resp_b)
+                    return err(413)
+                }
+                expected_total = body_off + cl_v
+            }
         }
+        if expected_total >= 0 and mbuf_len(resp_b) >= expected_total { break }
     }
     tcp_close(sock)
     raw_resp := mbuf_finish(move resp_b)
     sep := http_find_header_end(raw_resp)
     if sep < 0 { return err(502) }
     sp1 := str_find_byte(raw_resp, 32, 0)
-    if sp1 > 0 and sp1 + 4 <= sep {
-        st_code := parse_i64(str_slice(raw_resp, sp1 + 1, sp1 + 4)) or 0
-        if st_code < 200 or st_code >= 300 { return err(st_code) }
-    }
+    if sp1 <= 0 or sp1 + 4 > sep { return err(502) }
+    st_code := parse_i64(str_slice(raw_resp, sp1 + 1, sp1 + 4)) or 0
+    if st_code < 200 or st_code >= 300 { return err(if st_code > 0 { st_code } else { 502 }) }
     sid := http_get_header(raw_resp, "Mcp-Session-Id") or ""
     if str_len(sid) > 0 and http_is_safe_header_val(sid) { c.session_id = sid }
     sep_len := if str_find(raw_resp, "\r\n\r\n", 0) == sep { 4 } else { 2 }
@@ -2532,9 +2678,13 @@ fn mcp_server_handle_line(srv: McpServer, raw_line: str) -> McpParsedReq {
     m_id := jdoc_obj_get(doc, doc.root, "method")
     if m_id < 0 or jdoc_type(doc, m_id) != JVAL_STR() {
         jdoc_free(move doc)
-        return McpParsedReq(valid = false, is_notification = true, is_tool_call = false, id_raw = "null", method = "", tool_name = "", tool_args_json = "{}", auto_response = "")
+        return McpParsedReq(
+            valid = false, is_notification = false, is_tool_call = false,
+            id_raw = "null", method = "", tool_name = "", tool_args_json = "{}",
+            auto_response = mcp_build_error("null", -32600, "Invalid Request: missing method")
+        )
     }
-    method := jdoc_as_str(doc, m_id, "")
+    method := "" + jdoc_as_str(doc, m_id, "")
     id_n := jdoc_obj_get(doc, doc.root, "id")
     if id_n < 0 {
         jdoc_free(move doc)
@@ -2559,7 +2709,7 @@ fn mcp_server_handle_line(srv: McpServer, raw_line: str) -> McpParsedReq {
             if pv >= 0 and jdoc_type(doc, pv) == JVAL_STR() {
                 p_cand := jdoc_as_str(doc, pv, "2025-06-18")
                 if str_len(p_cand) > 0 and str_len(p_cand) <= 64 {
-                    proto = p_cand
+                    proto = "" + p_cand
                 }
             }
         }
@@ -2588,9 +2738,13 @@ fn mcp_server_handle_line(srv: McpServer, raw_line: str) -> McpParsedReq {
         jdoc_free(move doc)
         return McpParsedReq(valid = true, is_notification = false, is_tool_call = false, id_raw = id_raw, method = method, tool_name = "", tool_args_json = "{}", auto_response = mcp_build_ok(id_raw, mcp_server_build_tools_list(srv)))
     }
-    if str_eq(method, "resources/list") or str_eq(method, "resources/templates/list") {
+    if str_eq(method, "resources/list") {
         jdoc_free(move doc)
         return McpParsedReq(valid = true, is_notification = false, is_tool_call = false, id_raw = id_raw, method = method, tool_name = "", tool_args_json = "{}", auto_response = mcp_build_ok(id_raw, "{\"resources\":[]}"))
+    }
+    if str_eq(method, "resources/templates/list") {
+        jdoc_free(move doc)
+        return McpParsedReq(valid = true, is_notification = false, is_tool_call = false, id_raw = id_raw, method = method, tool_name = "", tool_args_json = "{}", auto_response = mcp_build_ok(id_raw, "{\"resourceTemplates\":[]}"))
     }
     if str_eq(method, "prompts/list") {
         jdoc_free(move doc)
@@ -2605,7 +2759,7 @@ fn mcp_server_handle_line(srv: McpServer, raw_line: str) -> McpParsedReq {
         mut targs := "{}"
         if params_n >= 0 and jdoc_type(doc, params_n) == JVAL_OBJECT() {
             tn_n := jdoc_obj_get(doc, params_n, "name")
-            if tn_n >= 0 and jdoc_type(doc, tn_n) == JVAL_STR() { tname = jdoc_as_str(doc, tn_n, "") }
+            if tn_n >= 0 and jdoc_type(doc, tn_n) == JVAL_STR() { tname = "" + jdoc_as_str(doc, tn_n, "") }
             ar_n := jdoc_obj_get(doc, params_n, "arguments")
             if ar_n >= 0 and jdoc_type(doc, ar_n) == JVAL_OBJECT() { targs = jdoc_stringify(doc, ar_n, false, 0) }
         }
@@ -2731,6 +2885,10 @@ fn mcp_http_rpc(url: str, session_id: str, req_id: i64, method: str, params_json
         raw
     }
     doc := jdoc_parse(json_payload) or return err(502)
+    if jdoc_type(doc, doc.root) != JVAL_OBJECT() {
+        jdoc_free(move doc)
+        return err(502)
+    }
     err_n := jdoc_obj_get(doc, doc.root, "error")
     if err_n >= 0 and not jdoc_is_null(doc, err_n) {
         jdoc_free(move doc)
@@ -2887,16 +3045,12 @@ fn mcp_hub_search(hub: McpHub, query: str = "", server_filter: str = "", limit: 
         if str_len(qlow) == 0 {
             sc = 1
         } else {
-            nml := str_to_lower(nm)
-            sigl := str_to_lower(sig)
-            descl := str_to_lower(desc)
-            srvl := str_to_lower(srv)
-            if str_eq(nml, qlow) { sc += 100 }
-            else if str_starts_with(nml, qlow) { sc += 50 }
-            else if str_contains(nml, qlow) { sc += 25 }
-            if str_contains(sigl, qlow) { sc += 10 }
-            if str_contains(descl, qlow) { sc += 5 }
-            if str_contains(srvl, qlow) { sc += 3 }
+            if _mcp_icase_eq(nm, qlow) { sc += 100 }
+            else if _mcp_icase_sw(nm, qlow) { sc += 50 }
+            else if _mcp_icase_find(nm, qlow) { sc += 25 }
+            if _mcp_icase_find(sig, qlow) { sc += 10 }
+            if _mcp_icase_find(desc, qlow) { sc += 5 }
+            if _mcp_icase_find(srv, qlow) { sc += 3 }
         }
         if sc > 0 {
             dvec_push(mut scores, sc)
