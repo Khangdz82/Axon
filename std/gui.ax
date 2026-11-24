@@ -209,16 +209,24 @@ fn _gui_win32_open(title: str, w_in: i64, h_in: i64, visible: bool) -> GuiWindow
     wtitle := _gui_utf8_to_utf16(k32, title)
 
     // Register WNDCLASSEXW (80 bytes on Win64) with hCursor = 0 so DefWindowProcW never resets IDC_HAND/IDC_IBEAM!
+    // Process-global class owns `hbr` once registered; if class already exists (atom == 0), delete duplicate `hbr` immediately!
     wc := ffi_alloc(96)
-    ffi_write_u32_le(wc, 0, 80)        // cbSize = 80
-    ffi_write_u32_le(wc, 4, 0x0023)    // CS_HREDRAW | CS_VREDRAW | CS_OWNDC
-    ffi_write_i64(wc, 1, f_def)        // lpfnWndProc at offset 8
-    ffi_write_i64(wc, 3, hinst)        // hInstance at offset 24
-    ffi_write_i64(wc, 5, 0)            // hCursor = 0 (managed explicitly by gui_set_cursor -> zero flicker!)
-    ffi_write_i64(wc, 6, hbr)          // hbrBackground at offset 48 (zero white flash!)
-    ffi_write_i64(wc, 8, wcname)       // lpszClassName at offset 64
-    _ := ffi_call1(f_reg, wc)
-    ffi_free(wc)
+    mut class_reg := false
+    if wc != 0 {
+        ffi_write_u32_le(wc, 0, 80)        // cbSize = 80
+        ffi_write_u32_le(wc, 4, 0x0023)    // CS_HREDRAW | CS_VREDRAW | CS_OWNDC
+        ffi_write_i64(wc, 1, f_def)        // lpfnWndProc at offset 8
+        ffi_write_i64(wc, 3, hinst)        // hInstance at offset 24
+        ffi_write_i64(wc, 5, 0)            // hCursor = 0 (managed explicitly by gui_set_cursor -> zero flicker!)
+        ffi_write_i64(wc, 6, hbr)          // hbrBackground at offset 48 (zero white flash!)
+        ffi_write_i64(wc, 8, wcname)       // lpszClassName at offset 64
+        class_reg = (ffi_call1(f_reg, wc) & 0xFFFF) != 0
+        ffi_free(wc)
+    }
+    if not class_reg and hbr != 0 {
+        f_delo0 := ffi_sym(g32, "DeleteObject")
+        if f_delo0 != 0 { _ := ffi_call1(f_delo0, hbr) }
+    }
 
     // CreateWindowExW(...)
     mut style := 0x00CF0000 // WS_OVERLAPPEDWINDOW
@@ -241,10 +249,6 @@ fn _gui_win32_open(title: str, w_in: i64, h_in: i64, visible: bool) -> GuiWindow
     ffi_free(wcname)
     ffi_free(wtitle)
     if hwnd == 0 {
-        if hbr != 0 {
-            f_delo := ffi_sym(g32, "DeleteObject")
-            if f_delo != 0 { _ := ffi_call1(f_delo, hbr) }
-        }
         return err(-602)
     }
 
@@ -304,22 +308,27 @@ fn _gui_win32_open(title: str, w_in: i64, h_in: i64, visible: bool) -> GuiWindow
         f_mw = ffi_sym(u32, "MsgWaitForMultipleObjects"),
         f_lcur = f_cur,
         f_scur = ffi_sym(u32, "SetCursor"),
-        hbr_bg = hbr,
+        hbr_bg = 0, // owned by global WNDCLASSEXW (never deleted per-window -> prevents CWE-416 UAF)
         hico = hico_def,
         dpi_changed = false
     ))
 }
 
-fn _gui_sdl2_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64 {
+fn _gui_sdl2_open(title: str, w_in: i64, h_in: i64, visible: bool) -> GuiWindow ! i64 {
+    mut w := w_in
+    mut h := h_in
+    if w < 100 { w = 100 } else if w > 7680 { w = 7680 }
+    if h < 100 { h = 100 } else if h > 4320 { h = 4320 }
     sdl := ffi_open("SDL2.dll", "libSDL2-2.0.so.0", "libSDL2.dylib")
     if sdl == 0 { return err(-610) }
     f_init := ffi_sym(sdl, "SDL_Init")
     f_cw   := ffi_sym(sdl, "SDL_CreateWindow")
     f_cr   := ffi_sym(sdl, "SDL_CreateRenderer")
     f_ct   := ffi_sym(sdl, "SDL_CreateTexture")
-    if f_cw == 0 { return err(-611) }
-    _ := ffi_call1(f_init, 0x20) // SDL_INIT_VIDEO
+    if f_cw == 0 or f_cr == 0 or f_ct == 0 { return err(-611) }
+    if f_init != 0 { _ := ffi_call1(f_init, 0x20) } // SDL_INIT_VIDEO
     ct := ffi_cstr(title)
+    if ct == 0 { return err(-612) }
     // SDL_WINDOW_SHOWN (4) | SDL_WINDOW_RESIZABLE (32) | SDL_WINDOW_ALLOW_HIGHDPI (8192)
     mut fl := 4 | 32 | 8192
     if not visible { fl = 8 | 32 | 8192 }
@@ -327,8 +336,20 @@ fn _gui_sdl2_open(title: str, w: i64, h: i64, visible: bool) -> GuiWindow ! i64 
     ffi_free(ct)
     if win == 0 { return err(-612) }
     ren := ffi_call3(f_cr, win, -1, 6) // SDL_RENDERER_ACCELERATED (2) | SDL_RENDERER_PRESENTVSYNC (4)
+    if ren == 0 {
+        f_dw := ffi_sym(sdl, "SDL_DestroyWindow")
+        if f_dw != 0 { _ := ffi_call1(f_dw, win) }
+        return err(-613)
+    }
     // SDL_PIXELFORMAT_ARGB8888 = 0x16362004, SDL_TEXTUREACCESS_STREAMING = 1
     tex := ffi_call5(f_ct, ren, 0x16362004, 1, w, h)
+    if tex == 0 {
+        f_dr := ffi_sym(sdl, "SDL_DestroyRenderer")
+        f_dw := ffi_sym(sdl, "SDL_DestroyWindow")
+        if f_dr != 0 { _ := ffi_call1(f_dr, ren) }
+        if f_dw != 0 { _ := ffi_call1(f_dw, win) }
+        return err(-614)
+    }
     return ok(GuiWindow(
         backend = 2, hwnd = win, aux1 = ren, aux2 = tex,
         width = w, height = h, mouse_x = 0, mouse_y = 0,
@@ -440,14 +461,20 @@ fn gui_set_icon_bgra(win: GuiWindow, w: i64, h: i64, pixels: ByteBuf) {
     ffi_free(mask_buf)
     if hbm_col != 0 and hbm_msk != 0 {
         ii := ffi_alloc(32)
-        ffi_write_u32_le(ii, 0, 1) // fIcon = TRUE
-        ffi_write_i64(ii, 2, hbm_msk) // offset 16: hbmMask
-        ffi_write_i64(ii, 3, hbm_col) // offset 24: hbmColor
-        hico := ffi_call1(f_ci, ii)
-        ffi_free(ii)
-        if hico != 0 {
-            _ := ffi_call4(f_sm, win.hwnd, 0x0080, 0, hico) // ICON_SMALL
-            _ := ffi_call4(f_sm, win.hwnd, 0x0080, 1, hico) // ICON_BIG
+        if ii != 0 {
+            ffi_write_u32_le(ii, 0, 1) // fIcon = TRUE
+            ffi_write_i64(ii, 2, hbm_msk) // offset 16: hbmMask
+            ffi_write_i64(ii, 3, hbm_col) // offset 24: hbmColor
+            hico := ffi_call1(f_ci, ii)
+            ffi_free(ii)
+            if hico != 0 {
+                prev_sm := ffi_call4(f_sm, win.hwnd, 0x0080, 0, hico) // ICON_SMALL
+                _ := ffi_call4(f_sm, win.hwnd, 0x0080, 1, hico) // ICON_BIG
+                if prev_sm != 0 and prev_sm != win.hico and prev_sm != hico {
+                    f_di := ffi_sym(win.user32, "DestroyIcon")
+                    if f_di != 0 { _ := ffi_call1(f_di, prev_sm) }
+                }
+            }
         }
     }
     if hbm_col != 0 { _ := ffi_call1(f_delo, hbm_col) }
@@ -616,7 +643,7 @@ fn gui_present_canvas(win: GuiWindow, canvas: Canvas) -> bool {
     if not win.is_open { return false }
     w := canvas.width
     h := canvas.height
-    if w <= 0 or h <= 0 { return false }
+    if w <= 0 or h <= 0 or w > 16384 or h > 16384 { return false }
     npix := w * h
     if buf_len(canvas.pixels) < npix * 4 { return false }
 
@@ -837,12 +864,14 @@ fn _p2d_f32_ratio(num: i64, den: i64) -> i64 {
     if a <= 0 or b <= 0 { return 0 }
     mut exp := 127
     while a < b and exp > 1 and a <= (1 << 61) { a *= 2; exp -= 1 }
+    while a < b and exp > 1 and b > 1 { b = b >> 1; exp -= 1 }
     while b <= (1 << 61) and a >= b * 2 and exp < 254 { b *= 2; exp += 1 }
     while a >= (1 << 39) or b >= (1 << 39) {
         a = a >> 1
         b = b >> 1
     }
     if b <= 0 { return s | (254 << 23) }
+    if a < b { a = b }
     mant := (((a - b) << 23) + (b / 2)) / b
     if mant >= 0x800000 {
         exp += 1
@@ -1387,7 +1416,13 @@ fn _p2d_is_reserved_img_path(path: str) -> bool {
         while en < n and str_byte(path, en) != 47 and str_byte(path, en) != 92 { en += 1 }
         seg := str_slice(path, st, en)
         dot := str_find_byte(seg, 46, 0)
-        base := if dot >= 0 { str_slice(seg, 0, dot) } else { seg }
+        raw_base := if dot >= 0 { str_slice(seg, 0, dot) } else { seg }
+        mut bend := str_len(raw_base)
+        while bend > 0 {
+            bb := str_byte(raw_base, bend - 1)
+            if bb == 32 or bb == 46 { bend -= 1 } else { break }
+        }
+        base := str_slice(raw_base, 0, bend)
         bl := str_len(base)
         if bl == 3 and (str_eq_ignore_case(base, "CON") or str_eq_ignore_case(base, "PRN") or str_eq_ignore_case(base, "AUX") or str_eq_ignore_case(base, "NUL")) {
             return true
@@ -1399,6 +1434,9 @@ fn _p2d_is_reserved_img_path(path: str) -> bool {
                 if str_eq_ignore_case(pr, "COM") or str_eq_ignore_case(pr, "LPT") { return true }
             }
         }
+        if (bl == 6 and str_eq_ignore_case(base, "CONIN$")) or (bl == 7 and str_eq_ignore_case(base, "CONOUT$")) {
+            return true
+        }
         st = en + 1
     }
     return false
@@ -1408,13 +1446,14 @@ fn _p2d_is_reserved_img_path(path: str) -> bool {
 fn _p2d_find_or_load_img(mut d2d: PhotonD2D, path: str) -> i64 {
     pn := str_len(path)
     if pn == 0 or pn > 512 or not d2d.ok { return -1 }
-    if pn >= 2 and (str_byte(path, 0) == 92 or str_byte(path, 0) == 47) and (str_byte(path, 1) == 92 or str_byte(path, 1) == 47) {
-        return -1
-    }
+    // Security (CWE-22): block absolute paths (`/`, `\`, UNC) and drive/NTFS-ADS colons (`:`) in HTML `<img src>`
+    c0 := str_byte(path, 0)
+    if c0 == 92 or c0 == 47 { return -1 }
     if _p2d_is_reserved_img_path(path) { return -1 }
     mut pi := 0
     while pi < pn {
-        if str_byte(path, pi) == 0 { return -1 }
+        pb := str_byte(path, pi)
+        if pb == 0 or pb == 58 or pb < 32 or pb == 127 { return -1 }
         pi += 1
     }
     ph := fnv1a_64(path)
@@ -1429,16 +1468,21 @@ fn _p2d_find_or_load_img(mut d2d: PhotonD2D, path: str) -> i64 {
 
     if d2d.gdiplus == 0 {
         d2d.gdiplus = ffi_open_one("gdiplus.dll")
-        if d2d.gdiplus == 0 { _p2d_cache_neg_img(mut d2d, ph); return -1 }
+        if d2d.gdiplus == 0 { if d2d.img_count < 32 { _p2d_cache_neg_img(mut d2d, ph) }; return -1 }
         f_st := ffi_sym(d2d.gdiplus, "GdiplusStartup")
-        if f_st == 0 { _p2d_cache_neg_img(mut d2d, ph); return -1 }
+        if f_st == 0 { if d2d.img_count < 32 { _p2d_cache_neg_img(mut d2d, ph) }; return -1 }
         si := ffi_alloc(32)
-        ffi_write_u32_le(si, 0, 1) // GdiplusVersion = 1
         tok_box := ffi_alloc(16)
+        if si == 0 or tok_box == 0 {
+            if si != 0 { ffi_free(si) }
+            if tok_box != 0 { ffi_free(tok_box) }
+            return -1
+        }
+        ffi_write_u32_le(si, 0, 1) // GdiplusVersion = 1
         st := ffi_call3(f_st, tok_box, si, 0) & 0xFFFFFFFF
         d2d.gdip_tok = ffi_read_i64(tok_box, 0)
         ffi_free(tok_box); ffi_free(si)
-        if st != 0 { d2d.gdiplus = 0; _p2d_cache_neg_img(mut d2d, ph); return -1 }
+        if st != 0 { d2d.gdiplus = 0; if d2d.img_count < 32 { _p2d_cache_neg_img(mut d2d, ph) }; return -1 }
     }
 
     f_load := ffi_sym(d2d.gdiplus, "GdipCreateBitmapFromFile")
@@ -1447,16 +1491,28 @@ fn _p2d_find_or_load_img(mut d2d: PhotonD2D, path: str) -> i64 {
     f_lock := ffi_sym(d2d.gdiplus, "GdipBitmapLockBits")
     f_unlk := ffi_sym(d2d.gdiplus, "GdipBitmapUnlockBits")
     f_disp := ffi_sym(d2d.gdiplus, "GdipDisposeImage")
-    if f_load == 0 or f_lock == 0 or f_disp == 0 { _p2d_cache_neg_img(mut d2d, ph); return -1 }
+    if f_load == 0 or f_gw == 0 or f_gh == 0 or f_lock == 0 or f_unlk == 0 or f_disp == 0 {
+        if d2d.img_count < 32 { _p2d_cache_neg_img(mut d2d, ph) }
+        return -1
+    }
 
     wpath := _gui_utf8_to_utf16(d2d.k32, path)
     gp_box := ffi_alloc(16)
+    if wpath == 0 or gp_box == 0 {
+        if wpath != 0 { ffi_free(wpath) }
+        if gp_box != 0 { ffi_free(gp_box) }
+        return -1
+    }
     st_l := ffi_call2(f_load, wpath, gp_box) & 0xFFFFFFFF
     gp_bmp := ffi_read_i64(gp_box, 0)
     ffi_free(gp_box); ffi_free(wpath)
-    if st_l != 0 or gp_bmp == 0 { _p2d_cache_neg_img(mut d2d, ph); return -1 }
+    if st_l != 0 or gp_bmp == 0 { if d2d.img_count < 32 { _p2d_cache_neg_img(mut d2d, ph) }; return -1 }
 
     wh_box := ffi_alloc(16)
+    if wh_box == 0 {
+        _ := ffi_call1(f_disp, gp_bmp)
+        return -1
+    }
     _ := ffi_call2(f_gw, gp_bmp, wh_box)
     _ := ffi_call2(f_gh, gp_bmp, wh_box + 8)
     iw := ffi_read_u32_le(wh_box, 0)
@@ -1464,14 +1520,20 @@ fn _p2d_find_or_load_img(mut d2d: PhotonD2D, path: str) -> i64 {
     ffi_free(wh_box)
     if iw <= 0 or ih <= 0 or iw > 8192 or ih > 8192 {
         _ := ffi_call1(f_disp, gp_bmp)
-        _p2d_cache_neg_img(mut d2d, ph)
+        if d2d.img_count < 32 { _p2d_cache_neg_img(mut d2d, ph) }
         return -1
     }
 
     rc := ffi_alloc(16)
+    bdata := ffi_alloc(48)
+    if rc == 0 or bdata == 0 {
+        if rc != 0 { ffi_free(rc) }
+        if bdata != 0 { ffi_free(bdata) }
+        _ := ffi_call1(f_disp, gp_bmp)
+        return -1
+    }
     ffi_write_u32_le(rc, 0, 0); ffi_write_u32_le(rc, 4, 0)
     ffi_write_u32_le(rc, 8, iw); ffi_write_u32_le(rc, 12, ih)
-    bdata := ffi_alloc(48)
     st_lk := ffi_call5(f_lock, gp_bmp, rc, 1, 0x000E200B, bdata) & 0xFFFFFFFF
     ffi_free(rc)
     mut d2d_bmp := 0
@@ -1492,7 +1554,7 @@ fn _p2d_find_or_load_img(mut d2d: PhotonD2D, path: str) -> i64 {
     }
     ffi_free(bdata)
     _ := ffi_call1(f_disp, gp_bmp)
-    if d2d_bmp == 0 { _p2d_cache_neg_img(mut d2d, ph); return -1 }
+    if d2d_bmp == 0 { if d2d.img_count < 32 { _p2d_cache_neg_img(mut d2d, ph) }; return -1 }
 
     slot := d2d.img_count
     ibuf_push(d2d.img_entries, ph)
@@ -1504,7 +1566,7 @@ fn _p2d_find_or_load_img(mut d2d: PhotonD2D, path: str) -> i64 {
 }
 
 fn _p2d_draw_img_rrect(mut d2d: PhotonD2D, path: str, x: i64, y: i64, w: i64, h: i64, rad: i64, obj_fit: i64 = 0) {
-    if w <= 0 or h <= 0 { return }
+    if w <= 0 or h <= 0 or w > 16384 or h > 16384 { return }
     slot := _p2d_find_or_load_img(mut d2d, path)
     if slot < 0 { return }
     bmp := ibuf_get(d2d.img_entries, slot * 4 + 1)
@@ -1731,13 +1793,16 @@ fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: 
             pv := parse_i64(str_trim(dom_get_text(app.tree, node_idx))) or 0
             mut pm := parse_i64(str_trim(dom_get_placeholder(app.tree, node_idx))) or 100
             if pm <= 0 { pm = 100 }
+            if pm > 1000000000 { pm = 1000000000 }
             mut clamped := pv
             if clamped < 0 { clamped = 0 } else if clamped > pm { clamped = pm }
             prad := bh / 2
             track_c := if style.bg_color != 0 { style.bg_color } else { 0xFF27272A }
             fill_c := if style.text_color != 0 and style.has_color { style.text_color } else { 0xFF6366F1 }
             _p2d_fill_rrect(mut d2d, bx, by, bw, bh, prad, _p2d_apply_opacity(track_c, style.opacity))
-            fw_bar := (bw * clamped) / pm
+            mut safe_bw := bw
+            if safe_bw > 32768 { safe_bw = 32768 } else if safe_bw < 0 { safe_bw = 0 }
+            fw_bar := (safe_bw * clamped) / pm
             if fw_bar > 0 {
                 _p2d_fill_rrect(mut d2d, bx, by, fw_bar, bh, prad, _p2d_apply_opacity(fill_c, style.opacity))
             }
@@ -1795,9 +1860,14 @@ fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: 
 
                 tf := _p2d_get_text_format(mut d2d, fz, fw, ha, va, wrap, style.font_mono, style.font_italic, style.text_ellipsis)
                 if tf != 0 {
-                    ctxt := ffi_cstr(raw_txt)
-                    wlen := ffi_sext32(ffi_call6(d2d.f_mb2w, 65001, 0, ctxt, tlen, d2d.wbuf, d2d.wcap))
-                    ffi_free(ctxt)
+                    // Zero-alloc UTF-8 -> UTF-16 directly from Axon string buffer + UTF-8-safe cap clamp!
+                    mut eff_tlen := tlen
+                    if eff_tlen > d2d.wcap - 1 {
+                        eff_tlen = d2d.wcap - 1
+                        while eff_tlen > 0 and (str_byte(raw_txt, eff_tlen) & 0xC0) == 0x80 { eff_tlen -= 1 }
+                    }
+                    txt_ptr := unsafe { raw_txt as i64 }
+                    wlen := if eff_tlen > 0 and txt_ptr != 0 { ffi_sext32(ffi_call6(d2d.f_mb2w, 65001, 0, txt_ptr, eff_tlen, d2d.wbuf, d2d.wcap)) } else { 0 }
                     if wlen > 0 {
                         rc := d2d.scratch + 32
                         _p2d_write_rect(rc, tx, ty, tw, th)
@@ -1931,6 +2001,7 @@ fn _p2d_paint_node(mut d2d: PhotonD2D, app: UiApp, node_idx: i64, hovered_node: 
             if content_h > bh and bh > 20 {
                 mut thumb_h := (bh * bh) / content_h
                 if thumb_h < 24 { thumb_h = 24 }
+                if thumb_h > bh { thumb_h = bh }
                 max_s := content_h - bh
                 thumb_y := by + ((bh - thumb_h) * own_scroll) / max_s
                 sb_col := if is_hov { 0xBB94A3B8 } else { 0x6671717A }
@@ -2027,14 +2098,17 @@ fn gui_present_photon_ui_cached(win: GuiWindow, mut app: UiApp, mut fonts: GuiFo
     if not win.is_open { return false }
     if not app.is_ready {
         parsed := html_parse(app.html_src) or dom_tree_new(app.html_src)
+        dom_tree_free(move app.tree)
         app.tree = parsed
-        app.layout = layout_compute(app.tree, app.sheet, app.width, app.height)
+        new_lt := layout_compute(app.tree, app.sheet, app.width, app.height)
+        layout_tree_free(move app.layout)
+        app.layout = new_lt
         app.is_ready = true
     }
 
     w := app.canvas.width
     h := app.canvas.height
-    if w <= 0 or h <= 0 or buf_len(app.canvas.pixels) < w * h * 4 { return false }
+    if w <= 0 or h <= 0 or w > 16384 or h > 16384 or buf_len(app.canvas.pixels) < w * h * 4 { return false }
 
     if win.backend != 1 {
         canv := ui_render(mut app)
@@ -2279,6 +2353,8 @@ fn gui_run_ui_app(mut app: UiApp, max_frames: i64 = 0, visible: bool = true) -> 
                     hst := css_compute_node_style(app.tree, hovered, app.sheet)
                     if hst.cursor != 0 {
                         cur_kind = hst.cursor
+                    } else if str_eq_ignore_case(htag, "input") and str_eq(dom_get_placeholder(app.tree, hovered), "__type:checkbox") {
+                        cur_kind = 1
                     } else if str_eq_ignore_case(htag, "input") or str_eq_ignore_case(htag, "textarea") {
                         cur_kind = 2
                     } else if str_eq_ignore_case(htag, "button") or str_eq_ignore_case(htag, "a") or str_len(dom_get_onclick(app.tree, hovered)) > 0 {
@@ -2336,6 +2412,7 @@ fn gui_run_ui_app(mut app: UiApp, max_frames: i64 = 0, visible: bool = true) -> 
     }
     photon_d2d_free(move d2d)
     gui_close(mut win)
+    buf_free(move win.char_queue)
     return frames
 }
 
@@ -2459,11 +2536,17 @@ fn gui_file_open_dialog(title: str = "Open File") -> str {
     ofn := ffi_alloc(160)   // sizeof(OPENFILENAMEA) = 152 on x64
     fbuf := ffi_alloc(1024)
     ct := ffi_cstr(title)
+    if ofn == 0 or fbuf == 0 or ct == 0 {
+        if ct != 0 { ffi_free(ct) }
+        if fbuf != 0 { ffi_free(fbuf) }
+        if ofn != 0 { ffi_free(ofn) }
+        return ""
+    }
     ffi_write_u32_le(ofn, 0, 152)  // lStructSize
     ffi_write_i64(ofn, 6, fbuf)    // lpstrFile = offset 48 on Win64
     ffi_write_u32_le(ofn, 56, 1023) // nMaxFile = offset 56
     ffi_write_i64(ofn, 11, ct)     // lpstrTitle = offset 88
-    ffi_write_u32_le(ofn, 96, 0x00081800) // Flags = offset 96 (OFN_EXPLORER | FILEMUSTEXIST | PATHMUSTEXIST)
+    ffi_write_u32_le(ofn, 96, 0x00081808) // Flags: OFN_EXPLORER | FILEMUSTEXIST | PATHMUSTEXIST | OFN_NOCHANGEDIR (CWE-426)
     ok_d := (ffi_call1(f_ofn, ofn) & 0xFFFFFFFF) != 0
     mut path := ""
     if ok_d { path = ffi_read_cstr(fbuf, 1024) }

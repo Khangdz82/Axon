@@ -188,7 +188,7 @@ fn _html_decode_entities(s: str) -> str {
                             j += 1
                         }
                     }
-                    if ok_num and cp > 0 and cp <= 0x10FFFF {
+                    if ok_num and cp > 0 and cp <= 0x10FFFF and not (cp >= 0xD800 and cp <= 0xDFFF) {
                         _html_push_utf8(out, cp)
                         i = semi + 1
                         continue
@@ -936,7 +936,7 @@ fn html_parse(raw_html: str) -> DomTree ! i64 {
                 if cur_txt_len <= 0 and cur_fc < 0 {
                     ibuf_set(tree.nodes, cur_parent * 16 + 8, txt_st)
                     ibuf_set(tree.nodes, cur_parent * 16 + 9, txt_l)
-                } else {
+                } else if tree.count < 32768 {
                     // Inline text node (`n_type = 2`, empty tag) preserves trailing text after <span>/<strong>
                     tnode := html_alloc_node(mut tree, 0, 0, 0, 0, 0, 0, 0, 0, txt_st, txt_l, cur_parent, 2, 0, 0)
                     tree.count += 1
@@ -1099,10 +1099,18 @@ fn dom_parse_fragment_into(mut tree: DomTree, parent_idx: i64, frag_in: str) -> 
     }
 
     mut stack := ibuf_new(64)
+    mut tail_stack := ibuf_new(64)
     mut stack_len := 0
     mut reuse_cursor := ibuf_new(2)
     ibuf_push(reuse_cursor, 0)
     mut cur_parent := parent_idx
+    // Cache current parent's last child for O(1) append (avoids O(N^2) innerHTML sibling walk!)
+    mut cur_tail := ibuf_get(tree.nodes, cur_parent * 16 + 11)
+    while cur_tail >= 0 {
+        nx := ibuf_get(tree.nodes, cur_tail * 16 + 12)
+        if nx < 0 { break }
+        cur_tail = nx
+    }
     mut added := 0
     mut p := 0
 
@@ -1129,13 +1137,23 @@ fn dom_parse_fragment_into(mut tree: DomTree, parent_idx: i64, frag_in: str) -> 
                     if str_len(cname) == 0 or str_eq_ignore_case(dom_get_tag(tree, cur_parent), cname) {
                         stack_len -= 1
                         cur_parent = ibuf_get(stack, stack_len)
+                        cur_tail = ibuf_get(tail_stack, stack_len)
                     } else {
                         mut sl := stack_len - 1
                         while sl >= 0 {
                             cand := ibuf_get(stack, sl)
                             if cand != parent_idx and str_eq_ignore_case(dom_get_tag(tree, cand), cname) {
                                 cur_parent = if sl > 0 { ibuf_get(stack, sl - 1) } else { parent_idx }
+                                cur_tail = if sl > 0 { ibuf_get(tail_stack, sl - 1) } else { -1 }
                                 stack_len = if sl > 0 { sl - 1 } else { 0 }
+                                if cur_tail < 0 {
+                                    cur_tail = ibuf_get(tree.nodes, cur_parent * 16 + 11)
+                                    while cur_tail >= 0 {
+                                        nx := ibuf_get(tree.nodes, cur_tail * 16 + 12)
+                                        if nx < 0 { break }
+                                        cur_tail = nx
+                                    }
+                                }
                                 break
                             }
                             sl -= 1
@@ -1156,26 +1174,33 @@ fn dom_parse_fragment_into(mut tree: DomTree, parent_idx: i64, frag_in: str) -> 
             tag_raw := str_slice(frag, tag_st, tag_st + tag_l)
             c0_low := str_byte(frag, tag_st) | 32
 
-            // Security (CWE-79): HTML5 innerHTML never executes <script> or <style> injections
-            if tag_l == 6 and c0_low == 115 and str_eq_ignore_case(tag_raw, "script") {
+            // Security (CWE-79): HTML5 innerHTML never executes <script> or <style> injections (case-insensitive)
+            if (tag_l == 6 and c0_low == 115 and str_eq_ignore_case(tag_raw, "script")) or
+               (tag_l == 5 and c0_low == 115 and str_eq_ignore_case(tag_raw, "style")) {
                 if is_sc { p = if tag_end < n { tag_end + 1 } else { n }; continue }
-                mut sc_end := str_find(frag, "</script>", tag_end + 1)
-                if sc_end < 0 { sc_end = str_find(frag, "</SCRIPT>", tag_end + 1) }
-                p = if sc_end >= 0 { sc_end + 9 } else { n }
-                continue
-            }
-            if tag_l == 5 and c0_low == 115 and str_eq_ignore_case(tag_raw, "style") {
-                if is_sc { p = if tag_end < n { tag_end + 1 } else { n }; continue }
-                mut st_end := str_find(frag, "</style>", tag_end + 1)
-                if st_end < 0 { st_end = str_find(frag, "</STYLE>", tag_end + 1) }
-                p = if st_end >= 0 { st_end + 8 } else { n }
+                mut scan := tag_end + 1
+                mut found_end := n
+                while scan + tag_l + 2 <= n {
+                    lt := str_find_byte(frag, 60, scan)
+                    if lt < 0 { break }
+                    if lt + 2 + tag_l <= n and str_byte(frag, lt + 1) == 47 and
+                       str_eq_ignore_case(str_slice(frag, lt + 2, lt + 2 + tag_l), tag_raw) {
+                        mut k_gt := lt + 2 + tag_l
+                        while k_gt < n and html_is_ws(str_byte(frag, k_gt)) { k_gt += 1 }
+                        if k_gt < n and str_byte(frag, k_gt) == 62 {
+                            found_end = k_gt + 1
+                            break
+                        }
+                    }
+                    scan = lt + 1
+                }
+                p = found_end
                 continue
             }
 
             mut id_v := ""
             mut cls_v := ""
             mut sty_v := ""
-            mut clk_v := ""
             mut val_v := ""
             mut ph_v := ""
             mut is_chk := false
@@ -1218,11 +1243,10 @@ fn dom_parse_fragment_into(mut tree: DomTree, parent_idx: i64, frag_in: str) -> 
                         }
                         aname := str_slice(frag, a_st, a_en)
                         aval := str_slice(frag, v_st, v_en)
+                        // Security (CWE-79): strip all inline JS event handlers (`onclick`/`onsubmit`/`onenter`) from innerHTML fragments
                         if str_eq_ignore_case(aname, "id") { id_v = aval }
                         else if str_eq_ignore_case(aname, "class") { cls_v = aval }
                         else if str_eq_ignore_case(aname, "style") { sty_v = aval }
-                        else if str_eq_ignore_case(aname, "onclick") { clk_v = aval }
-                        else if str_len(clk_v) == 0 and (str_eq_ignore_case(aname, "onsubmit") or str_eq_ignore_case(aname, "onenter")) { clk_v = aval }
                         else if str_eq_ignore_case(aname, "value") or str_eq_ignore_case(aname, "src") { val_v = aval }
                         else if str_len(val_v) == 0 and (str_eq_ignore_case(aname, "data-icon") or str_eq_ignore_case(aname, "icon")) { val_v = aval }
                         else if str_eq_ignore_case(aname, "placeholder") or (str_len(ph_v) == 0 and str_eq_ignore_case(aname, "max")) { ph_v = aval }
@@ -1242,22 +1266,32 @@ fn dom_parse_fragment_into(mut tree: DomTree, parent_idx: i64, frag_in: str) -> 
             if str_len(cls_v) > 0 { dom_set_dyn_slot(mut tree, nid, 4, cls_v) }
             if str_len(sty_v) > 0 { dom_set_dyn_slot(mut tree, nid, 6, sty_v) }
             if str_len(val_v) > 0 { dom_set_dyn_slot(mut tree, nid, 8, val_v) }
-            if str_len(clk_v) > 0 { dom_set_dyn_slot(mut tree, nid, 14, clk_v) }
             if is_chk {
                 dom_set_placeholder(mut tree, nid, "__type:checkbox")
                 dom_set_text(mut tree, nid, if is_checked { "1" } else { "0" })
             } else if str_len(ph_v) > 0 {
                 dom_set_placeholder(mut tree, nid, ph_v)
             }
-            html_append_child(tree, cur_parent, nid)
+            if cur_tail < 0 {
+                ibuf_set(tree.nodes, cur_parent * 16 + 11, nid)
+            } else {
+                ibuf_set(tree.nodes, cur_tail * 16 + 12, nid)
+            }
+            cur_tail = nid
             added += 1
 
             is_void := _html_is_void_tag(tag_raw, tag_l, c0_low)
             if not is_sc and not is_void and stack_len < 60 {
-                if stack_len < ibuf_len(stack) { ibuf_set(stack, stack_len, cur_parent) }
-                else { ibuf_push(stack, cur_parent) }
+                if stack_len < ibuf_len(stack) {
+                    ibuf_set(stack, stack_len, cur_parent)
+                    ibuf_set(tail_stack, stack_len, cur_tail)
+                } else {
+                    ibuf_push(stack, cur_parent)
+                    ibuf_push(tail_stack, cur_tail)
+                }
                 stack_len += 1
                 cur_parent = nid
+                cur_tail = -1
             }
             p = if tag_end < n { tag_end + 1 } else { n }
         } else {
@@ -1273,7 +1307,12 @@ fn dom_parse_fragment_into(mut tree: DomTree, parent_idx: i64, frag_in: str) -> 
                     tn := _dom_alloc_dynamic_node(mut tree, cur_parent, 2, mut reuse_cursor)
                     if tn >= 0 {
                         dom_set_text(mut tree, tn, raw_t)
-                        html_append_child(tree, cur_parent, tn)
+                        if cur_tail < 0 {
+                            ibuf_set(tree.nodes, cur_parent * 16 + 11, tn)
+                        } else {
+                            ibuf_set(tree.nodes, cur_tail * 16 + 12, tn)
+                        }
+                        cur_tail = tn
                         added += 1
                     }
                 }
@@ -1283,6 +1322,7 @@ fn dom_parse_fragment_into(mut tree: DomTree, parent_idx: i64, frag_in: str) -> 
     }
 
     buf_free(move stack)
+    buf_free(move tail_stack)
     buf_free(move reuse_cursor)
     return added
 }

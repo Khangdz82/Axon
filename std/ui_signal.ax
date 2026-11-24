@@ -504,8 +504,9 @@ fn signal_bind_attr_template(mut g: SignalGraph, node_idx: i64, target_type: i64
     rlen := str_len(raw)
     if rlen == 0 { return 0 }
 
-    // Collect placeholders [sig_idx, tok_st, tok_en]
-    hits := ibuf_new(32)
+    // Collect placeholders [sig_idx, tok_st, tok_en] (bounded safely to prevent fixed-cap trap)
+    hits_cap := 192
+    hits := ibuf_new(hits_cap)
     mut pos := 0
     while signal_next_placeholder(raw, pos, span_tmp) {
         tok_st := ibuf_get(span_tmp, 0)
@@ -513,7 +514,7 @@ fn signal_bind_attr_template(mut g: SignalGraph, node_idx: i64, target_type: i64
         ns := ibuf_get(span_tmp, 2)
         ne := ibuf_get(span_tmp, 3)
         sig_name := str_trim(str_slice(raw, ns, ne))
-        if str_len(sig_name) > 0 {
+        if str_len(sig_name) > 0 and ibuf_len(hits) + 3 <= hits_cap {
             mut s_idx := signal_find(g, sig_name)
             if s_idx < 0 {
                 s_idx = signal_register_str(mut g, sig_name, "")
@@ -594,13 +595,23 @@ fn signal_compile_template(mut g: SignalGraph, tree: DomTree) -> i64 {
 
 fn signal_eval_template(g: SignalGraph, tmpl: str) -> str {
     tlen := str_len(tmpl)
-    out := buf_new(tlen + 64)
     span_tmp := ibuf_new(4)
     ibuf_push(span_tmp, 0)
     ibuf_push(span_tmp, 0)
     ibuf_push(span_tmp, 0)
     ibuf_push(span_tmp, 0)
 
+    // Pass 1: exact capacity calculation so interpolated values never trap fixed ByteBuf cap
+    mut est := tlen + 16
+    mut pos0 := 0
+    while signal_next_placeholder(tmpl, pos0, span_tmp) {
+        tok_en0 := ibuf_get(span_tmp, 1)
+        ns0 := ibuf_get(span_tmp, 2)
+        ne0 := ibuf_get(span_tmp, 3)
+        est += str_len(signal_get_str(g, str_trim(str_slice(tmpl, ns0, ne0))))
+        pos0 = tok_en0
+    }
+    out := buf_new(est)
     mut pos := 0
     while signal_next_placeholder(tmpl, pos, span_tmp) {
         tok_st := ibuf_get(span_tmp, 0)
@@ -631,31 +642,33 @@ fn signal_dispatch_bindings(mut g: SignalGraph, mut tree: DomTree, base: i64, va
         full_off := ibuf_get(g.bindings, b_base + 10)
         full_len := ibuf_get(g.bindings, b_base + 11)
 
-        mut formatted := ""
-        if full_len >= 0 {
-            tmpl := buf_slice_str(g.templates_buf, full_off, full_off + full_len)
-            formatted = signal_eval_template(g, tmpl)
-        } else {
-            p_off := ibuf_get(g.bindings, b_base + 3)
-            p_len := ibuf_get(g.bindings, b_base + 4)
-            prefix := if p_len > 0 { buf_slice_str(g.templates_buf, p_off, p_off + p_len) } else { "" }
+        if node_idx >= 0 and node_idx < tree.count {
+            mut formatted := ""
+            if full_len >= 0 {
+                tmpl := buf_slice_str(g.templates_buf, full_off, full_off + full_len)
+                formatted = signal_eval_template(g, tmpl)
+            } else {
+                p_off := ibuf_get(g.bindings, b_base + 3)
+                p_len := ibuf_get(g.bindings, b_base + 4)
+                prefix := if p_len > 0 { buf_slice_str(g.templates_buf, p_off, p_off + p_len) } else { "" }
 
-            s_off := ibuf_get(g.bindings, b_base + 5)
-            s_len := ibuf_get(g.bindings, b_base + 6)
-            suffix := if s_len > 0 { buf_slice_str(g.templates_buf, s_off, s_off + s_len) } else { "" }
+                s_off := ibuf_get(g.bindings, b_base + 5)
+                s_len := ibuf_get(g.bindings, b_base + 6)
+                suffix := if s_len > 0 { buf_slice_str(g.templates_buf, s_off, s_off + s_len) } else { "" }
 
-            formatted = prefix + val_str + suffix
+                formatted = prefix + val_str + suffix
+            }
+
+            if target_type == signal_target_text() {
+                dom_set_text(mut tree, node_idx, formatted)
+            } else if target_type == signal_target_class() {
+                dom_set_class(mut tree, node_idx, formatted)
+            } else if target_type == signal_target_style() {
+                dom_set_style(mut tree, node_idx, formatted)
+            }
+
+            ibuf_set(g.bindings, b_base + 9, 1) // mark dirty
         }
-
-        if target_type == signal_target_text() {
-            dom_set_text(mut tree, node_idx, formatted)
-        } else if target_type == signal_target_class() {
-            dom_set_class(mut tree, node_idx, formatted)
-        } else if target_type == signal_target_style() {
-            dom_set_style(mut tree, node_idx, formatted)
-        }
-
-        ibuf_set(g.bindings, b_base + 9, 1) // mark dirty
         b_idx = ibuf_get(g.bindings, b_base + 7)
     }
 }
@@ -738,6 +751,7 @@ fn signal_patch_canvas(
     sheet: Stylesheet,
     lt: LayoutTree
 ) -> i64 {
+    if c.width <= 0 or c.height <= 0 { return 0 }
     mut patched := 0
     mut b := 0
     while b < g.binding_count {
@@ -745,9 +759,11 @@ fn signal_patch_canvas(
         if ibuf_get(g.bindings, b_base + 9) == 1 {
             node_idx := ibuf_get(g.bindings, b_base + 1)
             clear_bg := ibuf_get(g.bindings, b_base + 8)
-            canvas_paint_node(c, tree, sheet, lt, node_idx, clear_bg)
+            if node_idx >= 0 and node_idx < tree.count and node_idx < lt.count {
+                canvas_paint_node(c, tree, sheet, lt, node_idx, clear_bg)
+                patched += 1
+            }
             ibuf_set(g.bindings, b_base + 9, 0) // clear dirty
-            patched += 1
         }
         b += 1
     }

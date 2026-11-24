@@ -128,7 +128,34 @@ fn _webview_gen_csprng_token() -> str {
             }
         }
         if not got_rng {
-            // Entropy-mixed fallback (Unix / minimal sandbox)
+            // Unix OS CSPRNG: macOS arc4random_buf / Linux-POSIX /dev/urandom
+            libc := ffi_open("libSystem.B.dylib", "libc.so.6", "libc.so")
+            if libc != 0 {
+                f_arc := ffi_sym(libc, "arc4random_buf")
+                if f_arc != 0 {
+                    _ := ffi_call2(f_arc, raw, 16)
+                    got_rng = true
+                } else {
+                    f_open := ffi_sym(libc, "open")
+                    f_read := ffi_sym(libc, "read")
+                    f_close := ffi_sym(libc, "close")
+                    if f_open != 0 and f_read != 0 and f_close != 0 {
+                        p_dev := ffi_cstr("/dev/urandom")
+                        if p_dev != 0 {
+                            fd := ffi_sext32(ffi_call2(f_open, p_dev, 0))
+                            ffi_free(p_dev)
+                            if fd >= 0 {
+                                got := ffi_call3(f_read, fd, raw, 16)
+                                _ := ffi_call1(f_close, fd)
+                                if got == 16 { got_rng = true }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if not got_rng {
+            // Entropy-mixed fallback (minimal sandbox without OS RNG library)
             mut s1 := (clock_ns() ^ cpu_rdtsc() ^ (sys_pid() *% 0x9E3779B97F4A7C15))
             mut s2 := (s1 *% 0xBF58476D1CE4E5B9) ^ cpu_rdtsc()
             ffi_write_i64(raw, 0, s1)
@@ -228,11 +255,21 @@ fn _webview_inject_axon_head(html_in: str, accent_rgb: i64, dark_mode: bool) -> 
     cs_meta := if dark_mode { "<meta name=\"color-scheme\" content=\"dark\">" } else { "" }
     inject := f"{cs_meta}<link rel=\"icon\" type=\"image/svg+xml\" href=\"{svg_data}\"><link rel=\"icon\" type=\"image/x-icon\" href=\"/favicon.ico\">"
 
-    hpos := str_find(low, "<head>", 0)
-    if hpos >= 0 {
-        pre := str_slice(html_in, 0, hpos + 6)
-        post := str_slice(html_in, hpos + 6, str_len(html_in))
-        return f"{pre}{inject}{post}"
+    mut hpos := str_find(low, "<head", 0)
+    while hpos >= 0 {
+        after := hpos + 5
+        if after < str_len(low) {
+            ab := str_byte(low, after)
+            if ab == 62 or ab == 32 or ab == 9 or ab == 10 or ab == 13 {
+                gt := str_find_byte(html_in, 62, after)
+                if gt >= 0 {
+                    pre := str_slice(html_in, 0, gt + 1)
+                    post := str_slice(html_in, gt + 1, str_len(html_in))
+                    return f"{pre}{inject}{post}"
+                }
+            }
+        }
+        hpos = str_find(low, "<head", hpos + 5)
     }
     return f"{inject}{html_in}"
 }
@@ -382,17 +419,19 @@ fn _webview_is_safe_url(url: str) -> bool {
     return true
 }
 
-// Validates profile & binary paths via strict character whitelist (CWE-78 / CWE-22)
+// Validates profile & binary paths via strict character whitelist (CWE-78 / CWE-22 / CWE-88)
 fn _webview_is_safe_profile_path(p: str) -> bool {
     n := str_len(p)
     if n < 4 or n > 1024 { return false }
-    if str_contains(p, "..") { return false }
+    if str_contains(p, "..") or str_contains(p, "\\\\") { return false }
+    // Reject leading `-` (flag injection) and trailing `\` (escapes closing quote in argv!)
+    if str_byte(p, 0) == 45 or str_byte(p, n - 1) == 92 { return false }
     mut i := 0
     while i < n {
         b := str_byte(p, i)
         ok_c := (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or
                 b == 47 or b == 92 or b == 58 or b == 45 or b == 95 or b == 46 or b == 32 or
-                b == 40 or b == 41 // allow "(x86)" in Program Files (x86)
+                b == 40 or b == 41 or b >= 128 // allow "(x86)" and UTF-8 usernames
         if not ok_c { return false }
         i += 1
     }
@@ -506,6 +545,9 @@ fn webview_build_args(
     disable_gpu_cache: bool = true,
     dark_mode: bool = true
 ) -> str {
+    if not _webview_is_safe_url(url) or not _webview_is_safe_profile_path(profile_dir) {
+        return ""
+    }
     w := if width > 100 and width <= 7680 { width } else { 1200 }
     h := if height > 100 and height <= 4320 { height } else { 800 }
     mem := if max_mem_mb >= 16 and max_mem_mb <= 4096 { max_mem_mb } else { 64 }
@@ -587,6 +629,9 @@ fn webview_launch_window_ex(
     w := if width > 100 and width <= 7680 { width } else { 1200 }
     h := if height > 100 and height <= 4320 { height } else { 800 }
     args := webview_build_args(url, w, h, profile_dir, dev_tools, inprivate, max_mem_mb, disk_cache_mb, single_process, headless, disable_gpu_cache, dark_mode)
+    if str_len(args) == 0 {
+        return WebviewLaunchResult(success = false, proc_handle = 0, proc_id = 0, job_handle = 0)
+    }
 
     // Windows native CreateProcessA with CREATE_SUSPENDED | CREATE_NO_WINDOW (0x08000004) -> ZERO cmd flash!
     if str_contains(bin, "\\") or str_ends_with(bin, ".exe") {
@@ -651,8 +696,11 @@ fn webview_launch_window_ex(
         return WebviewLaunchResult(success = false, proc_handle = 0, proc_id = 0, job_handle = 0)
     }
 
-    // Linux / macOS safe fallback (both `bin` and `profile_dir` strictly whitelisted above!)
-    _ := os_exec(f"\"{bin}\" {args} >/dev/null 2>&1 &")
+    // Linux / macOS safe fallback (reject backslashes & quotes on POSIX shell!)
+    if str_contains(bin, "\\") or str_contains(profile_dir, "\\") {
+        return WebviewLaunchResult(success = false, proc_handle = 0, proc_id = 0, job_handle = 0)
+    }
+    _ := os_exec(f"'{bin}' {args} >/dev/null 2>&1 &")
     return WebviewLaunchResult(success = true, proc_handle = 0, proc_id = 0, job_handle = 0)
 }
 
@@ -804,6 +852,14 @@ fn webview_open_app(mut wv: WebviewApp, dev_tools: bool = false, inprivate: bool
     wv.job_handle = res.job_handle
     wv.is_open = res.success
     if res.success and not wv.headless {
+        if wv.app_hicon != 0 {
+            u32 := ffi_open_one("user32.dll")
+            if u32 != 0 {
+                f_di := ffi_sym(u32, "DestroyIcon")
+                if f_di != 0 { _ := ffi_call1(f_di, wv.app_hicon) }
+            }
+            wv.app_hicon = 0
+        }
         wv.app_hicon = webview_brand_win32_window(wv.title, wv.dark_titlebar, wv.accent_rgb)
     }
     return res.success
@@ -886,7 +942,13 @@ fn webview_close(wv: WebviewApp) {
 
 fn _webview_is_win_reserved_name(seg: str) -> bool {
     dot := str_find_byte(seg, 46, 0)
-    base := if dot >= 0 { str_slice(seg, 0, dot) } else { seg }
+    raw_base := if dot >= 0 { str_slice(seg, 0, dot) } else { seg }
+    mut end := str_len(raw_base)
+    while end > 0 {
+        b := str_byte(raw_base, end - 1)
+        if b == 32 or b == 46 { end -= 1 } else { break }
+    }
+    base := str_slice(raw_base, 0, end)
     bl := str_len(base)
     if bl == 3 {
         return str_eq_ignore_case(base, "CON") or str_eq_ignore_case(base, "PRN") or
@@ -899,6 +961,8 @@ fn _webview_is_win_reserved_name(seg: str) -> bool {
             return str_eq_ignore_case(pref, "COM") or str_eq_ignore_case(pref, "LPT")
         }
     }
+    if bl == 6 and str_eq_ignore_case(base, "CONIN$") { return true }
+    if bl == 7 and str_eq_ignore_case(base, "CONOUT$") { return true }
     return false
 }
 
@@ -915,6 +979,13 @@ fn _webview_is_safe_file_path(file_path: str) -> bool {
     while i < n {
         b := str_byte(file_path, i)
         if b < 32 or b == 127 { return false }
+        if b == 58 { // ':' only valid as Windows drive prefix `X:\` or `X:/`
+            if i != 1 or n < 3 { return false }
+            d0 := str_byte(file_path, 0)
+            is_alpha := (d0 >= 65 and d0 <= 90) or (d0 >= 97 and d0 <= 122)
+            s2 := str_byte(file_path, 2)
+            if not is_alpha or (s2 != 47 and s2 != 92) { return false }
+        }
         i += 1
     }
     mut st := 0
@@ -1001,32 +1072,64 @@ fn _webview_has_nul(s: str) -> bool {
     return false
 }
 
-// Reads full HTTP/1.1 request including split-packet POST bodies up to 4 MB with 16 KB header cap!
+// Extract `t=<token>` query param for constant-time comparison
+fn _webview_query_token(q: str) -> str {
+    n := str_len(q)
+    mut pos := 0
+    while pos < n {
+        mut amp := str_find_byte(q, 38, pos)
+        if amp < 0 { amp = n }
+        if amp - pos > 2 and str_byte(q, pos) == 116 and str_byte(q, pos + 1) == 61 {
+            return str_slice(q, pos + 2, amp)
+        }
+        pos = amp + 1
+    }
+    return ""
+}
+
+// Reads full HTTP/1.1 request including split-packet headers & POST bodies up to 4 MB with 16 KB header cap & 15s deadline!
 fn _webview_recv_full_req(sock: TcpStream) -> str {
-    first := tcp_recv(sock, 65536) or buf_new(0)
-    flen := buf_len(first)
-    if flen <= 0 {
-        buf_free(move first)
+    deadline_ns := clock_ns() +% 15000000000
+    hacc := buf_new(16448)
+    mut hdr_end := -1
+    mut h_chunks := 0
+    while hdr_end < 0 and buf_len(hacc) < 16384 and h_chunks < 32 {
+        if clock_ns() > deadline_ns { buf_free(move hacc); return "" }
+        h_chunks += 1
+        rem_h := 16384 - buf_len(hacc)
+        want_h := if rem_h > 4096 { 4096 } else { rem_h }
+        part := tcp_recv(sock, want_h) or buf_new(0)
+        plen := buf_len(part)
+        if plen <= 0 { buf_free(move part); break }
+        if buf_len(hacc) + plen > 16384 {
+            buf_free(move part)
+            buf_free(move hacc)
+            return ""
+        }
+        buf_push_str(hacc, buf_slice_str(part, 0, plen))
+        buf_free(move part)
+        hdr_end = str_find(buf_slice_str(hacc, 0, buf_len(hacc)), "\r\n\r\n", 0)
+    }
+    if hdr_end < 0 or hdr_end > 16384 {
+        buf_free(move hacc)
         return ""
     }
-    raw1 := buf_to_owned_str(move first)
-    hdr_end := str_find(raw1, "\r\n\r\n", 0)
-    if hdr_end < 0 or hdr_end > 16384 { return "" }
+    raw1 := buf_to_owned_str(move hacc)
     cl_str := http_get_header(raw1, "Content-Length") or ""
     if str_len(cl_str) == 0 { return raw1 }
+    cl_trim := str_trim(cl_str)
+    cn := str_len(cl_trim)
+    if cn == 0 { return "" }
     mut need_body := 0
     mut ci := 0
-    cn := str_len(cl_str)
     while ci < cn {
-        b := str_byte(cl_str, ci)
-        if b >= 48 and b <= 57 {
-            if need_body < 4194304 { need_body = need_body * 10 + (b - 48) }
-        } else if b != 32 {
-            break
-        }
+        b := str_byte(cl_trim, ci)
+        if b < 48 or b > 57 { return "" }
+        if need_body > 4194304 { return "" }
+        need_body = need_body * 10 + (b - 48)
         ci += 1
     }
-    if need_body > 4194304 { need_body = 4194304 }
+    if need_body > 4194304 { return "" }
     body_start := hdr_end + 4
     have_body := str_len(raw1) - body_start
     if have_body >= need_body { return raw1 }
@@ -1037,13 +1140,14 @@ fn _webview_recv_full_req(sock: TcpStream) -> str {
     mut rem := need_body - have_body
     mut chunks := 0
     while rem > 0 and chunks < 128 {
+        if clock_ns() > deadline_ns { buf_free(move acc); return "" }
         chunks += 1
         want := if rem > 65536 { 65536 } else { rem }
         part := tcp_recv(sock, want) or buf_new(0)
         plen := buf_len(part)
         if plen <= 0 { buf_free(move part); break }
-        p_str := buf_to_owned_str(move part)
-        if buf_len(acc) + str_len(p_str) <= total_cap { buf_push_str(acc, p_str) }
+        if buf_len(acc) + plen <= total_cap { buf_push_str(acc, buf_slice_str(part, 0, plen)) }
+        buf_free(move part)
         rem -= plen
     }
     return buf_to_owned_str(move acc)
@@ -1100,7 +1204,7 @@ fn webview_next_api_req(wv: WebviewApp) -> WebviewReq ! i64 {
             continue
         }
         sfs_hdr := http_get_header(raw, "Sec-Fetch-Site") or ""
-        if str_eq(sfs_hdr, "cross-site") {
+        if str_eq(sfs_hdr, "cross-site") or str_eq(sfs_hdr, "same-site") {
             _ := tcp_send_str(sock, _webview_build_resp_close(403, "text/plain; charset=utf-8", "Cross-Site Forbidden")) or 0
             tcp_close(sock)
             continue
@@ -1109,7 +1213,8 @@ fn webview_next_api_req(wv: WebviewApp) -> WebviewReq ! i64 {
         tok_ok := _webview_ct_eq(tok_hdr, wv.auth_token)
 
         if str_eq(req.path, "/__axon_close") {
-            if tok_ok or str_contains(req.query, wv.auth_token) {
+            q_tok := _webview_query_token(req.query)
+            if tok_ok or _webview_ct_eq(q_tok, wv.auth_token) {
                 _ := tcp_send_str(sock, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") or 0
                 tcp_close(sock)
                 return err(-603)
@@ -1118,10 +1223,13 @@ fn webview_next_api_req(wv: WebviewApp) -> WebviewReq ! i64 {
             tcp_close(sock)
             continue
         }
-        if str_eq(req.method, "GET") and str_eq(req.path, "/") {
+        if (str_eq(req.method, "GET") or str_eq(req.method, "HEAD")) and str_eq(req.path, "/") {
             inm := http_get_header(raw, "If-None-Match") or ""
             if str_len(wv.index_etag) > 0 and str_eq(str_trim(inm), wv.index_etag) {
                 _ := tcp_send_str(sock, f"HTTP/1.1 304 Not Modified\r\nETag: {wv.index_etag}\r\nConnection: close\r\n\r\n") or 0
+            } else if str_eq(req.method, "HEAD") {
+                sec := _webview_sec_headers()
+                _ := tcp_send_str(sock, f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {str_len(wv.html_body)}\r\n{sec}Connection: close\r\n\r\n") or 0
             } else if str_len(wv.cached_index_resp) > 0 {
                 _ := tcp_send_str(sock, wv.cached_index_resp) or 0
             } else {
@@ -1136,7 +1244,6 @@ fn webview_next_api_req(wv: WebviewApp) -> WebviewReq ! i64 {
             hdr := f"HTTP/1.1 200 OK\r\nContent-Type: application/javascript; charset=utf-8\r\nContent-Length: {str_len(bjs)}\r\n{sec}Cache-Control: no-store\r\nConnection: close\r\n\r\n{bjs}"
             _ := tcp_send_str(sock, hdr) or 0
             tcp_close(sock)
-            if not wv.headless { _ := webview_brand_win32_window(wv.title, wv.dark_titlebar, wv.accent_rgb, 0x00171414, 1) }
             continue
         }
         // Serve real 32x32 32-bit BGRA native Axon `.ico` (ELIMINATES generic browser globe icon!)
@@ -1149,27 +1256,23 @@ fn webview_next_api_req(wv: WebviewApp) -> WebviewReq ! i64 {
             if s1 { _ := tcp_send_bytes(sock, ico) or 0 }
             buf_free(move ico)
             tcp_close(sock)
-            if not wv.headless { _ := webview_brand_win32_window(wv.title, wv.dark_titlebar, wv.accent_rgb, 0x00171414, 1) }
             continue
         }
-        // Binary-safe static directory asset serving with Cache-Control & security headers
-        if str_len(wv.static_dir) > 0 and str_eq(req.method, "GET") {
+        // Binary-safe static directory asset serving with Cache-Control, SVG sandbox CSP & security headers
+        if str_len(wv.static_dir) > 0 and (str_eq(req.method, "GET") or str_eq(req.method, "HEAD")) {
             static_file := _webview_safe_resolve_static(wv.static_dir, req.path)
             if str_len(static_file) > 0 and sys_fs_exists(static_file) {
                 b_file := fs_read_file(static_file) or buf_new(0)
                 flen := buf_len(b_file)
-                if flen > 0 {
-                    mime := webview_content_type_from_path(static_file)
-                    sec := _webview_sec_headers()
-                    hdr := f"HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {flen}\r\n{sec}Cache-Control: public, max-age=3600\r\nConnection: close\r\n\r\n"
-                    s1 := (tcp_send_str(sock, hdr) or -1) >= 0
-                    if s1 { _ := tcp_send_bytes(sock, b_file) or 0 }
-                    buf_free(move b_file)
-                    tcp_close(sock)
-                    continue
-                } else {
-                    buf_free(move b_file)
-                }
+                mime := webview_content_type_from_path(static_file)
+                sec := _webview_sec_headers()
+                svg_csp := if str_ends_with(static_file, ".svg") { "Content-Security-Policy: sandbox\r\n" } else { "" }
+                hdr := f"HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {flen}\r\n{sec}{svg_csp}Cache-Control: public, max-age=3600\r\nConnection: close\r\n\r\n"
+                s1 := (tcp_send_str(sock, hdr) or -1) >= 0
+                if s1 and flen > 0 and not str_eq(req.method, "HEAD") { _ := tcp_send_bytes(sock, b_file) or 0 }
+                buf_free(move b_file)
+                tcp_close(sock)
+                continue
             }
         }
         // Optional strict CSPRNG token enforcement on API routes (CWE-306)
@@ -1191,7 +1294,11 @@ fn webview_reply_json(req: WebviewReq, json_body: str, status: i64 = 200) -> boo
 }
 
 fn webview_reply_html(req: WebviewReq, html_body: str, status: i64 = 200) -> bool {
-    resp := _webview_build_resp_close(status, "text/html; charset=utf-8", html_body)
+    reason := http_status_reason(status)
+    n := str_len(html_body)
+    sec := _webview_sec_headers()
+    csp := "Content-Security-Policy: default-src 'self' 'unsafe-inline' data: blob:; frame-ancestors 'none'\r\n"
+    resp := f"HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {n}\r\n{sec}{csp}Connection: close\r\n\r\n{html_body}"
     ok_s := (tcp_send_str(req.sock, resp) or -1) >= 0
     tcp_close(req.sock)
     return ok_s

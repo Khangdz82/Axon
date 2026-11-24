@@ -123,7 +123,7 @@ struct JsStateStore {
     fn_meta: IntBuf  // 6 ints per fn: [name_off, name_len, body_off, body_len, param_off, param_len]
     fn_count: i64
     str_pool: ByteBuf
-    str_meta: IntBuf // slot 0 = count; then 3 ints per entry: [khash, off, len (-1 = deleted)]
+    str_meta: IntBuf // slot 0 = count; then 4 ints per entry: [khash, off, len (-1 = deleted), cap]
 }
 
 fn js_state_free(move store: JsStateStore) {
@@ -137,7 +137,7 @@ fn js_state_free(move store: JsStateStore) {
 }
 
 fn js_state_new() -> JsStateStore {
-    sm := ibuf_new(784) // slot 0 + up to 256 string vars * 3
+    sm := ibuf_new(1040) // slot 0 + up to 256 string vars * 4
     ibuf_push(sm, 0)
     return JsStateStore(
         map = map_new(128),
@@ -214,12 +214,12 @@ fn js_state_set_str(store: JsStateStore, key: str, val: str) {
     cnt := ibuf_get(store.str_meta, 0)
     mut i := 0
     while i < cnt {
-        b := 1 + i * 3
+        b := 1 + i * 4
         if ibuf_get(store.str_meta, b) == kh {
             old_off := ibuf_get(store.str_meta, b + 1)
-            old_len := ibuf_get(store.str_meta, b + 2)
-            // Reuse existing slot in-place when new string fits (eliminates 32KB pool exhaustion!)
-            if old_len >= 0 and vl <= old_len {
+            old_cap := ibuf_get(store.str_meta, b + 3)
+            // Reuse existing slot in-place up to its allocated capacity (prevents pool exhaustion on shrink/grow!)
+            if vl <= old_cap {
                 mut k := 0
                 while k < vl {
                     buf_set(store.str_pool, old_off + k, str_byte(val, k))
@@ -233,6 +233,7 @@ fn js_state_set_str(store: JsStateStore, key: str, val: str) {
             if vl > 0 { buf_push_str(store.str_pool, val) }
             ibuf_set(store.str_meta, b + 1, off)
             ibuf_set(store.str_meta, b + 2, vl)
+            ibuf_set(store.str_meta, b + 3, vl)
             return
         }
         i += 1
@@ -243,6 +244,7 @@ fn js_state_set_str(store: JsStateStore, key: str, val: str) {
     ibuf_push(store.str_meta, kh)
     ibuf_push(store.str_meta, off)
     ibuf_push(store.str_meta, vl)
+    ibuf_push(store.str_meta, vl)
     ibuf_set(store.str_meta, 0, cnt + 1)
 }
 
@@ -251,7 +253,7 @@ fn js_state_has_str(store: JsStateStore, key: str) -> bool {
     cnt := ibuf_get(store.str_meta, 0)
     mut i := 0
     while i < cnt {
-        b := 1 + i * 3
+        b := 1 + i * 4
         if ibuf_get(store.str_meta, b) == kh {
             return ibuf_get(store.str_meta, b + 2) >= 0
         }
@@ -265,7 +267,7 @@ fn js_state_get_str(store: JsStateStore, key: str) -> str {
     cnt := ibuf_get(store.str_meta, 0)
     mut i := 0
     while i < cnt {
-        b := 1 + i * 3
+        b := 1 + i * 4
         if ibuf_get(store.str_meta, b) == kh {
             vl := ibuf_get(store.str_meta, b + 2)
             if vl <= 0 { return "" }
@@ -281,7 +283,7 @@ fn _js_clear_str(store: JsStateStore, kh: i64) {
     cnt := ibuf_get(store.str_meta, 0)
     mut i := 0
     while i < cnt {
-        b := 1 + i * 3
+        b := 1 + i * 4
         if ibuf_get(store.str_meta, b) == kh {
             ibuf_set(store.str_meta, b + 2, -1)
             return
@@ -303,7 +305,7 @@ fn js_state_get(store: JsStateStore, key: str, default_val: i64 = 0) -> i64 {
 
 fn js_state_inc(store: JsStateStore, key: str, step: i64 = 1) -> i64 {
     cur := js_state_get(store, key, 0)
-    new_val := cur + step
+    new_val := cur +% step
     js_state_set(store, key, new_val)
     return new_val
 }
@@ -642,19 +644,39 @@ fn _js_eval_str_dom(tree: DomTree, store: JsStateStore, raw_expr: str, depth: i6
     if (b0 == 39 or b0 == 34) and n >= 2 and str_byte(e, n - 1) == b0 {
         return _js_unescape_quoted(e, 1, n - 1)
     }
+    // Built-in HTML escaper: `escapeHtml(expr)` for CWE-79 safe innerHTML template interpolation
+    if n > 12 and str_starts_with(e, "escapeHtml(") and str_byte(e, n - 1) == 41 {
+        raw_s := _js_eval_str_dom(tree, store, str_slice(e, 11, n - 1), depth + 1)
+        rn := str_len(raw_s)
+        if rn == 0 { return "" }
+        eb := buf_new(rn * 6 + 16)
+        mut ei := 0
+        while ei < rn {
+            ch := str_byte(raw_s, ei)
+            if ch == 60 { buf_push_str(eb, "&lt;") }
+            else if ch == 62 { buf_push_str(eb, "&gt;") }
+            else if ch == 38 { buf_push_str(eb, "&amp;") }
+            else if ch == 34 { buf_push_str(eb, "&quot;") }
+            else if ch == 39 { buf_push_str(eb, "&#39;") }
+            else { buf_push(eb, ch) }
+            ei += 1
+        }
+        return buf_to_owned_str(move eb)
+    }
+
     // JS Template Literal interpolation: `Hello ${name}, total=${a + b}`!
     if b0 == 96 and n >= 2 and str_byte(e, n - 1) == 96 {
         inner := _js_unescape_quoted(e, 1, n - 1)
         if str_find(inner, "${", 0) < 0 { return inner }
         in_len := str_len(inner)
-        out := buf_new(in_len * 2 + 64)
+        out := buf_new(65544)
         mut k := 0
         while k < in_len {
             if k + 2 < in_len and str_byte(inner, k) == 36 and str_byte(inner, k + 1) == 123 {
                 rb := _js_find_matching(inner, k + 1, 123, 125)
                 if rb > k + 1 {
                     sub_val := _js_eval_str_dom(tree, store, str_slice(inner, k + 2, rb), depth + 1)
-                    if buf_len(out) + str_len(sub_val) < 65536 {
+                    if buf_len(out) + str_len(sub_val) <= 65536 {
                         buf_push_str(out, sub_val)
                     }
                     k = rb + 1
@@ -1175,7 +1197,7 @@ fn _js_eval_single_fuel(mut tree: DomTree, store: JsStateStore, action_str: str,
     if p_meq > 0 {
         vname := str_trim(str_slice(vsrc, 0, p_meq))
         rhs := _js_eval_num(tree, store, str_slice(vsrc, p_meq + 2, vn), 0)
-        _ := js_state_inc(store, vname, 0 - rhs)
+        _ := js_state_inc(store, vname, 0 -% rhs)
         return true
     }
     p_eq := _js_find_top_op(vsrc, "=", false)
@@ -1194,7 +1216,7 @@ fn _js_eval_single_fuel(mut tree: DomTree, store: JsStateStore, action_str: str,
 
     // --- JS Function Call with Arguments (shares global anti-DoS `fuel` across recursion!) ---
     lp := str_find_byte(act, 40, 0)
-    if lp > 0 and str_ends_with(act, ")") {
+    if lp > 0 and str_ends_with(act, ")") and _js_find_matching(act, lp, 40, 41) == n - 1 {
         fname := str_trim(str_slice(act, 0, lp))
         if str_find_byte(fname, 46, 0) < 0 and str_find_byte(fname, 32, 0) < 0 {
             body := js_find_fn_body(store, fname)
@@ -1449,10 +1471,13 @@ fn js_eval_script(mut tree: DomTree, mut store: JsStateStore, script: str) -> bo
             }
         }
         // Top-level `if`, `for`, or `while` block or single statement
-        if (p + 2 <= n and str_eq(str_slice(script, p, p + 2), "if") and (p + 2 == n or not _js_is_ident_char(str_byte(script, p + 2)))) or
-           (p + 3 <= n and str_eq(str_slice(script, p, p + 3), "for") and (p + 3 == n or not _js_is_ident_char(str_byte(script, p + 3)))) or
-           (p + 5 <= n and str_eq(str_slice(script, p, p + 5), "while") and (p + 5 == n or not _js_is_ident_char(str_byte(script, p + 5)))) {
-            lp := str_find_byte(script, 40, p)
+        mut kw_len := 0
+        if p + 2 <= n and str_eq(str_slice(script, p, p + 2), "if") and (p + 2 == n or not _js_is_ident_char(str_byte(script, p + 2))) { kw_len = 2 }
+        else if p + 3 <= n and str_eq(str_slice(script, p, p + 3), "for") and (p + 3 == n or not _js_is_ident_char(str_byte(script, p + 3))) { kw_len = 3 }
+        else if p + 5 <= n and str_eq(str_slice(script, p, p + 5), "while") and (p + 5 == n or not _js_is_ident_char(str_byte(script, p + 5))) { kw_len = 5 }
+        if kw_len > 0 {
+            lp_cand := _js_skip_ws_comments(script, p + kw_len)
+            lp := if lp_cand < n and str_byte(script, lp_cand) == 40 { lp_cand } else { -1 }
             rp := if lp > p { _js_find_matching(script, lp, 40, 41) } else { -1 }
             lb := if rp > lp { _js_skip_ws_comments(script, rp + 1) } else { -1 }
             mut rb := if lb > rp { _js_find_matching(script, lb, 123, 125) } else { -1 }
