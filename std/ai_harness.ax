@@ -14,6 +14,8 @@ use std::json_dom
 use std::path
 use std::sys
 use std::fs
+use std::shutil
+use std::subprocess
 use std::difflib
 use std::tls
 use std::http
@@ -239,7 +241,8 @@ fn agent_ctx_compact_tool_outputs(mut ctx: AgentContext, keep_recent_msgs: i64 =
         raw := if ln > 0 { buf_slice_str(ctx.text_buf, off, off + ln) } else { "" }
         mut text := raw
         if i > 0 and i < cutoff and role == 3 and ln > max_old_tool_chars {
-            text = harness_truncate_middle(raw, max_old_tool_chars)
+            trunc := harness_truncate_middle(raw, max_old_tool_chars)
+            if str_len(trunc) < ln { text = trunc }
         }
         new_off := buf_len(new_tb)
         if str_len(text) > 0 { buf_push_str(new_tb, text) }
@@ -827,7 +830,16 @@ fn harness_parse_tool_calls_all(resp: str) -> ToolCallBatch {
 
 fn harness_parse_tool_call(resp: str) -> ToolCall {
     batch := harness_parse_tool_calls_all(resp)
-    res := if batch.count > 0 { tool_batch_get(batch, 0) } else { ToolCall(found = false, id = "", name = "", args_json = "") }
+    mut res := ToolCall(found = false, id = "", name = "", args_json = "")
+    if batch.count > 0 {
+        tc0 := tool_batch_get(batch, 0)
+        res = ToolCall(
+            found = tc0.found,
+            id = "" + tc0.id,
+            name = "" + tc0.name,
+            args_json = "" + tc0.args_json
+        )
+    }
     tool_batch_free(move batch)
     return res
 }
@@ -878,7 +890,7 @@ fn _harness_is_token_ch(b: i64) -> bool {
     if b >= 48 and b <= 57 { return true }
     if b >= 65 and b <= 90 { return true }
     if b >= 97 and b <= 122 { return true }
-    return b == 45 or b == 95 or b == 46
+    return b == 45 or b == 95 or b == 46 or b == 43 or b == 47 or b == 61
 }
 
 // Scans text for leaked API keys, JWTs, Bearer tokens, and PEM private keys
@@ -915,6 +927,7 @@ fn harness_redact_secrets(text: str) -> str {
         if b == 66 and _harness_match_at(text, n, i, "Bearer ") {
             buf_push_str(out, "Bearer [REDACTED]")
             mut j := i + 7
+            while j < n and (str_byte(text, j) == 32 or str_byte(text, j) == 9) { j += 1 }
             while j < n and _harness_is_token_ch(str_byte(text, j)) { j += 1 }
             i = j
             continue
@@ -962,10 +975,20 @@ fn harness_detect_prompt_injection(text: str) -> bool {
     return false
 }
 
-// Jailed workspace file read (blocks `..`, drive-relative `C:foo`, UNC, Windows reserved device names)
+fn _harness_jail_resolve(root: str, rel_path: str) -> str ! i64 {
+    full := path_join_safe(root, rel_path) or return err(403)
+    root_abs := shutil_abspath(root)
+    full_abs := shutil_abspath(full)
+    if shutil_path_has_symlink(root_abs, full_abs) { return err(403) }
+    return ok(full)
+}
+
+// Jailed workspace file read (blocks `..`, symlinks/junctions, drive-relative `C:foo`, UNC, Windows reserved device names)
 fn harness_tool_read_file(mut sb: HarnessSandbox, rel_path: str) -> str ! i64 {
     if not harness_sandbox_consume_step(mut sb) { return err(429) }
-    full := path_join_safe(sb.workspace_root, rel_path) or return err(403)
+    full := _harness_jail_resolve(sb.workspace_root, rel_path) or return err(403)
+    st := shutil_stat(full)
+    if st.exists and st.size > 16777216 { return err(413) }
     raw := fs_read_file(full) or return err(404)
     n := buf_len(raw)
     lim := if n > sb.max_tool_bytes { sb.max_tool_bytes } else { n }
@@ -978,7 +1001,9 @@ fn harness_tool_read_file(mut sb: HarnessSandbox, rel_path: str) -> str ! i64 {
 fn harness_tool_read_lines(mut sb: HarnessSandbox, rel_path: str, start_line: i64, end_line: i64) -> str ! i64 {
     if start_line < 1 or end_line < start_line { return err(400) }
     if not harness_sandbox_consume_step(mut sb) { return err(429) }
-    full := path_join_safe(sb.workspace_root, rel_path) or return err(403)
+    full := _harness_jail_resolve(sb.workspace_root, rel_path) or return err(403)
+    st := shutil_stat(full)
+    if st.exists and st.size > 16777216 { return err(413) }
     raw := fs_read_file(full) or return err(404)
     n := buf_len(raw)
     if n > 16777216 { buf_free(move raw); return err(413) }
@@ -1002,11 +1027,11 @@ fn harness_tool_read_lines(mut sb: HarnessSandbox, rel_path: str, start_line: i6
     return ok(buf_to_owned_str(move out))
 }
 
-// Jailed workspace file write (atomic write + `read_only` mode + `path_join_safe`)
+// Jailed workspace file write (atomic write + `read_only` mode + `path_join_safe` + symlink guard)
 fn harness_tool_write_file(mut sb: HarnessSandbox, rel_path: str, content: str) -> i64 ! i64 {
     if sb.read_only { return err(403) }
     if not harness_sandbox_consume_step(mut sb) { return err(429) }
-    full := path_join_safe(sb.workspace_root, rel_path) or return err(403)
+    full := _harness_jail_resolve(sb.workspace_root, rel_path) or return err(403)
     if not fs_atomic_write(full, content) { return err(500) }
     return ok(str_len(content))
 }
@@ -1016,7 +1041,9 @@ fn harness_tool_edit_file(mut sb: HarnessSandbox, rel_path: str, target: str, re
     if sb.read_only { return err(403) }
     if str_len(target) == 0 { return err(400) }
     if not harness_sandbox_consume_step(mut sb) { return err(429) }
-    full := path_join_safe(sb.workspace_root, rel_path) or return err(403)
+    full := _harness_jail_resolve(sb.workspace_root, rel_path) or return err(403)
+    st := shutil_stat(full)
+    if st.exists and st.size > 8388608 { return err(413) }
     raw := fs_read_file(full) or return err(404)
     if buf_len(raw) > 8388608 { buf_free(move raw); return err(413) }
     src := buf_to_owned_str(move raw)
@@ -1036,7 +1063,9 @@ fn harness_tool_edit_strict(mut sb: HarnessSandbox, rel_path: str, target: str, 
     if sb.read_only { return err(403) }
     if str_len(target) == 0 { return err(400) }
     if not harness_sandbox_consume_step(mut sb) { return err(429) }
-    full := path_join_safe(sb.workspace_root, rel_path) or return err(403)
+    full := _harness_jail_resolve(sb.workspace_root, rel_path) or return err(403)
+    st := shutil_stat(full)
+    if st.exists and st.size > 8388608 { return err(413) }
     raw := fs_read_file(full) or return err(404)
     if buf_len(raw) > 8388608 { buf_free(move raw); return err(413) }
     src := buf_to_owned_str(move raw)
@@ -1063,7 +1092,9 @@ fn harness_tool_edit_strict(mut sb: HarnessSandbox, rel_path: str, target: str, 
 fn harness_tool_grep(mut sb: HarnessSandbox, rel_path: str, query: str, max_matches: i64 = 50) -> str ! i64 {
     if str_len(query) == 0 { return err(400) }
     if not harness_sandbox_consume_step(mut sb) { return err(429) }
-    full := path_join_safe(sb.workspace_root, rel_path) or return err(403)
+    full := _harness_jail_resolve(sb.workspace_root, rel_path) or return err(403)
+    st := shutil_stat(full)
+    if st.exists and st.size > 16777216 { return err(413) }
     raw := fs_read_file(full) or return err(404)
     n := buf_len(raw)
     if n > 16777216 { buf_free(move raw); return err(413) }
@@ -1090,33 +1121,136 @@ fn harness_tool_grep(mut sb: HarnessSandbox, rel_path: str, query: str, max_matc
     return ok(buf_to_owned_str(move out))
 }
 
-// Strict allowlist validator for agent shell commands (CWE-78 + CWE-88 hardened!)
-fn harness_is_safe_cmd(cmd: str) -> bool {
-    c := str_trim(cmd)
-    n := str_len(c)
-    if n == 0 or n > 256 { return false }
-    ok_pref := str_starts_with(c, "git status") or str_starts_with(c, "git diff") or str_starts_with(c, "git log") or str_starts_with(c, "bin/axc.exe check ") or str_starts_with(c, "bin/axc.exe test ")
-    if not ok_pref { return false }
-    // Block git/compiler argument-injection flags (CWE-88)
-    if str_contains(c, "--output") or str_contains(c, "--ext-diff") or str_contains(c, "--no-index") or str_contains(c, "--textconv") or str_contains(c, "--git-dir") or str_contains(c, "--work-tree") or str_contains(c, "--config-env") or str_contains(c, "--upload-pack") or str_contains(c, "--exec") or str_contains(c, "--paginate") or str_contains(c, " -c ") or str_contains(c, " -C ") or str_contains(c, " -o ") or str_contains(c, "--link-lib") or str_contains(c, " /") or str_contains(c, ":") {
-        return false
-    }
+fn _harness_is_safe_rel_arg(tok: str) -> bool {
+    n := str_len(tok)
+    if n == 0 or n > 160 { return false }
+    c0 := str_byte(tok, 0)
+    if c0 == 45 or c0 == 47 or c0 == 46 { return false } // no leading '-', '/', '.'
     mut i := 0
     while i < n {
-        b := str_byte(c, i)
+        b := str_byte(tok, i)
         alnum := (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
-        safe_p := b == 32 or b == 95 or b == 46 or b == 47 or b == 45
-        if not alnum and not safe_p { return false }
-        if b == 46 and i + 1 < n and str_byte(c, i + 1) == 46 { return false }
+        if not alnum and b != 95 and b != 46 and b != 47 and b != 45 { return false }
+        if b == 46 and i + 1 < n and str_byte(tok, i + 1) == 46 { return false }
         i += 1
     }
     return true
 }
 
+fn _harness_is_digits(s: str) -> bool {
+    n := str_len(s)
+    if n == 0 or n > 6 { return false }
+    mut i := 0
+    while i < n {
+        b := str_byte(s, i)
+        if b < 48 or b > 57 { return false }
+        i += 1
+    }
+    return true
+}
+
+fn _harness_parse_safe_argv(cmd: str) -> StrVec ! i64 {
+    c := str_trim(cmd)
+    n := str_len(c)
+    if n == 0 or n > 256 { return err(403) }
+    mut argv := svec_new(8, 256)
+    mut i := 0
+    while i < n {
+        while i < n and str_byte(c, i) == 32 { i += 1 }
+        if i >= n { break }
+        start := i
+        while i < n and str_byte(c, i) != 32 {
+            b := str_byte(c, i)
+            alnum := (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
+            if not alnum and b != 95 and b != 46 and b != 47 and b != 45 {
+                svec_free(move argv)
+                return err(403)
+            }
+            if b == 46 and i + 1 < n and str_byte(c, i + 1) == 46 {
+                svec_free(move argv)
+                return err(403)
+            }
+            i += 1
+        }
+        svec_push(mut argv, str_slice(c, start, i))
+        if svec_len(argv) > 8 { svec_free(move argv); return err(403) }
+    }
+    argc := svec_len(argv)
+    if argc < 2 { svec_free(move argv); return err(403) }
+    a0 := svec_get(argv, 0)
+    a1 := svec_get(argv, 1)
+    mut ok_cmd := false
+    if str_eq(a0, "git") and str_eq(a1, "status") {
+        ok_cmd = true
+        mut k := 2
+        while k < argc {
+            t := svec_get(argv, k)
+            if not (str_eq(t, "-s") or str_eq(t, "--short") or str_eq(t, "-b") or str_eq(t, "--branch") or str_eq(t, "--porcelain")) {
+                ok_cmd = false; break
+            }
+            k += 1
+        }
+    } else if str_eq(a0, "git") and str_eq(a1, "diff") {
+        ok_cmd = true
+        mut k := 2
+        while k < argc {
+            t := svec_get(argv, k)
+            if str_eq(t, "--stat") or str_eq(t, "--name-only") or str_eq(t, "--staged") or str_eq(t, "--cached") or str_eq(t, "--") or _harness_is_safe_rel_arg(t) {
+                k += 1
+            } else {
+                ok_cmd = false; break
+            }
+        }
+    } else if str_eq(a0, "git") and str_eq(a1, "log") {
+        ok_cmd = true
+        mut k := 2
+        while k < argc {
+            t := svec_get(argv, k)
+            if str_eq(t, "--oneline") or str_eq(t, "--stat") or str_eq(t, "--") or _harness_is_safe_rel_arg(t) {
+                k += 1
+            } else if str_eq(t, "-n") and k + 1 < argc and _harness_is_digits(svec_get(argv, k + 1)) {
+                k += 2
+            } else if str_len(t) >= 2 and str_byte(t, 0) == 45 and _harness_is_digits(str_slice(t, 1, str_len(t))) {
+                k += 1
+            } else {
+                ok_cmd = false; break
+            }
+        }
+    } else if str_eq(a0, "bin/axc.exe") and (str_eq(a1, "check") or str_eq(a1, "test")) {
+        if argc == 3 and _harness_is_safe_rel_arg(svec_get(argv, 2)) {
+            ok_cmd = true
+        } else if argc == 4 and str_eq(a1, "check") and str_eq(svec_get(argv, 2), "--json") and _harness_is_safe_rel_arg(svec_get(argv, 3)) {
+            ok_cmd = true
+        }
+    }
+    if not ok_cmd {
+        svec_free(move argv)
+        return err(403)
+    }
+    return ok(argv)
+}
+
+// Strict allowlist validator for agent commands (strict argv allowlist, ZERO shell execution — CWE-78 + CWE-88 immune!)
+fn harness_is_safe_cmd(cmd: str) -> bool {
+    argv := _harness_parse_safe_argv(cmd) or return false
+    svec_free(move argv)
+    return true
+}
+
 fn harness_tool_run_safe_cmd(mut sb: HarnessSandbox, cmd: str) -> str ! i64 {
-    if not harness_is_safe_cmd(cmd) { return err(403) }
-    if not harness_sandbox_consume_step(mut sb) { return err(429) }
-    raw := sys_exec_capture(cmd)
+    argv := _harness_parse_safe_argv(cmd) or return err(403)
+    if not harness_sandbox_consume_step(mut sb) {
+        svec_free(move argv)
+        return err(429)
+    }
+    res := subproc_run(argv, sb.workspace_root, "", 15000, sb.max_tool_bytes)
+    svec_free(move argv)
+    mut raw := res.stdout
+    if str_len(res.stderr) > 0 and str_len(res.stdout) > 0 {
+        raw = res.stdout + res.stderr
+    } else if str_len(res.stdout) == 0 {
+        raw = res.stderr
+    }
     trimmed := harness_truncate_middle(raw, sb.max_tool_bytes)
     return ok(harness_redact_secrets(trimmed))
 }
@@ -1132,7 +1266,10 @@ struct ToolResultCache {
 }
 
 fn tool_cache_new(default_ttl_ms: i64 = 15000) -> ToolResultCache {
-    ttl := if default_ttl_ms > 0 { default_ttl_ms * 1000000 } else { 15000000000 }
+    mut dms := default_ttl_ms
+    if dms <= 0 { dms = 15000 }
+    if dms > 86400000 { dms = 86400000 }
+    ttl := dms * 1000000
     return ToolResultCache(
         values = smap_new(64),
         expires_ns = smap_new(64),
@@ -1148,7 +1285,12 @@ fn tool_cache_free(move c: ToolResultCache) {
 }
 
 fn tool_cache_put(mut c: ToolResultCache, key: str, val: str, ttl_ms: i64 = -1) {
-    ttl_ns := if ttl_ms > 0 { ttl_ms * 1000000 } else { c.default_ttl_ns }
+    mut ttl_ns := c.default_ttl_ns
+    if ttl_ms > 0 {
+        mut tms := ttl_ms
+        if tms > 86400000 { tms = 86400000 }
+        ttl_ns = tms * 1000000
+    }
     smap_set_str(mut c.values, key, val)
     smap_set_i64(mut c.expires_ns, key, clock_ns() + ttl_ns)
 }
@@ -1166,7 +1308,7 @@ fn tool_cache_get(mut c: ToolResultCache, key: str) -> str ! i64 {
         return err(404)
     }
     c.hits += 1
-    return ok(smap_get_str(c.values, key, ""))
+    return ok("" + smap_get_str(c.values, key, ""))
 }
 
 fn tool_cache_invalidate(mut c: ToolResultCache, key: str) {
@@ -1210,10 +1352,13 @@ struct HarnessCircuitBreaker {
 }
 
 fn harness_cb_new(fail_threshold: i64 = 5, cooldown_ms: i64 = 30000) -> HarnessCircuitBreaker {
+    mut cms := cooldown_ms
+    if cms < 100 { cms = 100 }
+    if cms > 86400000 { cms = 86400000 }
     return HarnessCircuitBreaker(
         fail_threshold = if fail_threshold > 0 { fail_threshold } else { 5 },
         consecutive_fails = 0,
-        cooldown_ns = cooldown_ms * 1000000,
+        cooldown_ns = cms * 1000000,
         opened_at_ns = 0,
         is_open = false
     )

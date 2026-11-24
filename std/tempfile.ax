@@ -19,7 +19,7 @@ fn _tmp_has_sep_or_nul(s: str) -> bool {
     mut i := 0
     while i < n {
         b := str_byte(s, i)
-        if b == 0 or b == 47 or b == 92 { return true }
+        if b < 32 or b == 127 or b == 47 or b == 92 or b == 58 { return true }
         i += 1
     }
     return false
@@ -60,10 +60,11 @@ fn tempfile_gettempdir() -> str {
     return "/tmp"
 }
 
-fn _tmp_create_file_exclusive(full_path: str) -> bool {
+fn _tmp_create_file_exclusive_write(full_path: str, content: str, do_write: bool) -> bool {
     k32 := ffi_open_one("kernel32.dll")
     if k32 != 0 {
         f_cf := ffi_sym(k32, "CreateFileW")
+        f_wf := ffi_sym(k32, "WriteFile")
         f_cl := ffi_sym(k32, "CloseHandle")
         if f_cf == 0 or f_cl == 0 { return false }
         wp := ffi_wstr(full_path)
@@ -72,22 +73,81 @@ fn _tmp_create_file_exclusive(full_path: str) -> bool {
         h := ffi_call7(f_cf, wp, 0xC0000000, 0, 0, 1, 0x80, 0)
         ffi_free(wp)
         if h == -1 or (h & 0xFFFFFFFF) == 0xFFFFFFFF or h == 0 { return false }
+        mut ok_w := true
+        if do_write and str_len(content) > 0 {
+            if f_wf == 0 {
+                ok_w = false
+            } else {
+                n := str_len(content)
+                raw := ffi_cstr(content)
+                wb := ffi_alloc(8)
+                if raw == 0 or wb == 0 {
+                    ok_w = false
+                } else {
+                    mut sent := 0
+                    while sent < n {
+                        ffi_write_u32_le(wb, 0, 0)
+                        if (ffi_call5(f_wf, h, raw + sent, n - sent, wb, 0) & 0xFFFFFFFF) == 0 {
+                            ok_w = false
+                            break
+                        }
+                        w := ffi_read_u32_le(wb, 0)
+                        if w <= 0 { ok_w = false; break }
+                        sent += w
+                    }
+                }
+                ffi_free(raw); ffi_free(wb)
+            }
+        }
         _ := ffi_call1(f_cl, h)
-        return true
+        if not ok_w { _ := sys_fs_remove(full_path) }
+        return ok_w
     }
-    libc := ffi_open("", "libc.so.6", "libSystem.B.dylib")
+    mut is_mac := false
+    mut libc := ffi_open_one("libc.so.6")
+    if libc == 0 {
+        libc = ffi_open_one("libSystem.B.dylib")
+        is_mac = libc != 0
+    }
     if libc == 0 { return false }
     f_open := ffi_sym(libc, "open")
+    f_write := ffi_sym(libc, "write")
     f_close := ffi_sym(libc, "close")
     if f_open == 0 or f_close == 0 { return false }
     cp := ffi_cstr(full_path)
     if cp == 0 { return false }
-    // Linux x86_64: O_RDWR=2 | O_CREAT=0x40 | O_EXCL=0x80 = 0xC2; mode 0600 = 384
-    fd := ffi_sext32(ffi_call3(f_open, cp, 0xC2, 384))
+    // macOS: O_RDWR(2)|O_NOFOLLOW(0x100)|O_CREAT(0x200)|O_EXCL(0x800)=0x0B02; Linux x86_64: 0x200C2; mode 0600=384
+    oflags := if is_mac { 0x0B02 } else { 0x200C2 }
+    fd := ffi_sext32(ffi_call3(f_open, cp, oflags, 384))
     ffi_free(cp)
     if fd < 0 { return false }
+    mut ok_w := true
+    if do_write and str_len(content) > 0 {
+        if f_write == 0 {
+            ok_w = false
+        } else {
+            n := str_len(content)
+            raw := ffi_cstr(content)
+            if raw == 0 {
+                ok_w = false
+            } else {
+                mut sent := 0
+                while sent < n {
+                    w := ffi_sext32(ffi_call3(f_write, fd, raw + sent, n - sent))
+                    if w <= 0 { ok_w = false; break }
+                    sent += w
+                }
+                ffi_free(raw)
+            }
+        }
+    }
     _ := ffi_call1(f_close, fd)
-    return true
+    if not ok_w { _ := sys_fs_remove(full_path) }
+    return ok_w
+}
+
+fn _tmp_create_file_exclusive(full_path: str) -> bool {
+    return _tmp_create_file_exclusive_write(full_path, "", false)
 }
 
 fn _tmp_create_dir_exclusive(full_path: str) -> bool {
@@ -145,12 +205,18 @@ fn tempfile_mkdtemp(prefix: str = "axdir_", suffix: str = "", dir: str = "") -> 
     return err(-17)
 }
 
-// Creates a unique temp file via `mkstemp` and populates it with `content` (UTF-16LE safe).
+// Creates a unique temp file and writes `content` directly to the exclusive handle/fd (zero TOCTOU).
 fn tempfile_write_temp(content: str, prefix: str = "axtmp_", suffix: str = "", dir: str = "") -> str ! i64 {
-    p := tempfile_mkstemp(prefix, suffix, dir) or return
-    if not shutil_write_text(p, content) {
-        _ := sys_fs_remove(p)
-        return err(-5)
+    if _tmp_has_sep_or_nul(prefix) or _tmp_has_sep_or_nul(suffix) { return err(-400) }
+    base := if str_len(dir) > 0 { dir } else { tempfile_gettempdir() }
+    mut attempt := 0
+    while attempt < 32 {
+        tok := secrets_token_hex(12) or return err(-500)
+        cand := path_join(base, prefix + tok + suffix)
+        if _tmp_create_file_exclusive_write(cand, content, true) {
+            return ok(cand)
+        }
+        attempt += 1
     }
-    return ok(p)
+    return err(-17)
 }
