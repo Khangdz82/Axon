@@ -224,11 +224,11 @@ fn _mcp_unescape_json_slice(s: str, start: i64, end: i64) -> str {
                     i += 1
                 }
             } else {
-                mbuf_push(mut mb, esc)
+                mbuf_push(mut mb, if esc == 0 { 32 } else { esc })
                 i += 2
             }
         } else {
-            mbuf_push(mut mb, b)
+            mbuf_push(mut mb, if b == 0 { 32 } else { b })
             i += 1
         }
     }
@@ -247,6 +247,7 @@ fn _mcp_json_find_depth1(obj_json: str, key: str) -> (i64, i64) {
         if str_byte(obj_json, i) == 44 { i += 1; continue }
         if str_byte(obj_json, i) != 34 { break }
         kend := _mcp_scan_json_string_end(obj_json, i, n)
+        if kend <= i + 1 or str_byte(obj_json, kend - 1) != 34 { break }
         kraw := _mcp_unescape_json_slice(obj_json, i + 1, kend - 1)
         i = _mcp_skip_ws(obj_json, kend, n)
         if i >= n or str_byte(obj_json, i) != 58 { break }
@@ -1479,16 +1480,28 @@ fn mcp_stdio_send(json_payload: str) {
     }
 }
 
-// DNS-Rebinding Guard: allows missing Origin (CLI/IDE) or localhost/127.0.0.1/[::1] origins.
+// DNS-Rebinding Guard: allows missing Origin (CLI/IDE) or clean localhost/127.0.0.1/[::1] origins (no userinfo/path/query).
 fn mcp_is_allowed_origin(origin: str) -> bool {
     o := str_trim(str_to_lower(origin))
     if str_len(o) == 0 { return true }
     u := url_parse(o) or return false
     if not str_eq(u.scheme, "http") and not str_eq(u.scheme, "https") { return false }
+    if str_len(u.userinfo) > 0 or str_len(u.query) > 0 or str_len(u.fragment) > 0 or not str_eq(u.path, "/") {
+        return false
+    }
     if str_eq(u.host, "localhost") or str_eq(u.host, "127.0.0.1") or str_eq(u.host, "[::1]") {
         return true
     }
     return false
+}
+
+// Validates HTTP `Host` header to block DNS-rebinding attacks against localhost MCP servers.
+fn mcp_is_allowed_host(host_hdr: str) -> bool {
+    h := str_trim(str_to_lower(host_hdr))
+    if str_len(h) == 0 { return true }
+    u := url_parse("http://" + h) or return false
+    if str_len(u.userinfo) > 0 or not str_eq(u.path, "/") { return false }
+    return str_eq(u.host, "localhost") or str_eq(u.host, "127.0.0.1") or str_eq(u.host, "[::1]")
 }
 
 struct McpHttpState {
@@ -1505,6 +1518,10 @@ fn mcp_http_state_free(move st: McpHttpState) {
 }
 
 fn mcp_http_new_session(mut st: McpHttpState) -> str {
+    if smap_len(st.sessions) >= 4096 {
+        smap_free(move st.sessions)
+        st.sessions = smap_new(32)
+    }
     sid := uuid_v4()
     smap_set_i64(mut st.sessions, sid, 1)
     st.next_id += 1
@@ -1513,9 +1530,17 @@ fn mcp_http_new_session(mut st: McpHttpState) -> str {
 
 fn mcp_http_preflight_check(raw_http_req: str) -> (bool, str) {
     req := http_parse_request(raw_http_req) or return (true, http_json_response(400, "{\"error\":\"malformed HTTP request\"}"))
+    host_h := http_get_header(raw_http_req, "Host") or ""
+    if not mcp_is_allowed_host(host_h) {
+        return (true, http_json_response(403, "{\"error\":\"forbidden host\"}"))
+    }
     origin := http_get_header(raw_http_req, "Origin") or ""
     if not mcp_is_allowed_origin(origin) {
         return (true, http_json_response(403, "{\"error\":\"forbidden origin\"}"))
+    }
+    te_h := http_get_header(raw_http_req, "Transfer-Encoding") or ""
+    if str_len(str_trim(te_h)) > 0 {
+        return (true, http_json_response(400, "{\"error\":\"Transfer-Encoding not supported\"}"))
     }
     if str_eq(req.method, "OPTIONS") {
         hdr := "Access-Control-Allow-Origin: http://localhost\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Mcp-Session-Id, Last-Event-ID"
