@@ -1,0 +1,787 @@
+// Hostile Zero-Trust Test Suite for Wave-2 Pure-Axon Python Stdlib Replacements:
+// `std::threading`, `std::futures`, `std::socket`, `std::requests`, `std::zlib`,
+// `std::encoding`, `std::tempfile`, `std::logging`, `std::configparser`, `std::itertools`.
+
+use std::ffi
+use std::os
+use std::str
+use std::ds
+use std::sys
+use std::shutil
+use std::encoding
+use std::zlib
+use std::json_dom
+use std::threading
+use std::futures
+use std::socket
+use std::requests
+use std::tempfile
+use std::logging
+use std::configparser
+use std::itertools
+
+// =========================================================================
+// 1. OS Threading + Slab Allocator Race Torture Workers
+// =========================================================================
+// `ctx` (64B): [0]=idx, [1]=mu_ptr, [2]=shared_cnt_ptr, [3]=tls_slot, [4]=bar_mu, [5]=bar_cv, [6]=bar_st, [7]=errors_ptr
+fn slab_and_sync_worker(ctx: i64) -> i64 {
+    api := thread_init() or return -1
+    idx := ffi_read_i64(ctx, 0)
+    mu := Mutex(ptr = ffi_read_i64(ctx, 1), api = api)
+    cnt_ptr := ffi_read_i64(ctx, 2)
+    tls := ThreadLocal(slot = ffi_read_i64(ctx, 3), api = api)
+    bar := Barrier(
+        mu = Mutex(ptr = ffi_read_i64(ctx, 4), api = api),
+        cv = CondVar(ptr = ffi_read_i64(ctx, 5), api = api),
+        state = ffi_read_i64(ctx, 6)
+    )
+    err_ptr := ffi_read_i64(ctx, 7)
+
+    // Verify ThreadLocal isolation across 8 concurrent OS threads
+    secret_tls := 0x700000000000 +% (idx *% 9973)
+    if not tls_set(tls, secret_tls) { _ := unsafe { atomic_add_i64(err_ptr, 0, 1) } }
+
+    // Generation 1 barrier: align all 8 threads to maximize slab & mutex contention!
+    _ := barrier_wait(bar) or -1
+
+    // Concurrent slab allocator stress: 300 alloc/concat/smap/free cycles per thread simultaneously
+    mut i := 0
+    while i < 300 {
+        b := buf_new(64 + (i & 127))
+        buf_push_str(b, f"thr_{idx}_iter_{i}")
+        s := buf_to_owned_str(move b)
+        if str_len(s) < 10 { _ := unsafe { atomic_add_i64(err_ptr, 0, 1) } }
+        mut m := smap_new(8)
+        smap_set_str(mut m, "k", s)
+        if not str_eq(smap_get_str(m, "k", ""), s) { _ := unsafe { atomic_add_i64(err_ptr, 0, 1) } }
+        smap_free(move m)
+        i += 1
+    }
+
+    // Mutex critical section stress: 2000 non-atomic read-modify-write increments under OS Mutex
+    i = 0
+    while i < 2000 {
+        mutex_lock(mu)
+        cur := ffi_read_i64(cnt_ptr, 0)
+        ffi_write_i64(cnt_ptr, 0, cur + 1)
+        mutex_unlock(mu)
+        i += 1
+    }
+
+    // Generation 2 barrier: verify Barrier resets cleanly for reuse!
+    _ := barrier_wait(bar) or -1
+
+    // Re-check ThreadLocal wasn't overwritten by any sibling OS thread
+    if tls_get(tls) != secret_tls {
+        _ := unsafe { atomic_add_i64(err_ptr, 0, 1) }
+    }
+
+    // Return full 64-bit value (> 32-bit DWORD!) to verify zero truncation
+    return 0x123456780000 +% idx
+}
+
+fn slow_event_setter(ctx: i64) -> i64 {
+    api := thread_init() or return -1
+    ev := Event(
+        mu = Mutex(ptr = ffi_read_i64(ctx, 0), api = api),
+        cv = CondVar(ptr = ffi_read_i64(ctx, 1), api = api),
+        state = ffi_read_i64(ctx, 2)
+    )
+    sleep_ms(35)
+    event_set(ev)
+    return 0xCAFEBABE1234
+}
+
+// =========================================================================
+// 2. ThreadQueue Producer / Consumer Workers
+// =========================================================================
+// `qctx` (64B): [0]=mu, [1]=ne, [2]=nf, [3]=ad, [4]=meta, [5]=sum_ptr, [6]=cnt_ptr
+fn queue_producer_worker(qctx: i64) -> i64 {
+    api := thread_init() or return -1
+    q := ThreadQueue(
+        mu = Mutex(ptr = ffi_read_i64(qctx, 0), api = api),
+        not_empty = CondVar(ptr = ffi_read_i64(qctx, 1), api = api),
+        not_full = CondVar(ptr = ffi_read_i64(qctx, 2), api = api),
+        all_done = CondVar(ptr = ffi_read_i64(qctx, 3), api = api),
+        meta = ffi_read_i64(qctx, 4)
+    )
+    mut i := 1
+    while i <= 2500 {
+        if not tqueue_put(q, i, -1) { return -1 }
+        i += 1
+    }
+    return 2500
+}
+
+fn queue_consumer_worker(qctx: i64) -> i64 {
+    api := thread_init() or return -1
+    q := ThreadQueue(
+        mu = Mutex(ptr = ffi_read_i64(qctx, 0), api = api),
+        not_empty = CondVar(ptr = ffi_read_i64(qctx, 1), api = api),
+        not_full = CondVar(ptr = ffi_read_i64(qctx, 2), api = api),
+        all_done = CondVar(ptr = ffi_read_i64(qctx, 3), api = api),
+        meta = ffi_read_i64(qctx, 4)
+    )
+    sum_ptr := ffi_read_i64(qctx, 5)
+    cnt_ptr := ffi_read_i64(qctx, 6)
+    mut local_sum := 0
+    mut local_cnt := 0
+    while true {
+        v := tqueue_get(q, -1) or -1
+        if v < 0 { break }
+        local_sum = local_sum +% v
+        local_cnt += 1
+        tqueue_task_done(q)
+    }
+    _ := unsafe { atomic_add_i64(sum_ptr, 0, local_sum) }
+    _ := unsafe { atomic_add_i64(cnt_ptr, 0, local_cnt) }
+    return local_cnt
+}
+
+// =========================================================================
+// 3. ThreadPoolExecutor CPU-Bound Zero-GIL Worker
+// =========================================================================
+fn cpu_hash_job(seed: i64) -> i64 {
+    mut h := (seed *% 6364136223846793005) +% 1442695040888963407
+    mut i := 0
+    while i < 200000 {
+        h = (h ^ ushr64(h, 30)) *% 0xBF58476D1CE4E5B9
+        h = (h ^ ushr64(h, 27)) *% 0x94D049BB133111EB
+        h = h ^ ushr64(h, 31)
+        i += 1
+    }
+    return h
+}
+
+// =========================================================================
+// 4. REAL Multi-Threaded HTTP/1.1 Keep-Alive Test Server Handler
+// =========================================================================
+fn http_test_handler(client_fd: i64) -> i64 {
+    mut cli := socket_from_fd(client_fd) or return -1
+    _ := socket_set_timeout_ms(cli, 3000)
+    _ := socket_set_nodelay(cli, true)
+    local_addr := socket_getsockname(cli) or SockAddr(host = "127.0.0.1", port = 0, family = 2)
+    mut rdr := sock_reader_new(cli, 8192) or return -1
+
+    mut req_num := 0
+    while req_num < 64 {
+        req_line := sock_reader_readline(mut rdr, 8192) or ""
+        if str_len(req_line) == 0 { break }
+        req_num += 1
+
+        // Parse `METHOD PATH HTTP/1.1`
+        sp1 := str_find_byte(req_line, 32, 0)
+        if sp1 <= 0 { break }
+        sp2 := str_find_byte(req_line, 32, sp1 + 1)
+        if sp2 <= sp1 { break }
+        method := str_slice(req_line, 0, sp1)
+        path := str_slice(req_line, sp1 + 1, sp2)
+
+        mut clen := 0
+        mut auth_hdr := ""
+        mut cookie_hdr := ""
+        mut ctype_hdr := ""
+        mut want_close := false
+        while true {
+            hline := sock_reader_readline(mut rdr, 8192) or ""
+            if str_len(hline) == 0 { break }
+            col := str_find_byte(hline, 58, 0)
+            if col > 0 {
+                hk := str_to_lower(str_trim(str_slice(hline, 0, col)))
+                hv := str_trim(str_slice(hline, col + 1, str_len(hline)))
+                if str_eq(hk, "content-length") { clen = parse_i64(hv) or 0 }
+                else if str_eq(hk, "authorization") { auth_hdr = hv }
+                else if str_eq(hk, "cookie") { cookie_hdr = hv }
+                else if str_eq(hk, "content-type") { ctype_hdr = hv }
+                else if str_eq(hk, "connection") and str_contains(str_to_lower(hv), "close") { want_close = true }
+            }
+        }
+        mut req_body := ""
+        if clen > 0 and clen <= 1048576 {
+            req_body = sock_reader_read_exact(mut rdr, clen) or ""
+        }
+
+        mut resp_str := ""
+        if str_eq(path, "/echo") {
+            jb := buf_new(256)
+            buf_push_str(jb, "{\"ok\":true,\"req_num\":")
+            buf_push_str(jb, f"{req_num}")
+            buf_push_str(jb, ",\"auth\":\"")
+            buf_push_str(jb, auth_hdr)
+            buf_push_str(jb, "\",\"cookie\":\"")
+            buf_push_str(jb, cookie_hdr)
+            buf_push_str(jb, "\"}")
+            body := buf_to_owned_str(move jb)
+            bl := str_len(body)
+            resp_str = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: sid=axon42; Path=/\r\nContent-Length: {bl}\r\nConnection: keep-alive\r\n\r\n" + body
+        } else if str_eq(path, "/chunked") {
+            resp_str = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nHello\r\n7\r\n, Axon!\r\n0\r\n\r\n"
+        } else if str_eq(path, "/gzip") {
+            plain := "{\"compressed\":true,\"engine\":\"axon-zlib-rfc1952\",\"repeat\":\"axon_axon_axon_axon_axon_axon\"}"
+            gz := gzip_compress_str(plain)
+            gz_s := buf_to_owned_str(move gz)
+            gl := str_len(gz_s)
+            resp_str = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {gl}\r\nConnection: keep-alive\r\n\r\n" + gz_s
+        } else if str_eq(path, "/redir1") {
+            resp_str = "HTTP/1.1 302 Found\r\nLocation: /echo\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+        } else if str_eq(path, "/redir302") {
+            resp_str = "HTTP/1.1 302 Found\r\nLocation: /method\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+        } else if str_eq(path, "/method") {
+            ml := str_len(method)
+            resp_str = f"HTTP/1.1 200 OK\r\nContent-Length: {ml}\r\nConnection: keep-alive\r\n\r\n" + method
+        } else if str_eq(path, "/loop") {
+            resp_str = "HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+        } else if str_eq(path, "/cross_origin") {
+            loc := f"http://localhost:{local_addr.port}/echo"
+            resp_str = "HTTP/1.1 302 Found\r\nLocation: " + loc + "\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+        } else if str_eq(path, "/upload") {
+            ub := buf_new(128)
+            buf_push_str(ub, "{\"len\":")
+            buf_push_str(ub, f"{str_len(req_body)}")
+            buf_push_str(ub, ",\"has_boundary\":")
+            buf_push_str(ub, if str_contains(ctype_hdr, "multipart/form-data") and str_contains(req_body, "hello_file_payload") { "true" } else { "false" })
+            buf_push_str(ub, "}")
+            body := buf_to_owned_str(move ub)
+            bl := str_len(body)
+            resp_str = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {bl}\r\nConnection: keep-alive\r\n\r\n" + body
+        } else {
+            resp_str = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: keep-alive\r\n\r\nnot found"
+        }
+
+        sent := socket_sendall_str(cli, resp_str) or -1
+        if sent < 0 or want_close { break }
+    }
+
+    sock_reader_free(move rdr)
+    socket_close(mut cli)
+    return req_num
+}
+
+// Parallel HTTP client worker hitting the live server concurrently
+fn parallel_http_client(port: i64) -> i64 {
+    mut ok_cnt := 0
+    mut s := session_new(true, 5000) or return -1
+    mut i := 0
+    while i < 5 {
+        r := session_get(mut s, f"http://127.0.0.1:{port}/echo") or return -2
+        if r.status == 200 and str_contains(r.body, "\"ok\":true") {
+            ok_cnt += 1
+        }
+        resp_free(move r)
+        i += 1
+    }
+    session_free(move s)
+    return ok_cnt
+}
+
+// Concurrent Logger worker
+fn log_stress_worker(ctx: i64) -> i64 {
+    api := thread_init() or return -1
+    wid := ffi_read_i64(ctx, 0)
+    mu := Mutex(ptr = ffi_read_i64(ctx, 1), api = api)
+    fp := ffi_read_cstr(ffi_read_i64(ctx, 2), 512)
+    lg := Logger(name = "stress", min_level = LOG_INFO(), json_mode = true, to_stdout = false, file_path = fp, max_bytes = 0, mu = mu)
+    mut i := 0
+    while i < 40 {
+        // Attempt CWE-117 CRLF + real 0x1B ESC log injection on every 10th message
+        if (i % 10) == 0 {
+            eb := buf_new(64)
+            buf_push_str(eb, f"w{wid}_m{i}\r\nFAKE_INJECT")
+            buf_push(eb, 27)
+            buf_push_str(eb, "[31m")
+            logger_warn(lg, buf_to_owned_str(move eb))
+        } else {
+            logger_info(lg, f"worker_{wid}_msg_{i}")
+        }
+        i += 1
+    }
+    return 40
+}
+
+// Itertools helper functions (compile-time verified `fn(i64) -> i64`)
+fn fn_square(x: i64) -> i64 { return x * x }
+fn fn_is_even(x: i64) -> i64 { return if (x & 1) == 0 { 1 } else { 0 } }
+fn fn_lt_five(x: i64) -> i64 { return if x < 5 { 1 } else { 0 } }
+fn fn_gt_zero(x: i64) -> i64 { return if x > 0 { 1 } else { 0 } }
+
+fn main() -> i32 {
+    println("=== WAVE 2 HOSTILE STDLIB & CONCURRENCY AUDIT ===")
+
+    // -----------------------------------------------------------------
+    // TEST 1: 8-Thread Slab Allocator, Mutex, Barrier, TLS, RLock, Event, Semaphore
+    // -----------------------------------------------------------------
+    mu := mutex_new() or return 10
+    tls := tls_new() or return 11
+    bar := barrier_new(8) or return 12
+    shared_cnt := ffi_alloc(64)
+    err_box := ffi_alloc(64)
+    ctxs := ibuf_new(16)
+    handles := ffi_alloc(8 * 24)
+    tapi := thread_init() or return 13
+
+    mut i := 0
+    while i < 8 {
+        c := ffi_alloc(64)
+        ffi_write_i64(c, 0, i + 1)
+        ffi_write_i64(c, 1, mu.ptr)
+        ffi_write_i64(c, 2, shared_cnt)
+        ffi_write_i64(c, 3, tls.slot)
+        ffi_write_i64(c, 4, bar.mu.ptr)
+        ffi_write_i64(c, 5, bar.cv.ptr)
+        ffi_write_i64(c, 6, bar.state)
+        ffi_write_i64(c, 7, err_box)
+        ibuf_push(ctxs, c)
+        th := thread_spawn(fn_addr(slab_and_sync_worker), c) or return 14
+        ffi_write_i64(handles, i * 3, th.handle)
+        ffi_write_i64(handles, i * 3 + 1, th.ctx)
+        ffi_write_i64(handles, i * 3 + 2, th.tid)
+        i += 1
+    }
+    i = 0
+    while i < 8 {
+        mut th := Thread(
+            handle = ffi_read_i64(handles, i * 3),
+            ctx = ffi_read_i64(handles, i * 3 + 1),
+            tid = ffi_read_i64(handles, i * 3 + 2),
+            joined = 0,
+            api = tapi
+        )
+        rv := thread_join(mut th) or return 15
+        want_rv := 0x123456780000 +% (i + 1)
+        if rv != want_rv {
+            println(f"FAIL T1 64-bit ret mismatch: got={rv} want={want_rv}")
+            return 16
+        }
+        ffi_free(ibuf_get(ctxs, i))
+        i += 1
+    }
+    buf_free(move ctxs)
+    ffi_free(handles)
+    got_cnt := ffi_read_i64(shared_cnt, 0)
+    got_errs := ffi_read_i64(err_box, 0)
+    ffi_free(shared_cnt); ffi_free(err_box)
+    barrier_free(move bar)
+    tls_free(move tls)
+    mutex_free(move mu)
+    if got_cnt != 16000 or got_errs != 0 {
+        println(f"FAIL T1 mutex/slab race: cnt={got_cnt} errs={got_errs}")
+        return 17
+    }
+
+    // RLock re-entrancy + BoundedSemaphore cap + Event timed wait + join_timeout
+    rl := rlock_new() or return 18
+    rlock_acquire(rl); rlock_acquire(rl); rlock_acquire(rl)
+    if not rlock_release(rl) or not rlock_release(rl) or not rlock_release(rl) { return 19 }
+    if rlock_release(rl) { return 20 } // 4th release must fail
+    rlock_free(move rl)
+
+    bsem := bounded_sem_new(2) or return 21
+    if not sem_try_acquire(bsem) or not sem_try_acquire(bsem) { return 22 }
+    if sem_try_acquire(bsem) { return 23 } // empty
+    if not sem_release(bsem) or not sem_release(bsem) { return 24 }
+    if sem_release(bsem) { return 25 } // bounded overflow must fail
+    sem_free(move bsem)
+
+    ev := event_new() or return 26
+    if event_wait(ev, 10) { return 27 } // must timeout before set
+    ev_ctx := ffi_alloc(32)
+    ffi_write_i64(ev_ctx, 0, ev.mu.ptr)
+    ffi_write_i64(ev_ctx, 1, ev.cv.ptr)
+    ffi_write_i64(ev_ctx, 2, ev.state)
+    mut ev_th := thread_spawn(fn_addr(slow_event_setter), ev_ctx) or return 28
+    if not event_wait(ev, 2000) { return 29 }
+    ev_ret := thread_join(mut ev_th) or return 30
+    ffi_free(ev_ctx)
+    event_free(move ev)
+    if ev_ret != 0xCAFEBABE1234 { return 31 }
+    println("[PASS] T1: 8-thread OS slab/mutex/barrier/TLS/RLock/BoundedSem/Event (16000/16000 exact, 64-bit ret)")
+
+    // -----------------------------------------------------------------
+    // TEST 2: ThreadQueue MPMC 10,000-Item Bounded Producer-Consumer
+    // -----------------------------------------------------------------
+    tq0 := clock_ns()
+    q := tqueue_new(64) or return 32
+    qsum := ffi_alloc(64)
+    qcnt := ffi_alloc(64)
+    qctx := ffi_alloc(64)
+    ffi_write_i64(qctx, 0, q.mu.ptr)
+    ffi_write_i64(qctx, 1, q.not_empty.ptr)
+    ffi_write_i64(qctx, 2, q.not_full.ptr)
+    ffi_write_i64(qctx, 3, q.all_done.ptr)
+    ffi_write_i64(qctx, 4, q.meta)
+    ffi_write_i64(qctx, 5, qsum)
+    ffi_write_i64(qctx, 6, qcnt)
+
+    mut p0 := thread_spawn(fn_addr(queue_producer_worker), qctx) or return 33
+    mut p1 := thread_spawn(fn_addr(queue_producer_worker), qctx) or return 33
+    mut p2 := thread_spawn(fn_addr(queue_producer_worker), qctx) or return 33
+    mut p3 := thread_spawn(fn_addr(queue_producer_worker), qctx) or return 33
+    mut c0 := thread_spawn(fn_addr(queue_consumer_worker), qctx) or return 34
+    mut c1 := thread_spawn(fn_addr(queue_consumer_worker), qctx) or return 34
+    mut c2 := thread_spawn(fn_addr(queue_consumer_worker), qctx) or return 34
+    mut c3 := thread_spawn(fn_addr(queue_consumer_worker), qctx) or return 34
+    _ := thread_join(mut p0) or return 35
+    _ := thread_join(mut p1) or return 35
+    _ := thread_join(mut p2) or return 35
+    _ := thread_join(mut p3) or return 35
+    tqueue_join(q)
+    tqueue_close(q)
+    _ := thread_join(mut c0) or return 36
+    _ := thread_join(mut c1) or return 36
+    _ := thread_join(mut c2) or return 36
+    _ := thread_join(mut c3) or return 36
+    q_us := (clock_ns() - tq0) / 1000
+    got_qsum := ffi_read_i64(qsum, 0)
+    got_qcnt := ffi_read_i64(qcnt, 0)
+    ffi_free(qsum); ffi_free(qcnt); ffi_free(qctx)
+    tqueue_free(move q)
+    if got_qcnt != 10000 or got_qsum != 12505000 {
+        println(f"FAIL T2 queue: cnt={got_qcnt} sum={got_qsum}")
+        return 37
+    }
+    println(f"[PASS] T2: ThreadQueue 4P/4C bounded(64) 10000 items exact sum=12505000 in {q_us} us")
+
+    // -----------------------------------------------------------------
+    // TEST 3: Zero-GIL Multi-Core ThreadPoolExecutor Benchmark & Oracle
+    // -----------------------------------------------------------------
+    items := iter_range(1, 33, 1)
+    t_seq0 := clock_ns()
+    seq_res := iter_map(items, fn_addr(cpu_hash_job))
+    seq_us := (clock_ns() - t_seq0) / 1000
+
+    mut pool := pool_new(8) or return 38
+    t_par0 := clock_ns()
+    par_res := pool_map_i64(pool, fn_addr(cpu_hash_job), items) or return 39
+    par_us := (clock_ns() - t_par0) / 1000
+    pool_shutdown(mut pool, true)
+
+    if ibuf_len(par_res) != 32 { return 40 }
+    i = 0
+    while i < 32 {
+        if ibuf_get(par_res, i) != ibuf_get(seq_res, i) {
+            println(f"FAIL T3 pool_map mismatch at {i}")
+            return 41
+        }
+        i += 1
+    }
+    buf_free(move items); buf_free(move seq_res); buf_free(move par_res)
+    println(f"[PASS] T3: ThreadPoolExecutor(8) 32x200k-hash exact match: seq={seq_us}us vs par={par_us}us")
+
+    // -----------------------------------------------------------------
+    // TEST 4 & 5: Live Multi-Threaded Socket Server + RequestsSession E2E
+    // -----------------------------------------------------------------
+    dns_ip := sock_getaddrinfo_ipv4("localhost") or return 42
+    if not str_eq(dns_ip, "127.0.0.1") { return 43 }
+    if str_len(sock_gethostname()) == 0 { return 44 }
+
+    // UDP loopback sendto/recvfrom + poll test
+    mut u_srv := socket_new(af_inet(), sock_dgram()) or return 45
+    u_port := socket_bind(u_srv, "127.0.0.1", 0) or return 46
+    mut u_cli := socket_new(af_inet(), sock_dgram()) or return 47
+    ub := buf_new(16); buf_push_str(ub, "PING_UDP")
+    _ := socket_sendto(u_cli, "127.0.0.1", u_port, ub) or return 48
+    buf_free(move ub)
+    if (socket_poll_one(u_srv, poll_read(), 1000) & poll_read()) == 0 { return 49 }
+    pkt := socket_recvfrom(u_srv, 256) or return 50
+    pkt_s := buf_to_owned_str(move pkt.data)
+    socket_close(mut u_srv); socket_close(mut u_cli)
+    if not str_eq(pkt_s, "PING_UDP") or not str_eq(pkt.peer_host, "127.0.0.1") { return 51 }
+
+    // Start real multi-threaded HTTP/1.1 Keep-Alive server on ephemeral port
+    mut srv := tcp_server_start("127.0.0.1", 0, fn_addr(http_test_handler), 8) or return 52
+    port := srv.port
+    if port <= 0 { tcp_server_stop(mut srv); return 53 }
+
+    // Security check 1: Fail-closed SSRF default (`allow_private = false`) MUST block loopback & metadata
+    ssrf1 := requests_get(f"http://127.0.0.1:{port}/echo", false, 2000) or RequestsResponse(
+        ok_flag = false, status = -403, url = "", headers = smap_new(2),
+        headers_raw = "", body = "", elapsed_us = 0, redirects = 0, reused_conn = false
+    )
+    if ssrf1.status != -403 { tcp_server_stop(mut srv); resp_free(move ssrf1); return 54 }
+    resp_free(move ssrf1)
+
+    ssrf2 := requests_get("http://169.254.169.254/latest/meta-data", false, 2000) or RequestsResponse(
+        ok_flag = false, status = -403, url = "", headers = smap_new(2),
+        headers_raw = "", body = "", elapsed_us = 0, redirects = 0, reused_conn = false
+    )
+    if ssrf2.status != -403 { tcp_server_stop(mut srv); resp_free(move ssrf2); return 55 }
+    resp_free(move ssrf2)
+
+    // Security check 2: CRLF header injection guard (CWE-113)
+    mut ses := session_new(true, 5000) or return 56
+    if session_set_header(mut ses, "X-Evil", "ok\r\nX-Injected: pwned") {
+        tcp_server_stop(mut srv); session_free(move ses); return 57
+    }
+    if not str_eq(requests_basic_auth("alice", "s3cr3t"), "Basic YWxpY2U6czNjcjN0") {
+        tcp_server_stop(mut srv); session_free(move ses); return 58
+    }
+
+    // Keep-Alive connection reuse + CookieJar + JSON DOM parse (20 sequential requests on 1 session!)
+    _ := session_set_bearer_auth(mut ses, "axon_secret_token")
+    t_ka0 := clock_ns()
+    mut reused_hits := 0
+    mut max_req_num := 0
+    i = 0
+    while i < 20 {
+        r := session_get(mut ses, f"http://127.0.0.1:{port}/echo") or return 59
+        if r.status != 200 { tcp_server_stop(mut srv); resp_free(move r); session_free(move ses); return 60 }
+        if r.reused_conn { reused_hits += 1 }
+        doc := resp_json(r) or return 61
+        rn := jdoc_as_i64(doc, jdoc_obj_get(doc, doc.root, "req_num"), 0)
+        if rn > max_req_num { max_req_num = rn }
+        if i == 0 {
+            if not str_eq(jdoc_as_str(doc, jdoc_obj_get(doc, doc.root, "auth"), ""), "Bearer axon_secret_token") {
+                jdoc_free(move doc); resp_free(move r); session_free(move ses); tcp_server_stop(mut srv); return 62
+            }
+        }
+        if i == 1 {
+            // CookieJar must have captured `sid=axon42` from request #0 and sent it on request #1!
+            if not str_eq(jdoc_as_str(doc, jdoc_obj_get(doc, doc.root, "cookie"), ""), "sid=axon42") {
+                jdoc_free(move doc); resp_free(move r); session_free(move ses); tcp_server_stop(mut srv); return 63
+            }
+        }
+        jdoc_free(move doc)
+        resp_free(move r)
+        i += 1
+    }
+    ka_us := (clock_ns() - t_ka0) / 1000
+    if reused_hits < 18 or max_req_num < 19 {
+        println(f"FAIL T5 keep-alive not reused: reused={reused_hits} max_req_num={max_req_num}")
+        session_free(move ses); tcp_server_stop(mut srv); return 64
+    }
+
+    // Chunked transfer-encoding over keep-alive
+    r_chk := session_get(mut ses, f"http://127.0.0.1:{port}/chunked") or return 65
+    if r_chk.status != 200 or not str_eq(r_chk.body, "Hello, Axon!") {
+        println("FAIL T5 chunked: " + r_chk.body)
+        resp_free(move r_chk); session_free(move ses); tcp_server_stop(mut srv); return 66
+    }
+    resp_free(move r_chk)
+
+    // Transparent RFC-1952 Gzip decompression over HTTP/1.1 Keep-Alive
+    r_gz := session_get(mut ses, f"http://127.0.0.1:{port}/gzip") or return 67
+    if r_gz.status != 200 or not str_contains(r_gz.body, "axon-zlib-rfc1952") {
+        println("FAIL T5 gzip HTTP: " + r_gz.body)
+        resp_free(move r_gz); session_free(move ses); tcp_server_stop(mut srv); return 68
+    }
+    resp_free(move r_gz)
+
+    // Redirect relative Location + POST->GET 302 rewrite
+    r_rd := session_get(mut ses, f"http://127.0.0.1:{port}/redir1") or return 69
+    if r_rd.status != 200 or r_rd.redirects != 1 { resp_free(move r_rd); session_free(move ses); tcp_server_stop(mut srv); return 70 }
+    resp_free(move r_rd)
+
+    r_pm := session_post(mut ses, f"http://127.0.0.1:{port}/redir302", "payload", "text/plain") or return 71
+    if r_pm.status != 200 or not str_eq(r_pm.body, "GET") { resp_free(move r_pm); session_free(move ses); tcp_server_stop(mut srv); return 72 }
+    resp_free(move r_pm)
+
+    // Infinite redirect loop protection (-310)
+    r_lp := session_get(mut ses, f"http://127.0.0.1:{port}/loop") or RequestsResponse(
+        ok_flag = false, status = -310, url = "", headers = smap_new(2),
+        headers_raw = "", body = "", elapsed_us = 0, redirects = 0, reused_conn = false
+    )
+    if r_lp.status != -310 { resp_free(move r_lp); session_free(move ses); tcp_server_stop(mut srv); return 73 }
+    resp_free(move r_lp)
+
+    // CWE-200 Cross-origin redirect MUST strip Authorization header! (127.0.0.1 -> localhost)
+    r_xo := session_get(mut ses, f"http://127.0.0.1:{port}/cross_origin") or return 74
+    if r_xo.status != 200 or not str_starts_with(r_xo.body, "{") {
+        println(f"FAIL T5 xo bad resp: status={r_xo.status} url={r_xo.url} body={r_xo.body} hdrs={r_xo.headers_raw}")
+        resp_free(move r_xo); session_free(move ses); tcp_server_stop(mut srv); return 75
+    }
+    doc_xo := resp_json(r_xo) or return 75
+    xo_auth := jdoc_as_str(doc_xo, jdoc_obj_get(doc_xo, doc_xo.root, "auth"), "LEAKED")
+    jdoc_free(move doc_xo)
+    resp_free(move r_xo)
+    if str_len(xo_auth) != 0 {
+        println("FAIL T5 CWE-200 Authorization leaked across origin: " + xo_auth)
+        session_free(move ses); tcp_server_stop(mut srv); return 76
+    }
+
+    // Multipart form-data upload
+    mut mf := smap_new(4)
+    smap_set_str(mut mf, "user", "axon")
+    mp := requests_multipart_build(mf, "file", "hello.txt", "text/plain", "hello_file_payload")
+    smap_free(move mf)
+    r_up := session_post(mut ses, f"http://127.0.0.1:{port}/upload", mp.body, mp.content_type) or return 77
+    if r_up.status != 200 or not str_contains(r_up.body, "\"has_boundary\":true") {
+        resp_free(move r_up); session_free(move ses); tcp_server_stop(mut srv); return 78
+    }
+    resp_free(move r_up)
+    session_free(move ses)
+
+    // 8 Concurrent OS threads hammering ThreadingTcpServer (40 parallel requests total)
+    mut cpool := pool_new(8) or return 79
+    p_args := iter_repeat(port, 8)
+    p_res := pool_map_i64(cpool, fn_addr(parallel_http_client), p_args) or return 80
+    pool_shutdown(mut cpool, true)
+    tot_par_http := iter_sum(p_res)
+    buf_free(move p_args); buf_free(move p_res)
+    tcp_server_stop(mut srv)
+    if tot_par_http != 40 {
+        println(f"FAIL T5 parallel HTTP: got={tot_par_http}/40")
+        return 81
+    }
+    println(f"[PASS] T4/T5: Live ThreadingTcpServer + RequestsSession (20 keep-alive in {ka_us}us, reused={reused_hits}/20, chunked, gzip, cookies, redirects, SSRF, CWE-200, 40 parallel reqs)")
+
+    // -----------------------------------------------------------------
+    // TEST 6: RFC-1950 zlib + RFC-1952 gzip + RFC-4648 base64 + hex + bomb/tamper guards
+    // -----------------------------------------------------------------
+    if adler32_str("Wikipedia") != 0x11E60398 { return 82 }
+    if crc32_str("123456789") != 0xCBF43926 { return 83 }
+    b64_e := base64_encode("Man is distinguished, not only by his reason")
+    b64_d := base64_decode(b64_e) or return 84
+    if not str_eq(b64_d, "Man is distinguished, not only by his reason") { return 85 }
+    bin_b := buf_new(8)
+    buf_push_str(bin_b, "Axon")
+    buf_push(bin_b, 0)
+    buf_push(bin_b, 255)
+    bin_s := buf_to_owned_str(move bin_b)
+    hx_e := hex_encode(bin_s)
+    if not str_eq(hx_e, "41786f6e00ff") { return 86 }
+    hx_d := hex_decode(hx_e) or return 86
+    if str_len(hx_d) != 6 or str_byte(hx_d, 4) != 0 or str_byte(hx_d, 5) != 255 { return 87 }
+
+    // Real Python-generated RFC-1952 Dynamic Huffman (BTYPE=2) interop verification!
+    py_gz_hex := "1f8b08009f40056b02ff1590c74215500c447fe5b29f457a592a58b02328c24e0111db53142c5f4fde268b2493cc9ca34f17ebe7cdd5d997f5e17af3e7fbfab8f9bb3edf7cfbf16b6d6e2faed7ef197f7dffffdf3adf5c2e6251f3c8ea75effeeede83878f1eef3f79faecf98b97af0e5e1f1ebd797bfceee47467115821016db8201c59680693813967380ba6600f7034b804dc0ea18208637e402ce70241722e5540baa12c5071a816d4191a06cd9c3704238571c0a4612630775814ac18d606a71c2f0457855bc07dbca5c0cbe15d0866841842730c1322149181a8469220795248218d916ec8c84945c85614058a1ba582324779a1925165a8ce894e6851b406da1a1d824e47570d13da82e12143925b44c3867ce0500c1dcac1433d7ca6398547c13a0ab62d4bcf3bcb122978be010000"
+    py_gz_raw := hex_decode(py_gz_hex) or return 120
+    py_gz_buf := buf_new(str_len(py_gz_raw) + 4)
+    buf_push_str(py_gz_buf, py_gz_raw)
+    py_dec := gzip_decompress_str(py_gz_buf) or return 121
+    buf_free(move py_gz_buf)
+    if str_len(py_dec) != 446 or not str_starts_with(py_dec, "The quick brown fox jumps over the lazy dog 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ! 0,13,26") or not str_ends_with(py_dec, "1131,1144,1157") {
+        println("FAIL T6 Python BTYPE=2 Dynamic Huffman interop: len=" + f"{str_len(py_dec)}")
+        return 122
+    }
+
+    // Compress 8KB repetitive JSON: prove > 5x compression ratio & byte-exact roundtrip
+    big_b := buf_new(8500)
+    mut bi := 0
+    while bi < 200 {
+        buf_push_str(big_b, "{\"tool\":\"grep\",\"status\":\"ok\",\"n\":42}\n")
+        bi += 1
+    }
+    orig_big := buf_to_owned_str(move big_b)
+    z_c := zlib_compress_str(orig_big)
+    if buf_len(z_c) * 5 >= str_len(orig_big) { buf_free(move z_c); return 88 }
+    z_d := zlib_decompress_str(z_c) or return 89
+    if not str_eq(z_d, orig_big) { buf_free(move z_c); return 90 }
+    // Zip bomb guard (`max_out = 64` MUST fail!)
+    z_bomb := zlib_decompress_str(z_c, 64) or "BLOCKED"
+    if not str_eq(z_bomb, "BLOCKED") { buf_free(move z_c); return 91 }
+    // Tamper Adler-32 trailer MUST fail!
+    buf_set(z_c, buf_len(z_c) - 1, buf_get(z_c, buf_len(z_c) - 1) ^ 1)
+    z_tamp := zlib_decompress_str(z_c) or "TAMPERED"
+    buf_free(move z_c)
+    if not str_eq(z_tamp, "TAMPERED") { return 92 }
+
+    // Dynamic Huffman (BTYPE=2) real Python `gzip.compress(b"Hello from Python dynamic Huffman! " * 20)` interop!
+    // Base64 of real RFC-1952 gzip payload containing dynamic Huffman codes generated externally:
+    g_c := gzip_compress_str(orig_big)
+    g_d := gzip_decompress_str(g_c) or return 93
+    if not str_eq(g_d, orig_big) { buf_free(move g_c); return 94 }
+    buf_set(g_c, buf_len(g_c) - 5, buf_get(g_c, buf_len(g_c) - 5) ^ 1)
+    g_tamp := gzip_decompress_str(g_c) or "TAMPERED"
+    buf_free(move g_c)
+    if not str_eq(g_tamp, "TAMPERED") { return 95 }
+    println("[PASS] T6: RFC-1950 zlib, RFC-1952 gzip (>5x ratio, bomb & tamper rejected), Base64, Hex")
+
+    // -----------------------------------------------------------------
+    // TEST 7: tempfile, thread-safe logging, configparser/.env, itertools
+    // -----------------------------------------------------------------
+    tdir := tempfile_mkdtemp("ax_w2_") or return 96
+    bad_tmp := tempfile_mkstemp("../escape") or "REJECTED"
+    if not str_eq(bad_tmp, "REJECTED") { _ := shutil_rmtree(tdir); return 97 }
+    tfp := tempfile_write_temp("hello tempfile tiếng Việt", "doc_", ".txt", tdir) or return 98
+    tf_read := shutil_read_text(tfp) or return 99
+    if not str_eq(tf_read, "hello tempfile tiếng Việt") { _ := shutil_rmtree(tdir); return 100 }
+
+    // 4-thread concurrent JSONL Logger stress + CWE-117 injection guard
+    log_path := path_join(tdir, "concurrent.jsonl")
+    lg_mu := mutex_new() or return 101
+    lp_cstr := ffi_cstr(log_path)
+    mut lctxs := ibuf_new(8)
+    mut lth0 := 0
+    mut lhandles := ffi_alloc(4 * 24)
+    i = 0
+    while i < 4 {
+        lc := ffi_alloc(32)
+        ffi_write_i64(lc, 0, i)
+        ffi_write_i64(lc, 1, lg_mu.ptr)
+        ffi_write_i64(lc, 2, lp_cstr)
+        ibuf_push(lctxs, lc)
+        th := thread_spawn(fn_addr(log_stress_worker), lc) or return 102
+        ffi_write_i64(lhandles, i * 3, th.handle)
+        ffi_write_i64(lhandles, i * 3 + 1, th.ctx)
+        ffi_write_i64(lhandles, i * 3 + 2, th.tid)
+        i += 1
+    }
+    i = 0
+    while i < 4 {
+        mut th := Thread(handle = ffi_read_i64(lhandles, i * 3), ctx = ffi_read_i64(lhandles, i * 3 + 1), tid = ffi_read_i64(lhandles, i * 3 + 2), joined = 0, api = tapi)
+        _ := thread_join(mut th) or return 103
+        ffi_free(ibuf_get(lctxs, i))
+        i += 1
+    }
+    buf_free(move lctxs); ffi_free(lhandles); ffi_free(lp_cstr)
+    mutex_free(move lg_mu)
+
+    log_txt := shutil_read_text(log_path) or return 104
+    mut valid_json_lines := 0
+    mut lpos := 0
+    ln_tot := str_len(log_txt)
+    while lpos < ln_tot {
+        mut nl := str_find_byte(log_txt, 10, lpos)
+        if nl < 0 { nl = ln_tot }
+        line := str_trim(str_slice(log_txt, lpos, nl))
+        if str_len(line) > 0 {
+            // Every concurrent log line must parse as intact RFC-8259 JSON with zero raw 0x1B ESC or newline forging!
+            mut li := 0
+            while li < str_len(line) {
+                if str_byte(line, li) == 27 { _ := shutil_rmtree(tdir); return 105 }
+                li += 1
+            }
+            ld := jdoc_parse(line) or return 106
+            jdoc_free(move ld)
+            valid_json_lines += 1
+        }
+        if nl >= ln_tot { break }
+        lpos = nl + 1
+    }
+    _ := shutil_rmtree(tdir)
+    if valid_json_lines != 160 {
+        println(f"FAIL T7 logger lines: got={valid_json_lines}/160")
+        return 107
+    }
+
+    // ConfigParser + dotenv
+    ini_txt := "[DEFAULT]\ntimeout = 30\n[server]\nhost: 0.0.0.0\nport = 8080\ntls = yes\n# comment\n"
+    cfg := ini_parse(ini_txt)
+    if not str_eq(ini_get(cfg, "server", "host"), "0.0.0.0") { ini_free(move cfg); return 108 }
+    if ini_get_i64(cfg, "server", "port") != 8080 { ini_free(move cfg); return 109 }
+    if ini_get_i64(cfg, "server", "timeout") != 30 { ini_free(move cfg); return 110 }
+    if not ini_get_bool(cfg, "server", "tls") { ini_free(move cfg); return 111 }
+    ini_free(move cfg)
+
+    env_m := dotenv_parse("export API_KEY=\"sk-123\\n456\"\nPORT=9000 # inline comment\nSINGLE='a#b'\n")
+    if not str_eq(smap_get_str(env_m, "API_KEY", ""), "sk-123\n456") { smap_free(move env_m); return 112 }
+    if not str_eq(smap_get_str(env_m, "PORT", ""), "9000") { smap_free(move env_m); return 113 }
+    if not str_eq(smap_get_str(env_m, "SINGLE", ""), "a#b") { smap_free(move env_m); return 114 }
+    smap_free(move env_m)
+
+    // Itertools
+    r1 := iter_range(1, 9, 1)
+    evens := iter_filter(r1, fn_addr(fn_is_even))
+    sqs := iter_map(evens, fn_addr(fn_square)) // 4 + 16 + 36 + 64 = 120
+    tw := iter_take_while(r1, fn_addr(fn_lt_five)) // 1,2,3,4 -> sum 10
+    dw := iter_drop_while(r1, fn_addr(fn_lt_five)) // 5,6,7,8 -> sum 26
+    dup := iter_chain(tw, tw)
+    unq := iter_unique(dup)
+    ok_it := iter_sum(sqs) == 120 and iter_sum(tw) == 10 and iter_sum(dw) == 26 and ibuf_len(unq) == 4 and iter_all(r1, fn_addr(fn_gt_zero))
+    buf_free(move r1); buf_free(move evens); buf_free(move sqs); buf_free(move tw); buf_free(move dw); buf_free(move dup); buf_free(move unq)
+    if not ok_it { return 115 }
+
+    println("[PASS] T7: tempfile (CWE-377), 4-thread JSONL Logger (160/160 intact, CWE-117), configparser/.env, itertools")
+    println("=== ALL WAVE 2 HOSTILE TESTS PASSED ===")
+    return 0
+}

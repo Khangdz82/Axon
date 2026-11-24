@@ -1,0 +1,181 @@
+// Axon Standard Library: Thread-Safe Structured & Rotating Logger (`std/logging.ax`)
+// 100% Pure Axon replacement for Python's `logging` module (`Logger`, `FileHandler`, `RotatingFileHandler`).
+// Features:
+//   - OS Mutex serialized writes (zero garbled interleaving across concurrent threads)
+//   - Python-standard levels: DEBUG(10), INFO(20), WARN(30), ERROR(40), CRITICAL(50)
+//   - CWE-117 anti-log-forging sanitization (strips CRLF/NUL/ANSI ESC via `std::log::log_sanitize`)
+//   - Optional JSONL structured format (RFC-8259 safe escaping)
+//   - Automatic size-based file rotation (`app.log` -> `app.log.1`) via UTF-16LE Win32 / POSIX file append
+
+use std::ffi
+use std::os
+use std::str
+use std::log
+use std::sys
+use std::shutil
+use std::threading
+
+fn LOG_DEBUG() -> i64    { return 10 }
+fn LOG_INFO() -> i64     { return 20 }
+fn LOG_WARN() -> i64     { return 30 }
+fn LOG_ERROR() -> i64    { return 40 }
+fn LOG_CRITICAL() -> i64 { return 50 }
+
+struct Logger {
+    name: str
+    min_level: i64
+    json_mode: bool
+    to_stdout: bool
+    file_path: str
+    max_bytes: i64
+    mu: Mutex
+}
+
+fn _logging_level_name(lv: i64) -> str {
+    if lv <= 10 { return "DEBUG" }
+    if lv <= 20 { return "INFO" }
+    if lv <= 30 { return "WARN" }
+    if lv <= 40 { return "ERROR" }
+    return "CRITICAL"
+}
+
+fn _logging_json_esc(s: str) -> str {
+    clean := log_sanitize(s)
+    n := str_len(clean)
+    out := buf_new(n * 2 + 8)
+    mut i := 0
+    while i < n {
+        c := str_byte(clean, i)
+        if c == 34 { buf_push_str(out, "\\\"") }
+        else if c == 92 { buf_push_str(out, "\\\\") }
+        else { buf_push(out, c) }
+        i += 1
+    }
+    return buf_to_owned_str(move out)
+}
+
+fn _logging_append_file(path: str, line: str) -> bool {
+    if str_len(path) == 0 { return false }
+    k32 := ffi_open_one("kernel32.dll")
+    if k32 != 0 {
+        f_cf := ffi_sym(k32, "CreateFileW")
+        f_wf := ffi_sym(k32, "WriteFile")
+        f_cl := ffi_sym(k32, "CloseHandle")
+        if f_cf == 0 or f_wf == 0 or f_cl == 0 { return false }
+        wp := ffi_wstr(path)
+        if wp == 0 { return false }
+        // FILE_APPEND_DATA=4, FILE_SHARE_READ|WRITE=3, OPEN_ALWAYS=4, FILE_ATTRIBUTE_NORMAL=0x80
+        h := ffi_call7(f_cf, wp, 4, 3, 0, 4, 0x80, 0)
+        ffi_free(wp)
+        if h == -1 or (h & 0xFFFFFFFF) == 0xFFFFFFFF or h == 0 { return false }
+        payload := line + "\n"
+        plen := str_len(payload)
+        raw := ffi_cstr(payload)
+        wb := ffi_alloc(8)
+        mut ok_w := false
+        if raw != 0 and wb != 0 {
+            ok_w = ffi_sext32(ffi_call5(f_wf, h, raw, plen, wb, 0)) != 0
+        }
+        ffi_free(raw); ffi_free(wb)
+        _ := ffi_call1(f_cl, h)
+        return ok_w
+    }
+    libc := ffi_open("", "libc.so.6", "libSystem.B.dylib")
+    if libc == 0 { return false }
+    f_open := ffi_sym(libc, "open")
+    f_write := ffi_sym(libc, "write")
+    f_close := ffi_sym(libc, "close")
+    if f_open == 0 or f_write == 0 or f_close == 0 { return false }
+    cp := ffi_cstr(path)
+    if cp == 0 { return false }
+    // O_WRONLY=1 | O_CREAT=0x40 | O_APPEND=0x400 = 0x441, mode 0644=420
+    fd := ffi_sext32(ffi_call3(f_open, cp, 0x441, 420))
+    ffi_free(cp)
+    if fd < 0 { return false }
+    payload := line + "\n"
+    raw := ffi_cstr(payload)
+    mut ok_w := false
+    if raw != 0 {
+        ok_w = ffi_sext32(ffi_call3(f_write, fd, raw, str_len(payload))) >= 0
+        ffi_free(raw)
+    }
+    _ := ffi_call1(f_close, fd)
+    return ok_w
+}
+
+fn logger_new(name: str, min_level: i64 = 20, json_mode: bool = false, to_stdout: bool = true) -> Logger ! i64 {
+    mu := mutex_new() or return
+    return ok(Logger(
+        name = name,
+        min_level = min_level,
+        json_mode = json_mode,
+        to_stdout = to_stdout,
+        file_path = "",
+        max_bytes = 0,
+        mu = mu
+    ))
+}
+
+fn logger_set_file(mut lg: Logger, file_path: str, max_bytes: i64 = 0) {
+    mutex_lock(lg.mu)
+    lg.file_path = file_path
+    lg.max_bytes = max_bytes
+    mutex_unlock(lg.mu)
+}
+
+fn logger_set_level(mut lg: Logger, min_level: i64) {
+    mutex_lock(lg.mu)
+    lg.min_level = min_level
+    mutex_unlock(lg.mu)
+}
+
+fn logger_log(lg: Logger, level: i64, msg: str) {
+    if level < lg.min_level { return }
+    ts_us := clock_ns() / 1000
+    tid := thread_current_id()
+    lv_name := _logging_level_name(level)
+    mut line := ""
+    if lg.json_mode {
+        out := buf_new(str_len(msg) + str_len(lg.name) + 96)
+        buf_push_str(out, "{\"ts_us\":")
+        buf_push_str(out, f"{ts_us}")
+        buf_push_str(out, ",\"tid\":")
+        buf_push_str(out, f"{tid}")
+        buf_push_str(out, ",\"level\":\"")
+        buf_push_str(out, lv_name)
+        buf_push_str(out, "\",\"logger\":\"")
+        buf_push_str(out, _logging_json_esc(lg.name))
+        buf_push_str(out, "\",\"msg\":\"")
+        buf_push_str(out, _logging_json_esc(msg))
+        buf_push_str(out, "\"}")
+        line = buf_to_owned_str(move out)
+    } else {
+        line = f"[{ts_us}us] [T{tid}] " + log_format(lv_name, lg.name, msg)
+    }
+
+    mutex_lock(lg.mu)
+    if lg.to_stdout {
+        println(line)
+    }
+    if str_len(lg.file_path) > 0 {
+        if lg.max_bytes > 0 {
+            st := shutil_stat(lg.file_path)
+            if st.exists and st.size >= lg.max_bytes {
+                bak := lg.file_path + ".1"
+                _ := shutil_move(lg.file_path, bak)
+            }
+        }
+        _ := _logging_append_file(lg.file_path, line)
+    }
+    mutex_unlock(lg.mu)
+}
+
+fn logger_debug(lg: Logger, msg: str)    { logger_log(lg, LOG_DEBUG(), msg) }
+fn logger_info(lg: Logger, msg: str)     { logger_log(lg, LOG_INFO(), msg) }
+fn logger_warn(lg: Logger, msg: str)     { logger_log(lg, LOG_WARN(), msg) }
+fn logger_error(lg: Logger, msg: str)    { logger_log(lg, LOG_ERROR(), msg) }
+fn logger_critical(lg: Logger, msg: str) { logger_log(lg, LOG_CRITICAL(), msg) }
+
+fn logger_free(move lg: Logger) {
+    mutex_free(move lg.mu)
+}

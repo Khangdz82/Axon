@@ -3,6 +3,7 @@
 // so AI agents never need Python/C helper scripts for env vars, cwd, mkdir, delete, or exec capture.
 
 use std::ffi
+use std::subprocess
 
 fn _sys_kernel() -> i64 {
     return ffi_open("kernel32.dll", "libc.so.6", "libSystem.B.dylib")
@@ -137,6 +138,23 @@ fn sys_fs_remove(path: str) -> bool {
 
 fn sys_fs_size(path: str) -> i64 {
     if str_len(path) == 0 or _sys_has_nul(path) { return -1 }
+    k := _sys_kernel()
+    if k != 0 {
+        f_attr := ffi_sym(k, "GetFileAttributesExW")
+        if f_attr != 0 {
+            wp := ffi_wstr(path)
+            if wp == 0 { return -1 }
+            info := ffi_alloc(48)
+            if info == 0 { ffi_free(wp); return -1 }
+            ok_q := (ffi_call3(f_attr, wp, 0, info) & 0xFFFFFFFF) != 0
+            ffi_free(wp)
+            if not ok_q { ffi_free(info); return -1 }
+            sz_hi := ffi_read_u32_le(info, 28)
+            sz_lo := ffi_read_u32_le(info, 32)
+            ffi_free(info)
+            return (sz_hi << 32) | (sz_lo & 0xFFFFFFFF)
+        }
+    }
     b := fs_read_file(path) or return -1
     n := buf_len(b)
     buf_free(move b)
@@ -145,17 +163,11 @@ fn sys_fs_size(path: str) -> i64 {
 
 fn sys_exec_capture(cmd: str) -> str {
     if str_len(cmd) == 0 or _sys_has_nul(cmd) { return "" }
-    // Unpredictable per-invocation temp file (CWE-377) prevents clobbering & symlink races
-    nonce := (clock_ns() ^ cpu_rdtsc()) & 0x7FFFFFFF
-    tmp_path := f".axon_exec_{sys_pid()}_{nonce}.tmp"
-    is_win := ffi_open_one("kernel32.dll") != 0
-    full := if is_win {
-        f"cmd.exe /d /s /c \"{cmd} > {tmp_path} 2>&1\""
-    } else {
-        f"{cmd} > {tmp_path} 2>&1"
+    // Direct pipe capture via `std::subprocess` (ZERO temp files, timeout-safe, CWE-377 eliminated!)
+    res := subproc_run_shell(cmd, "", 30000, 4194304)
+    if str_len(res.stderr) > 0 and str_len(res.stdout) > 0 {
+        return res.stdout + res.stderr
     }
-    _ := os_exec(full)
-    b := fs_read_file(tmp_path) or buf_new(0)
-    _ := sys_fs_remove(tmp_path)
-    return buf_to_owned_str(move b)
+    if str_len(res.stdout) > 0 { return res.stdout }
+    return res.stderr
 }

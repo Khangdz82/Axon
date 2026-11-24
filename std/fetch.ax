@@ -1,0 +1,402 @@
+// Axon Standard Library — Unified HTTP/HTTPS Client, Query Encoder & SSE Parser (`std/fetch.ax`)
+// 100% Pure Axon replacement for Python's `urllib.request`, `urllib.parse.urlencode`, `http.client` & SSE readers:
+//   - Unified `fetch_request` handling BOTH `http://` (native TCP + chunked decoder + timeouts) & `https://` (WinHTTP TLS 1.3 + timeouts)
+//   - Fail-closed SSRF protection (`allow_private = false` default via `std::url::url_is_public_http`)
+//   - Strict CRLF / NUL header injection guard (CWE-113 / CWE-158)
+//   - Response status, raw headers, case-insensitive header lookup, body, and microsecond latency
+//   - SSE (`text/event-stream`) event/data parser for LLM streaming & MCP Streamable HTTP
+
+use std::ffi
+use std::str
+use std::ds
+use std::net
+use std::http
+use std::tls
+use std::url
+
+struct FetchResponse {
+    ok_flag: bool
+    status: i64
+    final_url: str
+    headers_raw: str
+    body: str
+    duration_us: i64
+}
+
+fn _fetch_is_unreserved(b: i64) -> bool {
+    if b >= 65 and b <= 90 { return true }
+    if b >= 97 and b <= 122 { return true }
+    if b >= 48 and b <= 57 { return true }
+    return b == 45 or b == 95 or b == 46 or b == 126
+}
+
+// RFC-3986 percent-encoding (equivalent to Python `urllib.parse.quote`)
+fn fetch_url_encode(s: str) -> str {
+    n := str_len(s)
+    if n == 0 { return "" }
+    out := buf_new(n * 3 + 8)
+    mut i := 0
+    while i < n {
+        b := str_byte(s, i) & 255
+        if _fetch_is_unreserved(b) {
+            buf_push(out, b)
+        } else {
+            buf_push(out, 37) // '%'
+            hi := (b >> 4) & 15
+            lo := b & 15
+            buf_push(out, if hi < 10 { 48 + hi } else { 55 + hi })
+            buf_push(out, if lo < 10 { 48 + lo } else { 55 + lo })
+        }
+        i += 1
+    }
+    return buf_to_owned_str(move out)
+}
+
+// Deterministic sorted query string encoder (Python `urllib.parse.urlencode`)
+fn fetch_urlencode(params: StrMap) -> str {
+    keys := smap_keys(params)
+    svec_sort(keys)
+    nk := svec_len(keys)
+    mut parts := svec_new(nk + 4, 256)
+    mut i := 0
+    while i < nk {
+        k := svec_get(keys, i)
+        v := smap_get_str(params, k, "")
+        svec_push(mut parts, fetch_url_encode(k) + "=" + fetch_url_encode(v))
+        i += 1
+    }
+    svec_free(move keys)
+    res := svec_join(parts, "&")
+    svec_free(move parts)
+    return res
+}
+
+fn fetch_append_params(base_url: str, params: StrMap) -> str {
+    qs := fetch_urlencode(params)
+    if str_len(qs) == 0 { return base_url }
+    sep := if str_contains(base_url, "?") { "&" } else { "?" }
+    return base_url + sep + qs
+}
+
+// Case-insensitive header lookup on `FetchResponse.headers_raw`
+fn fetch_response_header(resp: FetchResponse, name: str) -> str {
+    raw := resp.headers_raw
+    n := str_len(raw)
+    if n == 0 or str_len(name) == 0 { return "" }
+    mut i := 0
+    while i < n {
+        mut nl := str_find_byte(raw, 10, i)
+        if nl < 0 { nl = n }
+        mut end := nl
+        if end > i and str_byte(raw, end - 1) == 13 { end -= 1 }
+        line := str_slice(raw, i, end)
+        col := str_find_byte(line, 58, 0)
+        if col > 0 {
+            hname := str_trim(str_slice(line, 0, col))
+            if str_eq_ignore_case(hname, name) {
+                return str_trim(str_slice(line, col + 1, str_len(line)))
+            }
+        }
+        if nl >= n { break }
+        i = nl + 1
+    }
+    return ""
+}
+
+fn _fetch_decode_chunked(raw_body: str) -> str {
+    n := str_len(raw_body)
+    mut parts := svec_new(16, n + 16)
+    mut pos := 0
+    while pos < n {
+        mut nl := str_find_byte(raw_body, 10, pos)
+        if nl < 0 { break }
+        mut lend := nl
+        if lend > pos and str_byte(raw_body, lend - 1) == 13 { lend -= 1 }
+        // Parse hex chunk size (stopping at ';' extension)
+        mut sz := 0
+        mut k := pos
+        mut digits := 0
+        while k < lend {
+            b := str_byte(raw_body, k)
+            if b == 59 or b == 32 or b == 9 { break }
+            mut d := -1
+            if b >= 48 and b <= 57 { d = b - 48 }
+            else if b >= 65 and b <= 70 { d = b - 55 }
+            else if b >= 97 and b <= 102 { d = b - 87 }
+            else { break }
+            if sz > 16777216 { break }
+            sz = (sz << 4) | d
+            digits += 1
+            k += 1
+        }
+        pos = nl + 1
+        if digits == 0 or sz <= 0 { break }
+        if pos + sz > n { sz = n - pos }
+        svec_push(mut parts, str_slice(raw_body, pos, pos + sz))
+        pos = pos + sz
+        if pos < n and str_byte(raw_body, pos) == 13 { pos += 1 }
+        if pos < n and str_byte(raw_body, pos) == 10 { pos += 1 }
+    }
+    out := svec_join(parts, "")
+    svec_free(move parts)
+    return out
+}
+
+fn _fetch_http_plain(u: Url, method: str, target_path: str, headers: str, body: str, timeout_ms: i64, max_bytes: i64) -> FetchResponse ! i64 {
+    t0 := clock_ns()
+    sock := tcp_connect(u.host, u.port) or return err(-201)
+    _ := tcp_set_timeout_ms(sock, timeout_ms)
+    _ := tcp_set_nodelay(sock, true)
+
+    blen := str_len(body)
+    host_hdr := if u.port == 80 { u.host } else { f"{u.host}:{u.port}" }
+    req_b := buf_new(str_len(target_path) + str_len(headers) + blen + 256)
+    buf_push_str(req_b, f"{method} {target_path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: Axon-Fetch/1.1\r\nConnection: close\r\n")
+    if blen > 0 {
+        buf_push_str(req_b, f"Content-Length: {blen}\r\n")
+    }
+    if str_len(headers) > 0 {
+        buf_push_str(req_b, headers)
+        if not str_ends_with(headers, "\n") { buf_push_str(req_b, "\r\n") }
+    }
+    buf_push_str(req_b, "\r\n")
+    if blen > 0 { buf_push_str(req_b, body) }
+    sent := tcp_send_bytes(sock, req_b) or -1
+    buf_free(move req_b)
+    if sent < 0 { tcp_close(sock); return err(-202) }
+
+    mut chunks := svec_new(16, 4096)
+    mut total := 0
+    while total < max_bytes {
+        chunk := tcp_recv(sock, 32768) or buf_new(0)
+        cn := buf_len(chunk)
+        if cn <= 0 { buf_free(move chunk); break }
+        svec_push(mut chunks, buf_to_owned_str(move chunk))
+        total += cn
+    }
+    tcp_close(sock)
+    raw := svec_join(chunks, "")
+    svec_free(move chunks)
+    dur_us := (clock_ns() - t0) / 1000
+
+    sep := str_find(raw, "\r\n\r\n", 0)
+    mut hdr_end := sep
+    mut body_off := sep + 4
+    if hdr_end < 0 {
+        sep2 := str_find(raw, "\n\n", 0)
+        if sep2 < 0 { return err(-203) }
+        hdr_end = sep2
+        body_off = sep2 + 2
+    }
+    hdr_block := str_slice(raw, 0, hdr_end)
+    // Parse HTTP/1.x STATUS
+    sp1 := str_find_byte(hdr_block, 32, 0)
+    mut status := 0
+    if sp1 > 0 and sp1 + 4 <= str_len(hdr_block) {
+        status = parse_i64(str_slice(hdr_block, sp1 + 1, sp1 + 4)) or 0
+    }
+    mut resp_body := str_slice(raw, body_off, str_len(raw))
+    resp := FetchResponse(
+        ok_flag = (status >= 200 and status < 400),
+        status = status,
+        final_url = url_build(u),
+        headers_raw = hdr_block,
+        body = resp_body,
+        duration_us = dur_us
+    )
+    te := str_to_lower(fetch_response_header(resp, "Transfer-Encoding"))
+    if str_contains(te, "chunked") {
+        decoded := _fetch_decode_chunked(resp_body)
+        return ok(FetchResponse(
+            ok_flag = resp.ok_flag, status = status, final_url = resp.final_url,
+            headers_raw = hdr_block, body = decoded, duration_us = dur_us
+        ))
+    }
+    return ok(resp)
+}
+
+fn _fetch_https_winhttp(u: Url, method: str, target_path: str, headers: str, body: str, timeout_ms: i64, max_bytes: i64) -> FetchResponse ! i64 {
+    t0 := clock_ns()
+    wh := ffi_open_one("winhttp.dll")
+    if wh == 0 {
+        // Fallback to std::tls::https_request (OpenSSL on Linux/macOS)
+        r := https_request(method, u.host, u.port, target_path, headers, body) or return
+        return ok(FetchResponse(
+            ok_flag = (r.status >= 200 and r.status < 400),
+            status = r.status,
+            final_url = url_build(u),
+            headers_raw = "",
+            body = r.body,
+            duration_us = (clock_ns() - t0) / 1000
+        ))
+    }
+    f_open := ffi_sym(wh, "WinHttpOpen")
+    f_tout := ffi_sym(wh, "WinHttpSetTimeouts")
+    f_conn := ffi_sym(wh, "WinHttpConnect")
+    f_req  := ffi_sym(wh, "WinHttpOpenRequest")
+    f_send := ffi_sym(wh, "WinHttpSendRequest")
+    f_recv := ffi_sym(wh, "WinHttpReceiveResponse")
+    f_qhdr := ffi_sym(wh, "WinHttpQueryHeaders")
+    f_qavl := ffi_sym(wh, "WinHttpQueryDataAvailable")
+    f_read := ffi_sym(wh, "WinHttpReadData")
+    f_cls  := ffi_sym(wh, "WinHttpCloseHandle")
+    if f_open == 0 or f_conn == 0 or f_req == 0 or f_send == 0 or f_recv == 0 { return err(-210) }
+
+    w_ag := ffi_wstr("Axon-Fetch/1.1")
+    w_ho := ffi_wstr(u.host)
+    w_me := ffi_wstr(method)
+    w_pa := ffi_wstr(target_path)
+    mut w_hd := 0
+    mut hlen := 0
+    if str_len(headers) > 0 {
+        w_hd = ffi_wstr(headers)
+        hlen = ffi_wstr_len(w_hd, 65536)
+    }
+    mut bptr := 0
+    blen := str_len(body)
+    if blen > 0 { bptr = ffi_cstr(body) }
+
+    h_ses := ffi_call5(f_open, w_ag, 0, 0, 0, 0)
+    if h_ses == 0 {
+        ffi_free(w_ag); ffi_free(w_ho); ffi_free(w_me); ffi_free(w_pa); ffi_free(w_hd); ffi_free(bptr)
+        return err(-211)
+    }
+    if f_tout != 0 and timeout_ms > 0 {
+        _ := ffi_call5(f_tout, h_ses, timeout_ms, timeout_ms, timeout_ms, timeout_ms)
+    }
+    h_con := ffi_call4(f_conn, h_ses, w_ho, u.port, 0)
+    mut h_rq := 0
+    if h_con != 0 {
+        h_rq = ffi_call7(f_req, h_con, w_me, w_pa, 0, 0, 0, 0x00800000) // WINHTTP_FLAG_SECURE
+    }
+    mut ok_r := false
+    if h_rq != 0 {
+        if (ffi_call7(f_send, h_rq, w_hd, hlen, bptr, blen, blen, 0) & 0xFFFFFFFF) != 0 {
+            ok_r = (ffi_call2(f_recv, h_rq, 0) & 0xFFFFFFFF) != 0
+        }
+    }
+
+    mut status := 0
+    mut hdrs_raw := ""
+    mut chunks := svec_new(16, 4096)
+    if ok_r {
+        st_box := ffi_alloc(8)
+        sz_box := ffi_alloc(8)
+        ffi_write_u32_le(sz_box, 0, 4)
+        _ := ffi_call6(f_qhdr, h_rq, 0x20000013, 0, st_box, sz_box, 0)
+        status = ffi_read_u32_le(st_box, 0)
+
+        // Query raw CRLF headers (WINHTTP_QUERY_RAW_HEADERS_CRLF = 22)
+        hbuf := ffi_alloc(16384)
+        ffi_write_u32_le(sz_box, 0, 16380)
+        if (ffi_call6(f_qhdr, h_rq, 22, 0, hbuf, sz_box, 0) & 0xFFFFFFFF) != 0 {
+            hdrs_raw = ffi_read_wstr(hbuf, 8190)
+        }
+        ffi_free(hbuf); ffi_free(st_box); ffi_free(sz_box)
+
+        avl_box := ffi_alloc(8)
+        rd_box := ffi_alloc(8)
+        chunk := ffi_alloc(16384)
+        mut total := 0
+        while total < max_bytes {
+            ffi_write_u32_le(avl_box, 0, 0)
+            if (ffi_call2(f_qavl, h_rq, avl_box) & 0xFFFFFFFF) == 0 { break }
+            mut avail := ffi_read_u32_le(avl_box, 0)
+            if avail <= 0 { break }
+            if avail > 16384 { avail = 16384 }
+            ffi_write_u32_le(rd_box, 0, 0)
+            if (ffi_call4(f_read, h_rq, chunk, avail, rd_box) & 0xFFFFFFFF) == 0 { break }
+            got := ffi_read_u32_le(rd_box, 0)
+            if got <= 0 { break }
+            bb := ffi_read_bytes(chunk, got)
+            svec_push(mut chunks, buf_to_owned_str(move bb))
+            total += got
+        }
+        ffi_free(avl_box); ffi_free(rd_box); ffi_free(chunk)
+    }
+
+    if h_rq != 0 { _ := ffi_call1(f_cls, h_rq) }
+    if h_con != 0 { _ := ffi_call1(f_cls, h_con) }
+    _ := ffi_call1(f_cls, h_ses)
+    ffi_free(w_ag); ffi_free(w_ho); ffi_free(w_me); ffi_free(w_pa); ffi_free(w_hd); ffi_free(bptr)
+
+    body_out := svec_join(chunks, "")
+    svec_free(move chunks)
+    if not ok_r { return err(-212) }
+    return ok(FetchResponse(
+        ok_flag = (status >= 200 and status < 400),
+        status = status,
+        final_url = url_build(u),
+        headers_raw = hdrs_raw,
+        body = body_out,
+        duration_us = (clock_ns() - t0) / 1000
+    ))
+}
+
+// Unified HTTP/HTTPS fetch (`allow_private = false` enforces fail-closed SSRF guard by default!)
+fn fetch_request(url: str, method: str = "GET", headers: str = "", body: str = "", timeout_ms: i64 = 30000, allow_private: bool = false, max_bytes: i64 = 8388608) -> FetchResponse ! i64 {
+    u := url_parse(url) or return err(400)
+    if not str_eq(u.scheme, "http") and not str_eq(u.scheme, "https") { return err(400) }
+    if not allow_private and not url_is_public_http(u) { return err(403) }
+    meth := str_to_upper(str_trim(method))
+    if not tls_is_safe_http_token(meth) or not tls_is_safe_http_token(u.host) { return err(400) }
+    if str_len(headers) > 0 and not tls_is_safe_http_headers(headers) { return err(400) }
+    target_path := if str_len(u.query) > 0 { u.path + "?" + u.query } else { u.path }
+    if not tls_is_safe_http_token(target_path) { return err(400) }
+
+    mut lim := max_bytes
+    if lim < 1024 { lim = 1024 }
+    if lim > 33554432 { lim = 33554432 }
+    mut tout := timeout_ms
+    if tout <= 0 { tout = 30000 }
+
+    if str_eq(u.scheme, "https") {
+        return _fetch_https_winhttp(u, meth, target_path, headers, body, tout, lim)
+    }
+    return _fetch_http_plain(u, meth, target_path, headers, body, tout, lim)
+}
+
+fn fetch_get(url: str, headers: str = "", timeout_ms: i64 = 30000, allow_private: bool = false) -> FetchResponse ! i64 {
+    return fetch_request(url, "GET", headers, "", timeout_ms, allow_private, 8388608)
+}
+
+fn fetch_post_json(url: str, json_body: str, extra_headers: str = "", timeout_ms: i64 = 30000, allow_private: bool = false) -> FetchResponse ! i64 {
+    hdrs := if str_len(extra_headers) > 0 {
+        "Content-Type: application/json; charset=utf-8\r\n" + extra_headers
+    } else {
+        "Content-Type: application/json; charset=utf-8"
+    }
+    return fetch_request(url, "POST", hdrs, json_body, timeout_ms, allow_private, 8388608)
+}
+
+// Parse all `data:` frames from a Server-Sent Events (`text/event-stream`) payload
+fn sse_parse_all_data(raw_sse: str) -> StrVec {
+    mut out := svec_new(16, str_len(raw_sse) + 32)
+    n := str_len(raw_sse)
+    mut i := 0
+    while i < n {
+        mut nl := str_find_byte(raw_sse, 10, i)
+        if nl < 0 { nl = n }
+        mut end := nl
+        if end > i and str_byte(raw_sse, end - 1) == 13 { end -= 1 }
+        line := str_slice(raw_sse, i, end)
+        if str_starts_with(line, "data:") {
+            chunk := str_trim(str_slice(line, 5, str_len(line)))
+            if str_len(chunk) > 0 and not str_eq(chunk, "[DONE]") {
+                svec_push(mut out, chunk)
+            }
+        }
+        if nl >= n { break }
+        i = nl + 1
+    }
+    return out
+}
+
+// Returns the last non-empty `data:` payload in an SSE response (used by MCP Streamable HTTP)
+fn sse_parse_last_data(raw_sse: str) -> str {
+    all := sse_parse_all_data(raw_sse)
+    n := svec_len(all)
+    res := if n > 0 { svec_get(all, n - 1) } else { "" }
+    svec_free(move all)
+    return res
+}

@@ -8,6 +8,7 @@ use std::path
 use std::ffi
 use std::sys
 use std::ds
+use std::secrets
 
 fn _fs_safe_str(p: str) -> bool {
     n := str_len(p)
@@ -146,11 +147,11 @@ fn fs_move_file(src: str, dst: str) -> bool {
     return ok_m
 }
 
-// Crash-safe atomic file replacement via unique sibling `.tmp` + atomic OS rename.
+// Crash-safe atomic file replacement via CSPRNG-unique sibling `.tmp` + atomic UTF-16 OS rename (CWE-377 safe)
 fn fs_atomic_write(path: str, content: str) -> bool {
     if not _fs_safe_str(path) { return false }
-    nonce := (clock_ns() ^ cpu_rdtsc()) & 0x7FFFFFFF
-    tmp := f"{path}.tmp.{sys_pid()}.{nonce}"
+    tok := secrets_token_hex(8) or return false
+    tmp := f"{path}.tmp.{sys_pid()}.{tok}"
     if not fs_write_text(tmp, content) { return false }
     if fs_move_file(tmp, path) { return true }
     _ := sys_fs_remove(tmp)
@@ -167,26 +168,26 @@ fn fs_temp_dir() -> str {
     return "/tmp"
 }
 
-// Lists non-`.`/`..` entry names inside `dir_path` (Win32 `WIN32_FIND_DATAA` offset 44 = `cFileName`).
+// Lists non-`.`/`..` entry names inside `dir_path` using UTF-16LE `FindFirstFileW` on Win64 + `opendir`/`readdir` on Unix.
 fn fs_list_dir(dir_path: str) -> StrVec {
     mut out := svec_new(32, 512)
     if not _fs_safe_str(dir_path) { return out }
     k := ffi_open("kernel32.dll", "libc.so.6", "libSystem.B.dylib")
     if k == 0 { return out }
-    f_first := ffi_sym(k, "FindFirstFileA")
-    f_next := ffi_sym(k, "FindNextFileA")
+    f_first := ffi_sym(k, "FindFirstFileW")
+    f_next := ffi_sym(k, "FindNextFileW")
     f_close := ffi_sym(k, "FindClose")
     if f_first != 0 and f_next != 0 and f_close != 0 {
         pat := path_join(dir_path, "*")
-        cpat := ffi_cstr(pat)
-        fdata := ffi_alloc(640) // WIN32_FIND_DATAA = 320 bytes
-        if cpat != 0 and fdata != 0 {
-            h := ffi_call2(f_first, cpat, fdata)
+        wpat := ffi_wstr(pat)
+        fdata := ffi_alloc(640) // WIN32_FIND_DATAW = 592 bytes; cFileName at offset 44
+        if wpat != 0 and fdata != 0 {
+            h := ffi_call2(f_first, wpat, fdata)
             if h != -1 and h != 0xFFFFFFFFFFFFFFFF {
                 mut more := true
                 mut guard := 0
                 while more and guard < 100000 {
-                    name := ffi_read_cstr(fdata + 44, 260)
+                    name := ffi_read_wstr(fdata + 44, 260)
                     if not str_eq(name, ".") and not str_eq(name, "..") and str_len(name) > 0 {
                         svec_push(mut out, name)
                     }
@@ -197,7 +198,32 @@ fn fs_list_dir(dir_path: str) -> StrVec {
             }
         }
         if fdata != 0 { ffi_free(fdata) }
-        if cpat != 0 { ffi_free(cpat) }
+        if wpat != 0 { ffi_free(wpat) }
+        return out
+    }
+    // Unix fallback: opendir / readdir / closedir (struct dirent d_name at offset 19 on Linux x86_64)
+    f_op := ffi_sym(k, "opendir")
+    f_rd := ffi_sym(k, "readdir")
+    f_cl := ffi_sym(k, "closedir")
+    if f_op != 0 and f_rd != 0 and f_cl != 0 {
+        cp := ffi_cstr(dir_path)
+        if cp != 0 {
+            dp := ffi_call1(f_op, cp)
+            ffi_free(cp)
+            if dp != 0 {
+                mut guard := 0
+                while guard < 100000 {
+                    ent := ffi_call1(f_rd, dp)
+                    if ent == 0 { break }
+                    name := ffi_read_cstr(ent + 19, 256)
+                    if str_len(name) > 0 and not str_eq(name, ".") and not str_eq(name, "..") {
+                        svec_push(mut out, name)
+                    }
+                    guard += 1
+                }
+                _ := ffi_call1(f_cl, dp)
+            }
+        }
     }
     return out
 }

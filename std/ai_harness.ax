@@ -1,35 +1,55 @@
 // Axon Production AI Agent & Evaluation Harness Core (`std/ai_harness.ax`)
-// 100% Pure Axon, Zero-GC, Zero Python/Node.js:
-//   1. Multi-Turn Context & Token-Budget Compaction (`AgentContext`)
-//   2. Multi-Provider Chat Builders & Callers (OpenAI, Anthropic, Gemini, Local Ollama/vLLM)
-//   3. Multi-Tool Registry, Schema Generator & Parallel Tool-Call Parser (`ToolRegistry`, `ToolCallBatch`)
-//   4. Jailed Workspace Sandbox (read/write/edit/grep/safe-cmd), Secret Redactor & Prompt-Injection Guard
-//   5. Exponential Backoff Retry Policy & Circuit Breaker (`HarnessRetryPolicy`, `HarnessCircuitBreaker`)
-//   6. Deterministic Eval Suite Summary (`EvalSuite`)
+// 100% Pure Axon, Zero-GC, Zero Python/Node.js — High-Speed, Token-Optimized & Zero-Trust Hardened:
+//   1. Auto-Growing Multi-Turn Context + True Text Compaction + Old-Tool-Output Token Compressor (`AgentContext`)
+//   2. Auto-Growing Hash-Indexed Tool Registry + Cloudflare Code Mode Progressive Discovery (`ToolRegistry`)
+//   3. Multi-Provider Chat Builders (OpenAI, Anthropic, Gemini) + Structural JSON-DOM Parallel Tool-Call Parser
+//   4. Jailed Workspace Sandbox (streaming line-slice, full-file grep, strict ambiguity-checked edit + unified diff, safe-cmd)
+//   5. O(N) Single-Pass Secret Redactor (API keys, JWTs, PEM blocks), Prompt-Injection Guard & Tool Result Cache
+//   6. CRLF-Guarded Multi-Provider HTTPS Callers, Retry Policy, Circuit Breaker & Eval Summary
 
 use std::str
+use std::ds
 use std::json
+use std::json_dom
 use std::path
 use std::sys
+use std::fs
+use std::difflib
 use std::tls
 use std::http
 use std::ai_serve
 
-// ==================== 1. JSON ESCAPING & MULTI-TURN CONTEXT ====================
+// ==================== 1. JSON ESCAPING, TRUNCATION & MULTI-TURN CONTEXT ====================
 
+// RFC-8259 compliant JSON string escaping (escapes all control bytes < 0x20 as \u00XX)
 fn harness_push_json_escaped(out: ByteBuf, s: str) {
-    n := str_len(s)
-    mut i := 0
-    while i < n {
-        b := str_byte(s, i)
-        if b == 34 { buf_push_str(out, "\\\"") }
-        else if b == 92 { buf_push_str(out, "\\\\") }
-        else if b == 10 { buf_push_str(out, "\\n") }
-        else if b == 13 { buf_push_str(out, "\\r") }
-        else if b == 9  { buf_push_str(out, "\\t") }
-        else if b >= 32 { buf_push(out, b) }
-        i += 1
+    json_push_escaped(out, s)
+}
+
+// Line-boundary-preserving middle truncation (keeps head context + tail stacktrace, slashes token waste!)
+fn harness_truncate_middle(text: str, max_chars: i64 = 12000) -> str {
+    n := str_len(text)
+    if max_chars <= 0 or n <= max_chars { return text }
+    if max_chars < 64 { return str_slice(text, 0, max_chars) }
+    half := max_chars / 2
+    mut head_end := half
+    // Snap head backward to newline if within outer 25%
+    mut hi := half - 1
+    mut h_min := half / 2
+    while hi >= h_min {
+        if str_byte(text, hi) == 10 { head_end = hi; break }
+        hi -= 1
     }
+    mut tail_start := n - half
+    mut ti := tail_start
+    mut t_max := n - (half / 2)
+    while ti < t_max {
+        if str_byte(text, ti) == 10 { tail_start = ti + 1; break }
+        ti += 1
+    }
+    if tail_start <= head_end { return str_slice(text, 0, max_chars) }
+    omitted := tail_start - head_end
+    return str_slice(text, 0, head_end) + f"\n... [truncated {omitted} chars] ...\n" + str_slice(text, tail_start, n)
 }
 
 // Role codes: 0 = system, 1 = user, 2 = assistant, 3 = tool
@@ -74,25 +94,38 @@ fn _agent_ctx_ensure_text(mut ctx: AgentContext, add_len: i64) {
     cur := buf_len(ctx.text_buf)
     if cur + add_len + 8 <= ctx.text_cap { return }
     mut nc := ctx.text_cap * 2
-    while nc < cur + add_len + 16 and nc < 16777216 { nc = nc * 2 }
-    if nc > 16777216 { nc = 16777216 }
+    while nc < cur + add_len + 16 and nc < 33554432 { nc = nc * 2 }
+    if nc > 33554432 { nc = 33554432 }
     if cur + add_len + 8 > nc { return }
     nb := buf_new(nc)
-    mut i := 0
-    while i < cur { buf_push(nb, buf_get(ctx.text_buf, i)); i += 1 }
+    if cur > 0 { buf_push_str(nb, buf_slice_str(ctx.text_buf, 0, cur)) }
     buf_free(move ctx.text_buf)
     ctx.text_buf = nb
     ctx.text_cap = nc
 }
 
+fn _agent_ctx_ensure_meta(mut ctx: AgentContext) -> bool {
+    if ctx.msg_count < ctx.meta_cap { return true }
+    if ctx.meta_cap >= 16384 { return false }
+    nc := ctx.meta_cap * 2
+    nm := ibuf_new(nc * 4)
+    cur := ibuf_len(ctx.meta)
+    mut i := 0
+    while i < cur { ibuf_push(nm, ibuf_get(ctx.meta, i)); i += 1 }
+    buf_free(move ctx.meta)
+    ctx.meta = nm
+    ctx.meta_cap = nc
+    return true
+}
+
 fn agent_ctx_push(mut ctx: AgentContext, role: i64, content: str) -> bool {
-    if ctx.msg_count >= ctx.meta_cap { return false }
+    if not _agent_ctx_ensure_meta(mut ctx) { return false }
     clen := str_len(content)
     if clen > 4194304 { return false }
     _agent_ctx_ensure_text(mut ctx, clen)
     if buf_len(ctx.text_buf) + clen + 4 > ctx.text_cap { return false }
     off := buf_len(ctx.text_buf)
-    buf_push_str(ctx.text_buf, content)
+    if clen > 0 { buf_push_str(ctx.text_buf, content) }
     toks := estimate_prompt_tokens(content) + 4
     ibuf_push(ctx.meta, role)
     ibuf_push(ctx.meta, off)
@@ -116,7 +149,33 @@ fn agent_ctx_msg_text(ctx: AgentContext, idx: i64) -> str {
     return buf_slice_str(ctx.text_buf, off, off + ln)
 }
 
-// Deterministic sliding-window compaction: preserves system prompt (idx 0) & most recent turns within `max_tokens`.
+// Rebuilds `ctx.text_buf` compactly from live messages (eliminates dead-byte memory creep!)
+fn _agent_ctx_compact_text(mut ctx: AgentContext) {
+    mut live_bytes := 0
+    mut i := 0
+    while i < ctx.msg_count {
+        live_bytes += ibuf_get(ctx.meta, i * 4 + 2)
+        i += 1
+    }
+    mut nc := 16384
+    while nc < live_bytes + 1024 { nc = nc * 2 }
+    nb := buf_new(nc)
+    i = 0
+    while i < ctx.msg_count {
+        b := i * 4
+        old_off := ibuf_get(ctx.meta, b + 1)
+        ln := ibuf_get(ctx.meta, b + 2)
+        new_off := buf_len(nb)
+        if ln > 0 { buf_push_str(nb, buf_slice_str(ctx.text_buf, old_off, old_off + ln)) }
+        ibuf_set(ctx.meta, b + 1, new_off)
+        i += 1
+    }
+    buf_free(move ctx.text_buf)
+    ctx.text_buf = nb
+    ctx.text_cap = nc
+}
+
+// Deterministic sliding-window compaction: preserves system prompt (idx 0), compacts text_buf, and keeps latest turns.
 fn agent_ctx_prune_to_budget(mut ctx: AgentContext) -> i64 {
     if ctx.total_tokens <= ctx.max_tokens or ctx.msg_count <= 2 { return 0 }
     has_sys := ibuf_get(ctx.meta, 0) == 0
@@ -158,56 +217,267 @@ fn agent_ctx_prune_to_budget(mut ctx: AgentContext) -> i64 {
     ctx.meta = new_meta
     ctx.msg_count = new_cnt
     ctx.total_tokens = new_toks
+    _agent_ctx_compact_text(mut ctx)
     return dropped
 }
 
-// ==================== 2. TOOL REGISTRY & MULTI-PROVIDER BUILDERS ====================
+// Token-saving compressor: compacts bulky historical `tool` outputs (`role == 3`) older than `keep_recent_msgs`
+// Returns exact estimated tokens saved!
+fn agent_ctx_compact_tool_outputs(mut ctx: AgentContext, keep_recent_msgs: i64 = 4, max_old_tool_chars: i64 = 240) -> i64 {
+    if ctx.msg_count <= keep_recent_msgs + 1 or max_old_tool_chars < 64 { return 0 }
+    cutoff := ctx.msg_count - keep_recent_msgs
+    mut saved := 0
+    mut new_tb := buf_new(ctx.text_cap)
+    mut new_tot := 0
+    mut i := 0
+    while i < ctx.msg_count {
+        b := i * 4
+        role := ibuf_get(ctx.meta, b)
+        off := ibuf_get(ctx.meta, b + 1)
+        ln := ibuf_get(ctx.meta, b + 2)
+        old_toks := ibuf_get(ctx.meta, b + 3)
+        raw := if ln > 0 { buf_slice_str(ctx.text_buf, off, off + ln) } else { "" }
+        mut text := raw
+        if i > 0 and i < cutoff and role == 3 and ln > max_old_tool_chars {
+            text = harness_truncate_middle(raw, max_old_tool_chars)
+        }
+        new_off := buf_len(new_tb)
+        if str_len(text) > 0 { buf_push_str(new_tb, text) }
+        new_toks := estimate_prompt_tokens(text) + 4
+        if new_toks < old_toks { saved += old_toks - new_toks }
+        ibuf_set(ctx.meta, b + 1, new_off)
+        ibuf_set(ctx.meta, b + 2, str_len(text))
+        ibuf_set(ctx.meta, b + 3, new_toks)
+        new_tot += new_toks
+        i += 1
+    }
+    buf_free(move ctx.text_buf)
+    ctx.text_buf = new_tb
+    ctx.total_tokens = new_tot
+    return saved
+}
+
+// ==================== 2. AUTO-GROWING HASH-INDEXED TOOL REGISTRY & PROGRESSIVE DISCOVERY ====================
 
 struct ToolRegistry {
     data: ByteBuf
     data_cap: i64
-    meta: IntBuf // 6 ints per tool: [name_off, name_len, desc_off, desc_len, schema_off, schema_len]
+    meta: IntBuf       // 6 ints per tool: [name_off, name_len, desc_off, desc_len, schema_off, schema_len]
+    meta_cap: i64
+    name_idx: StrMap   // O(1) name -> tool index
     count: i64
 }
 
 fn tool_reg_new() -> ToolRegistry {
-    return ToolRegistry(data = buf_new(16384), data_cap = 16384, meta = ibuf_new(384), count = 0)
+    return ToolRegistry(
+        data = buf_new(16384),
+        data_cap = 16384,
+        meta = ibuf_new(384),
+        meta_cap = 64,
+        name_idx = smap_new(64),
+        count = 0
+    )
 }
 
 fn tool_reg_free(move reg: ToolRegistry) {
     buf_free(move reg.data)
     buf_free(move reg.meta)
+    smap_free(move reg.name_idx)
+}
+
+fn _tool_reg_ensure(mut reg: ToolRegistry, add_bytes: i64) -> bool {
+    if reg.count >= 2048 { return false }
+    cur_b := buf_len(reg.data)
+    if cur_b + add_bytes + 32 > reg.data_cap {
+        mut nc := reg.data_cap * 2
+        while nc < cur_b + add_bytes + 64 and nc < 4194304 { nc = nc * 2 }
+        if nc > 4194304 or cur_b + add_bytes + 32 > nc { return false }
+        nb := buf_new(nc)
+        if cur_b > 0 { buf_push_str(nb, buf_slice_str(reg.data, 0, cur_b)) }
+        buf_free(move reg.data)
+        reg.data = nb
+        reg.data_cap = nc
+    }
+    if reg.count >= reg.meta_cap {
+        nm_cap := reg.meta_cap * 2
+        nm := ibuf_new(nm_cap * 6)
+        cur_m := ibuf_len(reg.meta)
+        mut i := 0
+        while i < cur_m { ibuf_push(nm, ibuf_get(reg.meta, i)); i += 1 }
+        buf_free(move reg.meta)
+        reg.meta = nm
+        reg.meta_cap = nm_cap
+    }
+    return true
 }
 
 fn tool_reg_add(mut reg: ToolRegistry, name: str, desc: str, params_schema_json: str) -> bool {
-    if reg.count >= 64 or str_len(name) == 0 { return false }
+    if str_len(name) == 0 { return false }
     need := str_len(name) + str_len(desc) + str_len(params_schema_json)
-    if buf_len(reg.data) + need + 16 > reg.data_cap { return false }
+    if not _tool_reg_ensure(mut reg, need) { return false }
     no := buf_len(reg.data); nl := str_len(name); buf_push_str(reg.data, name)
     do := buf_len(reg.data); dl := str_len(desc); buf_push_str(reg.data, desc)
     so := buf_len(reg.data); sl := str_len(params_schema_json); buf_push_str(reg.data, params_schema_json)
+    idx := reg.count
     ibuf_push(reg.meta, no); ibuf_push(reg.meta, nl)
     ibuf_push(reg.meta, do); ibuf_push(reg.meta, dl)
     ibuf_push(reg.meta, so); ibuf_push(reg.meta, sl)
+    smap_set_i64(mut reg.name_idx, name, idx)
     reg.count += 1
     return true
 }
 
+// O(1) hash lookup
 fn tool_reg_exists(reg: ToolRegistry, name: str) -> bool {
-    nl := str_len(name)
+    return smap_has(reg.name_idx, name)
+}
+
+fn tool_reg_find_idx(reg: ToolRegistry, name: str) -> i64 {
+    if not smap_has(reg.name_idx, name) { return -1 }
+    return smap_get_i64(reg.name_idx, name, -1)
+}
+
+// Formats a compact Python/Axon-style typed signature from a JSON Schema string (saves ~90% tokens vs raw JSON schema!)
+fn harness_compact_schema_sig(tool_name: str, schema_json: str) -> str {
+    doc := jdoc_parse(schema_json) or return f"{tool_name}()"
+    props_id := jdoc_obj_get(doc, doc.root, "properties")
+    if props_id < 0 or jdoc_type(doc, props_id) != JVAL_OBJECT() {
+        jdoc_free(move doc)
+        return f"{tool_name}()"
+    }
+    // Collect required param names
+    mut req_map := smap_new(16)
+    req_id := jdoc_obj_get(doc, doc.root, "required")
+    if req_id >= 0 and jdoc_type(doc, req_id) == JVAL_ARRAY() {
+        mut rc := jdoc_first_child(doc, req_id)
+        while rc >= 0 {
+            if jdoc_type(doc, rc) == JVAL_STR() {
+                smap_set_i64(mut req_map, jdoc_as_str(doc, rc, ""), 1)
+            }
+            rc = jdoc_next_sib(doc, rc)
+        }
+    }
+    mut req_parts := svec_new(8, 128)
+    mut opt_parts := svec_new(8, 128)
+    mut p := jdoc_first_child(doc, props_id)
+    while p >= 0 {
+        pname := jdoc_key(doc, p)
+        ty_id := jdoc_obj_get(doc, p, "type")
+        mut pt := "any"
+        if ty_id >= 0 and jdoc_type(doc, ty_id) == JVAL_STR() {
+            raw_t := jdoc_as_str(doc, ty_id, "any")
+            if str_eq(raw_t, "string") { pt = "str" }
+            else if str_eq(raw_t, "integer") { pt = "i64" }
+            else if str_eq(raw_t, "number") { pt = "f64" }
+            else if str_eq(raw_t, "boolean") { pt = "bool" }
+            else if str_eq(raw_t, "array") { pt = "list" }
+            else if str_eq(raw_t, "object") { pt = "dict" }
+            else { pt = raw_t }
+        }
+        if smap_has(req_map, pname) {
+            svec_push(mut req_parts, f"{pname}: {pt}")
+        } else {
+            svec_push(mut opt_parts, f"{pname}?: {pt}")
+        }
+        p = jdoc_next_sib(doc, p)
+    }
+    jdoc_free(move doc)
+    smap_free(move req_map)
+    r_s := svec_join(req_parts, ", ")
+    o_s := svec_join(opt_parts, ", ")
+    svec_free(move req_parts)
+    svec_free(move opt_parts)
+    if str_len(r_s) > 0 and str_len(o_s) > 0 { return f"{tool_name}({r_s}, {o_s})" }
+    if str_len(r_s) > 0 { return f"{tool_name}({r_s})" }
+    return f"{tool_name}({o_s})"
+}
+
+// Cloudflare Code Mode progressive tool discovery: compact 1-line keyword search (~15 tokens/hit instead of ~180!)
+fn tool_reg_search(reg: ToolRegistry, query: str, limit: i64 = 10) -> str {
+    qlow := str_to_lower(str_trim(query))
+    mut lines := svec_new(16, 1024)
+    mut scores := dvec_new(16)
+    mut idxs := dvec_new(16)
     mut i := 0
     while i < reg.count {
         b := i * 6
-        if ibuf_get(reg.meta, b + 1) == nl {
-            no := ibuf_get(reg.meta, b)
-            if str_eq(buf_slice_str(reg.data, no, no + nl), name) { return true }
+        tn := buf_slice_str(reg.data, ibuf_get(reg.meta, b), ibuf_get(reg.meta, b) + ibuf_get(reg.meta, b + 1))
+        td := buf_slice_str(reg.data, ibuf_get(reg.meta, b + 2), ibuf_get(reg.meta, b + 2) + ibuf_get(reg.meta, b + 3))
+        ts := buf_slice_str(reg.data, ibuf_get(reg.meta, b + 4), ibuf_get(reg.meta, b + 4) + ibuf_get(reg.meta, b + 5))
+        mut sc := 0
+        if str_len(qlow) == 0 {
+            sc = 1
+        } else {
+            tnl := str_to_lower(tn)
+            tdl := str_to_lower(td)
+            tsl := str_to_lower(ts)
+            if str_eq(tnl, qlow) { sc += 100 }
+            else if str_starts_with(tnl, qlow) { sc += 50 }
+            else if str_contains(tnl, qlow) { sc += 25 }
+            if str_contains(tdl, qlow) { sc += 10 }
+            if str_contains(tsl, qlow) { sc += 5 }
+        }
+        if sc > 0 {
+            dvec_push(mut scores, sc)
+            dvec_push(mut idxs, i)
         }
         i += 1
     }
-    return false
+    // Sort matched indices by score descending
+    nm := dvec_len(idxs)
+    mut a := 1
+    while a < nm {
+        ks := dvec_get(scores, a, 0)
+        ki := dvec_get(idxs, a, 0)
+        mut j := a - 1
+        while j >= 0 and dvec_get(scores, j, 0) < ks {
+            _ := dvec_set(mut scores, j + 1, dvec_get(scores, j, 0))
+            _ := dvec_set(mut idxs, j + 1, dvec_get(idxs, j, 0))
+            j -= 1
+        }
+        _ := dvec_set(mut scores, j + 1, ks)
+        _ := dvec_set(mut idxs, j + 1, ki)
+        a += 1
+    }
+    mut lim := limit
+    if lim <= 0 { lim = 10 }
+    if lim > nm { lim = nm }
+    mut k := 0
+    while k < lim {
+        ti := dvec_get(idxs, k, 0)
+        b := ti * 6
+        tn := buf_slice_str(reg.data, ibuf_get(reg.meta, b), ibuf_get(reg.meta, b) + ibuf_get(reg.meta, b + 1))
+        td := buf_slice_str(reg.data, ibuf_get(reg.meta, b + 2), ibuf_get(reg.meta, b + 2) + ibuf_get(reg.meta, b + 3))
+        ts := buf_slice_str(reg.data, ibuf_get(reg.meta, b + 4), ibuf_get(reg.meta, b + 4) + ibuf_get(reg.meta, b + 5))
+        sig := harness_compact_schema_sig(tn, ts)
+        svec_push(mut lines, f"- {sig}: {td}")
+        k += 1
+    }
+    dvec_free(move scores)
+    dvec_free(move idxs)
+    res := svec_join(lines, "\n")
+    svec_free(move lines)
+    return res
 }
 
-// Registers the standard coding-agent toolset (`read_file`, `write_file`, `edit_file`, `grep`, `run_check`)
+// Ultra-compact full manifest of registered tools (minimal prompt token footprint)
+fn tool_reg_compact_manifest(reg: ToolRegistry) -> str {
+    return tool_reg_search(reg, "", reg.count)
+}
+
+// On-demand full description + schema for one tool (`mcp.describe` style)
+fn tool_reg_describe(reg: ToolRegistry, name: str) -> str ! i64 {
+    idx := tool_reg_find_idx(reg, name)
+    if idx < 0 { return err(404) }
+    b := idx * 6
+    tn := buf_slice_str(reg.data, ibuf_get(reg.meta, b), ibuf_get(reg.meta, b) + ibuf_get(reg.meta, b + 1))
+    td := buf_slice_str(reg.data, ibuf_get(reg.meta, b + 2), ibuf_get(reg.meta, b + 2) + ibuf_get(reg.meta, b + 3))
+    ts := buf_slice_str(reg.data, ibuf_get(reg.meta, b + 4), ibuf_get(reg.meta, b + 4) + ibuf_get(reg.meta, b + 5))
+    sig := harness_compact_schema_sig(tn, ts)
+    return ok(f"{sig}\n  {td}\nSchema: {ts}")
+}
+
+// Registers the standard coding-agent toolset (`read_file`, `write_file`, `edit_file`, `grep`, `run_safe_cmd`)
 fn tool_reg_add_coding_defaults(mut reg: ToolRegistry) {
     _ := tool_reg_add(mut reg, "read_file", "Read a file inside workspace", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"start_line\":{\"type\":\"integer\"},\"end_line\":{\"type\":\"integer\"}},\"required\":[\"path\"]}")
     _ := tool_reg_add(mut reg, "write_file", "Write a file inside workspace", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}")
@@ -216,9 +486,9 @@ fn tool_reg_add_coding_defaults(mut reg: ToolRegistry) {
     _ := tool_reg_add(mut reg, "run_safe_cmd", "Run allowlisted check/test/git command", "{\"type\":\"object\",\"properties\":{\"cmd\":{\"type\":\"string\"}},\"required\":[\"cmd\"]}")
 }
 
-// 2a. OpenAI / DeepSeek / Groq / OpenRouter / Ollama Chat Completions JSON
+// 2a. OpenAI / DeepSeek / Groq / OpenRouter / Ollama Chat Completions JSON (6x escape-safe capacity)
 fn agent_ctx_build_chat_json(ctx: AgentContext, reg: ToolRegistry, model: str, max_out_tokens: i64 = 1024) -> str {
-    est := buf_len(ctx.text_buf) * 2 + buf_len(reg.data) * 2 + ctx.msg_count * 64 + reg.count * 128 + 2048
+    est := buf_len(ctx.text_buf) * 6 + buf_len(reg.data) * 6 + str_len(model) * 6 + ctx.msg_count * 64 + reg.count * 128 + 2048
     out := buf_new(est)
     buf_push_str(out, "{\"model\":\"")
     harness_push_json_escaped(out, model)
@@ -235,7 +505,7 @@ fn agent_ctx_build_chat_json(ctx: AgentContext, reg: ToolRegistry, model: str, m
         buf_push_str(out, "\"}")
         i += 1
     }
-    buf_push(out, 93) // ']'
+    buf_push(out, 93)
     if reg.count > 0 {
         buf_push_str(out, ",\"tools\":[")
         mut ti := 0
@@ -256,13 +526,13 @@ fn agent_ctx_build_chat_json(ctx: AgentContext, reg: ToolRegistry, model: str, m
         }
         buf_push(out, 93)
     }
-    buf_push(out, 125) // '}'
+    buf_push(out, 125)
     return buf_to_owned_str(move out)
 }
 
-// 2b. Anthropic Messages API JSON (`system` top-level + `messages` + `tools` with `input_schema`)
+// 2b. Anthropic Messages API JSON
 fn agent_ctx_build_anthropic_json(ctx: AgentContext, reg: ToolRegistry, model: str, max_out_tokens: i64 = 1024) -> str {
-    est := buf_len(ctx.text_buf) * 2 + buf_len(reg.data) * 2 + ctx.msg_count * 64 + reg.count * 128 + 2048
+    est := buf_len(ctx.text_buf) * 6 + buf_len(reg.data) * 6 + str_len(model) * 6 + ctx.msg_count * 64 + reg.count * 128 + 2048
     out := buf_new(est)
     buf_push_str(out, "{\"model\":\"")
     harness_push_json_escaped(out, model)
@@ -315,11 +585,11 @@ fn agent_ctx_build_anthropic_json(ctx: AgentContext, reg: ToolRegistry, model: s
     return buf_to_owned_str(move out)
 }
 
-// 2c. Google Gemini `generateContent` JSON (`systemInstruction` + `contents` + `tools.functionDeclarations`)
+// 2c. Google Gemini `generateContent` JSON
 fn agent_ctx_build_gemini_json(ctx: AgentContext, reg: ToolRegistry, max_out_tokens: i64 = 1024) -> str {
-    est := buf_len(ctx.text_buf) * 2 + buf_len(reg.data) * 2 + ctx.msg_count * 80 + reg.count * 128 + 2048
+    est := buf_len(ctx.text_buf) * 6 + buf_len(reg.data) * 6 + ctx.msg_count * 80 + reg.count * 128 + 2048
     out := buf_new(est)
-    buf_push(out, 123) // '{'
+    buf_push(out, 123)
     mut need_comma := false
     if ctx.msg_count > 0 and agent_ctx_msg_role(ctx, 0) == 0 {
         buf_push_str(out, "\"systemInstruction\":{\"parts\":[{\"text\":\"")
@@ -372,7 +642,7 @@ fn agent_ctx_build_gemini_json(ctx: AgentContext, reg: ToolRegistry, max_out_tok
     return buf_to_owned_str(move out)
 }
 
-// ==================== 3. PARALLEL TOOL-CALL PARSER (OPENAI / ANTHROPIC / GEMINI / XML) ====================
+// ==================== 3. STRUCTURAL JSON-DOM PARALLEL TOOL-CALL PARSER ====================
 
 struct ToolCall {
     found: bool
@@ -381,94 +651,11 @@ struct ToolCall {
     args_json: str
 }
 
-// Extracts balanced `{...}` object starting at `pos` (quote-aware)
-fn _harness_extract_balanced_obj(s: str, start_pos: i64) -> str {
-    n := str_len(s)
-    lb := str_find_byte(s, 123, start_pos)
-    if lb < 0 { return "{}" }
-    mut depth := 0
-    mut in_q := false
-    mut i := lb
-    while i < n {
-        b := str_byte(s, i)
-        if b == 92 and in_q { i += 2; continue }
-        if b == 34 { in_q = not in_q }
-        else if not in_q {
-            if b == 123 { depth += 1 }
-            else if b == 125 {
-                depth -= 1
-                if depth == 0 { return str_slice(s, lb, i + 1) }
-            }
-        }
-        i += 1
-    }
-    return "{}"
-}
-
-// Parses OpenAI `tool_calls`, Anthropic `tool_use`, Gemini `functionCall`, or `<tool name="...">...</tool>`
-fn harness_parse_tool_call(resp: str) -> ToolCall {
-    // 1. OpenAI `"tool_calls"`
-    p_tc := str_find(resp, "\"tool_calls\"", 0)
-    if p_tc >= 0 {
-        sub := str_slice(resp, p_tc, str_len(resp))
-        cid := json_get_str(sub, "id") or "call_0"
-        nm  := json_get_str(sub, "name") or ""
-        arg := json_get_str(sub, "arguments") or "{}"
-        if str_len(nm) > 0 {
-            return ToolCall(found = true, id = cid, name = nm, args_json = arg)
-        }
-    }
-    // 2. Anthropic `"type":"tool_use"`
-    p_tu := str_find(resp, "\"tool_use\"", 0)
-    if p_tu >= 0 {
-        sub := str_slice(resp, p_tu, str_len(resp))
-        cid := json_get_str(sub, "id") or "toolu_0"
-        nm  := json_get_str(sub, "name") or ""
-        p_in := str_find(sub, "\"input\"", 0)
-        arg := if p_in >= 0 { _harness_extract_balanced_obj(sub, p_in + 7) } else { "{}" }
-        if str_len(nm) > 0 {
-            return ToolCall(found = true, id = cid, name = nm, args_json = arg)
-        }
-    }
-    // 3. Gemini `"functionCall"`
-    p_fc := str_find(resp, "\"functionCall\"", 0)
-    if p_fc >= 0 {
-        sub := str_slice(resp, p_fc, str_len(resp))
-        nm  := json_get_str(sub, "name") or ""
-        p_ar := str_find(sub, "\"args\"", 0)
-        arg := if p_ar >= 0 { _harness_extract_balanced_obj(sub, p_ar + 6) } else { "{}" }
-        if str_len(nm) > 0 {
-            return ToolCall(found = true, id = "gem_0", name = nm, args_json = arg)
-        }
-    }
-    // 4. Lightweight XML `<tool name="...">...</tool>`
-    p_tag := str_find(resp, "<tool ", 0)
-    if p_tag >= 0 {
-        gt := str_find_byte(resp, 62, p_tag)
-        end_t := if gt > p_tag { str_find(resp, "</tool>", gt + 1) } else { -1 }
-        if gt > p_tag and end_t > gt {
-            hdr := str_slice(resp, p_tag, gt)
-            p_nm := str_find(hdr, "name=", 0)
-            if p_nm >= 0 {
-                mut q1 := str_find_byte(hdr, 34, p_nm + 5)
-                mut qc := 34
-                if q1 < 0 { q1 = str_find_byte(hdr, 39, p_nm + 5); qc = 39 }
-                q2 := if q1 >= 0 { str_find_byte(hdr, qc, q1 + 1) } else { -1 }
-                if q2 > q1 {
-                    nm := str_slice(hdr, q1 + 1, q2)
-                    body := str_trim(str_slice(resp, gt + 1, end_t))
-                    return ToolCall(found = true, id = "xml_0", name = nm, args_json = body)
-                }
-            }
-        }
-    }
-    return ToolCall(found = false, id = "", name = "", args_json = "")
-}
-
-// Batch parallel tool-call extractor (extracts up to 16 `<tool>` or OpenAI `function` calls in one turn)
 struct ToolCallBatch {
     buf: ByteBuf
+    buf_cap: i64
     meta: IntBuf // 6 ints per call: [id_off, id_len, name_off, name_len, args_off, args_len]
+    meta_cap: i64
     count: i64
 }
 
@@ -493,70 +680,159 @@ fn tool_batch_get(batch: ToolCallBatch, idx: i64) -> ToolCall {
     )
 }
 
-fn _tool_batch_push(buf: ByteBuf, meta: IntBuf, count: i64, id: str, name: str, args: str) -> i64 {
-    if count >= 16 { return count }
+fn _tool_batch_push(mut batch: ToolCallBatch, id: str, name: str, args: str) {
+    if batch.count >= 256 or str_len(name) == 0 { return }
     need := str_len(id) + str_len(name) + str_len(args)
-    if buf_len(buf) + need + 16 > 32768 { return count }
-    io := buf_len(buf); il := str_len(id); buf_push_str(buf, id)
-    no := buf_len(buf); nl := str_len(name); buf_push_str(buf, name)
-    ao := buf_len(buf); al := str_len(args); buf_push_str(buf, args)
-    ibuf_push(meta, io); ibuf_push(meta, il)
-    ibuf_push(meta, no); ibuf_push(meta, nl)
-    ibuf_push(meta, ao); ibuf_push(meta, al)
-    return count + 1
+    cur := buf_len(batch.buf)
+    if cur + need + 32 > batch.buf_cap {
+        mut nc := batch.buf_cap * 2
+        while nc < cur + need + 64 and nc < 8388608 { nc = nc * 2 }
+        if nc > 8388608 or cur + need + 32 > nc { return }
+        nb := buf_new(nc)
+        if cur > 0 { buf_push_str(nb, buf_slice_str(batch.buf, 0, cur)) }
+        buf_free(move batch.buf)
+        batch.buf = nb
+        batch.buf_cap = nc
+    }
+    if batch.count >= batch.meta_cap {
+        nm_cap := batch.meta_cap * 2
+        nm := ibuf_new(nm_cap * 6)
+        mut k := 0
+        while k < ibuf_len(batch.meta) { ibuf_push(nm, ibuf_get(batch.meta, k)); k += 1 }
+        buf_free(move batch.meta)
+        batch.meta = nm
+        batch.meta_cap = nm_cap
+    }
+    io := buf_len(batch.buf); il := str_len(id); if il > 0 { buf_push_str(batch.buf, id) }
+    no := buf_len(batch.buf); nl := str_len(name); buf_push_str(batch.buf, name)
+    ao := buf_len(batch.buf); al := str_len(args); if al > 0 { buf_push_str(batch.buf, args) }
+    ibuf_push(batch.meta, io); ibuf_push(batch.meta, il)
+    ibuf_push(batch.meta, no); ibuf_push(batch.meta, nl)
+    ibuf_push(batch.meta, ao); ibuf_push(batch.meta, al)
+    batch.count += 1
 }
 
+// Structural JSON-DOM multi-provider parser (ZERO false-triggers on prose mentioning `"tool_calls"` or `"function"`!)
+// Supports OpenAI (parallel), Anthropic (parallel `tool_use`), Gemini (parallel `functionCall`), and XML `<tool>` fallback.
 fn harness_parse_tool_calls_all(resp: str) -> ToolCallBatch {
-    buf := buf_new(32768)
-    meta := ibuf_new(96)
-    mut cnt := 0
-    n := str_len(resp)
+    mut batch := ToolCallBatch(buf = buf_new(16384), buf_cap = 16384, meta = ibuf_new(192), meta_cap = 32, count = 0)
+    trimmed := str_trim(resp)
+    if str_len(trimmed) == 0 { return batch }
 
-    // 1. Scan all XML `<tool name="...">...</tool>` tags
+    // 1. Structural JSON parse (OpenAI / Anthropic / Gemini)
+    if str_byte(trimmed, 0) == 123 {
+        doc := jdoc_parse(trimmed) or JsonDoc(nodes = ibuf_new(0), nodes_cap = 0, node_count = 0, strings = buf_new(0), str_cap = 0, root = -1)
+        if doc.root >= 0 {
+            // 1a. OpenAI: `/choices/0/message/tool_calls` OR direct top-level `/tool_calls`
+            mut tc_arr := jdoc_path(doc, "/choices/0/message/tool_calls")
+            if tc_arr < 0 { tc_arr = jdoc_obj_get(doc, doc.root, "tool_calls") }
+            if tc_arr >= 0 and jdoc_type(doc, tc_arr) == JVAL_ARRAY() {
+                mut cur := jdoc_first_child(doc, tc_arr)
+                while cur >= 0 {
+                    if jdoc_type(doc, cur) == JVAL_OBJECT() {
+                        id_n := jdoc_obj_get(doc, cur, "id")
+                        cid := if id_n >= 0 and jdoc_type(doc, id_n) == JVAL_STR() { jdoc_as_str(doc, id_n, "") } else { f"call_{batch.count}" }
+                        fn_n := jdoc_obj_get(doc, cur, "function")
+                        if fn_n >= 0 and jdoc_type(doc, fn_n) == JVAL_OBJECT() {
+                            nm_n := jdoc_obj_get(doc, fn_n, "name")
+                            ar_n := jdoc_obj_get(doc, fn_n, "arguments")
+                            nm := if nm_n >= 0 { jdoc_as_str(doc, nm_n, "") } else { "" }
+                            mut arg_s := "{}"
+                            if ar_n >= 0 {
+                                if jdoc_type(doc, ar_n) == JVAL_STR() { arg_s = jdoc_as_str(doc, ar_n, "{}") }
+                                else { arg_s = jdoc_stringify(doc, ar_n, false, 0) }
+                            }
+                            if str_len(nm) > 0 { _tool_batch_push(mut batch, cid, nm, arg_s) }
+                        }
+                    }
+                    cur = jdoc_next_sib(doc, cur)
+                }
+            }
+
+            // 1b. Anthropic: `/content` array of `{"type":"tool_use","id":...,"name":...,"input":{...}}`
+            if batch.count == 0 {
+                c_arr := jdoc_obj_get(doc, doc.root, "content")
+                if c_arr >= 0 and jdoc_type(doc, c_arr) == JVAL_ARRAY() {
+                    mut cur := jdoc_first_child(doc, c_arr)
+                    while cur >= 0 {
+                        if jdoc_type(doc, cur) == JVAL_OBJECT() {
+                            ty_n := jdoc_obj_get(doc, cur, "type")
+                            if ty_n >= 0 and str_eq(jdoc_as_str(doc, ty_n, ""), "tool_use") {
+                                id_n := jdoc_obj_get(doc, cur, "id")
+                                cid := if id_n >= 0 { jdoc_as_str(doc, id_n, f"toolu_{batch.count}") } else { f"toolu_{batch.count}" }
+                                nm_n := jdoc_obj_get(doc, cur, "name")
+                                nm := if nm_n >= 0 { jdoc_as_str(doc, nm_n, "") } else { "" }
+                                in_n := jdoc_obj_get(doc, cur, "input")
+                                arg_s := if in_n >= 0 { jdoc_stringify(doc, in_n, false, 0) } else { "{}" }
+                                if str_len(nm) > 0 { _tool_batch_push(mut batch, cid, nm, arg_s) }
+                            }
+                        }
+                        cur = jdoc_next_sib(doc, cur)
+                    }
+                }
+            }
+
+            // 1c. Gemini: `/candidates/0/content/parts` array containing `{"functionCall":{"name":...,"args":{...}}}`
+            if batch.count == 0 {
+                parts := jdoc_path(doc, "/candidates/0/content/parts")
+                if parts >= 0 and jdoc_type(doc, parts) == JVAL_ARRAY() {
+                    mut cur := jdoc_first_child(doc, parts)
+                    while cur >= 0 {
+                        if jdoc_type(doc, cur) == JVAL_OBJECT() {
+                            fc_n := jdoc_obj_get(doc, cur, "functionCall")
+                            if fc_n >= 0 and jdoc_type(doc, fc_n) == JVAL_OBJECT() {
+                                nm_n := jdoc_obj_get(doc, fc_n, "name")
+                                nm := if nm_n >= 0 { jdoc_as_str(doc, nm_n, "") } else { "" }
+                                ar_n := jdoc_obj_get(doc, fc_n, "args")
+                                arg_s := if ar_n >= 0 { jdoc_stringify(doc, ar_n, false, 0) } else { "{}" }
+                                if str_len(nm) > 0 { _tool_batch_push(mut batch, f"gem_{batch.count}", nm, arg_s) }
+                            }
+                        }
+                        cur = jdoc_next_sib(doc, cur)
+                    }
+                }
+            }
+            jdoc_free(move doc)
+            return batch
+        }
+        jdoc_free(move doc)
+    }
+
+    // 2. Lightweight XML `<tool name="...">...</tool>` tags (for local / non-JSON models)
+    n := str_len(resp)
     mut pos := 0
-    while pos < n and cnt < 16 {
+    while pos < n and batch.count < 64 {
         p_tag := str_find(resp, "<tool ", pos)
         if p_tag < 0 { break }
         gt := str_find_byte(resp, 62, p_tag)
         end_t := if gt > p_tag { str_find(resp, "</tool>", gt + 1) } else { -1 }
         if gt < 0 or end_t < 0 { break }
-        tc := harness_parse_tool_call(str_slice(resp, p_tag, end_t + 7))
-        if tc.found {
-            cnt = _tool_batch_push(buf, meta, cnt, f"xml_{cnt}", tc.name, tc.args_json)
+        hdr := str_slice(resp, p_tag, gt)
+        p_nm := str_find(hdr, "name=", 0)
+        if p_nm >= 0 {
+            mut q1 := str_find_byte(hdr, 34, p_nm + 5)
+            mut qc := 34
+            if q1 < 0 { q1 = str_find_byte(hdr, 39, p_nm + 5); qc = 39 }
+            q2 := if q1 >= 0 { str_find_byte(hdr, qc, q1 + 1) } else { -1 }
+            if q2 > q1 {
+                nm := str_slice(hdr, q1 + 1, q2)
+                body := str_trim(str_slice(resp, gt + 1, end_t))
+                _tool_batch_push(mut batch, f"xml_{batch.count}", nm, body)
+            }
         }
         pos = end_t + 7
     }
-
-    // 2. Scan all OpenAI `"function":{"name":...,"arguments":...}` objects
-    if cnt == 0 {
-        p_tc := str_find(resp, "\"tool_calls\"", 0)
-        if p_tc >= 0 {
-            mut fpos := p_tc
-            while fpos < n and cnt < 16 {
-                pf := str_find(resp, "\"function\"", fpos)
-                if pf < 0 { break }
-                sub := str_slice(resp, pf, n)
-                nm := json_get_str(sub, "name") or ""
-                arg := json_get_str(sub, "arguments") or "{}"
-                if str_len(nm) > 0 {
-                    cnt = _tool_batch_push(buf, meta, cnt, f"call_{cnt}", nm, arg)
-                }
-                fpos = pf + 10
-            }
-        }
-    }
-
-    // 3. Fallback to single-call parser (Anthropic / Gemini)
-    if cnt == 0 {
-        tc := harness_parse_tool_call(resp)
-        if tc.found {
-            cnt = _tool_batch_push(buf, meta, cnt, tc.id, tc.name, tc.args_json)
-        }
-    }
-    return ToolCallBatch(buf = buf, meta = meta, count = cnt)
+    return batch
 }
 
-// ==================== 4. JAILED WORKSPACE SANDBOX, REDACTOR & INJECTION GUARD ====================
+fn harness_parse_tool_call(resp: str) -> ToolCall {
+    batch := harness_parse_tool_calls_all(resp)
+    res := if batch.count > 0 { tool_batch_get(batch, 0) } else { ToolCall(found = false, id = "", name = "", args_json = "") }
+    tool_batch_free(move batch)
+    return res
+}
+
+// ==================== 4. JAILED WORKSPACE SANDBOX, O(N) REDACTOR, CACHE & INJECTION GUARD ====================
 
 struct HarnessSandbox {
     workspace_root: str
@@ -585,14 +861,19 @@ fn harness_sandbox_consume_step(mut sb: HarnessSandbox) -> bool {
     return true
 }
 
-// Scans tool/model text for leaked API keys (`sk-`, `ghp_`, `AIza`, `AKIA`)
-fn harness_contains_secret(text: str) -> bool {
-    if str_contains(text, "sk-proj-") or str_contains(text, "sk-ant-") or str_contains(text, "sk-live-") { return true }
-    if str_contains(text, "ghp_") or str_contains(text, "gho_") or str_contains(text, "AIzaSy") or str_contains(text, "AKIA") { return true }
-    if str_contains(text, "Bearer ") or str_contains(text, "eyJhbGci") { return true }
-    return false
+@no_alloc
+fn _harness_match_at(text: str, n: i64, pos: i64, pat: str) -> bool {
+    plen := str_len(pat)
+    if pos + plen > n { return false }
+    mut i := 0
+    while i < plen {
+        if str_byte(text, pos + i) != str_byte(pat, i) { return false }
+        i += 1
+    }
+    return true
 }
 
+@no_alloc
 fn _harness_is_token_ch(b: i64) -> bool {
     if b >= 48 and b <= 57 { return true }
     if b >= 65 and b <= 90 { return true }
@@ -600,52 +881,84 @@ fn _harness_is_token_ch(b: i64) -> bool {
     return b == 45 or b == 95 or b == 46
 }
 
-// Actively redacts secret tokens (`sk-proj-*`, `sk-ant-*`, `sk-live-*`, `ghp_*`, `AIzaSy*`, `AKIA*`, `Bearer *`, JWT `eyJhbGci*`) -> `[REDACTED]`
+// Scans text for leaked API keys, JWTs, Bearer tokens, and PEM private keys
+fn harness_contains_secret(text: str) -> bool {
+    if str_contains(text, "sk-proj-") or str_contains(text, "sk-ant-") or str_contains(text, "sk-live-") or str_contains(text, "sk_live_") or str_contains(text, "rk_live_") { return true }
+    if str_contains(text, "ghp_") or str_contains(text, "gho_") or str_contains(text, "github_pat_") or str_contains(text, "AIzaSy") or str_contains(text, "AKIA") or str_contains(text, "ASIA") { return true }
+    if str_contains(text, "xoxb-") or str_contains(text, "xoxp-") or str_contains(text, "Bearer ") or str_contains(text, "eyJhbGci") or str_contains(text, "PRIVATE KEY-----") { return true }
+    return false
+}
+
+// O(N) single-pass zero-slice secret redactor (eliminates O(N^2) blowup on huge tool outputs!)
 fn harness_redact_secrets(text: str) -> str {
     if not harness_contains_secret(text) { return text }
     n := str_len(text)
-    // Worst-case expansion: 4-byte `"AKIA"` -> 10-byte `"[REDACTED]"` (2.5x), so `n * 3 + 64` is mathematically overflow-proof
     out := buf_new(n * 3 + 64)
     mut i := 0
     while i < n {
-        rem := str_slice(text, i, n)
-        if str_starts_with(rem, "Bearer ") {
+        b := str_byte(text, i)
+        // Quick first-byte dispatch to avoid checking all prefixes on every byte
+        if b == 45 and _harness_match_at(text, n, i, "-----BEGIN ") {
+            end_hdr := str_find(text, "PRIVATE KEY-----", i)
+            if end_hdr >= 0 and end_hdr - i < 64 {
+                end_pem := str_find(text, "-----END ", end_hdr + 16)
+                mut skip_to := n
+                if end_pem >= 0 {
+                    end_dash := str_find(text, "-----", end_pem + 9)
+                    if end_dash >= 0 { skip_to = end_dash + 5 }
+                }
+                buf_push_str(out, "[REDACTED_PRIVATE_KEY]")
+                i = skip_to
+                continue
+            }
+        }
+        if b == 66 and _harness_match_at(text, n, i, "Bearer ") {
             buf_push_str(out, "Bearer [REDACTED]")
             mut j := i + 7
             while j < n and _harness_is_token_ch(str_byte(text, j)) { j += 1 }
             i = j
-        } else {
-            mut match_len := 0
-            if str_starts_with(rem, "sk-proj-") { match_len = 8 }
-            else if str_starts_with(rem, "sk-ant-") { match_len = 7 }
-            else if str_starts_with(rem, "sk-live-") { match_len = 8 }
-            else if str_starts_with(rem, "ghp_") or str_starts_with(rem, "gho_") or str_starts_with(rem, "AKIA") { match_len = 4 }
-            else if str_starts_with(rem, "AIzaSy") { match_len = 6 }
-            else if str_starts_with(rem, "eyJhbGci") { match_len = 8 }
+            continue
+        }
+        mut match_len := 0
+        if b == 115 { // 's'
+            if _harness_match_at(text, n, i, "sk-proj-") { match_len = 8 }
+            else if _harness_match_at(text, n, i, "sk-ant-") { match_len = 7 }
+            else if _harness_match_at(text, n, i, "sk-live-") { match_len = 8 }
+            else if _harness_match_at(text, n, i, "sk_live_") { match_len = 8 }
+        } else if b == 114 and _harness_match_at(text, n, i, "rk_live_") {
+            match_len = 8
+        } else if b == 103 { // 'g'
+            if _harness_match_at(text, n, i, "ghp_") or _harness_match_at(text, n, i, "gho_") { match_len = 4 }
+            else if _harness_match_at(text, n, i, "github_pat_") { match_len = 11 }
+        } else if b == 65 { // 'A'
+            if _harness_match_at(text, n, i, "AIzaSy") { match_len = 6 }
+            else if _harness_match_at(text, n, i, "AKIA") or _harness_match_at(text, n, i, "ASIA") { match_len = 4 }
+        } else if b == 101 and _harness_match_at(text, n, i, "eyJhbGci") {
+            match_len = 8
+        } else if b == 120 and (_harness_match_at(text, n, i, "xoxb-") or _harness_match_at(text, n, i, "xoxp-")) {
+            match_len = 5
+        }
 
-            if match_len > 0 {
-                mut j := i + match_len
-                while j < n and _harness_is_token_ch(str_byte(text, j)) { j += 1 }
-                buf_push_str(out, "[REDACTED]")
-                i = j
-            } else {
-                buf_push(out, str_byte(text, i))
-                i += 1
-            }
+        if match_len > 0 {
+            mut j := i + match_len
+            while j < n and _harness_is_token_ch(str_byte(text, j)) { j += 1 }
+            buf_push_str(out, "[REDACTED]")
+            i = j
+        } else {
+            buf_push(out, b)
+            i += 1
         }
     }
     return buf_to_owned_str(move out)
 }
 
-// Detects common indirect prompt-injection attempts inside untrusted tool/web outputs (case-insensitive)
+// Detects indirect prompt-injection attempts inside untrusted tool/web outputs (case-insensitive)
 fn harness_detect_prompt_injection(text: str) -> bool {
     low := str_to_lower(text)
-    if str_contains(low, "ignore previous instructions") { return true }
-    if str_contains(low, "ignore all previous") { return true }
-    if str_contains(low, "disregard prior instructions") { return true }
-    if str_contains(low, "<|im_start|>system") { return true }
-    if str_contains(low, "begin system prompt") { return true }
-    if str_contains(low, "you are now in developer mode") { return true }
+    if str_contains(low, "ignore previous instructions") or str_contains(low, "ignore all previous") { return true }
+    if str_contains(low, "disregard prior instructions") or str_contains(low, "disregard all previous") { return true }
+    if str_contains(low, "<|im_start|>system") or str_contains(low, "begin system prompt") { return true }
+    if str_contains(low, "you are now in developer mode") or str_contains(low, "override system prompt") { return true }
     return false
 }
 
@@ -661,11 +974,15 @@ fn harness_tool_read_file(mut sb: HarnessSandbox, rel_path: str) -> str ! i64 {
     return ok(out)
 }
 
-// Jailed line-range file reader (`1-based` inclusive `start_line..end_line`, with line numbers!)
+// FIXED: reads FULL file up to 16MB BEFORE slicing 1-based inclusive `start_line..end_line` (no 16KB pre-truncation bug!)
 fn harness_tool_read_lines(mut sb: HarnessSandbox, rel_path: str, start_line: i64, end_line: i64) -> str ! i64 {
     if start_line < 1 or end_line < start_line { return err(400) }
-    content := harness_tool_read_file(mut sb, rel_path) or return
-    n := str_len(content)
+    if not harness_sandbox_consume_step(mut sb) { return err(429) }
+    full := path_join_safe(sb.workspace_root, rel_path) or return err(403)
+    raw := fs_read_file(full) or return err(404)
+    n := buf_len(raw)
+    if n > 16777216 { buf_free(move raw); return err(413) }
+    content := buf_to_owned_str(move raw)
     out := buf_new(sb.max_tool_bytes + 128)
     mut line_no := 1
     mut i := 0
@@ -685,27 +1002,23 @@ fn harness_tool_read_lines(mut sb: HarnessSandbox, rel_path: str, start_line: i6
     return ok(buf_to_owned_str(move out))
 }
 
-// Jailed workspace file write (enforces `read_only` mode + `path_join_safe`)
+// Jailed workspace file write (atomic write + `read_only` mode + `path_join_safe`)
 fn harness_tool_write_file(mut sb: HarnessSandbox, rel_path: str, content: str) -> i64 ! i64 {
     if sb.read_only { return err(403) }
     if not harness_sandbox_consume_step(mut sb) { return err(429) }
     full := path_join_safe(sb.workspace_root, rel_path) or return err(403)
-    b := buf_new(str_len(content) + 4)
-    buf_push_str(b, content)
-    wr := fs_write_file(full, b) or -1
-    buf_free(move b)
-    if wr < 0 { return err(500) }
-    return ok(wr)
+    if not fs_atomic_write(full, content) { return err(500) }
+    return ok(str_len(content))
 }
 
-// Jailed exact search-and-replace patch (like coding agent `edit_file`)
+// Jailed exact search-and-replace patch
 fn harness_tool_edit_file(mut sb: HarnessSandbox, rel_path: str, target: str, replacement: str) -> bool ! i64 {
     if sb.read_only { return err(403) }
     if str_len(target) == 0 { return err(400) }
     if not harness_sandbox_consume_step(mut sb) { return err(429) }
     full := path_join_safe(sb.workspace_root, rel_path) or return err(403)
     raw := fs_read_file(full) or return err(404)
-    if buf_len(raw) > 4194304 { buf_free(move raw); return err(413) }
+    if buf_len(raw) > 8388608 { buf_free(move raw); return err(413) }
     src := buf_to_owned_str(move raw)
     pos := str_find(src, target, 0)
     if pos < 0 { return ok(false) }
@@ -713,17 +1026,48 @@ fn harness_tool_edit_file(mut sb: HarnessSandbox, rel_path: str, target: str, re
     buf_push_str(out, str_slice(src, 0, pos))
     buf_push_str(out, replacement)
     buf_push_str(out, str_slice(src, pos + str_len(target), str_len(src)))
-    wr := fs_write_file(full, out) or -1
-    buf_free(move out)
-    if wr < 0 { return err(500) }
+    updated := buf_to_owned_str(move out)
+    if not fs_atomic_write(full, updated) { return err(500) }
     return ok(true)
 }
 
-// Jailed substring grep over a workspace file -> returns `line_no: line` matches
+// Strict ambiguity-checked edit with optional unified diff (rejects 0 matches -> 404, ambiguous >1 matches -> 409)
+fn harness_tool_edit_strict(mut sb: HarnessSandbox, rel_path: str, target: str, replacement: str, replace_all: bool = false, show_diff: bool = false) -> str ! i64 {
+    if sb.read_only { return err(403) }
+    if str_len(target) == 0 { return err(400) }
+    if not harness_sandbox_consume_step(mut sb) { return err(429) }
+    full := path_join_safe(sb.workspace_root, rel_path) or return err(403)
+    raw := fs_read_file(full) or return err(404)
+    if buf_len(raw) > 8388608 { buf_free(move raw); return err(413) }
+    src := buf_to_owned_str(move raw)
+    tlen := str_len(target)
+    mut count := 0
+    mut p := 0
+    while true {
+        f := str_find(src, target, p)
+        if f < 0 { break }
+        count += 1
+        p = f + tlen
+    }
+    if count == 0 { return err(404) }
+    if count > 1 and not replace_all { return err(409) }
+    after := str_replace(src, target, replacement)
+    if not fs_atomic_write(full, after) { return err(500) }
+    if show_diff {
+        return ok(diff_unified(src, after, "a/" + rel_path, "b/" + rel_path, 3))
+    }
+    return ok(f"OK: {count} replacement(s) in {rel_path}")
+}
+
+// FIXED: greps FULL file up to 16MB (no 16KB pre-truncation bug!), capping only returned match output
 fn harness_tool_grep(mut sb: HarnessSandbox, rel_path: str, query: str, max_matches: i64 = 50) -> str ! i64 {
     if str_len(query) == 0 { return err(400) }
-    content := harness_tool_read_file(mut sb, rel_path) or return
-    n := str_len(content)
+    if not harness_sandbox_consume_step(mut sb) { return err(429) }
+    full := path_join_safe(sb.workspace_root, rel_path) or return err(403)
+    raw := fs_read_file(full) or return err(404)
+    n := buf_len(raw)
+    if n > 16777216 { buf_free(move raw); return err(413) }
+    content := buf_to_owned_str(move raw)
     out := buf_new(sb.max_tool_bytes + 128)
     mut line_no := 1
     mut matches := 0
@@ -746,23 +1090,24 @@ fn harness_tool_grep(mut sb: HarnessSandbox, rel_path: str, query: str, max_matc
     return ok(buf_to_owned_str(move out))
 }
 
-// Strict allowlist validator for agent shell commands (CWE-78): blocks ALL shell metachars & unknown binaries
+// Strict allowlist validator for agent shell commands (CWE-78 + CWE-88 hardened!)
 fn harness_is_safe_cmd(cmd: str) -> bool {
     c := str_trim(cmd)
     n := str_len(c)
     if n == 0 or n > 256 { return false }
-    // Allowlist prefixes ONLY: read-only / compiler verification commands (block git arg-injection flags too, CWE-88)
     ok_pref := str_starts_with(c, "git status") or str_starts_with(c, "git diff") or str_starts_with(c, "git log") or str_starts_with(c, "bin/axc.exe check ") or str_starts_with(c, "bin/axc.exe test ")
     if not ok_pref { return false }
-    if str_contains(c, "--output") or str_contains(c, "--ext-diff") or str_contains(c, "--no-index") or str_contains(c, " -c ") or str_contains(c, " -o ") or str_contains(c, "--link-lib") or str_contains(c, "--exec") or str_contains(c, " /") or str_contains(c, ":") { return false }
-    // Strict character whitelist: [a-zA-Z0-9 _./:-] — ZERO `;|&><$`'"\n\r`
+    // Block git/compiler argument-injection flags (CWE-88)
+    if str_contains(c, "--output") or str_contains(c, "--ext-diff") or str_contains(c, "--no-index") or str_contains(c, "--textconv") or str_contains(c, "--git-dir") or str_contains(c, "--work-tree") or str_contains(c, "--config-env") or str_contains(c, "--upload-pack") or str_contains(c, "--exec") or str_contains(c, "--paginate") or str_contains(c, " -c ") or str_contains(c, " -C ") or str_contains(c, " -o ") or str_contains(c, "--link-lib") or str_contains(c, " /") or str_contains(c, ":") {
+        return false
+    }
     mut i := 0
     while i < n {
         b := str_byte(c, i)
         alnum := (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
         safe_p := b == 32 or b == 95 or b == 46 or b == 47 or b == 45
         if not alnum and not safe_p { return false }
-        if b == 46 and i + 1 < n and str_byte(c, i + 1) == 46 { return false } // block `..`
+        if b == 46 and i + 1 < n and str_byte(c, i + 1) == 46 { return false }
         i += 1
     }
     return true
@@ -772,9 +1117,61 @@ fn harness_tool_run_safe_cmd(mut sb: HarnessSandbox, cmd: str) -> str ! i64 {
     if not harness_is_safe_cmd(cmd) { return err(403) }
     if not harness_sandbox_consume_step(mut sb) { return err(429) }
     raw := sys_exec_capture(cmd)
-    n := str_len(raw)
-    trimmed := if n > sb.max_tool_bytes { str_slice(raw, 0, sb.max_tool_bytes) } else { raw }
+    trimmed := harness_truncate_middle(raw, sb.max_tool_bytes)
     return ok(harness_redact_secrets(trimmed))
+}
+
+// ==================== 4b. HIGH-SPEED TOOL RESULT CACHE (TTL + INVALIDATION) ====================
+
+struct ToolResultCache {
+    values: StrMap
+    expires_ns: StrMap
+    default_ttl_ns: i64
+    hits: i64
+    misses: i64
+}
+
+fn tool_cache_new(default_ttl_ms: i64 = 15000) -> ToolResultCache {
+    ttl := if default_ttl_ms > 0 { default_ttl_ms * 1000000 } else { 15000000000 }
+    return ToolResultCache(
+        values = smap_new(64),
+        expires_ns = smap_new(64),
+        default_ttl_ns = ttl,
+        hits = 0,
+        misses = 0
+    )
+}
+
+fn tool_cache_free(move c: ToolResultCache) {
+    smap_free(move c.values)
+    smap_free(move c.expires_ns)
+}
+
+fn tool_cache_put(mut c: ToolResultCache, key: str, val: str, ttl_ms: i64 = -1) {
+    ttl_ns := if ttl_ms > 0 { ttl_ms * 1000000 } else { c.default_ttl_ns }
+    smap_set_str(mut c.values, key, val)
+    smap_set_i64(mut c.expires_ns, key, clock_ns() + ttl_ns)
+}
+
+fn tool_cache_get(mut c: ToolResultCache, key: str) -> str ! i64 {
+    if not smap_has(c.values, key) {
+        c.misses += 1
+        return err(404)
+    }
+    exp := smap_get_i64(c.expires_ns, key, 0)
+    if clock_ns() > exp {
+        _ := smap_remove(mut c.values, key)
+        _ := smap_remove(mut c.expires_ns, key)
+        c.misses += 1
+        return err(404)
+    }
+    c.hits += 1
+    return ok(smap_get_str(c.values, key, ""))
+}
+
+fn tool_cache_invalidate(mut c: ToolResultCache, key: str) {
+    _ := smap_remove(mut c.values, key)
+    _ := smap_remove(mut c.expires_ns, key)
 }
 
 // ==================== 5. RETRY POLICY, CIRCUIT BREAKER & MULTI-PROVIDER CALLERS ====================
@@ -855,6 +1252,13 @@ struct HarnessLlmResult {
 }
 
 fn harness_llm_call(host: str, port: i64, api_path: str, api_key: str, json_body: str) -> HarnessLlmResult {
+    // Reject CRLF/NUL injection in api_key / host / api_path (CWE-113)
+    if not tls_is_safe_http_token(host) or not tls_is_safe_http_token(api_path) {
+        return HarnessLlmResult(ok_flag = false, status = 400, latency_us = 0, raw_body = "invalid_host_or_path", content = "", tool_call = ToolCall(found = false, id = "", name = "", args_json = ""))
+    }
+    if str_len(api_key) > 0 and not http_is_safe_header_val(api_key) {
+        return HarnessLlmResult(ok_flag = false, status = 400, latency_us = 0, raw_body = "invalid_api_key", content = "", tool_call = ToolCall(found = false, id = "", name = "", args_json = ""))
+    }
     t0 := clock_ns()
     hdr := if str_len(api_key) > 0 {
         "Content-Type: application/json\r\nAuthorization: Bearer " + api_key
@@ -878,8 +1282,11 @@ fn harness_llm_call(host: str, port: i64, api_path: str, api_key: str, json_body
     )
 }
 
-// Anthropic Messages HTTPS caller (`x-api-key` + `anthropic-version: 2023-06-01`)
+// Anthropic Messages HTTPS caller (CRLF-hardened)
 fn harness_llm_call_anthropic(api_key: str, json_body: str) -> HarnessLlmResult {
+    if str_len(api_key) == 0 or not http_is_safe_header_val(api_key) {
+        return HarnessLlmResult(ok_flag = false, status = 400, latency_us = 0, raw_body = "invalid_api_key", content = "", tool_call = ToolCall(found = false, id = "", name = "", args_json = ""))
+    }
     t0 := clock_ns()
     hdr := "Content-Type: application/json\r\nanthropic-version: 2023-06-01\r\nx-api-key: " + api_key
     resp := https_request("POST", "api.anthropic.com", 443, "/v1/messages", hdr, json_body) or HttpsResponse(status = 0, body = "")

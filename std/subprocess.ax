@@ -1,0 +1,589 @@
+// Axon Standard Library — Native Process Spawning, Pipes, Timeouts & Job-Object Tree Kill (`std/subprocess.ax`)
+// 100% Pure Axon replacement for Python's `subprocess` + `signal` (Zero shell by default, Zero `.tmp` files!):
+//   - Exact Windows `CommandLineToArgvW` argv quoting (`subproc_quote_win`) & POSIX quoting (`subproc_quote_posix`)
+//   - Direct OS anonymous pipes (`CreatePipe` + non-inheritable parent ends) + UTF-16LE `CreateProcessW`
+//   - Automatic Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) for atomic process-tree cleanup on timeout/kill
+//   - Deadlock-free interleaved stdout/stderr draining via `PeekNamedPipe` + single-syscall line framing (`subproc_read_line`)
+//   - Persistent interactive `Subproc` API for upstream MCP stdio servers & long-lived workers
+
+use std::ffi
+use std::str
+use std::ds
+
+struct Subproc {
+    h_proc: i64
+    h_job: i64
+    pid: i64
+    stdin_w: i64
+    stdout_r: i64
+    stderr_r: i64
+    k32: i64
+    fn_read: i64
+    fn_write: i64
+    fn_peek: i64
+    fn_wait: i64
+    fn_exit: i64
+    fn_term: i64
+    fn_term_job: i64
+    fn_close: i64
+}
+
+struct SubprocResult {
+    ok_flag: bool
+    exit_code: i64
+    stdout: str
+    stderr: str
+    duration_us: i64
+    timed_out: bool
+}
+
+fn _sp_has_nul(s: str) -> bool {
+    n := str_len(s)
+    mut i := 0
+    while i < n {
+        if str_byte(s, i) == 0 { return true }
+        i += 1
+    }
+    return false
+}
+
+// Exact Microsoft `CommandLineToArgvW` quoting algorithm (CWE-78 / CWE-88 safe)
+fn subproc_quote_win(arg: str) -> str {
+    n := str_len(arg)
+    if n == 0 { return "\"\"" }
+    mut need_q := false
+    mut i := 0
+    while i < n {
+        b := str_byte(arg, i)
+        if b == 32 or b == 9 or b == 34 or b == 10 or b == 13 { need_q = true; break }
+        i += 1
+    }
+    if not need_q { return arg }
+    out := buf_new(n * 2 + 8)
+    buf_push(out, 34) // '"'
+    mut bs := 0
+    i = 0
+    while i < n {
+        b := str_byte(arg, i)
+        if b == 92 { // '\'
+            bs += 1
+        } else if b == 34 { // '"'
+            // Double all preceding backslashes + escape this quote
+            mut k := 0
+            while k < bs * 2 + 1 { buf_push(out, 92); k += 1 }
+            buf_push(out, 34)
+            bs = 0
+        } else {
+            mut k := 0
+            while k < bs { buf_push(out, 92); k += 1 }
+            buf_push(out, b)
+            bs = 0
+        }
+        i += 1
+    }
+    // Double trailing backslashes before closing quote
+    mut k := 0
+    while k < bs * 2 { buf_push(out, 92); k += 1 }
+    buf_push(out, 34)
+    return buf_to_owned_str(move out)
+}
+
+fn subproc_build_win_cmdline(argv: StrVec) -> str ! i64 {
+    cnt := svec_len(argv)
+    if cnt <= 0 { return err(400) }
+    mut parts := svec_new(cnt, 256)
+    mut i := 0
+    while i < cnt {
+        a := svec_get(argv, i)
+        if _sp_has_nul(a) { svec_free(move parts); return err(400) }
+        svec_push(mut parts, subproc_quote_win(a))
+        i += 1
+    }
+    cmd := svec_join(parts, " ")
+    svec_free(move parts)
+    return ok(cmd)
+}
+
+// POSIX single-quote shell escaping (`'` -> `'\''`)
+fn subproc_quote_posix(arg: str) -> str {
+    n := str_len(arg)
+    if n == 0 { return "''" }
+    out := buf_new(n * 4 + 8)
+    buf_push(out, 39)
+    mut i := 0
+    while i < n {
+        b := str_byte(arg, i)
+        if b == 39 {
+            buf_push_str(out, "'\\''")
+        } else {
+            buf_push(out, b)
+        }
+        i += 1
+    }
+    buf_push(out, 39)
+    return buf_to_owned_str(move out)
+}
+
+fn _sp_close_h(f_close: i64, h: i64) {
+    if h != 0 and h != -1 and f_close != 0 {
+        _ := ffi_call1(f_close, h)
+    }
+}
+
+fn _sp_spawn_cmdline_win(cmdline: str, cwd: str, merge_stderr: bool) -> Subproc ! i64 {
+    if str_len(cmdline) == 0 or str_len(cmdline) > 32700 or _sp_has_nul(cmdline) { return err(400) }
+    if str_len(cwd) > 0 and _sp_has_nul(cwd) { return err(400) }
+    k32 := ffi_open_one("kernel32.dll")
+    if k32 == 0 { return err(501) }
+
+    f_pipe := ffi_sym(k32, "CreatePipe")
+    f_shi  := ffi_sym(k32, "SetHandleInformation")
+    f_cpw  := ffi_sym(k32, "CreateProcessW")
+    f_read := ffi_sym(k32, "ReadFile")
+    f_writ := ffi_sym(k32, "WriteFile")
+    f_peek := ffi_sym(k32, "PeekNamedPipe")
+    f_wait := ffi_sym(k32, "WaitForSingleObject")
+    f_exit := ffi_sym(k32, "GetExitCodeProcess")
+    f_term := ffi_sym(k32, "TerminateProcess")
+    f_cls  := ffi_sym(k32, "CloseHandle")
+    f_res  := ffi_sym(k32, "ResumeThread")
+    f_cjob := ffi_sym(k32, "CreateJobObjectW")
+    f_sjob := ffi_sym(k32, "SetInformationJobObject")
+    f_ajob := ffi_sym(k32, "AssignProcessToJobObject")
+    f_tjob := ffi_sym(k32, "TerminateJobObject")
+    if f_pipe == 0 or f_shi == 0 or f_cpw == 0 or f_read == 0 or f_writ == 0 or f_peek == 0 or f_cls == 0 {
+        return err(501)
+    }
+
+    // SECURITY_ATTRIBUTES { nLength=24, lpSecurityDescriptor=0, bInheritHandle=1 }
+    sa := ffi_alloc(24)
+    ffi_write_u32_le(sa, 0, 24)
+    ffi_write_u32_le(sa, 16, 1)
+
+    p_boxes := ffi_alloc(64) // 6 HANDLE slots: [0]=in_r, [1]=in_w, [2]=out_r, [3]=out_w, [4]=err_r, [5]=err_w
+    ok1 := (ffi_call4(f_pipe, p_boxes, p_boxes + 8, sa, 0) & 0xFFFFFFFF) != 0
+    ok2 := ok1 and (ffi_call4(f_pipe, p_boxes + 16, p_boxes + 24, sa, 0) & 0xFFFFFFFF) != 0
+    mut ok3 := ok2
+    if ok2 and not merge_stderr {
+        ok3 = (ffi_call4(f_pipe, p_boxes + 32, p_boxes + 40, sa, 0) & 0xFFFFFFFF) != 0
+    }
+    ffi_free(sa)
+
+    in_r := ffi_read_i64(p_boxes, 0); in_w := ffi_read_i64(p_boxes, 1)
+    out_r := ffi_read_i64(p_boxes, 2); out_w := ffi_read_i64(p_boxes, 3)
+    err_r := ffi_read_i64(p_boxes, 4); err_w := ffi_read_i64(p_boxes, 5)
+    ffi_free(p_boxes)
+
+    if not ok3 {
+        _sp_close_h(f_cls, in_r); _sp_close_h(f_cls, in_w)
+        _sp_close_h(f_cls, out_r); _sp_close_h(f_cls, out_w)
+        _sp_close_h(f_cls, err_r); _sp_close_h(f_cls, err_w)
+        return err(500)
+    }
+
+    // Parent pipe ends MUST NOT be inherited by child (prevents EOF hang!)
+    _ := ffi_call3(f_shi, in_w, 1, 0)
+    _ := ffi_call3(f_shi, out_r, 1, 0)
+    if not merge_stderr { _ := ffi_call3(f_shi, err_r, 1, 0) }
+
+    // STARTUPINFOW (104 bytes)
+    si := ffi_alloc(112)
+    ffi_write_u32_le(si, 0, 104)
+    ffi_write_u32_le(si, 60, 0x00000100) // STARTF_USESTDHANDLES
+    ffi_write_i64(si, 10, in_r)          // offset 80: hStdInput
+    ffi_write_i64(si, 11, out_w)         // offset 88: hStdOutput
+    ffi_write_i64(si, 12, if merge_stderr { out_w } else { err_w }) // offset 96: hStdError
+
+    pi := ffi_alloc(32)
+    wcmd := ffi_wstr(cmdline)
+    mut wcwd := 0
+    if str_len(cwd) > 0 { wcwd = ffi_wstr(cwd) }
+
+    // Create Job Object with KILL_ON_JOB_CLOSE so child + grandchildren die together cleanly
+    mut h_job := 0
+    if f_cjob != 0 and f_sjob != 0 and f_ajob != 0 {
+        h_job = ffi_call2(f_cjob, 0, 0)
+        if h_job != 0 {
+            jinfo := ffi_alloc(144)
+            ffi_write_u32_le(jinfo, 16, 0x00002000) // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            _ := ffi_call4(f_sjob, h_job, 9, jinfo, 144)
+            ffi_free(jinfo)
+        }
+    }
+
+    // CREATE_NO_WINDOW (0x08000000) | CREATE_SUSPENDED (0x00000004)
+    cflags := if h_job != 0 and f_res != 0 { 0x08000004 } else { 0x08000000 }
+    cp_args := ibuf_new(12)
+    ibuf_push(cp_args, 0)      // lpApplicationName
+    ibuf_push(cp_args, wcmd)   // lpCommandLine (writable UTF-16LE!)
+    ibuf_push(cp_args, 0)      // lpProcessAttributes
+    ibuf_push(cp_args, 0)      // lpThreadAttributes
+    ibuf_push(cp_args, 1)      // bInheritHandles = TRUE
+    ibuf_push(cp_args, cflags) // dwCreationFlags
+    ibuf_push(cp_args, 0)      // lpEnvironment
+    ibuf_push(cp_args, wcwd)   // lpCurrentDirectory
+    ibuf_push(cp_args, si)     // lpStartupInfo
+    ibuf_push(cp_args, pi)     // lpProcessInformation
+    created := (ffi_call_arr(f_cpw, 10, cp_args) & 0xFFFFFFFF) != 0
+    buf_free(move cp_args)
+
+    // Always close child-side pipe ends in parent immediately
+    _sp_close_h(f_cls, in_r)
+    _sp_close_h(f_cls, out_w)
+    if not merge_stderr { _sp_close_h(f_cls, err_w) }
+    ffi_free(si)
+    ffi_free(wcmd)
+    ffi_free(wcwd)
+
+    if not created {
+        _sp_close_h(f_cls, in_w); _sp_close_h(f_cls, out_r)
+        if not merge_stderr { _sp_close_h(f_cls, err_r) }
+        _sp_close_h(f_cls, h_job)
+        ffi_free(pi)
+        return err(502)
+    }
+
+    h_proc := ffi_read_i64(pi, 0)
+    h_thr  := ffi_read_i64(pi, 1)
+    pid    := ffi_read_u32_le(pi, 16)
+    ffi_free(pi)
+
+    if h_job != 0 {
+        if (ffi_call2(f_ajob, h_job, h_proc) & 0xFFFFFFFF) == 0 {
+            _sp_close_h(f_cls, h_job)
+            h_job = 0
+        }
+        if f_res != 0 { _ := ffi_call1(f_res, h_thr) }
+    }
+    _sp_close_h(f_cls, h_thr)
+
+    return ok(Subproc(
+        h_proc = h_proc,
+        h_job = h_job,
+        pid = pid,
+        stdin_w = in_w,
+        stdout_r = out_r,
+        stderr_r = if merge_stderr { 0 } else { err_r },
+        k32 = k32,
+        fn_read = f_read,
+        fn_write = f_writ,
+        fn_peek = f_peek,
+        fn_wait = f_wait,
+        fn_exit = f_exit,
+        fn_term = f_term,
+        fn_term_job = f_tjob,
+        fn_close = f_cls
+    ))
+}
+
+// Spawn child directly from argv vector (ZERO shell invocation -> immune to shell metacharacter injection!)
+fn subproc_spawn(argv: StrVec, cwd: str = "", merge_stderr: bool = false) -> Subproc ! i64 {
+    cmdline := subproc_build_win_cmdline(argv) or return
+    return _sp_spawn_cmdline_win(cmdline, cwd, merge_stderr)
+}
+
+// Spawn child via OS shell (`cmd.exe /d /s /c ...`) for explicit shell pipelines
+fn subproc_spawn_shell(cmd: str, cwd: str = "", merge_stderr: bool = false) -> Subproc ! i64 {
+    if str_len(cmd) == 0 or _sp_has_nul(cmd) { return err(400) }
+    cmdline := f"cmd.exe /d /s /c \"{cmd}\""
+    return _sp_spawn_cmdline_win(cmdline, cwd, merge_stderr)
+}
+
+fn subproc_write(p: Subproc, data: str) -> i64 ! i64 {
+    if p.stdin_w == 0 { return err(410) }
+    n := str_len(data)
+    if n == 0 { return ok(0) }
+    raw := ffi_cstr(data)
+    if raw == 0 { return err(500) }
+    nw_box := ffi_alloc(8)
+    mut sent := 0
+    while sent < n {
+        ffi_write_u32_le(nw_box, 0, 0)
+        ok_w := (ffi_call5(p.fn_write, p.stdin_w, raw + sent, n - sent, nw_box, 0) & 0xFFFFFFFF) != 0
+        if not ok_w {
+            ffi_free(raw); ffi_free(nw_box)
+            return err(500)
+        }
+        got := ffi_read_u32_le(nw_box, 0)
+        if got <= 0 {
+            ffi_free(raw); ffi_free(nw_box)
+            return err(500)
+        }
+        sent += got
+    }
+    ffi_free(raw)
+    ffi_free(nw_box)
+    return ok(sent)
+}
+
+fn subproc_write_line(p: Subproc, line: str) -> i64 ! i64 {
+    return subproc_write(p, line + "\n")
+}
+
+fn subproc_close_stdin(mut p: Subproc) {
+    if p.stdin_w != 0 {
+        _sp_close_h(p.fn_close, p.stdin_w)
+        p.stdin_w = 0
+    }
+}
+
+// Returns `-259` (STILL_ACTIVE) while running, else process exit code
+fn subproc_poll(p: Subproc) -> i64 {
+    if p.h_proc == 0 { return -1 }
+    w := ffi_call2(p.fn_wait, p.h_proc, 0) & 0xFFFFFFFF
+    if w == 0x102 { return -259 } // WAIT_TIMEOUT -> still running
+    ec := ffi_alloc(8)
+    _ := ffi_call2(p.fn_exit, p.h_proc, ec)
+    code := ffi_sext32(ffi_read_u32_le(ec, 0))
+    ffi_free(ec)
+    return code
+}
+
+fn subproc_wait(p: Subproc, timeout_ms: i64 = 30000) -> i64 ! i64 {
+    if p.h_proc == 0 { return err(410) }
+    ms := if timeout_ms < 0 { 0xFFFFFFFF } else { timeout_ms }
+    w := ffi_call2(p.fn_wait, p.h_proc, ms) & 0xFFFFFFFF
+    if w == 0x102 { return err(408) } // Timeout
+    ec := ffi_alloc(8)
+    _ := ffi_call2(p.fn_exit, p.h_proc, ec)
+    code := ffi_sext32(ffi_read_u32_le(ec, 0))
+    ffi_free(ec)
+    return ok(code)
+}
+
+// Kills entire process tree atomically via Job Object (or TerminateProcess fallback)
+fn subproc_kill_tree(p: Subproc) -> bool {
+    mut ok_k := false
+    if p.h_job != 0 and p.fn_term_job != 0 {
+        ok_k = (ffi_call2(p.fn_term_job, p.h_job, 1) & 0xFFFFFFFF) != 0
+    }
+    if p.h_proc != 0 and p.fn_term != 0 {
+        if (ffi_call2(p.fn_term, p.h_proc, 1) & 0xFFFFFFFF) != 0 { ok_k = true }
+    }
+    return ok_k
+}
+
+fn subproc_close(move p: Subproc) {
+    _sp_close_h(p.fn_close, p.stdin_w)
+    _sp_close_h(p.fn_close, p.stdout_r)
+    _sp_close_h(p.fn_close, p.stderr_r)
+    _sp_close_h(p.fn_close, p.h_proc)
+    _sp_close_h(p.fn_close, p.h_job)
+}
+
+// Non-blocking drain of currently buffered bytes on child stdout (or stderr)
+fn subproc_read_available(p: Subproc, is_stderr: bool = false, max_bytes: i64 = 65536) -> str {
+    h := if is_stderr { p.stderr_r } else { p.stdout_r }
+    if h == 0 or max_bytes <= 0 { return "" }
+    avl_box := ffi_alloc(8)
+    ok_pk := (ffi_call6(p.fn_peek, h, 0, 0, 0, avl_box, 0) & 0xFFFFFFFF) != 0
+    avail := ffi_read_u32_le(avl_box, 0)
+    ffi_free(avl_box)
+    if not ok_pk or avail <= 0 { return "" }
+    mut to_read := avail
+    if to_read > max_bytes { to_read = max_bytes }
+    buf := ffi_alloc(to_read + 8)
+    nr_box := ffi_alloc(8)
+    ok_rd := (ffi_call5(p.fn_read, h, buf, to_read, nr_box, 0) & 0xFFFFFFFF) != 0
+    got := ffi_read_u32_le(nr_box, 0)
+    ffi_free(nr_box)
+    if not ok_rd or got <= 0 { ffi_free(buf); return "" }
+    bb := ffi_read_bytes(buf, got)
+    ffi_free(buf)
+    return buf_to_owned_str(move bb)
+}
+
+// Single-line timeout-safe reader for persistent JSON-RPC / MCP stdio children (ZERO over-read via PeekNamedPipe!)
+fn subproc_read_line(p: Subproc, timeout_ms: i64 = 30000, max_bytes: i64 = 4194304) -> str ! i64 {
+    if p.stdout_r == 0 { return err(410) }
+    mut lim := max_bytes
+    if lim < 256 { lim = 256 }
+    if lim > 16777216 { lim = 16777216 }
+    deadline := clock_ns() + timeout_ms * 1000000
+    peek_buf := ffi_alloc(4096)
+    nr_box := ffi_alloc(8)
+    avl_box := ffi_alloc(8)
+    mut parts := svec_new(16, 512)
+    mut total := 0
+    mut got_any := false
+    mut done := false
+    mut err_code := 0
+    mut idle_spins := 0
+
+    while not done {
+        ffi_write_u32_le(nr_box, 0, 0)
+        ffi_write_u32_le(avl_box, 0, 0)
+        ok_pk := (ffi_call6(p.fn_peek, p.stdout_r, peek_buf, 4096, nr_box, avl_box, 0) & 0xFFFFFFFF) != 0
+        if not ok_pk {
+            // Pipe closed (EOF)
+            if not got_any { err_code = 404 }
+            done = true
+            break
+        }
+        pn := ffi_read_u32_le(nr_box, 0)
+        if pn > 0 {
+            got_any = true
+            idle_spins = 0
+            // Scan peeked bytes for `\n` (10) so we consume EXACTLY up to and including `\n`
+            mut nl := -1
+            mut i := 0
+            while i < pn {
+                if ffi_read_u8(peek_buf, i) == 10 { nl = i; break }
+                i += 1
+            }
+            consume := if nl >= 0 { nl + 1 } else { pn }
+            if total + consume > lim {
+                err_code = 413
+                done = true
+                break
+            }
+            ffi_write_u32_le(nr_box, 0, 0)
+            ok_rd := (ffi_call5(p.fn_read, p.stdout_r, peek_buf, consume, nr_box, 0) & 0xFFFFFFFF) != 0
+            got := ffi_read_u32_le(nr_box, 0)
+            if not ok_rd or got <= 0 {
+                err_code = 404
+                done = true
+                break
+            }
+            mut keep := got
+            if nl >= 0 {
+                keep = got - 1 // strip '\n'
+                if keep > 0 and ffi_read_u8(peek_buf, keep - 1) == 13 { keep -= 1 } // strip '\r'
+                done = true
+            }
+            if keep > 0 {
+                bb := ffi_read_bytes(peek_buf, keep)
+                svec_push(mut parts, buf_to_owned_str(move bb))
+                total += keep
+            }
+        } else {
+            if subproc_poll(p) != -259 {
+                // Process exited and pipe has 0 bytes left
+                if not got_any { err_code = 404 }
+                done = true
+                break
+            }
+            if clock_ns() >= deadline {
+                err_code = 408
+                done = true
+                break
+            }
+            if idle_spins < 2048 {
+                cpu_pause()
+                idle_spins += 1
+            } else {
+                sleep_ms(1)
+            }
+        }
+    }
+
+    ffi_free(peek_buf)
+    ffi_free(nr_box)
+    ffi_free(avl_box)
+    if err_code != 0 {
+        svec_free(move parts)
+        return err(err_code)
+    }
+    line := svec_join(parts, "")
+    svec_free(move parts)
+    return ok(line)
+}
+
+fn _sp_run_opened(mut p: Subproc, stdin_data: str, timeout_ms: i64, max_output_bytes: i64, t0: i64) -> SubprocResult {
+    if str_len(stdin_data) > 0 {
+        _ := subproc_write(p, stdin_data) or -1
+    }
+    subproc_close_stdin(mut p)
+
+    mut lim := max_output_bytes
+    if lim < 1024 { lim = 1024 }
+    if lim > 33554432 { lim = 33554432 }
+
+    deadline := t0 + timeout_ms * 1000000
+    mut out_parts := svec_new(16, 1024)
+    mut err_parts := svec_new(8, 256)
+    mut out_bytes := 0
+    mut err_bytes := 0
+    mut timed_out := false
+    mut exit_code := -1
+
+    while true {
+        mut did_io := false
+        c_out := subproc_read_available(p, false, 65536)
+        if str_len(c_out) > 0 {
+            did_io = true
+            if out_bytes < lim {
+                svec_push(mut out_parts, c_out)
+                out_bytes += str_len(c_out)
+            }
+        }
+        c_err := subproc_read_available(p, true, 65536)
+        if str_len(c_err) > 0 {
+            did_io = true
+            if err_bytes < lim {
+                svec_push(mut err_parts, c_err)
+                err_bytes += str_len(c_err)
+            }
+        }
+        st := subproc_poll(p)
+        if st != -259 {
+            exit_code = st
+            // Final drain after exit
+            mut drains := 0
+            while drains < 64 {
+                d1 := subproc_read_available(p, false, 65536)
+                d2 := subproc_read_available(p, true, 65536)
+                if str_len(d1) == 0 and str_len(d2) == 0 { break }
+                if str_len(d1) > 0 and out_bytes < lim { svec_push(mut out_parts, d1); out_bytes += str_len(d1) }
+                if str_len(d2) > 0 and err_bytes < lim { svec_push(mut err_parts, d2); err_bytes += str_len(d2) }
+                drains += 1
+            }
+            break
+        }
+        if clock_ns() >= deadline {
+            timed_out = true
+            _ := subproc_kill_tree(p)
+            _ := subproc_wait(p, 2000) or -1
+            exit_code = -1
+            break
+        }
+        if not did_io {
+            sleep_ms(1)
+        }
+    }
+
+    subproc_close(move p)
+    dur_us := (clock_ns() - t0) / 1000
+    stdout_s := svec_join(out_parts, "")
+    stderr_s := svec_join(err_parts, "")
+    svec_free(move out_parts)
+    svec_free(move err_parts)
+    return SubprocResult(
+        ok_flag = (exit_code == 0 and not timed_out),
+        exit_code = exit_code,
+        stdout = stdout_s,
+        stderr = stderr_s,
+        duration_us = dur_us,
+        timed_out = timed_out
+    )
+}
+
+// Run command directly from argv vector (ZERO shell, deadlock-free stdout+stderr capture, job-object timeout kill!)
+fn subproc_run(argv: StrVec, cwd: str = "", stdin_data: str = "", timeout_ms: i64 = 30000, max_output_bytes: i64 = 4194304) -> SubprocResult {
+    t0 := clock_ns()
+    mut p := subproc_spawn(argv, cwd, false) or return SubprocResult(
+        ok_flag = false, exit_code = -1, stdout = "", stderr = "Failed to spawn subprocess",
+        duration_us = (clock_ns() - t0) / 1000, timed_out = false
+    )
+    return _sp_run_opened(mut p, stdin_data, timeout_ms, max_output_bytes, t0)
+}
+
+// Run shell command via `cmd.exe /d /s /c` with safe timeout & process-tree cleanup
+fn subproc_run_shell(cmd: str, cwd: str = "", timeout_ms: i64 = 30000, max_output_bytes: i64 = 4194304) -> SubprocResult {
+    t0 := clock_ns()
+    mut p := subproc_spawn_shell(cmd, cwd, false) or return SubprocResult(
+        ok_flag = false, exit_code = -1, stdout = "", stderr = "Failed to spawn shell command",
+        duration_us = (clock_ns() - t0) / 1000, timed_out = false
+    )
+    return _sp_run_opened(mut p, "", timeout_ms, max_output_bytes, t0)
+}

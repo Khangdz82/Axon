@@ -1,0 +1,659 @@
+// Axon Standard Library: RFC-1950 `zlib`, RFC-1951 `DEFLATE`, & RFC-1952 `gzip` (`std/zlib.ax`)
+// 100% Pure Axon, zero C dependencies, wire-compatible with Python `zlib` & `gzip` and HTTP `Content-Encoding`.
+// Features:
+//   - Full RFC-1951 DEFLATE decompressor: Stored (type 0), Fixed Huffman (type 1), Dynamic Huffman (type 2)
+//   - LZ77 (32KB window, 4096-entry 3-byte hash) + Fixed Huffman RFC-1951 DEFLATE compressor
+//   - RFC-1950 `zlib_compress`/`zlib_decompress` with Adler-32 verification
+//   - RFC-1952 `gzip_compress`/`gzip_decompress` with CRC-32 + ISIZE verification & optional FEXTRA/FNAME/FCOMMENT/FHCRC
+//   - Decompression bomb guard (`max_out`, default 32 MB, CWE-409 immune)
+
+use std::str
+use std::encoding
+
+// --- Adler-32 (RFC 1950) ---
+fn adler32_bytes(b: ByteBuf) -> i64 {
+    n := buf_len(b)
+    mut s1 := 1
+    mut s2 := 0
+    mut i := 0
+    while i < n {
+        // Defer modulo every 5552 bytes (NMAX) for ~10x speedup without u32 overflow
+        mut chunk_end := i + 5552
+        if chunk_end > n { chunk_end = n }
+        while i < chunk_end {
+            s1 += buf_get(b, i)
+            s2 += s1
+            i += 1
+        }
+        s1 = s1 % 65521
+        s2 = s2 % 65521
+    }
+    return ((s2 & 0xFFFF) << 16) | (s1 & 0xFFFF)
+}
+
+fn adler32_str(s: str) -> i64 {
+    b := buf_new(str_len(s) + 4)
+    buf_push_str(b, s)
+    v := adler32_bytes(b)
+    buf_free(move b)
+    return v
+}
+
+// --- RFC-1951 Static Tables ---
+fn _def_len_base(idx: i64) -> i64 {
+    if idx == 0 { return 3 }   if idx == 1 { return 4 }   if idx == 2 { return 5 }   if idx == 3 { return 6 }
+    if idx == 4 { return 7 }   if idx == 5 { return 8 }   if idx == 6 { return 9 }   if idx == 7 { return 10 }
+    if idx == 8 { return 11 }  if idx == 9 { return 13 }  if idx == 10 { return 15 } if idx == 11 { return 17 }
+    if idx == 12 { return 19 } if idx == 13 { return 23 } if idx == 14 { return 27 } if idx == 15 { return 31 }
+    if idx == 16 { return 35 } if idx == 17 { return 43 } if idx == 18 { return 51 } if idx == 19 { return 59 }
+    if idx == 20 { return 67 } if idx == 21 { return 83 } if idx == 22 { return 99 } if idx == 23 { return 115 }
+    if idx == 24 { return 131 } if idx == 25 { return 163 } if idx == 26 { return 195 } if idx == 27 { return 227 }
+    return 258
+}
+
+fn _def_len_extra(idx: i64) -> i64 {
+    if idx < 8 or idx == 28 { return 0 }
+    return (idx - 4) / 4
+}
+
+fn _def_dist_base(idx: i64) -> i64 {
+    if idx == 0 { return 1 }      if idx == 1 { return 2 }      if idx == 2 { return 3 }      if idx == 3 { return 4 }
+    if idx == 4 { return 5 }      if idx == 5 { return 7 }      if idx == 6 { return 9 }      if idx == 7 { return 13 }
+    if idx == 8 { return 17 }     if idx == 9 { return 25 }     if idx == 10 { return 33 }    if idx == 11 { return 49 }
+    if idx == 12 { return 65 }    if idx == 13 { return 97 }    if idx == 14 { return 129 }   if idx == 15 { return 193 }
+    if idx == 16 { return 257 }   if idx == 17 { return 385 }   if idx == 18 { return 513 }   if idx == 19 { return 769 }
+    if idx == 20 { return 1025 }  if idx == 21 { return 1537 }  if idx == 22 { return 2049 }  if idx == 23 { return 3073 }
+    if idx == 24 { return 4097 }  if idx == 25 { return 6145 }  if idx == 26 { return 8193 }  if idx == 27 { return 12289 }
+    if idx == 28 { return 16385 }
+    return 24577
+}
+
+fn _def_dist_extra(idx: i64) -> i64 {
+    if idx < 4 { return 0 }
+    return (idx - 2) / 2
+}
+
+fn _def_cl_order(i: i64) -> i64 {
+    if i == 0 { return 16 } if i == 1 { return 17 } if i == 2 { return 18 } if i == 3 { return 0 }
+    if i == 4 { return 8 }  if i == 5 { return 7 }  if i == 6 { return 9 }  if i == 7 { return 6 }
+    if i == 8 { return 10 } if i == 9 { return 5 }  if i == 10 { return 11 } if i == 11 { return 4 }
+    if i == 12 { return 12 } if i == 13 { return 3 } if i == 14 { return 13 } if i == 15 { return 2 }
+    if i == 16 { return 14 } if i == 17 { return 1 }
+    return 15
+}
+
+fn _def_bitrev(code: i64, nbits: i64) -> i64 {
+    mut v := code
+    mut r := 0
+    mut i := 0
+    while i < nbits {
+        r = (r << 1) | (v & 1)
+        v = v >> 1
+        i += 1
+    }
+    return r
+}
+
+// --- Growable Output Byte Buffer Wrapper ---
+struct ZOut {
+    b: ByteBuf
+    cap: i64
+    max_lim: i64
+}
+
+fn _zout_new(init_cap: i64, max_lim: i64) -> ZOut {
+    mut c := init_cap
+    if c < 64 { c = 64 }
+    if c > max_lim { c = max_lim }
+    return ZOut(b = buf_new(c + 8), cap = c, max_lim = max_lim)
+}
+
+fn _zout_push(mut z: ZOut, byte_v: i64) -> bool {
+    cur := buf_len(z.b)
+    if cur >= z.max_lim { return false }
+    if cur >= z.cap {
+        mut ncap := z.cap * 2
+        if ncap > z.max_lim { ncap = z.max_lim }
+        nb := buf_new(ncap + 8)
+        mut i := 0
+        while i < cur {
+            buf_push(nb, buf_get(z.b, i))
+            i += 1
+        }
+        buf_free(move z.b)
+        z.b = nb
+        z.cap = ncap
+    }
+    buf_push(z.b, byte_v & 255)
+    return true
+}
+
+// --- LSB-First Bit Reader ---
+struct BitReader {
+    src: ByteBuf
+    n: i64
+    byte_pos: i64
+    bit_buf: i64
+    bit_cnt: i64
+    err_flag: bool
+}
+
+fn _br_new(src: ByteBuf, start_off: i64, end_off: i64) -> BitReader {
+    return BitReader(src = src, n = end_off, byte_pos = start_off, bit_buf = 0, bit_cnt = 0, err_flag = false)
+}
+
+fn _br_read_bits(mut br: BitReader, k: i64) -> i64 {
+    if k <= 0 { return 0 }
+    while br.bit_cnt < k {
+        if br.byte_pos >= br.n {
+            br.err_flag = true
+            return 0
+        }
+        b := buf_get(br.src, br.byte_pos)
+        br.byte_pos += 1
+        br.bit_buf = br.bit_buf | (b << br.bit_cnt)
+        br.bit_cnt += 8
+    }
+    val := br.bit_buf & ((1 << k) - 1)
+    br.bit_buf = ushr64(br.bit_buf, k)
+    br.bit_cnt -= k
+    return val
+}
+
+fn _br_align_byte(mut br: BitReader) {
+    br.bit_buf = 0
+    br.bit_cnt = 0
+}
+
+// --- Canonical Huffman Decoder (RFC 1951) ---
+// `counts[0..15]`, `symbols[0..max_syms-1]`
+struct HuffTable {
+    counts: IntBuf
+    symbols: IntBuf
+    ok_flag: bool
+}
+
+fn _huff_build(lens: IntBuf, num_syms: i64) -> HuffTable {
+    counts := ibuf_new(20)
+    mut i := 0
+    while i < 16 { ibuf_push(counts, 0); i += 1 }
+    i = 0
+    while i < num_syms {
+        l := ibuf_get(lens, i)
+        if l < 0 or l > 15 {
+            return HuffTable(counts = counts, symbols = ibuf_new(1), ok_flag = false)
+        }
+        if l > 0 { ibuf_set(counts, l, ibuf_get(counts, l) + 1) }
+        i += 1
+    }
+    // Check over-subscribed code lengths
+    mut left := 1
+    mut b := 1
+    while b <= 15 {
+        left = left * 2 - ibuf_get(counts, b)
+        if left < 0 {
+            return HuffTable(counts = counts, symbols = ibuf_new(1), ok_flag = false)
+        }
+        b += 1
+    }
+    offs := ibuf_new(20)
+    i = 0
+    while i < 16 { ibuf_push(offs, 0); i += 1 }
+    mut sum := 0
+    b = 1
+    while b <= 15 {
+        ibuf_set(offs, b, sum)
+        sum += ibuf_get(counts, b)
+        b += 1
+    }
+    syms := ibuf_new(sum + 4)
+    i = 0
+    while i < sum { ibuf_push(syms, 0); i += 1 }
+    i = 0
+    while i < num_syms {
+        l := ibuf_get(lens, i)
+        if l > 0 {
+            idx := ibuf_get(offs, l)
+            ibuf_set(syms, idx, i)
+            ibuf_set(offs, l, idx + 1)
+        }
+        i += 1
+    }
+    buf_free(move offs)
+    return HuffTable(counts = counts, symbols = syms, ok_flag = true)
+}
+
+fn _huff_free(move h: HuffTable) {
+    buf_free(move h.counts)
+    buf_free(move h.symbols)
+}
+
+fn _huff_decode(mut br: BitReader, h: HuffTable) -> i64 {
+    mut code := 0
+    mut first := 0
+    mut index := 0
+    mut len := 1
+    while len <= 15 {
+        code = (code << 1) | _br_read_bits(mut br, 1)
+        if br.err_flag { return -1 }
+        cnt := ibuf_get(h.counts, len)
+        if code - cnt < first {
+            return ibuf_get(h.symbols, index + (code - first))
+        }
+        index += cnt
+        first = (first + cnt) << 1
+        len += 1
+    }
+    return -1
+}
+
+fn _inflate_huff_block(mut br: BitReader, lit_h: HuffTable, dist_h: HuffTable, mut out: ZOut) -> bool {
+    while true {
+        sym := _huff_decode(mut br, lit_h)
+        if sym < 0 { return false }
+        if sym < 256 {
+            if not _zout_push(mut out, sym) { return false }
+        } else if sym == 256 {
+            return true
+        } else if sym <= 285 {
+            lidx := sym - 257
+            mlen := _def_len_base(lidx) + _br_read_bits(mut br, _def_len_extra(lidx))
+            if br.err_flag { return false }
+            dsym := _huff_decode(mut br, dist_h)
+            if dsym < 0 or dsym > 29 { return false }
+            dist := _def_dist_base(dsym) + _br_read_bits(mut br, _def_dist_extra(dsym))
+            if br.err_flag { return false }
+            cur_len := buf_len(out.b)
+            if dist <= 0 or dist > cur_len { return false }
+            mut k := 0
+            while k < mlen {
+                b := buf_get(out.b, buf_len(out.b) - dist)
+                if not _zout_push(mut out, b) { return false }
+                k += 1
+            }
+        } else {
+            return false
+        }
+    }
+    return false
+}
+
+// Raw RFC-1951 DEFLATE decompression (`start_off..end_off` slice inside `src`, guarded by `max_out`).
+fn deflate_decompress_range(src: ByteBuf, start_off: i64, end_off: i64, max_out: i64 = 33554432) -> ByteBuf ! i64 {
+    if start_off < 0 or end_off > buf_len(src) or start_off > end_off { return err(400) }
+    mut br := _br_new(src, start_off, end_off)
+    mut init_c := (end_off - start_off) * 3 + 64
+    if init_c > max_out { init_c = max_out }
+    mut out := _zout_new(init_c, max_out)
+
+    while true {
+        bfinal := _br_read_bits(mut br, 1)
+        btype := _br_read_bits(mut br, 2)
+        if br.err_flag { buf_free(move out.b); return err(400) }
+
+        if btype == 0 {
+            // Stored (uncompressed) block
+            _br_align_byte(mut br)
+            if br.byte_pos + 4 > br.n { buf_free(move out.b); return err(400) }
+            len_lo := buf_get(src, br.byte_pos)
+            len_hi := buf_get(src, br.byte_pos + 1)
+            nlen_lo := buf_get(src, br.byte_pos + 2)
+            nlen_hi := buf_get(src, br.byte_pos + 3)
+            br.byte_pos += 4
+            blen := len_lo | (len_hi << 8)
+            nblen := nlen_lo | (nlen_hi << 8)
+            if (blen ^ nblen) != 0xFFFF { buf_free(move out.b); return err(400) }
+            if br.byte_pos + blen > br.n { buf_free(move out.b); return err(400) }
+            mut k := 0
+            while k < blen {
+                if not _zout_push(mut out, buf_get(src, br.byte_pos + k)) {
+                    buf_free(move out.b)
+                    return err(413)
+                }
+                k += 1
+            }
+            br.byte_pos += blen
+        } else if btype == 1 {
+            // Fixed Huffman block
+            lit_lens := ibuf_new(292)
+            mut i := 0
+            while i <= 143 { ibuf_push(lit_lens, 8); i += 1 }
+            while i <= 255 { ibuf_push(lit_lens, 9); i += 1 }
+            while i <= 279 { ibuf_push(lit_lens, 7); i += 1 }
+            while i <= 287 { ibuf_push(lit_lens, 8); i += 1 }
+            dist_lens := ibuf_new(36)
+            i = 0
+            while i < 32 { ibuf_push(dist_lens, 5); i += 1 }
+            lit_h := _huff_build(lit_lens, 288)
+            dist_h := _huff_build(dist_lens, 32)
+            buf_free(move lit_lens)
+            buf_free(move dist_lens)
+            ok_blk := lit_h.ok_flag and dist_h.ok_flag and _inflate_huff_block(mut br, lit_h, dist_h, mut out)
+            _huff_free(move lit_h)
+            _huff_free(move dist_h)
+            if not ok_blk { buf_free(move out.b); return err(400) }
+        } else if btype == 2 {
+            // Dynamic Huffman block (RFC 1951 §3.2.7)
+            hlit := _br_read_bits(mut br, 5) + 257
+            hdist := _br_read_bits(mut br, 5) + 1
+            hclen := _br_read_bits(mut br, 4) + 4
+            if br.err_flag or hlit > 286 or hdist > 30 { buf_free(move out.b); return err(400) }
+
+            cl_lens := ibuf_new(24)
+            mut i := 0
+            while i < 19 { ibuf_push(cl_lens, 0); i += 1 }
+            i = 0
+            while i < hclen {
+                ibuf_set(cl_lens, _def_cl_order(i), _br_read_bits(mut br, 3))
+                i += 1
+            }
+            if br.err_flag { buf_free(move cl_lens); buf_free(move out.b); return err(400) }
+            cl_h := _huff_build(cl_lens, 19)
+            buf_free(move cl_lens)
+            if not cl_h.ok_flag { _huff_free(move cl_h); buf_free(move out.b); return err(400) }
+
+            tot := hlit + hdist
+            all_lens := ibuf_new(tot + 8)
+            i = 0
+            while i < tot { ibuf_push(all_lens, 0); i += 1 }
+            mut idx := 0
+            mut dyn_ok := true
+            while idx < tot {
+                sym := _huff_decode(mut br, cl_h)
+                if sym < 0 { dyn_ok = false; break }
+                if sym < 16 {
+                    ibuf_set(all_lens, idx, sym)
+                    idx += 1
+                } else if sym == 16 {
+                    if idx == 0 { dyn_ok = false; break }
+                    prev_l := ibuf_get(all_lens, idx - 1)
+                    rep := 3 + _br_read_bits(mut br, 2)
+                    if br.err_flag or idx + rep > tot { dyn_ok = false; break }
+                    mut r := 0
+                    while r < rep { ibuf_set(all_lens, idx, prev_l); idx += 1; r += 1 }
+                } else if sym == 17 {
+                    rep := 3 + _br_read_bits(mut br, 3)
+                    if br.err_flag or idx + rep > tot { dyn_ok = false; break }
+                    mut r := 0
+                    while r < rep { ibuf_set(all_lens, idx, 0); idx += 1; r += 1 }
+                } else if sym == 18 {
+                    rep := 11 + _br_read_bits(mut br, 7)
+                    if br.err_flag or idx + rep > tot { dyn_ok = false; break }
+                    mut r := 0
+                    while r < rep { ibuf_set(all_lens, idx, 0); idx += 1; r += 1 }
+                } else {
+                    dyn_ok = false
+                    break
+                }
+            }
+            _huff_free(move cl_h)
+            if not dyn_ok { buf_free(move all_lens); buf_free(move out.b); return err(400) }
+
+            lit_lens := ibuf_new(hlit + 4)
+            i = 0
+            while i < hlit { ibuf_push(lit_lens, ibuf_get(all_lens, i)); i += 1 }
+            dist_lens := ibuf_new(hdist + 4)
+            i = 0
+            while i < hdist { ibuf_push(dist_lens, ibuf_get(all_lens, hlit + i)); i += 1 }
+            buf_free(move all_lens)
+
+            lit_h := _huff_build(lit_lens, hlit)
+            dist_h := _huff_build(dist_lens, hdist)
+            buf_free(move lit_lens)
+            buf_free(move dist_lens)
+            ok_blk := lit_h.ok_flag and dist_h.ok_flag and _inflate_huff_block(mut br, lit_h, dist_h, mut out)
+            _huff_free(move lit_h)
+            _huff_free(move dist_h)
+            if not ok_blk { buf_free(move out.b); return err(400) }
+        } else {
+            buf_free(move out.b)
+            return err(400)
+        }
+        if bfinal != 0 { break }
+    }
+    return ok(out.b)
+}
+
+fn deflate_decompress(src: ByteBuf, max_out: i64 = 33554432) -> ByteBuf ! i64 {
+    return deflate_decompress_range(src, 0, buf_len(src), max_out)
+}
+
+// --- LSB-First Bit Writer & RFC-1951 LZ77 + Fixed Huffman Compressor ---
+struct BitWriter {
+    out: ZOut
+    bit_buf: i64
+    bit_cnt: i64
+}
+
+fn _bw_write_bits(mut bw: BitWriter, val: i64, nbits: i64) {
+    bw.bit_buf = bw.bit_buf | ((val & ((1 << nbits) - 1)) << bw.bit_cnt)
+    bw.bit_cnt += nbits
+    while bw.bit_cnt >= 8 {
+        _ := _zout_push(mut bw.out, bw.bit_buf & 255)
+        bw.bit_buf = ushr64(bw.bit_buf, 8)
+        bw.bit_cnt -= 8
+    }
+}
+
+fn _bw_flush(mut bw: BitWriter) {
+    if bw.bit_cnt > 0 {
+        _ := _zout_push(mut bw.out, bw.bit_buf & 255)
+        bw.bit_buf = 0
+        bw.bit_cnt = 0
+    }
+}
+
+fn _bw_emit_fixed_lit(mut bw: BitWriter, sym: i64) {
+    if sym <= 143 {
+        _bw_write_bits(mut bw, _def_bitrev(48 + sym, 8), 8)
+    } else if sym <= 255 {
+        _bw_write_bits(mut bw, _def_bitrev(400 + (sym - 144), 9), 9)
+    } else if sym <= 279 {
+        _bw_write_bits(mut bw, _def_bitrev(sym - 256, 7), 7)
+    } else {
+        _bw_write_bits(mut bw, _def_bitrev(192 + (sym - 280), 8), 8)
+    }
+}
+
+fn _bw_emit_fixed_match(mut bw: BitWriter, mlen: i64, dist: i64) {
+    // Length symbol 257..285
+    mut lidx := 28
+    if mlen < 258 {
+        mut k := 0
+        while k < 28 {
+            if mlen < _def_len_base(k + 1) { lidx = k; break }
+            k += 1
+        }
+    }
+    _bw_emit_fixed_lit(mut bw, 257 + lidx)
+    lex := _def_len_extra(lidx)
+    if lex > 0 { _bw_write_bits(mut bw, mlen - _def_len_base(lidx), lex) }
+
+    // Distance symbol 0..29 (5-bit fixed Huffman reversed)
+    mut didx := 29
+    mut dk := 0
+    while dk < 29 {
+        if dist < _def_dist_base(dk + 1) { didx = dk; break }
+        dk += 1
+    }
+    _bw_write_bits(mut bw, _def_bitrev(didx, 5), 5)
+    dex := _def_dist_extra(didx)
+    if dex > 0 { _bw_write_bits(mut bw, dist - _def_dist_base(didx), dex) }
+}
+
+fn _def_hash3(src: ByteBuf, pos: i64) -> i64 {
+    h := (buf_get(src, pos) << 16) | (buf_get(src, pos + 1) << 8) | buf_get(src, pos + 2)
+    return ushr64((h *% 2654435761) & 0xFFFFFFFF, 20) & 4095
+}
+
+// Raw RFC-1951 DEFLATE compression (LZ77 32KB sliding window + Fixed Huffman).
+fn deflate_compress(src: ByteBuf) -> ByteBuf {
+    n := buf_len(src)
+    mut bw := BitWriter(out = _zout_new(n + 64, n * 2 + 1024), bit_buf = 0, bit_cnt = 0)
+    // BFINAL=1, BTYPE=1 (Fixed Huffman)
+    _bw_write_bits(mut bw, 1, 1)
+    _bw_write_bits(mut bw, 1, 2)
+
+    ht := ibuf_new(4096)
+    mut hi := 0
+    while hi < 4096 { ibuf_push(ht, -1); hi += 1 }
+
+    mut i := 0
+    while i < n {
+        if i + 3 <= n {
+            slot := _def_hash3(src, i)
+            ref_p := ibuf_get(ht, slot)
+            ibuf_set(ht, slot, i)
+            if ref_p >= 0 and i - ref_p <= 32768 and i - ref_p >= 1 {
+                if buf_get(src, ref_p) == buf_get(src, i) and buf_get(src, ref_p + 1) == buf_get(src, i + 1) and buf_get(src, ref_p + 2) == buf_get(src, i + 2) {
+                    mut mlen := 3
+                    mut max_m := n - i
+                    if max_m > 258 { max_m = 258 }
+                    while mlen < max_m and buf_get(src, ref_p + mlen) == buf_get(src, i + mlen) {
+                        mlen += 1
+                    }
+                    _bw_emit_fixed_match(mut bw, mlen, i - ref_p)
+                    // Insert skipped positions into hash table for better compression ratio
+                    mut step := 1
+                    while step < mlen and i + step + 3 <= n {
+                        ibuf_set(ht, _def_hash3(src, i + step), i + step)
+                        step += 1
+                    }
+                    i += mlen
+                    continue
+                }
+            }
+        }
+        _bw_emit_fixed_lit(mut bw, buf_get(src, i))
+        i += 1
+    }
+    buf_free(move ht)
+    _bw_emit_fixed_lit(mut bw, 256) // End-of-block symbol
+    _bw_flush(mut bw)
+    return bw.out.b
+}
+
+// --- RFC-1950 `zlib` (`zlib.compress` / `zlib.decompress`) ---
+fn zlib_compress(src: ByteBuf) -> ByteBuf {
+    df := deflate_compress(src)
+    dn := buf_len(df)
+    adler := adler32_bytes(src)
+    out := buf_new(dn + 16)
+    buf_push(out, 0x78) // CM=8 (DEFLATE), CINFO=7 (32KB window)
+    buf_push(out, 0x9C) // FLEVEL=2, FCHECK so (0x789C % 31 == 0)
+    mut i := 0
+    while i < dn { buf_push(out, buf_get(df, i)); i += 1 }
+    buf_free(move df)
+    buf_push(out, (adler >> 24) & 255)
+    buf_push(out, (adler >> 16) & 255)
+    buf_push(out, (adler >> 8) & 255)
+    buf_push(out, adler & 255)
+    return out
+}
+
+fn zlib_compress_str(s: str) -> ByteBuf {
+    b := buf_new(str_len(s) + 4)
+    buf_push_str(b, s)
+    res := zlib_compress(b)
+    buf_free(move b)
+    return res
+}
+
+fn zlib_decompress(zdata: ByteBuf, max_out: i64 = 33554432) -> ByteBuf ! i64 {
+    zn := buf_len(zdata)
+    if zn < 6 { return err(400) }
+    cmf := buf_get(zdata, 0)
+    flg := buf_get(zdata, 1)
+    if (cmf & 15) != 8 { return err(400) }
+    if ((cmf << 8) | flg) % 31 != 0 { return err(400) }
+    if (flg & 32) != 0 { return err(400) } // FDICT preset dictionary unsupported
+    raw := deflate_decompress_range(zdata, 2, zn - 4, max_out) or return
+    want_adler := (buf_get(zdata, zn - 4) << 24) | (buf_get(zdata, zn - 3) << 16) | (buf_get(zdata, zn - 2) << 8) | buf_get(zdata, zn - 1)
+    got_adler := adler32_bytes(raw)
+    if got_adler != want_adler {
+        buf_free(move raw)
+        return err(422)
+    }
+    return ok(raw)
+}
+
+fn zlib_decompress_str(zdata: ByteBuf, max_out: i64 = 33554432) -> str ! i64 {
+    b := zlib_decompress(zdata, max_out) or return
+    return ok(buf_to_owned_str(move b))
+}
+
+// --- RFC-1952 `gzip` (`gzip.compress` / `gzip.decompress`) ---
+fn gzip_compress(src: ByteBuf) -> ByteBuf {
+    df := deflate_compress(src)
+    dn := buf_len(df)
+    crc := crc32_bytes(src)
+    isize := buf_len(src) & 0xFFFFFFFF
+    out := buf_new(dn + 24)
+    buf_push(out, 0x1F) // ID1
+    buf_push(out, 0x8B) // ID2
+    buf_push(out, 0x08) // CM = DEFLATE
+    buf_push(out, 0x00) // FLG
+    buf_push(out, 0x00); buf_push(out, 0x00); buf_push(out, 0x00); buf_push(out, 0x00) // MTIME
+    buf_push(out, 0x00) // XFL
+    buf_push(out, 0xFF) // OS = unknown
+    mut i := 0
+    while i < dn { buf_push(out, buf_get(df, i)); i += 1 }
+    buf_free(move df)
+    buf_push(out, crc & 255)
+    buf_push(out, (crc >> 8) & 255)
+    buf_push(out, (crc >> 16) & 255)
+    buf_push(out, (crc >> 24) & 255)
+    buf_push(out, isize & 255)
+    buf_push(out, (isize >> 8) & 255)
+    buf_push(out, (isize >> 16) & 255)
+    buf_push(out, (isize >> 24) & 255)
+    return out
+}
+
+fn gzip_compress_str(s: str) -> ByteBuf {
+    b := buf_new(str_len(s) + 4)
+    buf_push_str(b, s)
+    res := gzip_compress(b)
+    buf_free(move b)
+    return res
+}
+
+fn gzip_decompress(gdata: ByteBuf, max_out: i64 = 33554432) -> ByteBuf ! i64 {
+    gn := buf_len(gdata)
+    if gn < 18 { return err(400) }
+    if buf_get(gdata, 0) != 0x1F or buf_get(gdata, 1) != 0x8B or buf_get(gdata, 2) != 0x08 {
+        return err(400)
+    }
+    flg := buf_get(gdata, 3)
+    mut pos := 10
+    if (flg & 4) != 0 { // FEXTRA
+        if pos + 2 > gn - 8 { return err(400) }
+        xlen := buf_get(gdata, pos) | (buf_get(gdata, pos + 1) << 8)
+        pos += 2 + xlen
+    }
+    if (flg & 8) != 0 { // FNAME (NUL-terminated)
+        while pos < gn - 8 and buf_get(gdata, pos) != 0 { pos += 1 }
+        pos += 1
+    }
+    if (flg & 16) != 0 { // FCOMMENT (NUL-terminated)
+        while pos < gn - 8 and buf_get(gdata, pos) != 0 { pos += 1 }
+        pos += 1
+    }
+    if (flg & 2) != 0 { // FHCRC (2 bytes)
+        pos += 2
+    }
+    if pos > gn - 8 { return err(400) }
+    raw := deflate_decompress_range(gdata, pos, gn - 8, max_out) or return
+    want_crc := buf_get(gdata, gn - 8) | (buf_get(gdata, gn - 7) << 8) | (buf_get(gdata, gn - 6) << 16) | (buf_get(gdata, gn - 5) << 24)
+    want_sz := buf_get(gdata, gn - 4) | (buf_get(gdata, gn - 3) << 8) | (buf_get(gdata, gn - 2) << 16) | (buf_get(gdata, gn - 1) << 24)
+    if crc32_bytes(raw) != want_crc or (buf_len(raw) & 0xFFFFFFFF) != want_sz {
+        buf_free(move raw)
+        return err(422)
+    }
+    return ok(raw)
+}
+
+fn gzip_decompress_str(gdata: ByteBuf, max_out: i64 = 33554432) -> str ! i64 {
+    b := gzip_decompress(gdata, max_out) or return
+    return ok(buf_to_owned_str(move b))
+}

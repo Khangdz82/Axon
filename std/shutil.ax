@@ -1,0 +1,595 @@
+// Axon Standard Library — High-Level File Operations, Stat, Which & Streaming Hashing (`std/shutil.ax`)
+// 100% Pure Axon replacement for Python's `shutil` + `os.stat` + `os.path.expanduser`/`abspath`:
+//   - UTF-16LE Win32 (`GetFileAttributesExW`, `CreateFileW`, `FindFirstFileW`, `MoveFileExW`, `RemoveDirectoryW`) + Unix fallbacks
+//   - O(1) `shutil_stat` (never loads file contents into RAM!)
+//   - Streaming 64KB `shutil_copyfile` & `shutil_sha256_file` (handles multi-GB files with O(1) memory)
+//   - Cycle-safe `shutil_copytree` & safety-guarded `shutil_rmtree` (skips symlinks/reparse points, blocks root deletion)
+
+use std::ffi
+use std::str
+use std::path
+use std::sys
+use std::ds
+use std::crypto
+use std::secrets
+
+struct FileStat {
+    exists: bool
+    is_dir: bool
+    is_file: bool
+    is_symlink: bool
+    size: i64
+    mtime_ns: i64
+}
+
+fn _shutil_safe_path(p: str) -> bool {
+    n := str_len(p)
+    if n <= 0 or n > 4096 { return false }
+    mut i := 0
+    while i < n {
+        if str_byte(p, i) == 0 { return false }
+        i += 1
+    }
+    return true
+}
+
+fn _shutil_k32() -> i64 {
+    return ffi_open_one("kernel32.dll")
+}
+
+// O(1) OS metadata lookup (`os.stat` / `os.lstat` equivalent — does NOT read file contents)
+fn shutil_stat(path: str) -> FileStat {
+    empty := FileStat(exists = false, is_dir = false, is_file = false, is_symlink = false, size = 0, mtime_ns = 0)
+    if not _shutil_safe_path(path) { return empty }
+    k32 := _shutil_k32()
+    if k32 != 0 {
+        f_attr := ffi_sym(k32, "GetFileAttributesExW")
+        if f_attr == 0 { return empty }
+        wp := ffi_wstr(path)
+        if wp == 0 { return empty }
+        // WIN32_FILE_ATTRIBUTE_DATA = 36 bytes:
+        // [0..3]=dwFileAttributes, [20..23]=ftLastWriteTime.dwLow, [24..27]=ftLastWriteTime.dwHigh,
+        // [28..31]=nFileSizeHigh, [32..35]=nFileSizeLow
+        info := ffi_alloc(48)
+        if info == 0 { ffi_free(wp); return empty }
+        ok_q := (ffi_call3(f_attr, wp, 0, info) & 0xFFFFFFFF) != 0
+        ffi_free(wp)
+        if not ok_q {
+            ffi_free(info)
+            return empty
+        }
+        attrs := ffi_read_u32_le(info, 0)
+        ft_lo := ffi_read_u32_le(info, 20)
+        ft_hi := ffi_read_u32_le(info, 24)
+        sz_hi := ffi_read_u32_le(info, 28)
+        sz_lo := ffi_read_u32_le(info, 32)
+        ffi_free(info)
+
+        is_dir := (attrs & 0x10) != 0
+        is_sym := (attrs & 0x400) != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+        fsize := (sz_hi << 32) | (sz_lo & 0xFFFFFFFF)
+        // Windows FILETIME (100ns ticks since 1601-01-01) -> Unix epoch ns
+        ft := (ft_hi << 32) | (ft_lo & 0xFFFFFFFF)
+        mut mns := 0
+        if ft > 116444736000000000 {
+            mns = (ft - 116444736000000000) * 100
+        }
+        return FileStat(
+            exists = true,
+            is_dir = is_dir,
+            is_file = not is_dir,
+            is_symlink = is_sym,
+            size = fsize,
+            mtime_ns = mns
+        )
+    }
+    // Unix fallback
+    ex := sys_fs_exists(path)
+    if not ex { return empty }
+    return FileStat(exists = true, is_dir = false, is_file = true, is_symlink = false, size = 0, mtime_ns = 0)
+}
+
+fn shutil_home_dir() -> str {
+    h1 := sys_env_get("USERPROFILE")
+    if str_len(h1) > 0 { return h1 }
+    h2 := sys_env_get("HOME")
+    if str_len(h2) > 0 { return h2 }
+    hd := sys_env_get("HOMEDRIVE")
+    hp := sys_env_get("HOMEPATH")
+    if str_len(hd) > 0 and str_len(hp) > 0 { return hd + hp }
+    return "."
+}
+
+fn shutil_expanduser(p: str) -> str {
+    n := str_len(p)
+    if n == 0 or str_byte(p, 0) != 126 { return p } // '~'
+    if n == 1 { return shutil_home_dir() }
+    if path_is_sep(str_byte(p, 1)) {
+        return path_join(shutil_home_dir(), str_slice(p, 2, n))
+    }
+    return p
+}
+
+fn shutil_abspath(p: str) -> str {
+    exp := shutil_expanduser(p)
+    if path_is_abs(exp) { return path_normalize(exp) }
+    cwd := sys_cwd()
+    if str_len(cwd) == 0 { return path_normalize(exp) }
+    return path_join(cwd, exp)
+}
+
+// Equivalent to Python `shutil.which(cmd)` — resolves executable on PATH (handles PATHEXT on Windows)
+fn shutil_which(cmd: str) -> str {
+    if not _shutil_safe_path(cmd) { return "" }
+    if str_contains(cmd, "/") or str_contains(cmd, "\\") {
+        st := shutil_stat(cmd)
+        if st.exists and st.is_file { return shutil_abspath(cmd) }
+        return ""
+    }
+    is_win := _shutil_k32() != 0
+    path_env := sys_env_get("PATH")
+    if str_len(path_env) == 0 { return "" }
+    sep_byte := if is_win { 59 } else { 58 } // ';' or ':'
+    ranges := str_split_ranges(path_env, sep_byte)
+    cnt := str_split_count(ranges)
+    mut i := 0
+    while i < cnt {
+        dir := str_trim(str_split_at(path_env, ranges, i))
+        if str_len(dir) > 0 {
+            cand := path_join(dir, cmd)
+            st0 := shutil_stat(cand)
+            if st0.exists and st0.is_file {
+                buf_free(move ranges)
+                return cand
+            }
+            if is_win and str_len(path_ext(cmd)) == 0 {
+                c_exe := cand + ".exe"
+                if shutil_stat(c_exe).is_file { buf_free(move ranges); return c_exe }
+                c_cmd := cand + ".cmd"
+                if shutil_stat(c_cmd).is_file { buf_free(move ranges); return c_cmd }
+                c_bat := cand + ".bat"
+                if shutil_stat(c_bat).is_file { buf_free(move ranges); return c_bat }
+            }
+        }
+        i += 1
+    }
+    buf_free(move ranges)
+    return ""
+}
+
+fn _shutil_mkdir_w(path: str) -> bool {
+    if not _shutil_safe_path(path) { return false }
+    k32 := _shutil_k32()
+    if k32 != 0 {
+        f_mk := ffi_sym(k32, "CreateDirectoryW")
+        if f_mk != 0 {
+            wp := ffi_wstr(path)
+            if wp == 0 { return false }
+            r := (ffi_call2(f_mk, wp, 0) & 0xFFFFFFFF) != 0
+            ffi_free(wp)
+            return r
+        }
+    }
+    return sys_fs_mkdir(path)
+}
+
+fn shutil_mkdir_all(path: str) -> bool {
+    if not _shutil_safe_path(path) { return false }
+    norm := path_normalize(path)
+    if shutil_stat(norm).is_dir { return true }
+    n := str_len(norm)
+    mut i := 1
+    while i <= n {
+        if i == n or path_is_sep(str_byte(norm, i)) {
+            sub := str_slice(norm, 0, i)
+            if str_len(sub) > 0 and not (str_len(sub) == 2 and str_byte(sub, 1) == 58) {
+                if not shutil_stat(sub).is_dir {
+                    _ := _shutil_mkdir_w(sub)
+                }
+            }
+        }
+        i += 1
+    }
+    return shutil_stat(norm).is_dir
+}
+
+// Streaming 64KB chunk file copy (Win32 CreateFileW + ReadFile/WriteFile, O(1) RAM)
+fn shutil_copyfile(src: str, dst: str) -> bool {
+    if not _shutil_safe_path(src) or not _shutil_safe_path(dst) { return false }
+    k32 := _shutil_k32()
+    if k32 != 0 {
+        f_cf := ffi_sym(k32, "CreateFileW")
+        f_rf := ffi_sym(k32, "ReadFile")
+        f_wf := ffi_sym(k32, "WriteFile")
+        f_ch := ffi_sym(k32, "CloseHandle")
+        if f_cf != 0 and f_rf != 0 and f_wf != 0 and f_ch != 0 {
+            wsrc := ffi_wstr(src)
+            wdst := ffi_wstr(dst)
+            if wsrc == 0 or wdst == 0 {
+                ffi_free(wsrc); ffi_free(wdst)
+                return false
+            }
+            // GENERIC_READ=0x80000000, FILE_SHARE_READ|WRITE|DEL=7, OPEN_EXISTING=3, FILE_FLAG_SEQUENTIAL_SCAN=0x08000000
+            hs := ffi_call7(f_cf, wsrc, 0x80000000, 7, 0, 3, 0x08000000, 0)
+            ffi_free(wsrc)
+            if hs == -1 or (hs & 0xFFFFFFFF) == 0xFFFFFFFF {
+                ffi_free(wdst)
+                return false
+            }
+            // GENERIC_WRITE=0x40000000, CREATE_ALWAYS=2, FILE_ATTRIBUTE_NORMAL=0x80
+            hd := ffi_call7(f_cf, wdst, 0x40000000, 0, 0, 2, 0x80, 0)
+            ffi_free(wdst)
+            if hd == -1 or (hd & 0xFFFFFFFF) == 0xFFFFFFFF {
+                _ := ffi_call1(f_ch, hs)
+                return false
+            }
+            chunk := ffi_alloc(65536)
+            nread := ffi_alloc(8)
+            nwrit := ffi_alloc(8)
+            mut ok_cp := chunk != 0 and nread != 0 and nwrit != 0
+            while ok_cp {
+                ffi_write_u32_le(nread, 0, 0)
+                if (ffi_call5(f_rf, hs, chunk, 65536, nread, 0) & 0xFFFFFFFF) == 0 {
+                    ok_cp = false
+                    break
+                }
+                got := ffi_read_u32_le(nread, 0)
+                if got <= 0 { break }
+                mut sent := 0
+                while sent < got {
+                    ffi_write_u32_le(nwrit, 0, 0)
+                    if (ffi_call5(f_wf, hd, chunk + sent, got - sent, nwrit, 0) & 0xFFFFFFFF) == 0 {
+                        ok_cp = false
+                        break
+                    }
+                    w := ffi_read_u32_le(nwrit, 0)
+                    if w <= 0 { ok_cp = false; break }
+                    sent += w
+                }
+            }
+            ffi_free(chunk); ffi_free(nread); ffi_free(nwrit)
+            _ := ffi_call1(f_ch, hs)
+            _ := ffi_call1(f_ch, hd)
+            return ok_cp
+        }
+    }
+    b := fs_read_file(src) or return false
+    rc := fs_write_file(dst, b) or -1
+    buf_free(move b)
+    return rc >= 0
+}
+
+// Streaming 64KB chunk SHA-256 of any file on disk (O(1) RAM, handles arbitrary file sizes)
+fn shutil_sha256_file(path: str) -> str ! i64 {
+    if not _shutil_safe_path(path) { return err(400) }
+    k32 := _shutil_k32()
+    if k32 != 0 {
+        f_cf := ffi_sym(k32, "CreateFileW")
+        f_rf := ffi_sym(k32, "ReadFile")
+        f_ch := ffi_sym(k32, "CloseHandle")
+        if f_cf != 0 and f_rf != 0 and f_ch != 0 {
+            wp := ffi_wstr(path)
+            if wp == 0 { return err(500) }
+            hf := ffi_call7(f_cf, wp, 0x80000000, 7, 0, 3, 0x08000000, 0)
+            ffi_free(wp)
+            if hf == -1 or (hf & 0xFFFFFFFF) == 0xFFFFFFFF { return err(404) }
+            chunk := ffi_alloc(65536)
+            nread := ffi_alloc(8)
+            if chunk == 0 or nread == 0 {
+                ffi_free(chunk); ffi_free(nread)
+                _ := ffi_call1(f_ch, hf)
+                return err(500)
+            }
+            mut ctx := sha256_ctx_new()
+            mut ok_r := true
+            while true {
+                ffi_write_u32_le(nread, 0, 0)
+                if (ffi_call5(f_rf, hf, chunk, 65536, nread, 0) & 0xFFFFFFFF) == 0 {
+                    ok_r = false
+                    break
+                }
+                got := ffi_read_u32_le(nread, 0)
+                if got <= 0 { break }
+                blk := ffi_read_bytes(chunk, got)
+                sha256_ctx_update_bytes(mut ctx, blk, 0, got)
+                buf_free(move blk)
+            }
+            ffi_free(chunk); ffi_free(nread)
+            _ := ffi_call1(f_ch, hf)
+            if not ok_r {
+                sha256_ctx_free(move ctx)
+                return err(500)
+            }
+            hex := sha256_ctx_finish_hex(mut ctx)
+            sha256_ctx_free(move ctx)
+            return ok(hex)
+        }
+    }
+    raw := fs_read_file(path) or return err(404)
+    hex := sha256_bytes(raw)
+    buf_free(move raw)
+    return ok(hex)
+}
+
+fn _shutil_delete_file_w(path: str) -> bool {
+    k32 := _shutil_k32()
+    if k32 != 0 {
+        f_del := ffi_sym(k32, "DeleteFileW")
+        if f_del != 0 {
+            wp := ffi_wstr(path)
+            if wp == 0 { return false }
+            r := (ffi_call1(f_del, wp) & 0xFFFFFFFF) != 0
+            ffi_free(wp)
+            return r
+        }
+    }
+    return sys_fs_remove(path)
+}
+
+fn _shutil_rmdir_w(path: str) -> bool {
+    k32 := _shutil_k32()
+    if k32 != 0 {
+        f_rd := ffi_sym(k32, "RemoveDirectoryW")
+        if f_rd != 0 {
+            wp := ffi_wstr(path)
+            if wp == 0 { return false }
+            r := (ffi_call1(f_rd, wp) & 0xFFFFFFFF) != 0
+            ffi_free(wp)
+            return r
+        }
+    }
+    lc := ffi_open("", "libc.so.6", "libSystem.B.dylib")
+    if lc != 0 {
+        f_rm := ffi_sym(lc, "rmdir")
+        if f_rm != 0 {
+            cp := ffi_cstr(path)
+            r := ffi_sext32(ffi_call1(f_rm, cp)) == 0
+            ffi_free(cp)
+            return r
+        }
+    }
+    return false
+}
+
+fn _shutil_is_dangerous_root(p: str) -> bool {
+    norm := path_normalize(p)
+    n := str_len(norm)
+    if n == 0 or str_eq(norm, "/") or str_eq(norm, ".") or str_eq(norm, "..") { return true }
+    if n == 3 and str_byte(norm, 1) == 58 and str_byte(norm, 2) == 47 { return true } // `C:/`
+    if n == 2 and str_byte(norm, 1) == 58 { return true } // `C:`
+    return false
+}
+
+// Safety-guarded recursive directory deletion (skips reparse-point recursion, refuses root paths!)
+fn shutil_rmtree(dir_path: str, max_depth: i64 = 64) -> bool {
+    if not _shutil_safe_path(dir_path) or _shutil_is_dangerous_root(dir_path) or max_depth < 0 {
+        return false
+    }
+    st := shutil_stat(dir_path)
+    if not st.exists { return true }
+    if not st.is_dir { return _shutil_delete_file_w(dir_path) }
+    if st.is_symlink { return _shutil_rmdir_w(dir_path) }
+
+    k32 := _shutil_k32()
+    if k32 != 0 {
+        f_ff := ffi_sym(k32, "FindFirstFileW")
+        f_fn := ffi_sym(k32, "FindNextFileW")
+        f_fc := ffi_sym(k32, "FindClose")
+        if f_ff != 0 and f_fn != 0 and f_fc != 0 {
+            pat := path_join(dir_path, "*")
+            wpat := ffi_wstr(pat)
+            fdata := ffi_alloc(640) // WIN32_FIND_DATAW = 592 bytes; cFileName at offset 44
+            if wpat != 0 and fdata != 0 {
+                h := ffi_call2(f_ff, wpat, fdata)
+                if h != -1 and h != 0xFFFFFFFFFFFFFFFF {
+                    mut more := true
+                    mut guard := 0
+                    while more and guard < 200000 {
+                        name := ffi_read_wstr(fdata + 44, 260)
+                        if str_len(name) > 0 and not str_eq(name, ".") and not str_eq(name, "..") {
+                            attrs := ffi_read_u32_le(fdata, 0)
+                            is_d := (attrs & 0x10) != 0
+                            is_rep := (attrs & 0x400) != 0
+                            child := path_join(dir_path, name)
+                            if is_d {
+                                if is_rep { _ := _shutil_rmdir_w(child) }
+                                else { _ := shutil_rmtree(child, max_depth - 1) }
+                            } else {
+                                _ := _shutil_delete_file_w(child)
+                            }
+                        }
+                        more = (ffi_call2(f_fn, h, fdata) & 0xFFFFFFFF) != 0
+                        guard += 1
+                    }
+                    _ := ffi_call1(f_fc, h)
+                }
+            }
+            ffi_free(fdata)
+            ffi_free(wpat)
+        }
+    }
+    return _shutil_rmdir_w(dir_path)
+}
+
+// Cycle-safe UTF-16 recursive directory tree copy (`shutil.copytree(..., dirs_exist_ok=True)`)
+fn shutil_copytree(src: str, dst: str, max_depth: i64 = 64) -> bool {
+    if not _shutil_safe_path(src) or not _shutil_safe_path(dst) or max_depth < 0 { return false }
+    st := shutil_stat(src)
+    if not st.exists or not st.is_dir or st.is_symlink { return false }
+    if not shutil_mkdir_all(dst) { return false }
+
+    k32 := _shutil_k32()
+    if k32 != 0 {
+        f_ff := ffi_sym(k32, "FindFirstFileW")
+        f_fn := ffi_sym(k32, "FindNextFileW")
+        f_fc := ffi_sym(k32, "FindClose")
+        if f_ff == 0 or f_fn == 0 or f_fc == 0 { return false }
+        wpat := ffi_wstr(path_join(src, "*"))
+        fdata := ffi_alloc(640)
+        mut all_ok := wpat != 0 and fdata != 0
+        if all_ok {
+            h := ffi_call2(f_ff, wpat, fdata)
+            if h != -1 and h != 0xFFFFFFFFFFFFFFFF {
+                mut more := true
+                mut guard := 0
+                while more and guard < 200000 {
+                    name := ffi_read_wstr(fdata + 44, 260)
+                    if str_len(name) > 0 and not str_eq(name, ".") and not str_eq(name, "..") {
+                        attrs := ffi_read_u32_le(fdata, 0)
+                        is_d := (attrs & 0x10) != 0
+                        is_rep := (attrs & 0x400) != 0
+                        cs := path_join(src, name)
+                        cd := path_join(dst, name)
+                        if is_d {
+                            if not is_rep {
+                                if not shutil_copytree(cs, cd, max_depth - 1) { all_ok = false }
+                            }
+                        } else {
+                            if not shutil_copyfile(cs, cd) { all_ok = false }
+                        }
+                    }
+                    more = (ffi_call2(f_fn, h, fdata) & 0xFFFFFFFF) != 0
+                    guard += 1
+                }
+                _ := ffi_call1(f_fc, h)
+            }
+        }
+        ffi_free(fdata)
+        ffi_free(wpat)
+        return all_ok
+    }
+    return false
+}
+
+// Atomic UTF-16 file/dir move (`shutil.move` equivalent)
+fn shutil_move(src: str, dst: str) -> bool {
+    if not _shutil_safe_path(src) or not _shutil_safe_path(dst) { return false }
+    k32 := _shutil_k32()
+    if k32 != 0 {
+        f_mv := ffi_sym(k32, "MoveFileExW")
+        if f_mv != 0 {
+            ws := ffi_wstr(src)
+            wd := ffi_wstr(dst)
+            if ws == 0 or wd == 0 { ffi_free(ws); ffi_free(wd); return false }
+            r := (ffi_call3(f_mv, ws, wd, 3) & 0xFFFFFFFF) != 0
+            ffi_free(ws); ffi_free(wd)
+            return r
+        }
+    }
+    return false
+}
+
+// UTF-16LE Win32 file writer (handles Unicode/Vietnamese/emoji paths cleanly; falls back to `fs_write_file` on Unix)
+fn shutil_write_text(path: str, content: str) -> bool {
+    if not _shutil_safe_path(path) { return false }
+    k32 := _shutil_k32()
+    if k32 != 0 {
+        f_cf := ffi_sym(k32, "CreateFileW")
+        f_wf := ffi_sym(k32, "WriteFile")
+        f_ch := ffi_sym(k32, "CloseHandle")
+        if f_cf != 0 and f_wf != 0 and f_ch != 0 {
+            wp := ffi_wstr(path)
+            if wp == 0 { return false }
+            // GENERIC_WRITE=0x40000000, CREATE_ALWAYS=2, FILE_ATTRIBUTE_NORMAL=0x80
+            hf := ffi_call7(f_cf, wp, 0x40000000, 0, 0, 2, 0x80, 0)
+            ffi_free(wp)
+            if hf == -1 or (hf & 0xFFFFFFFF) == 0xFFFFFFFF { return false }
+            n := str_len(content)
+            mut ok_w := true
+            if n > 0 {
+                raw := ffi_cstr(content)
+                nw_box := ffi_alloc(8)
+                if raw == 0 or nw_box == 0 {
+                    ffi_free(raw); ffi_free(nw_box)
+                    _ := ffi_call1(f_ch, hf)
+                    return false
+                }
+                mut sent := 0
+                while sent < n {
+                    ffi_write_u32_le(nw_box, 0, 0)
+                    if (ffi_call5(f_wf, hf, raw + sent, n - sent, nw_box, 0) & 0xFFFFFFFF) == 0 {
+                        ok_w = false
+                        break
+                    }
+                    w := ffi_read_u32_le(nw_box, 0)
+                    if w <= 0 { ok_w = false; break }
+                    sent += w
+                }
+                ffi_free(raw)
+                ffi_free(nw_box)
+            }
+            _ := ffi_call1(f_ch, hf)
+            return ok_w
+        }
+    }
+    b := buf_new(str_len(content) + 16)
+    if str_len(content) > 0 { buf_push_str(b, content) }
+    wr := fs_write_file(path, b) or -1
+    buf_free(move b)
+    return wr >= 0
+}
+
+// UTF-16LE Win32 file reader (handles Unicode/Vietnamese/emoji paths cleanly; capped at `max_bytes`)
+fn shutil_read_text(path: str, max_bytes: i64 = 67108864) -> str ! i64 {
+    if not _shutil_safe_path(path) { return err(400) }
+    k32 := _shutil_k32()
+    if k32 != 0 {
+        f_cf := ffi_sym(k32, "CreateFileW")
+        f_rf := ffi_sym(k32, "ReadFile")
+        f_ch := ffi_sym(k32, "CloseHandle")
+        if f_cf != 0 and f_rf != 0 and f_ch != 0 {
+            st := shutil_stat(path)
+            if not st.exists or not st.is_file { return err(404) }
+            if st.size > max_bytes { return err(413) }
+            if st.size == 0 { return ok("") }
+            wp := ffi_wstr(path)
+            if wp == 0 { return err(500) }
+            hf := ffi_call7(f_cf, wp, 0x80000000, 7, 0, 3, 0x08000000, 0)
+            ffi_free(wp)
+            if hf == -1 or (hf & 0xFFFFFFFF) == 0xFFFFFFFF { return err(404) }
+            raw := ffi_alloc(st.size + 8)
+            nr_box := ffi_alloc(8)
+            if raw == 0 or nr_box == 0 {
+                ffi_free(raw); ffi_free(nr_box)
+                _ := ffi_call1(f_ch, hf)
+                return err(500)
+            }
+            mut got_tot := 0
+            mut ok_r := true
+            while got_tot < st.size {
+                ffi_write_u32_le(nr_box, 0, 0)
+                rem := st.size - got_tot
+                req := if rem > 1048576 { 1048576 } else { rem }
+                if (ffi_call5(f_rf, hf, raw + got_tot, req, nr_box, 0) & 0xFFFFFFFF) == 0 {
+                    ok_r = false
+                    break
+                }
+                got := ffi_read_u32_le(nr_box, 0)
+                if got <= 0 { break }
+                got_tot += got
+            }
+            _ := ffi_call1(f_ch, hf)
+            ffi_free(nr_box)
+            if not ok_r { ffi_free(raw); return err(500) }
+            bb := ffi_read_bytes(raw, got_tot)
+            ffi_free(raw)
+            return ok(buf_to_owned_str(move bb))
+        }
+    }
+    b := fs_read_file(path) or return err(404)
+    return ok(buf_to_owned_str(move b))
+}
+
+// Cryptographically-unique atomic UTF-16LE file write (CWE-377 safe, uses CSPRNG nonce via `std::secrets`)
+fn shutil_atomic_write(path: str, content: str) -> bool {
+    if not _shutil_safe_path(path) { return false }
+    tok := secrets_token_hex(8) or return false
+    tmp := f"{path}.tmp.{sys_pid()}.{tok}"
+    if not shutil_write_text(tmp, content) {
+        _ := _shutil_delete_file_w(tmp)
+        return false
+    }
+    if shutil_move(tmp, path) { return true }
+    _ := _shutil_delete_file_w(tmp)
+    return false
+}

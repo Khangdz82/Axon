@@ -21,6 +21,7 @@ struct NetApi {
     fn_setsockopt: i64
     fn_close: i64
     fn_gethostbyname: i64
+    fn_getsockname: i64
 }
 
 struct TcpListener {
@@ -69,7 +70,8 @@ fn net_init() -> NetApi ! i64 {
         fn_recvfrom = ffi_sym(lib, "recvfrom"),
         fn_setsockopt = ffi_sym(lib, "setsockopt"),
         fn_close = ffi_sym2(lib, "closesocket", "close"),
-        fn_gethostbyname = ffi_sym(lib, "gethostbyname")
+        fn_gethostbyname = ffi_sym(lib, "gethostbyname"),
+        fn_getsockname = ffi_sym(lib, "getsockname")
     )
     if api.fn_socket == 0 { return err(-2) }
     return ok(api)
@@ -105,8 +107,15 @@ fn net_parse_ipv4(ip: str) -> i64 ! i64 {
     return ok(oct)
 }
 
-// Resolve hostname or IPv4 literal to 32-bit network-order IPv4 address
+// Resolve hostname or IPv4 literal to 32-bit network-order IPv4 address (rejects embedded NUL)
 fn net_resolve_ipv4(api: NetApi, host: str) -> i64 ! i64 {
+    hn := str_len(host)
+    if hn == 0 or hn > 255 { return err(-3) }
+    mut hi := 0
+    while hi < hn {
+        if str_byte(host, hi) == 0 { return err(-3) }
+        hi += 1
+    }
     lit := net_parse_ipv4(host) or -1
     if lit >= 0 { return ok(lit) }
     if api.fn_gethostbyname == 0 { return err(-3) }
@@ -156,7 +165,19 @@ fn tcp_listen(bind_ip: str, port: i64, backlog: i64 = 128) -> TcpListener ! i64 
         _ := ffi_call1(api.fn_close, fd)
         return err(-12)
     }
-    return ok(TcpListener(fd = fd, port = port, api = api))
+    // Resolve kernel-assigned ephemeral port when `port == 0` via `getsockname`
+    mut bound_port := port
+    if bound_port == 0 and api.fn_getsockname != 0 {
+        gs_sa := ffi_alloc(32)
+        gs_len := ffi_alloc(8)
+        ffi_write_u32_le(gs_len, 0, 16)
+        if ffi_sext32(ffi_call3(api.fn_getsockname, fd, gs_sa, gs_len)) == 0 {
+            bound_port = ffi_read_u16_be(gs_sa, 2)
+        }
+        ffi_free(gs_sa)
+        ffi_free(gs_len)
+    }
+    return ok(TcpListener(fd = fd, port = bound_port, api = api))
 }
 
 fn tcp_accept(ln: TcpListener) -> TcpStream ! i64 {
@@ -274,6 +295,61 @@ fn tcp_recv_exact(s: TcpStream, exact_bytes: i64) -> ByteBuf ! i64 {
     }
     ffi_free(raw)
     return ok(out)
+}
+
+// Reads one `\n`-terminated line up to `max_bytes` (strips trailing `\r\n`, bounded against memory exhaustion DoS)
+fn tcp_recv_line(s: TcpStream, max_bytes: i64 = 1048576) -> str ! i64 {
+    mut lim := max_bytes
+    if lim <= 0 { lim = 4096 }
+    if lim > 16777216 { lim = 16777216 }
+    ch_box := ffi_alloc(8)
+    if ch_box == 0 { return err(-35) }
+    mut cap := 256
+    if cap > lim { cap = lim }
+    mut out := buf_new(cap)
+    mut got_any := false
+    while true {
+        rc := ffi_sext32(ffi_call4(s.api.fn_recv, s.fd, ch_box, 1, 0))
+        if rc < 0 {
+            ffi_free(ch_box)
+            buf_free(move out)
+            return err(-32)
+        }
+        if rc == 0 {
+            break
+        }
+        got_any = true
+        b := ffi_read_u8(ch_box, 0)
+        if b == 10 {
+            break
+        }
+        if buf_len(out) >= lim {
+            ffi_free(ch_box)
+            buf_free(move out)
+            return err(-36)
+        }
+        if buf_len(out) >= cap {
+            mut ncap := cap * 2
+            if ncap > lim { ncap = lim }
+            nb := buf_new(ncap)
+            cur_n := buf_len(out)
+            if cur_n > 0 { buf_push_str(nb, buf_slice_str(out, 0, cur_n)) }
+            buf_free(move out)
+            out = nb
+            cap = ncap
+        }
+        buf_push(out, b)
+    }
+    ffi_free(ch_box)
+    if not got_any {
+        buf_free(move out)
+        return err(-33)
+    }
+    mut n := buf_len(out)
+    if n > 0 and buf_get(out, n - 1) == 13 {
+        buf_truncate(out, n - 1)
+    }
+    return ok(buf_to_owned_str(move out))
 }
 
 fn tcp_close(s: TcpStream) {
