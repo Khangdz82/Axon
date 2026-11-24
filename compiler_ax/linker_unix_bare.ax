@@ -26,25 +26,39 @@ fn ub_fixed_str(buf: ByteBuf, s: str, width: i64) {
     }
 }
 
+fn ub_nonzero_len(buf: ByteBuf) -> i64 {
+    mut n := buf_len(buf)
+    while n > 0 {
+        if buf_get(buf, n - 1) != 0 { return n }
+        n -= 1
+    }
+    return 0
+}
+
 // --- 1. Linux / Bare-Metal `ELF64` Direct Executable Builder (`x86_64` = 62, `AArch64` = 183, `RISC-V` = 243) ---
-// Computes `[text_vaddr, rdata_vaddr, data_vaddr, rdata_file_off, data_file_off]` with 64 KB W^X separation
-// so binaries satisfy both 4 KB x86_64 pages and 16 KB / 64 KB ARM64 Linux kernel pages.
+// Computes `[text_vaddr, rdata_vaddr, data_vaddr, rdata_file_off, data_file_off]` using ELF congruent page addressing:
+// Zero disk padding while strictly separating RX, RO, and RW onto distinct 4 KB / 64 KB virtual pages!
 fn elf64_compute_layout_aligned(text_len: i64, rdata_len: i64, seg_align: i64, layout_out: IntBuf) {
     base_va := 0x400000
-    text_file_off := 0x1000
+    text_file_off := 0x120 // Exact end of 64B Elf64_Ehdr + 4 * 56B Elf64_Phdr (`288 == 0x120`)
     mut tlen := text_len
-    if tlen < 16 { tlen = 16 }
-    text_end_off := text_file_off + tlen
+    if tlen < 4 { tlen = 4 }
+    rx_end_off := text_file_off + tlen
 
-    rdata_file_off := align_up(text_end_off, seg_align)
+    rdata_file_off := align_up(rx_end_off, 16)
+    rx_va_end := align_up(base_va + rx_end_off, seg_align)
+    rdata_va := rx_va_end + (rdata_file_off & (seg_align - 1))
+
     mut rlen := rdata_len
-    if rlen < 16 { rlen = 16 }
-    // Reserve 64 bytes after `rdata` for minimal `.eh_frame` CIE/FDE
-    data_file_off := align_up(rdata_file_off + rlen + 64, seg_align)
+    if rlen < 8 { rlen = 8 }
+    ro_total := align_up(rlen, 8) + 26 // 26B minimal `.eh_frame` CIE + terminator
+    data_file_off := align_up(rdata_file_off + ro_total, 16)
+    ro_va_end := align_up(rdata_va + ro_total, seg_align)
+    data_va := ro_va_end + (data_file_off & (seg_align - 1))
 
     ibuf_push(layout_out, base_va + text_file_off)
-    ibuf_push(layout_out, base_va + rdata_file_off)
-    ibuf_push(layout_out, base_va + data_file_off)
+    ibuf_push(layout_out, rdata_va)
+    ibuf_push(layout_out, data_va)
     ibuf_push(layout_out, rdata_file_off)
     ibuf_push(layout_out, data_file_off)
 }
@@ -77,130 +91,6 @@ fn emit_elf64_shdr(out: ByteBuf, sh_name: i64, sh_type: i64, sh_flags: i64, sh_a
     buf_push_u64(out, 0)
 }
 
-fn is_elf64_safety_trap_range(text_code: ByteBuf, s_off: i64, e_off: i64) -> bool {
-    if s_off < 0 or e_off > buf_len(text_code) or e_off <= s_off { return false }
-    rlen := e_off - s_off
-    if rlen >= 5 {
-        mut p := s_off
-        if rlen >= 9 and buf_get(text_code, p) == 0xF3 and buf_get(text_code, p + 1) == 0x0F {
-            p += 4
-        }
-        if p + 5 <= e_off {
-            op := buf_get(text_code, p)
-            if op == 0xB9 or op == 0xBF {
-                code := buf_get(text_code, p + 1) | (buf_get(text_code, p + 2) << 8) | (buf_get(text_code, p + 3) << 16) | (buf_get(text_code, p + 4) << 24)
-                if code == 101 or code == 254 or code == 255 {
-                    return true
-                }
-            }
-        }
-    }
-    if rlen >= 20 {
-        mut p := s_off
-        while p + 8 <= e_off {
-            if buf_get(text_code, p) == 0x15 and buf_get(text_code, p + 1) == 0x7C and buf_get(text_code, p + 2) == 0x4A and buf_get(text_code, p + 3) == 0x7F {
-                return true
-            }
-            p += 1
-        }
-    }
-    return false
-}
-
-// Dead-Code Elimination (DCE) & Symbol Stripping Analysis for ELF64
-fn elf64_dce_strip_analysis(text_code: ByteBuf, fn_ranges: IntBuf, is_strip: bool) -> i64 {
-    t_len := buf_len(text_code)
-    rcnt := ibuf_len(fn_ranges) / 2
-    if rcnt <= 0 or not is_strip { return 0 }
-
-    live_ranges := ibuf_new(rcnt + 8)
-    scanned_ranges := ibuf_new(rcnt + 8)
-    mut i := 0
-    while i < rcnt {
-        ibuf_push(live_ranges, 0)
-        ibuf_push(scanned_ranges, 0)
-        i += 1
-    }
-    ibuf_set(live_ranges, 0, 1)
-
-    // Mark safety trap routines permanently live
-    i = 0
-    while i < rcnt {
-        s_off := ibuf_get(fn_ranges, i * 2)
-        e_off := ibuf_get(fn_ranges, i * 2 + 1)
-        if is_elf64_safety_trap_range(text_code, s_off, e_off) {
-            ibuf_set(live_ranges, i, 1)
-        }
-        i += 1
-    }
-
-    // Fixed-point iteration until no new ranges are marked live
-    mut changed := true
-    while changed {
-        changed = false
-        mut ri := 0
-        while ri < rcnt {
-            if ibuf_get(live_ranges, ri) == 1 and ibuf_get(scanned_ranges, ri) == 0 {
-                ibuf_set(scanned_ranges, ri, 1)
-                f_start := ibuf_get(fn_ranges, ri * 2)
-                f_end := ibuf_get(fn_ranges, ri * 2 + 1)
-                mut p := f_start
-                while p < f_end {
-                    b := buf_get(text_code, p)
-                    mut target_off := -1
-
-                    // 0xE8 (CALL rel32) or 0xE9 (JMP rel32)
-                    if (b == 0xE8 or b == 0xE9) and p + 5 <= f_end {
-                        disp := buf_get(text_code, p + 1) | (buf_get(text_code, p + 2) << 8) | (buf_get(text_code, p + 3) << 16) | (buf_get(text_code, p + 4) << 24)
-                        mut s_disp := disp
-                        if (s_disp & 0x80000000) != 0 { s_disp = s_disp - 0x100000000 }
-                        target_off = p + 5 + s_disp
-                    } else if b == 0x0F and p + 6 <= f_end {
-                        b2 := buf_get(text_code, p + 1)
-                        // 0x0F 0x80 .. 0x8F (Jcc near rel32)
-                        if b2 >= 0x80 and b2 <= 0x8F {
-                            disp := buf_get(text_code, p + 2) | (buf_get(text_code, p + 3) << 8) | (buf_get(text_code, p + 4) << 16) | (buf_get(text_code, p + 5) << 24)
-                            mut s_disp := disp
-                            if (s_disp & 0x80000000) != 0 { s_disp = s_disp - 0x100000000 }
-                            target_off = p + 6 + s_disp
-                        }
-                    }
-
-                    if target_off >= 0 and target_off < t_len {
-                        mut k := 0
-                        while k < rcnt {
-                            if ibuf_get(live_ranges, k) == 0 {
-                                s_off := ibuf_get(fn_ranges, k * 2)
-                                e_off := ibuf_get(fn_ranges, k * 2 + 1)
-                                if target_off >= s_off and target_off < e_off {
-                                    ibuf_set(live_ranges, k, 1)
-                                    changed = true
-                                    break
-                                }
-                            }
-                            k += 1
-                        }
-                    }
-                    p += 1
-                }
-            }
-            ri += 1
-        }
-    }
-
-    mut stripped_count := 0
-    i = 0
-    while i < rcnt {
-        if ibuf_get(live_ranges, i) == 0 {
-            stripped_count += 1
-        }
-        i += 1
-    }
-    buf_free(move live_ranges)
-    buf_free(move scanned_ranges)
-    return stripped_count
-}
-
 fn build_elf64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBuf, machine: i64, elf_out: ByteBuf) {
     mut seg_align := 0x10000
     if machine == 62 { seg_align = 0x1000 }
@@ -214,11 +104,10 @@ fn build_elf64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBuf,
     buf_free(move lay)
 
     base_va := 0x400000
+    text_foff := 0x120
     mut tlen := buf_len(text_code)
-    if tlen < 1 {
-        if machine == 183 or machine == 243 { tlen = 4 } else { tlen = 1 }
-    }
-    rx_filesz := 0x1000 + tlen
+    if tlen < 4 { tlen = 4 }
+    rx_filesz := text_foff + tlen
 
     // Build `.rodata` + minimal DWARF `.eh_frame` CIE + terminator
     ro_blob := buf_new(buf_len(rdata) + 128)
@@ -227,14 +116,13 @@ fn build_elf64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBuf,
         buf_push(ro_blob, buf_get(rdata, ri))
         ri += 1
     }
-    if buf_len(ro_blob) == 0 {
-        buf_push_u64(ro_blob, 0)
+    while buf_len(ro_blob) < 8 {
+        buf_push(ro_blob, 0)
     }
     while (buf_len(ro_blob) & 7) != 0 {
         buf_push(ro_blob, 0)
     }
     eh_off_in_ro := buf_len(ro_blob)
-    // Minimal valid DWARF `.eh_frame` CIE (`length=16`, `CIE_id=0`, `ver=1`, `"zR\0"`, `code_align=1`, `data_align=-8`, `ret_reg=16`) + `0` terminator
     buf_push_u32(ro_blob, 16)
     buf_push_u32(ro_blob, 0)
     buf_push(ro_blob, 1)
@@ -253,10 +141,9 @@ fn build_elf64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBuf,
     eh_size := buf_len(ro_blob) - eh_off_in_ro
     ro_filesz := buf_len(ro_blob)
 
-    mut d_filesz := buf_len(data_sec)
-    if d_filesz < 64 { d_filesz = 64 }
+    d_filesz := ub_nonzero_len(data_sec)
     mut d_memsz := 0x2000
-    if d_filesz > d_memsz { d_memsz = d_filesz }
+    if buf_len(data_sec) > d_memsz { d_memsz = buf_len(data_sec) }
 
     // `.shstrtab`
     shstr := buf_new(128)
@@ -271,7 +158,11 @@ fn build_elf64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBuf,
     buf_push_str(shstr, ".eh_frame")
     buf_push(shstr, 0)
     nm_data := buf_len(shstr)
-    buf_push_str(shstr, ".data")
+    if d_filesz == 0 {
+        buf_push_str(shstr, ".bss")
+    } else {
+        buf_push_str(shstr, ".data")
+    }
     buf_push(shstr, 0)
     nm_shstr := buf_len(shstr)
     buf_push_str(shstr, ".shstrtab")
@@ -297,7 +188,6 @@ fn build_elf64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBuf,
     buf_push_u64(elf_out, 64)      // e_phoff
     buf_push_u64(elf_out, shdr_foff)
     if machine == 243 {
-        // EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_DOUBLE = 0x0005
         buf_push_u32(elf_out, 5)
     } else {
         buf_push_u32(elf_out, 0)
@@ -306,18 +196,18 @@ fn build_elf64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBuf,
     buf_push_u16(elf_out, 56)
     buf_push_u16(elf_out, 4) // 4 Phdrs: RX, RO, RW, GNU_STACK
     buf_push_u16(elf_out, 64)
-    buf_push_u16(elf_out, 6) // NULL, .text, .rodata, .eh_frame, .data, .shstrtab
+    buf_push_u16(elf_out, 6) // NULL, .text, .rodata, .eh_frame, .data/.bss, .shstrtab
     buf_push_u16(elf_out, 5)
 
-    // Program Headers (`4 * 56 = 224` bytes)
-    // PT_LOAD = 1, PT_GNU_STACK = 0x6474E551; PF_X = 1, PF_W = 2, PF_R = 4
+    // Program Headers (`4 * 56 = 224` bytes -> ends at `0x120 == text_foff`!)
     emit_elf64_phdr(elf_out, 1, 5, 0,          base_va,  rx_filesz, rx_filesz, seg_align)
     emit_elf64_phdr(elf_out, 1, 4, rdata_foff, rdata_va, ro_filesz, ro_filesz, seg_align)
     emit_elf64_phdr(elf_out, 1, 6, data_foff,  data_va,  d_filesz,  d_memsz,   seg_align)
     emit_elf64_phdr(elf_out, 0x6474E551, 6, 0, 0, 0, 0, 16)
 
-    // Pad to `0x1000` and write `.text`
-    ub_zeros(elf_out, 0x1000 - buf_len(elf_out))
+    if buf_len(elf_out) < text_foff {
+        ub_zeros(elf_out, text_foff - buf_len(elf_out))
+    }
     mut ti := 0
     while ti < buf_len(text_code) {
         buf_push(elf_out, buf_get(text_code, ti))
@@ -330,10 +220,17 @@ fn build_elf64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBuf,
             buf_push_u32(elf_out, 0x00008067) // RV64 RET
         } else {
             buf_push(elf_out, 0xC3)           // x86_64 RET
+            buf_push(elf_out, 0x90)
+            buf_push(elf_out, 0x90)
+            buf_push(elf_out, 0x90)
+        }
+    } else {
+        while buf_len(elf_out) < text_foff + tlen {
+            buf_push(elf_out, 0x90)
         }
     }
 
-    // Pad to `rdata_foff` and write `.rodata` + `.eh_frame`
+    // Pad to `rdata_foff` (0..15 bytes) and write `.rodata` + `.eh_frame`
     ub_zeros(elf_out, rdata_foff - buf_len(elf_out))
     ri = 0
     while ri < ro_filesz {
@@ -341,15 +238,12 @@ fn build_elf64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBuf,
         ri += 1
     }
 
-    // Pad to `data_foff` and write `.data`
+    // Pad to `data_foff` (0..15 bytes) and write non-zero `.data` prefix (`0` bytes when `.bss`)
     ub_zeros(elf_out, data_foff - buf_len(elf_out))
     mut di := 0
-    while di < buf_len(data_sec) {
+    while di < d_filesz {
         buf_push(elf_out, buf_get(data_sec, di))
         di += 1
-    }
-    if buf_len(data_sec) < d_filesz {
-        ub_zeros(elf_out, d_filesz - buf_len(data_sec))
     }
 
     // Pad to `shstr_foff` and write `.shstrtab`
@@ -364,22 +258,24 @@ fn build_elf64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBuf,
     ub_zeros(elf_out, shdr_foff - buf_len(elf_out))
     mut rdata_only_len := buf_len(rdata)
     if rdata_only_len < 8 { rdata_only_len = 8 }
-    emit_elf64_shdr(elf_out, 0,         0, 0, 0, 0, 0, 0)
-    emit_elf64_shdr(elf_out, nm_text,   1, 6, text_va,                  0x1000,                  tlen,           16)
-    emit_elf64_shdr(elf_out, nm_rodata, 1, 2, rdata_va,                 rdata_foff,              rdata_only_len, 16)
-    emit_elf64_shdr(elf_out, nm_eh,     1, 2, rdata_va + eh_off_in_ro,  rdata_foff + eh_off_in_ro, eh_size,      8)
-    emit_elf64_shdr(elf_out, nm_data,   1, 3, data_va,                  data_foff,               d_filesz,       16)
-    emit_elf64_shdr(elf_out, nm_shstr,  3, 0, 0,                        shstr_foff,              buf_len(shstr), 1)
+    d_sh_type := if d_filesz == 0 { 8 } else { 1 }
+    d_sh_size := if d_filesz == 0 { d_memsz } else { d_filesz }
+    emit_elf64_shdr(elf_out, 0,         0,         0, 0,                       0,                         0,              0)
+    emit_elf64_shdr(elf_out, nm_text,   1,         6, text_va,                 text_foff,                 tlen,           16)
+    emit_elf64_shdr(elf_out, nm_rodata, 1,         2, rdata_va,                rdata_foff,                rdata_only_len, 16)
+    emit_elf64_shdr(elf_out, nm_eh,     1,         2, rdata_va + eh_off_in_ro, rdata_foff + eh_off_in_ro, eh_size,        8)
+    emit_elf64_shdr(elf_out, nm_data,   d_sh_type, 3, data_va,                 data_foff,                 d_sh_size,      16)
+    emit_elf64_shdr(elf_out, nm_shstr,  3,         0, 0,                       shstr_foff,                buf_len(shstr), 1)
 
     buf_free(move shstr)
     buf_free(move ro_blob)
 }
 
 // --- 2. macOS 64-bit (`Mach-O 64` 16 KB Page-Aligned for Apple Silicon `ARM64` & `x86_64`) ---
-// Computes `[text_vaddr, rdata_vaddr, data_vaddr, text_seg_size]`
+// Computes `[text_vaddr, rdata_vaddr, data_vaddr, text_seg_size, rdata_foff]`
 fn macho64_compute_layout(text_len: i64, rdata_len: i64, layout_out: IntBuf) {
     base_va := 0x100000000
-    text_foff := 0x4000
+    text_foff := 0x400 // Compact 1024B offset right after 736B Mach-O header + 9 Load Commands!
     mut tlen := text_len
     if tlen < 16 { tlen = 16 }
     rdata_foff := align_up(text_foff + tlen, 16)
@@ -420,17 +316,20 @@ fn build_macho64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBu
     rdata_foff := ibuf_get(lay, 4)
     buf_free(move lay)
 
+    text_foff := 0x400
     mut tlen := buf_len(text_code)
     if tlen < 4 { tlen = 4 }
     mut rlen := buf_len(rdata)
     if rlen < 8 { rlen = 8 }
 
     data_foff := text_seg_sz
-    mut d_raw := buf_len(data_sec)
-    if d_raw < 0x1000 { d_raw = 0x1000 }
-    data_seg_sz := align_up(d_raw, 0x4000)
+    nz_data := ub_nonzero_len(data_sec)
+    mut d_vsize := 0x2000
+    if buf_len(data_sec) > d_vsize { d_vsize = buf_len(data_sec) }
+    data_seg_sz := align_up(d_vsize, 0x4000)
+    data_filesz := if nz_data == 0 { 0 } else { align_up(nz_data, 0x4000) }
     linkedit_va := data_va + data_seg_sz
-    linkedit_foff := data_foff + data_seg_sz
+    linkedit_foff := data_foff + data_filesz
     linkedit_sz := 0x4000
 
     // Build Load Commands in `lcs` buffer first so `sizeofcmds` is exact
@@ -461,22 +360,26 @@ fn build_macho64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBu
     buf_push_u32(lcs, 5)
     buf_push_u32(lcs, 2)
     buf_push_u32(lcs, 0)
-    emit_macho_section64(lcs, "__text",  "__TEXT", text_va,  tlen, 0x4000,     4, 0x80000400)
+    emit_macho_section64(lcs, "__text",  "__TEXT", text_va,  tlen, text_foff,  4, 0x80000400)
     emit_macho_section64(lcs, "__const", "__TEXT", rdata_va, rlen, rdata_foff, 4, 0)
 
-    // 3. LC_SEGMENT_64 ("__DATA") with 1 section ("__data") = 72 + 80 = 152 bytes
+    // 3. LC_SEGMENT_64 ("__DATA") with 1 section ("__bss" S_ZEROFILL when all-zero, else "__data") = 152 bytes
     buf_push_u32(lcs, 0x19)
     buf_push_u32(lcs, 152)
     ub_fixed_str(lcs, "__DATA", 16)
     buf_push_u64(lcs, data_va)
     buf_push_u64(lcs, data_seg_sz)
     buf_push_u64(lcs, data_foff)
-    buf_push_u64(lcs, data_seg_sz)
+    buf_push_u64(lcs, data_filesz)
     buf_push_u32(lcs, 3) // VM_PROT_READ | VM_PROT_WRITE
     buf_push_u32(lcs, 3)
     buf_push_u32(lcs, 1)
     buf_push_u32(lcs, 0)
-    emit_macho_section64(lcs, "__data", "__DATA", data_va, d_raw, data_foff, 4, 0)
+    if nz_data == 0 {
+        emit_macho_section64(lcs, "__bss",  "__DATA", data_va, d_vsize, 0,         4, 1) // S_ZEROFILL (0 disk bytes!)
+    } else {
+        emit_macho_section64(lcs, "__data", "__DATA", data_va, nz_data, data_foff, 4, 0)
+    }
 
     // 4. LC_SEGMENT_64 ("__LINKEDIT") = 72 bytes
     buf_push_u32(lcs, 0x19)
@@ -500,7 +403,7 @@ fn build_macho64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBu
     // 6. LC_MAIN (`0x80000028`) = 24 bytes
     buf_push_u32(lcs, 0x80000028)
     buf_push_u32(lcs, 24)
-    buf_push_u64(lcs, 0x4000) // entryoff
+    buf_push_u64(lcs, text_foff) // entryoff = 0x400
     buf_push_u64(lcs, 0x400000)
 
     // 7. LC_FUNCTION_STARTS (`0x26`) = 16 bytes
@@ -548,8 +451,8 @@ fn build_macho64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBu
     }
     buf_free(move lcs)
 
-    // Pad to `0x4000` (`__text`)
-    ub_zeros(macho_out, 0x4000 - buf_len(macho_out))
+    // Pad to `0x400` (`__text`)
+    ub_zeros(macho_out, text_foff - buf_len(macho_out))
     mut ti := 0
     while ti < buf_len(text_code) {
         buf_push(macho_out, buf_get(text_code, ti))
@@ -571,21 +474,21 @@ fn build_macho64_executable(text_code: ByteBuf, rdata: ByteBuf, data_sec: ByteBu
         ri += 1
     }
 
-    // Pad to `data_foff` (`__data`)
+    // Pad to `data_foff` (`__TEXT` 16KB page end) and emit `__data` only if non-zero
     ub_zeros(macho_out, data_foff - buf_len(macho_out))
-    mut di := 0
-    while di < buf_len(data_sec) {
-        buf_push(macho_out, buf_get(data_sec, di))
-        di += 1
+    if data_filesz > 0 {
+        mut di := 0
+        while di < nz_data {
+            buf_push(macho_out, buf_get(data_sec, di))
+            di += 1
+        }
+        ub_zeros(macho_out, linkedit_foff - buf_len(macho_out))
     }
 
-    // Pad to `linkedit_foff` (`__LINKEDIT`: function starts ULEB128 + `_main` nlist_64 + strtab)
-    ub_zeros(macho_out, linkedit_foff - buf_len(macho_out))
-    // ULEB128 for `0x4000` (`0x80, 0x80, 0x01`) + padding to 8 bytes
+    // `__LINKEDIT`: function starts ULEB128 for `0x400` (`0x80, 0x08`) + `_main` nlist_64 + strtab
     buf_push(macho_out, 0x80)
-    buf_push(macho_out, 0x80)
-    buf_push(macho_out, 0x01)
-    ub_zeros(macho_out, 5)
+    buf_push(macho_out, 0x08)
+    ub_zeros(macho_out, 6)
     // 16-byte `nlist_64` for `_main` (`n_strx = 1`, `n_type = 0x0F`, `n_sect = 1`, `n_desc = 0`, `n_value = text_va`)
     buf_push_u32(macho_out, 1)
     buf_push(macho_out, 0x0F)

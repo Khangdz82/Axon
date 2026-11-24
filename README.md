@@ -1,23 +1,28 @@
-# Axon Programming Language (`.ax`) — v1.1.1
+# Axon Programming Language (`.ax`) — v1.2.0
 
-**Axon** is a self-hosted, multi-OS native systems programming language combining **Pythonic readability**, **extreme native AVX2/FMA3/multi-core performance** (`5x–18x` faster than Rust across core allocation, matrix, string, and recursion workloads; `30x–50x` faster cold native builds; `11.79x–19.00x` faster than MSVC `/O2 /arch:AVX2` across the 30-benchmark suite), **zero-GC Perceus linear ownership**, **native zero-WebView HTML5/CSS3/Tailwind/JS Desktop GUI (Photon-D2D v2)**, a **103-module pure-Axon standard library**, and **fail-closed compile-time & runtime security (`E0501`–`E0503`, `--shield`)**.
+**Axon** is a self-hosted, multi-OS native systems & data-science programming language combining **Pythonic readability**, **extreme native AVX2/FMA3/NEON/WASM-SIMD performance**, **zero-GC Perceus linear ownership**, **`AxIR` Mid-Level Optimization (`-O0 | -O2 | -O3 | -Os`)**, **native zero-WebView HTML5/CSS3/Tailwind/JS Desktop GUI (Photon-D2D v2)**, a **115-module pure-Axon standard library**, and **fail-closed compile-time & runtime security (`E0501`–`E0503`, `--shield`)**.
 
-The entire compiler ([`compiler_ax/`](file:///c:/Users/Admin/Downloads/Languague/compiler_ax) — `18` pure Axon modules, `37,570` lines) compiles `.ax` source and `.h` C headers directly in memory into standalone executables, shared libraries, GPU kernels, and WASI WebAssembly modules across **11 hardware/OS targets** — with **zero** dependency on `LLVM`, `Clang`, `GCC`, `MSVC`, `link.exe`, `lld`, or external SDKs.
+The entire compiler ([`compiler_ax/`](file:///c:/Users/Admin/Downloads/Languague/compiler_ax) — **`19` pure Axon modules, `40,878` lines**) compiles `.ax` source and `.h` C headers directly in memory into standalone executables, shared libraries, GPU kernels, and WASI WebAssembly modules across **11 hardware/OS targets** — with **zero** dependency on `LLVM`, `Clang`, `GCC`, `MSVC`, `link.exe`, `lld`, or external SDKs, and **zero build/run temp garbage**.
 
 ---
 
-## Key Highlights (v1.1.1)
+## Key Highlights (v1.2.0)
 
-- **Extreme Native Speed ( AVX2 Auto-Vectorization + Lock-Free Slab Allocator):**
-  - **8-lane (`2×YMM`) interleaved `i64` range & linear-recurrence auto-vectorizer** (`VPADDQ`, `VPSUBQ`, `VPMULUDQ`, exact 64-bit signed `SAR`, and power-of-2 `/` & `%`), **64-byte/iter `VPSADBW` byte-stream reduction**, **single-shot dual-YMM 32–64B `VPCMPEQB` string equality**, and **`n <= 7` recursive leaf shrink-wrapping**.
-  - **8-class lock-free slab allocator** (`64 B .. 64 KB`, zero atomic `LOCK` overhead on single-threaded paths via `mt_active`, hardware spinlock when multi-threaded, double-free canary guard): `200,000 × 4 KB` alloc/touch/free runs in **`1 ms`** vs Rust `10 ms` (**10.0x faster**), Go `157 ms` (**157x**), Java `150 ms` (**150x**).
-- **Complete 103-Module Pure-Axon Standard Library (`39,719` Lines, Zero C/Python Helpers):**
-  - **New in v1.2 (Core -> Web -> Graph):** $O(N)$ LSD Radix Sort + Priority Queue + DSU ([`std/algo.ax`](file:///c:/Users/Admin/Downloads/Languague/std/algo.ax)), auto-growing Perceus containers `DynIntVec`/`StrVec`/`DynMap`/`StrMap`/`IntDeque`/`BitSet` ([`std/ds.ax`](file:///c:/Users/Admin/Downloads/Languague/std/ds.ax)), atomic filesystem & directory listing ([`std/fs.ax`](file:///c:/Users/Admin/Downloads/Languague/std/fs.ax)), radix/table/human formatters ([`std/fmt.ax`](file:///c:/Users/Admin/Downloads/Languague/std/fmt.ax)), `p50`/`p95`/`p99` microbenchmark harness ([`std/bench.ax`](file:///c:/Users/Admin/Downloads/Languague/std/bench.ax)), RFC-3986 URL parser + octal/hex/IMDS SSRF guard ([`std/url.ax`](file:///c:/Users/Admin/Downloads/Languague/std/url.ax)), RFC-7519 HS256 JWT + `"alg":"none"` blocker + password hashing ([`std/jwt.ax`](file:///c:/Users/Admin/Downloads/Languague/std/jwt.ax)), RFC-6455 WebSockets ([`std/ws.ax`](file:///c:/Users/Admin/Downloads/Languague/std/ws.ax)), `:param` web router + static file server ([`std/web.ax`](file:///c:/Users/Admin/Downloads/Languague/std/web.ax)), and forward-star BFS/Dijkstra/Topological-Sort graphs ([`std/graph.ax`](file:///c:/Users/Admin/Downloads/Languague/std/graph.ax)).
-  - **Full-Stack Foundations:** TCP/UDP (`std::net`), TLS 1.2/1.3 (`std::tls`), HTTP/1.1 (`std::http`), HTTP/2 + HPACK + Protobuf v3 + gRPC (`std::grpc`), PostgreSQL Wire v3.0 (`std::postgres`), MySQL Wire v10 (`std::mysql`), SQLite3 (`std::sqlite`), 16-arg Win64/SysV C-ABI FFI (`std::ffi`), AI Agent Harness & Eval (`std::ai_harness`, `std::ai_agent`, `std::ai_eval`), zero-`nvcc` CUDA/GGUF/LLaMA/vLLM/FAISS, and 2D/3D Game Engine.
-- **Native Photon-D2D v2 Desktop UI (`0` WebView, `0` Electron, `< 12 MB` RAM):** Write desktop apps in pure HTML5 + CSS3 (Flexbox, Grid, `:hover`, `:focus`, `:active`, linear gradients, multi-layer shadows, `border-radius`) + Tailwind CSS + `<script>` JS engine (`let`/`const`, `if`/`else`, `while`, `===`, `&&`/`||`, DOM bindings) with smooth 60 FPS mouse-wheel inertia, dark native DWM titlebar, and HiDPI ClearType Direct2D rendering ([`std/ui.ax`](file:///c:/Users/Admin/Downloads/Languague/std/ui.ax), [`std/gui.ax`](file:///c:/Users/Admin/Downloads/Languague/std/gui.ax), [`examples/antigravity_ui.ax`](file:///c:/Users/Admin/Downloads/Languague/examples/antigravity_ui.ax)).
-- **Self-Hosted Deterministic Toolchain & Zero-Trust Verification:**
-  - Verified by 3-stage deterministic self-hosting bootstrap (`SHA256(Stage 2) == SHA256(Stage 3) = D6064066AD2600074A31C52158E73BE2BFA09761B56BD164475F4C7C6DE01A96`, `2,357,248` bytes).
-  - **`76/76`** end-to-end & hostile runtime test suites ([`tests/pass/`](file:///c:/Users/Admin/Downloads/Languague/tests/pass)) + **`37/37`** compile-time rejection gates ([`tests/fail_compile/`](file:///c:/Users/Admin/Downloads/Languague/tests/fail_compile)).
+- **`AxIR` Mid-Level Optimizer & Multi-Arch Auto-Vectorization (`-O0 | -O2 | -O3 | -Os`):**
+  - **5-Pass Low-RAM (`< 4 MB` bump-arena) `AxIR` Pipeline ([`compiler_ax/ir_opt.ax`](file:///c:/Users/Admin/Downloads/Languague/compiler_ax/ir_opt.ax)):** Whole-program Call-Graph Reachability (`DCE-0`), frequency-weighted bottom-up auto-inliner, **`SRoA`** (Scalar Replacement of 1–4-field value structs into CPU registers), Shield-safe `ConstProp`/`GVN`/`CSE` + dead-branch pruning, and trap-free `LICM`.
+  - **Backend Codegen Optimizations:** **64-bit `MagicDiv`** (replaces `40–90c` signed `IDIV` with `4c` `IMUL` magic multipliers), Java HotSpot C2-style **`RCE`** (Range-Check Elimination inside `0..n` loops), **`8×f64` AVX2+FMA3** (`VFMADD231PD` / `VADDPD`), **`8×i64` AVX2**, **ARM64 `128-bit NEON`** + on-demand DCE (`1.40 MB` `axc-macos-arm64`), **WASM `0xFD SIMD128`**, and `-Os` size-focused unroll gating.
+  - **8-Class Lock-Free Slab Allocator:** `64 B .. 64 KB`, zero `LOCK` overhead on single-threaded paths via `mt_active`, double-free canary guard (`200,000 × 4 KB` alloc/touch/free in **`1 ms`** vs Rust `10 ms`, Go `157 ms`, Java `150 ms`).
+- **Complete `115`-Module Pure-Axon Standard Library (`48,817` Lines, Zero C/Python Helpers):**
+  - **Mathematics Suite (`v1.2.0`):** Dense `MatF64` (LU, Cholesky, Householder QR, Least-Squares, Jacobi Eigen, Hestenes-Jacobi SVD) + sparse `CsrMat` (`CG`, `BiCGSTAB`) ([`std/linalg.ax`](file:///c:/Users/Admin/Downloads/Languague/std/linalg.ax)); zero-`libm` transcendentals, `Complex`, Radix-2 `FFT`/`IFFT`, 16-pt Gauss-Legendre, `CubicSpline`, `BrentSolver`, `Rk4State`, `LbfgsState`, `Simplex LP` ([`std/numeric.ax`](file:///c:/Users/Admin/Downloads/Languague/std/numeric.ax)); `lgamma`, `gammainc`, `betainc`, 8 distributions + `ProbRng` ([`std/prob.ax`](file:///c:/Users/Admin/Downloads/Languague/std/prob.ax)); overflow-safe base-$10^9$ `BigInt`, Miller–Rabin primality & `Rational` ([`std/bigint.ax`](file:///c:/Users/Admin/Downloads/Languague/std/bigint.ax)).
+  - **Data Science & ML Suite (`v1.2.0`):** Arrow-style columnar `DataFrame` (CSV, JSONL, binary `AXDF` IPC, null bitmask, `groupby_agg`, hash `join`, `describe`) ([`std/dataframe.ax`](file:///c:/Users/Admin/Downloads/Languague/std/dataframe.ax)); Welford moments, $O(N)$ Quickselect quantiles, `welch_ttest`, `chi2`, `anova_1way`, `ks_2samp`, `OLS` econometrics, `Holt-Winters` ([`std/stats.ax`](file:///c:/Users/Admin/Downloads/Languague/std/stats.ax)); `PCA`, `Ridge`, `Lasso`, `Logistic`, `DecisionTree`, `RandomForest`, `GBDT`, `KMeans++`, `DBSCAN`, `KNN`, `GaussianNB`, `ROC-AUC`/`F1` ([`std/ml.ax`](file:///c:/Users/Admin/Downloads/Languague/std/ml.ax)).
+  - **OS Auth & Identity Security (`v1.2.0`):** Kernel CSPRNG (`BCryptGenRandom`/`getentropy`/`/dev/urandom`), `SID`/`UID`, Admin elevation, `LogonUserW`, **Win32 DPAPI**, **Credential Vault** ([`std/os_auth.ax`](file:///c:/Users/Admin/Downloads/Languague/std/os_auth.ax)); RFC 9106 **`Argon2id` `v=19`**, RFC 7693 `BLAKE2b`, `PBKDF2`, `HKDF`, RFC 6238 `TOTP`/`HOTP`, `OAuth2 PKCE`, `RbacPolicy` ([`std/auth.ax`](file:///c:/Users/Admin/Downloads/Languague/std/auth.ax)).
+  - **Database Suite & Upgrades (`v1.2.0`):** RESP2/RESP3 Redis + `RedisPipeline` ([`std/redis.ax`](file:///c:/Users/Admin/Downloads/Languague/std/redis.ax)); Zero-DLL Embedded ACID KV Store with IEEE `CRC-32` WAL, `begin`/`commit`/`rollback`, TTL & `compact` ([`std/kv_acid.ax`](file:///c:/Users/Admin/Downloads/Languague/std/kv_acid.ax)); SQLi-proof `SqlBuilder`, `SqlitePool` WAL & `db_migrate_sqlite` ([`std/db_pool.ax`](file:///c:/Users/Admin/Downloads/Languague/std/db_pool.ax)); **PostgreSQL 14–17 `SCRAM-SHA-256`** ([`std/postgres.ax`](file:///c:/Users/Admin/Downloads/Languague/std/postgres.ax)); SQLite `f64`/`blob`/`null` ([`std/sqlite.ax`](file:///c:/Users/Admin/Downloads/Languague/std/sqlite.ax)).
+- **`axon-anything` Universal Code Migration Engine:**
+  - Behavior-preserving 6-stage porting pipeline (`Analyze -> Record -> Bridge -> Port -> Diff Gate -> Lift`) from Python/NumPy/Pandas/Scikit-Learn, Rust, C/C++, Go, Java, and TypeScript into 100% Pure Axon ([`.agents/skills/axon-anything/SKILL.md`](file:///c:/Users/Admin/Downloads/Languague/.agents/skills/axon-anything/SKILL.md), [`.agents/rules/axon-porting-rules.md`](file:///c:/Users/Admin/Downloads/Languague/.agents/rules/axon-porting-rules.md), pure-Axon CLI [`axon_anything.ax`](file:///c:/Users/Admin/Downloads/Languague/.agents/skills/axon-anything/scripts/axon_anything.ax), and MCP tool `axon_port_guide`).
+- **Native Photon-D2D v2 Desktop UI (`0` WebView, `0` Electron, `< 12 MB` RAM):** Write desktop apps in pure HTML5 + CSS3 + Tailwind CSS + `<script>` JS with HiDPI ClearType Direct2D rendering ([`std/ui.ax`](file:///c:/Users/Admin/Downloads/Languague/std/ui.ax), [`std/gui.ax`](file:///c:/Users/Admin/Downloads/Languague/std/gui.ax)).
+- **Self-Hosted Deterministic Toolchain:**
+  - Verified by 3-stage deterministic self-hosting bootstrap (`SHA256(Stage 2) == SHA256(Stage 3) = 129366ABCC3124DFBC09D3794916178F5000B6A9C3B2792902BE5380A2E52300`, `2,639,872` bytes).
+  - **`77/77`** end-to-end runtime test suites ([`tests/pass/`](file:///c:/Users/Admin/Downloads/Languague/tests/pass)) + **`37/37`** compile-time rejection gates ([`tests/fail_compile/`](file:///c:/Users/Admin/Downloads/Languague/tests/fail_compile)).
 
 ---
 
@@ -27,18 +32,18 @@ The entire compiler ([`compiler_ax/`](file:///c:/Users/Admin/Downloads/Languague
 | :--- | :--- | :--- |
 | **Humans (Beginner -> Expert)** | [**`docs/LEARN_AXON_HUMAN.md`**](file:///c:/Users/Admin/Downloads/Languague/docs/LEARN_AXON_HUMAN.md) | Structured 8-module hands-on course from Day-1 syntax & Perceus 0-GC to Web/JWT/WS, SQLite, Native HTML/Tailwind GUI, and AI/GPU |
 | **Humans (Full Textbooks)** | [`LEARN_AXON_VI.md`](file:///c:/Users/Admin/Downloads/Languague/LEARN_AXON_VI.md) / [`LEARN_AXON_EN.md`](file:///c:/Users/Admin/Downloads/Languague/LEARN_AXON_EN.md) | 20-chapter Vietnamese & English reference textbooks + 4-week study roadmap |
-| **AI Coding Agents (Master Spec)** | [**`docs/AGENT_MASTER_GUIDE.md`**](file:///c:/Users/Admin/Downloads/Languague/docs/AGENT_MASTER_GUIDE.md) | Zero-hallucination grammar rules, full 103-module lookup matrix, `E0001..E0604` fix dictionary, and full-stack copy-paste templates |
-| **AI Agents (Quick Rules & MCP)** | [`AGENTS.md`](file:///c:/Users/Admin/Downloads/Languague/AGENTS.md) / [`AXON_LLM_SPEC.md`](file:///c:/Users/Admin/Downloads/Languague/AXON_LLM_SPEC.md) / [`docs/AGENT_FULLSTACK_GUIDE.md`](file:///c:/Users/Admin/Downloads/Languague/docs/AGENT_FULLSTACK_GUIDE.md) | Workspace agent rules, compact LLM grammar sheet, and production full-stack recipes |
-| **Architecture & Compiler Memory** | [**`MEMORY.md`**](file:///c:/Users/Admin/Downloads/Languague/MEMORY.md) / [`docs/MEMORY_ARCHITECTURE.md`](file:///c:/Users/Admin/Downloads/Languague/docs/MEMORY_ARCHITECTURE.md) | Complete compiler internals, AST/state layouts, Perceus 0-GC + slab allocator, x86-64/AVX2 register conventions, and pitfalls |
+| **AI Coding Agents (Porting)** | [**`.agents/skills/axon-anything/SKILL.md`**](file:///c:/Users/Admin/Downloads/Languague/.agents/skills/axon-anything/SKILL.md) | Universal 6-stage migration engine + 115-module mapping from Python/DS, Rust, C/C++, Go, Java, TS |
+| **AI Agents (Master Spec & Rules)** | [`AGENTS.md`](file:///c:/Users/Admin/Downloads/Languague/AGENTS.md) / [`docs/AGENT_MASTER_GUIDE.md`](file:///c:/Users/Admin/Downloads/Languague/docs/AGENT_MASTER_GUIDE.md) / [`AXON_LLM_SPEC.md`](file:///c:/Users/Admin/Downloads/Languague/AXON_LLM_SPEC.md) | Workspace agent rules, full 115-module lookup matrix, `E0001..E0604` fix dictionary, and compact LLM spec |
+| **Architecture & Compiler Memory** | [**`MEMORY.md`**](file:///c:/Users/Admin/Downloads/Languague/MEMORY.md) / [`docs/MEMORY_ARCHITECTURE.md`](file:///c:/Users/Admin/Downloads/Languague/docs/MEMORY_ARCHITECTURE.md) | Compiler `AxIR` passes, AST/state layouts, Perceus 0-GC + slab allocator, x86-64/AVX2/ARM64 register conventions |
 | **Benchmarks** | [`docs/BENCHMARK_REPORT.md`](file:///c:/Users/Admin/Downloads/Languague/docs/BENCHMARK_REPORT.md) | Reproducible multi-language benchmark methodology & hardware notes |
 
 ---
 
-## Verified 10-Domain Benchmark Suite (Axon v1.2 vs Rust, Go, Java, Node.js, Python)
+## Verified 10-Domain Benchmark Suite (Axon vs Rust, Go, Java, Node.js, Python)
 
-Measured live (median of 3 trials, **10/10 bit-identical mathematical checksums** across all languages: `chk=25493856,-3125000,5000000,8574940808537483579,39088169,148933,8160000000,0,1500147,256`) on Windows x64 against `rustc -O`, `rustc -C opt-level=3 -C target-cpu=native`, `go1.26.4`, `OpenJDK 21`, `Node.js v24.15.0`, and `Python 3.11`:
+Measured live (median of 3 trials, **10/10 bit-identical mathematical checksums** across all languages) on Windows x64 against `rustc -O`, `rustc -C opt-level=3 -C target-cpu=native`, `go1.26.4`, `OpenJDK 21`, `Node.js v24.15.0`, and `Python 3.11`:
 
-| Domain | Workload | Axon v1.2 | Rust (`-O`) | Rust (`-O3 native`) | Go 1.26 | Java 21 | Node v24 | Speedup vs Rust (`-O`) |
+| Domain | Workload | Axon | Rust (`-O`) | Rust (`-O3 native`) | Go 1.26 | Java 21 | Node v24 | Speedup vs Rust (`-O`) |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
 | **Cold Build** | Standalone native `.exe` compile | **`17 ms`** | `854 ms` | `524 ms` | `715 ms` | `641 ms` | — | **`50.2x` faster** (`30.8x` vs native) |
 | **1. `alloc4k`** | `200,000 × 4 KB` alloc + R/W + free | **`1 ms`** | `10 ms` | `10 ms` | `157 ms` | `150 ms` | `410 ms` | **`10.0x` faster** |
@@ -53,80 +58,21 @@ Measured live (median of 3 trials, **10/10 bit-identical mathematical checksums*
 | **10. `gemm512`** | `512 × 512` FP32 MatMul (`268.4M` FLOPs) | **`2 ms`** | `18 ms` | `10 ms` | `78 ms` | `167 ms` | `301 ms` | **`9.00x` faster** (`5.00x` vs native) |
 | **Total Runtime** | **Sum of all 10 compute/mem domains** | **`88–91 ms`** | **`247 ms`** | **`196 ms`** | **`574 ms`** | **`774 ms`** | **`2,620 ms`** | **`2.71x` overall** (`6.3x` Go, `8.5x` Java, `28.8x` Node, `>270x` Python) |
 
-- **30-Benchmark Suite (`examples/bench_30_suite/axon_bench_30.ax` vs MSVC `/O2 /arch:AVX2`):** **`11.79x` faster overall** (`120.1 ms` vs `1,416.1 ms`, `0 B` leaks), including **`19.00x` faster** on Extreme AI/Game/UI workloads (FlashAttention-2 `52.71x`, Binary-Heap A* `46.09x`, 64-dim L2 Search `39.81x`, Reactive UI Signals `34.99x`).
-
 ---
 
-## Language Tour at a Glance
-
-```axon
-// 1. Dynamic Containers (`std::ds`) + O(N) Radix Sort (`std::algo`) + Formatting (`std::fmt`)
-use std::ds
-use std::algo
-use std::fmt
-
-fn main() -> i32 {
-    mut scores := ibuf_new(8)
-    ibuf_push(scores, 9500); ibuf_push(scores, -120); ibuf_push(scores, 42000)
-    sort_i64(scores) // O(N) LSD Radix Sort across full signed i64
-
-    mut users := smap_new()
-    smap_set_str(mut users, "alice", "admin")
-    println(f"Top={fmt_commas(ibuf_get(scores, 2))} role={smap_get_str(users, 'alice')}")
-
-    smap_free(move users)
-    buf_free(move scores)
-    return 0
-}
-```
-
-```axon
-// 2. Web Router (`std::web`) + HS256 JWT (`std::jwt`) + SSRF Guard (`std::url`)
-use std::web
-use std::jwt
-use std::url
-
-fn handle_api(method: str, path: str, secret: str) -> str {
-    if web_route_match(method, path, "GET", "/users/:id") {
-        uid := web_param(path, "/users/:id", "id")
-        tok := jwt_sign_hs256("{\"sub\":\"" + uid + "\",\"exp\":2000000000}", secret) or ""
-        return web_json(200, "{\"id\":\"" + uid + "\",\"token\":\"" + tok + "\"}")
-    }
-    return web_json(404, "{\"error\":\"not found\"}")
-}
-```
-
-```axon
-// 3. Native Zero-WebView HTML5 + Tailwind + JS Desktop App (Photon-D2D v2)
-use std::ui
-use std::gui
-
-fn main() -> i32 {
-    html := "<div class='flex flex-col h-screen bg-slate-950 text-slate-100 p-6 gap-4'>"
-          + "<h1 class='text-2xl font-bold text-sky-400'>Axon Native Photon-D2D UI</h1>"
-          + "<button id='btn' class='px-4 py-2 rounded-lg bg-sky-500 text-white' onclick=\"count = count + 1; setText('out', 'Clicks: ' + count)\">Click me</button>"
-          + "<div id='out' class='text-slate-300'>Clicks: 0</div></div>"
-          + "<script>let count = 0;</script>"
-    mut doc := ui_window_html("Axon App", 960, 640, html)
-    gui_run_ui_app(mut doc)
-    return 0
-}
-```
-
----
-
-## Complete Standard Library (`103` Pure Axon Modules, `39,719` Lines)
+## Complete Standard Library (`115` Pure Axon Modules, `48,817` Lines)
 
 | Category | Modules (`use std::<name>`) | Key Capabilities |
 | :--- | :--- | :--- |
-| **Core, Math & Formatting** | `prelude`, `str`, `fmt`, `math`, `decimal`, `rand`, `time`, `datetime`, `uuid`, `binary`, `encoding`, `bench`, `test_kit` | UTF-8/SWAR strings, hex/bin/oct/comma/`f64`/Markdown-table formatters, fixed-point `dec`, `p50`/`p95`/`p99` benchmarking, Base64/Base64URL/Hex |
-| **Algorithms, Containers & Graphs** | `algo`, `ds`, `graph`, `vec`, `collections`, `ringbuf`, `cache`, `linq`, `crdt` | $O(N)$ signed `i64` LSD Radix Sort, QuickSort, binary search, min-heap, DSU, auto-growing `DynIntVec`/`StrVec`/`DynMap`/`StrMap`/`IntDeque`/`BitSet`, BFS/Dijkstra/Kahn TopoSort, zero-cost generics (`Box[T]`, `Option[T]`) |
-| **OS, Filesystem, CLI & FFI** | `fs`, `sys`, `os`, `path`, `cli`, `terminal`, `log`, `ffi`, `sync`, `memory`, `mem_guard` | Crash-safe `fs_atomic_write`, `fs_mkdir_all`, `fs_read_lines`, `fs_list_dir`, 16-arg Win64/SysV C-ABI FFI (`ffi_open`/`ffi_sym`/`ffi_call_arr`), mutexes, atomics, channels |
-| **Web, Networking, Auth & DB** | `net`, `tls`, `http`, `url`, `jwt`, `ws`, `web`, `grpc`, `async_io`, `sqlite`, `postgres`, `mysql` | TCP/UDP, TLS 1.2/1.3 (WinHTTP Schannel + OpenSSL), HTTP/1.1, `:param` router & static server, RFC-3986 URL + SSRF guard, HS256 JWT + password hashing, RFC-6455 WebSockets, gRPC/HTTP2/Protobuf, SQLite3, PostgreSQL v3, MySQL v10 |
-| **Data Formats & Storage** | `json`, `csv`, `toml`, `regex`, `compress`, `data` | SWAR JSON parser + `to_json`, RFC-4180 CSV, TOML, NFA/DFA Regex, LZ/RLE compression, checksummed `KvStore` |
-| **Desktop GUI & WebView** | `ui`, `gui`, `html`, `css`, `ui_tailwind`, `ui_layout`, `ui_render`, `ui_js`, `ui_signal`, `webview` | Direct2D HiDPI ClearType HTML5/CSS3/Tailwind/JS desktop engine (`< 12 MB` RAM, 60 FPS wheel inertia, `:hover`/`:focus`/`:active`) + lean `--app=` Edge/Chromium host |
-| **AI Agents, LLM & GPU Compute** | `ai`, `ai_harness`, `ai_agent`, `ai_eval`, `ai_engine`, `ai_math`, `ai_nn`, `ai_autograd`, `ai_quant`, `ai_local`, `ai_gguf`, `ai_lora`, `ai_serve`, `llama`, `vllm`, `transformers`, `cuda`, `npu`, `faiss`, `onnx`, `safetensors`, `tiktoken`, `torch`, `numpy`, `sklearn`, `quant` | Multi-provider Agent Harness, ReAct + DAG + Swarm, multi-core AVX2+FMA3 FP32/Q8/Q4/BitNet GEMM, zero-`nvcc` PTX JIT CUDA, GGUF/LLaMA/vLLM PagedAttention, FAISS vector search |
-| **2D/3D Games, Audio & Kernel** | `game`, `game2d`, `game3d`, `game_ecs`, `game_physics`, `game_render`, `math3d`, `audio`, `cap`, `taint`, `crypto`, `shield`, `kernel`, `ring_bridge`, `iot`, `semiconductor` | SoA `Table[T]` SIMD ECS, rigid-body physics, PBR 3D, PCM/WAV audio, SHA-256/HMAC/ChaCha20/constant-time `ct_eq_str`, `tainted[str]` (`E0502`), `RootCap` (`E0501`), `--shield`, Ring-0/MMIO |
+| **Mathematics & Numerical** | `linalg`, `numeric`, `prob`, `bigint`, `math`, `decimal`, `rand` | `MatF64` (LU, Cholesky, QR, Eigen, SVD), `CsrMat` (`CG`/`BiCGSTAB`), `Complex`, Radix-2 `FFT`, `Gauss-Legendre`, `BrentSolver`, `Rk4State`, `LbfgsState`, `Simplex LP`, 8 distributions, arbitrary-precision `BigInt` & `Rational` |
+| **Data Science & ML** | `dataframe`, `stats`, `ml`, `csv`, `json`, `toml` | Columnar `DataFrame` (CSV/JSONL/Binary IPC `AXDF`, `groupby_agg`, hash `join`), `welch_ttest`, `anova_1way`, `ks_2samp`, `OLS`, `Holt-Winters`, `PCA`, `Ridge`, `Lasso`, `RandomForest`, `GBDT`, `KMeans++`, `DBSCAN`, `ROC-AUC` |
+| **OS Auth & Security** | `os_auth`, `auth`, `crypto`, `jwt`, `cap`, `taint`, `shield` | Kernel CSPRNG, Win32 DPAPI & Credential Vault, `Argon2id` `v=19`, `BLAKE2b`, `PBKDF2`, `HKDF`, `TOTP`/`HOTP`, `OAuth2 PKCE`, `RbacPolicy`, `tainted[str]` (`E0502`), `RootCap` (`E0501`), `--shield` |
+| **Databases & Storage** | `postgres`, `sqlite`, `mysql`, `redis`, `kv_acid`, `db_pool` | PostgreSQL Wire v3 + `SCRAM-SHA-256`, SQLite3 (`f64`/`blob`/`null`), MySQL v10, Redis RESP2/3 + Pipeline, Embedded CRC32-WAL `KvStore`, `SqlBuilder`, `SqlitePool`, `db_migrate_sqlite` |
+| **Core, Containers & Graphs** | `prelude`, `str`, `fmt`, `algo`, `ds`, `graph`, `vec`, `collections`, `ringbuf`, `cache`, `linq`, `crdt`, `bench`, `test_kit` | $O(N)$ signed `i64` Radix Sort, min-heap, DSU, auto-growing `DynIntVec`/`StrVec`/`DynMap`/`StrMap`/`IntDeque`/`BitSet`, BFS/Dijkstra/TopoSort, zero-cost generics (`Box[T]`, `Option[T]`) |
+| **Web, Networking & gRPC** | `net`, `tls`, `http`, `url`, `ws`, `web`, `grpc`, `async_io` | TCP/UDP, TLS 1.2/1.3 (WinHTTP Schannel + OpenSSL), HTTP/1.1, `:param` router, SSRF guard, RFC-6455 WebSockets, gRPC + HTTP/2 + Protobuf v3 |
+| **OS, Filesystem & FFI** | `fs`, `sys`, `os`, `path`, `cli`, `terminal`, `log`, `ffi`, `sync`, `memory`, `mem_guard`, `encoding`, `binary`, `regex`, `compress`, `time`, `datetime`, `uuid` | Crash-safe `fs_atomic_write`, `fs_mkdir_all`, `fs_list_dir`, 16-arg Win64/SysV C-ABI FFI (`ffi_open`/`ffi_sym`/`ffi_call_arr`), mutexes, atomics, channels |
+| **Desktop GUI & WebView** | `ui`, `gui`, `html`, `css`, `ui_tailwind`, `ui_layout`, `ui_render`, `ui_js`, `ui_signal`, `webview` | Direct2D HiDPI ClearType HTML5/CSS3/Tailwind/JS desktop engine (`< 12 MB` RAM, 60 FPS inertia) + Edge/Chromium `--app=` host |
+| **AI, LLM, GPU & Games** | `ai`, `ai_agent`, `ai_autograd`, `ai_engine`, `ai_eval`, `ai_gguf`, `ai_harness`, `ai_local`, `ai_lora`, `ai_math`, `ai_nn`, `ai_quant`, `ai_serve`, `cuda`, `npu`, `faiss`, `llama`, `vllm`, `transformers`, `onnx`, `safetensors`, `tiktoken`, `torch`, `numpy`, `sklearn`, `quant`, `game`, `game2d`, `game3d`, `game_ecs`, `game_physics`, `game_render`, `math3d`, `audio`, `kernel`, `ring_bridge`, `iot`, `semiconductor` | Multi-provider AI Agent Harness, AVX2+FMA3 Q4/Q8/BitNet GEMM, zero-`nvcc` PTX JIT CUDA, GGUF/LLaMA/vLLM, FAISS, SoA `Table[T]` 2D/3D Game Engine & Physics, Ring-0/MMIO |
 
 ---
 
@@ -136,25 +82,22 @@ fn main() -> i32 {
 # 1. Sub-millisecond static verification (types, Perceus 0-GC, taint E0502, unsafe E0503, shapes)
 .\bin\axc.exe check --json examples/hello.ax
 
-# 2. Compile & run immediately, or run `@test` unit tests
-.\bin\axc.exe run examples/hello.ax
+# 2. Compile & run immediately (zero leftover temp binaries!) or run `@test` unit tests
+.\bin\axc.exe run tests/pass/54_v1_2_ds_math_auth_db_ir.ax
 .\bin\axc.exe test tests/pass/53_stdlib_v2_and_avx2_hostile.ax
 
-# 3. Build standalone native executable (with optional Shield v5 + symbol map)
-.\bin\axc.exe build examples/antigravity_ui.ax -o app.exe
-.\bin\axc.exe build examples/hello.ax --shield --emit-map -o hello_shield.exe
+# 3. Build standalone native executable (`-O2` default, `-O3` max speed/SIMD, `-Os` smallest binary)
+.\bin\axc.exe build examples/hello.ax -O3 --shield --emit-map -o hello.exe
+.\bin\axc.exe build examples/hello.ax -Os -o hello_tiny.exe
 
 # 4. Cross-compile to any of the 11 built-in targets (0 external linker/SDK!)
 .\bin\axc.exe build examples/hello.ax --target linux-x64 -o hello_linux
-.\bin\axc.exe build examples/hello.ax --target linux-arm64 -o hello_arm64
 .\bin\axc.exe build examples/hello.ax --target macos-arm64 -o hello_macos
 .\bin\axc.exe build examples/hello.ax --target wasm32 -o hello.wasm
 
-# 5. Reproduce 3-stage deterministic self-hosting bootstrap
-.\bin\axc.exe build compiler_ax/main.ax -o axc_s1.exe
-.\axc_s1.exe build compiler_ax/main.ax -o axc_s2.exe
-.\axc_s2.exe build compiler_ax/main.ax -o axc_s3.exe
-Get-FileHash axc_s2.exe, axc_s3.exe -Algorithm SHA256 # Identical SHA-256!
+# 5. Port code from Python/Rust/C++/Go/Java/TS with `axon-anything`
+.\bin\axc.exe run .agents/skills/axon-anything/scripts/axon_anything.ax -- analyze path/to/legacy_src
+.\bin\axc.exe run .agents/skills/axon-anything/scripts/axon_anything.ax -- gate path/to/ported.ax
 ```
 
 ---
@@ -165,12 +108,12 @@ Get-FileHash axc_s2.exe, axc_s3.exe -Algorithm SHA256 # Identical SHA-256!
 | :--- | :--- | :--- | :--- |
 | **Desktop / Server** | `win-x64` (default) | Win64 `PE32+` (`.exe`, `--shared` `.dll`/`.pyd`) | Unlimited multi-DLL `.idata`, `.edata`, `.pdata` SEH, strict `W^X`, COFF `.obj`/`.lib`, `IOCP` |
 | **Desktop / Server** | `linux-x64` | Linux x86_64 `ELF64` | Direct `SYSCALL` zero-CRT runtime, `.eh_frame`, `SSE2`/`AVX2`/`AVX-512` |
-| **Desktop / Server** | `linux-arm64` | Linux AArch64 `ELF64` | Native ARM64 machine code (`MOVZ`/`MOVK` >64KB pool safe) + 128-bit `NEON` |
-| **Desktop / Server** | `macos-arm64` | Apple Silicon `Mach-O 64` | 16 KB page-aligned `LC_MAIN` + `NEON` |
+| **Desktop / Server** | `linux-arm64` | Linux AArch64 `ELF64` | Native ARM64 machine code + 128-bit `NEON` + DCE |
+| **Desktop / Server** | `macos-arm64` | Apple Silicon `Mach-O 64` | 16 KB page-aligned `LC_MAIN` + `NEON` + DCE |
 | **Desktop / Server** | `macos-x64` | Intel macOS `Mach-O 64` | Direct Darwin BSD `SYSCALL` |
 | **Web / Edge** | `wasm32` | W3C WebAssembly (`.wasm`) | `wasi_snapshot_preview1`, `0xFD SIMD128`, dynamic `memory.grow`, 0 external SDK |
 | **Bare-Metal** | `unikernel-x64` | `Multiboot2` (`0xE85250D6`) | Ring-0 bare-metal kernel image + `COM1 UART` |
 | **Bare-Metal** | `freestanding-x64` | Zero-OS x86_64 `ELF64` | Embedded / bootloader bare-metal output |
-| **Bare-Metal** | `freestanding-riscv64` | `RV64GC` `ELF64` (`EM_RISCV=243`) | Native RISC-V 64 machine code (`LUI`/`ADDI` 32-bit pool offsets) |
+| **Bare-Metal** | `freestanding-riscv64` | `RV64GC` `ELF64` (`EM_RISCV=243`) | Native RISC-V 64 machine code + Reachability DCE |
 | **GPU (`--emit-gpu`)** | `spirv` | Khronos `SPIR-V 1.6` (`.spv`) | Direct compute kernels from `@gpu_kernel` / `@shader` |
 | **GPU (`--emit-gpu`)** | `ptx` | NVIDIA `PTX 8.0` (`.ptx`) | Direct `sm_80` GPU kernels without `nvcc` |

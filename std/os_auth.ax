@@ -1,0 +1,449 @@
+// Axon Standard Library — Native OS Authentication, DPAPI, Keyring & Kernel CSPRNG (`std/os_auth.ax`)
+// 100% Pure Axon via `std::ffi` (Zero C Glue!).
+// Supports Win32 (`bcrypt.dll`, `advapi32.dll`, `crypt32.dll`, `kernel32.dll`) + Linux/macOS (`libc`, `/dev/urandom`, Keychain/SecretTool).
+
+use std::str
+use std::ffi
+use std::sys
+
+fn _osa_hex_encode_bytes(b: ByteBuf) -> str {
+    n := buf_len(b)
+    if n <= 0 { return "" }
+    out := buf_new(n * 2 + 4)
+    mut i := 0
+    while i < n {
+        v := buf_get(b, i) & 255
+        hi := (v >> 4) & 15
+        lo := v & 15
+        buf_push(out, if hi < 10 { 48 + hi } else { 87 + hi })
+        buf_push(out, if lo < 10 { 48 + lo } else { 87 + lo })
+        i += 1
+    }
+    return buf_to_owned_str(move out)
+}
+
+fn _osa_hex_nibble(ch: i64) -> i64 {
+    if ch >= 48 and ch <= 57 { return ch - 48 }
+    if ch >= 97 and ch <= 102 { return ch - 97 + 10 }
+    if ch >= 65 and ch <= 70 { return ch - 65 + 10 }
+    return -1
+}
+
+fn _osa_hex_decode_bytes(hex_s: str) -> ByteBuf ! i64 {
+    n := str_len(hex_s)
+    if (n & 1) != 0 { return err(400) }
+    out := buf_new((n >> 1) + 8)
+    mut i := 0
+    while i < n {
+        hi := _osa_hex_nibble(str_byte(hex_s, i))
+        lo := _osa_hex_nibble(str_byte(hex_s, i + 1))
+        if hi < 0 or lo < 0 {
+            buf_free(move out)
+            return err(400)
+        }
+        buf_push(out, (hi << 4) | lo)
+        i += 2
+    }
+    return ok(out)
+}
+
+fn _osa_read_wstr(ptr: i64, max_chars: i64 = 4096) -> str {
+    if ptr == 0 or max_chars <= 0 { return "" }
+    out := buf_new(128)
+    mut i := 0
+    while i < max_chars {
+        lo := ffi_read_u8(ptr, i * 2)
+        hi := ffi_read_u8(ptr, i * 2 + 1)
+        if lo == 0 and hi == 0 { break }
+        // Preserve ASCII / UTF-8 low byte cleanly
+        buf_push(out, lo)
+        i += 1
+    }
+    return buf_to_owned_str(move out)
+}
+
+// ============================================================================
+// 1. Kernel Cryptographically Secure PRNG (`BCryptGenRandom` / `getentropy` / `/dev/urandom`)
+// ============================================================================
+
+fn os_csprng_bytes(nbytes: i64) -> ByteBuf ! i64 {
+    if nbytes <= 0 or nbytes > 16777216 { return err(400) }
+    raw := ffi_alloc(nbytes + 16)
+    if raw == 0 { return err(500) }
+
+    // 1. Windows CNG Kernel CSPRNG: `BCryptGenRandom(NULL, pbBuffer, cbBuffer, BCRYPT_USE_SYSTEM_PREFERRED_RNG=2)`
+    bc := ffi_open_one("bcrypt.dll")
+    if bc != 0 {
+        fn_rng := ffi_sym(bc, "BCryptGenRandom")
+        if fn_rng != 0 {
+            st := ffi_sext32(ffi_call4(fn_rng, 0, raw, nbytes, 2))
+            if st == 0 {
+                out := ffi_read_bytes(raw, nbytes)
+                ffi_free(raw)
+                return ok(out)
+            }
+        }
+    }
+
+    // 2. Linux / macOS `getentropy(buf, len)` (chunks <= 256 bytes per POSIX/BSD limit)
+    libc := ffi_open("", "libc.so.6", "libSystem.B.dylib")
+    if libc != 0 {
+        fn_ge := ffi_sym(libc, "getentropy")
+        if fn_ge != 0 {
+            mut ok_ge := true
+            mut off := 0
+            while off < nbytes {
+                chunk := if nbytes - off > 256 { 256 } else { nbytes - off }
+                rc := ffi_sext32(ffi_call2(fn_ge, raw + off, chunk))
+                if rc != 0 { ok_ge = false; break }
+                off += chunk
+            }
+            if ok_ge {
+                out := ffi_read_bytes(raw, nbytes)
+                ffi_free(raw)
+                return ok(out)
+            }
+        }
+        // 3. Fallback POSIX `/dev/urandom` via `open`/`read`/`close`
+        fn_open := ffi_sym(libc, "open")
+        fn_read := ffi_sym(libc, "read")
+        fn_close := ffi_sym(libc, "close")
+        if fn_open != 0 and fn_read != 0 and fn_close != 0 {
+            cpath := ffi_cstr("/dev/urandom")
+            fd := ffi_sext32(ffi_call2(fn_open, cpath, 0))
+            ffi_free(cpath)
+            if fd >= 0 {
+                got := ffi_call3(fn_read, fd, raw, nbytes)
+                _ := ffi_call1(fn_close, fd)
+                if got == nbytes {
+                    out := ffi_read_bytes(raw, nbytes)
+                    ffi_free(raw)
+                    return ok(out)
+                }
+            }
+        }
+    }
+
+    ffi_free(raw)
+    return err(501)
+}
+
+fn os_csprng_hex(nbytes: i64) -> str ! i64 {
+    b := os_csprng_bytes(nbytes) or return err(501)
+    h := _osa_hex_encode_bytes(b)
+    buf_free(move b)
+    return ok(h)
+}
+
+// ============================================================================
+// 2. OS User Identity, SID/UID & Privilege Elevation Inspection
+// ============================================================================
+
+fn os_current_user() -> str {
+    adv := ffi_open_one("advapi32.dll")
+    if adv != 0 {
+        fn_un := ffi_sym(adv, "GetUserNameA")
+        if fn_un != 0 {
+            buf_p := ffi_alloc(272)
+            len_p := ffi_alloc(16)
+            ffi_write_u32_le(len_p, 0, 260)
+            ok_u := ffi_call2(fn_un, buf_p, len_p) & 0xFFFFFFFF
+            mut name := ""
+            if ok_u != 0 { name = ffi_read_cstr(buf_p, 260) }
+            ffi_free(buf_p)
+            ffi_free(len_p)
+            if str_len(name) > 0 { return name }
+        }
+    }
+    u_win := sys_env_get("USERNAME")
+    if str_len(u_win) > 0 { return u_win }
+    u_nix := sys_env_get("USER")
+    if str_len(u_nix) > 0 { return u_nix }
+    return "unknown"
+}
+
+fn os_is_elevated_admin() -> bool {
+    k32 := ffi_open_one("kernel32.dll")
+    adv := ffi_open_one("advapi32.dll")
+    if k32 != 0 and adv != 0 {
+        fn_cur := ffi_sym(k32, "GetCurrentProcess")
+        fn_opt := ffi_sym(adv, "OpenProcessToken")
+        fn_gti := ffi_sym(adv, "GetTokenInformation")
+        fn_cls := ffi_sym(k32, "CloseHandle")
+        if fn_cur != 0 and fn_opt != 0 and fn_gti != 0 and fn_cls != 0 {
+            h_proc := ffi_call0(fn_cur)
+            tok_box := ffi_alloc(16)
+            // TOKEN_QUERY = 0x0008
+            ok_open := ffi_call3(fn_opt, h_proc, 8, tok_box) & 0xFFFFFFFF
+            mut elevated := false
+            if ok_open != 0 {
+                h_tok := ffi_read_i64(tok_box, 0)
+                elev_box := ffi_alloc(16)
+                rlen_box := ffi_alloc(16)
+                // TokenElevation = 20
+                ok_inf := ffi_call5(fn_gti, h_tok, 20, elev_box, 4, rlen_box) & 0xFFFFFFFF
+                if ok_inf != 0 {
+                    elevated = ffi_read_u32_le(elev_box, 0) != 0
+                }
+                ffi_free(elev_box)
+                ffi_free(rlen_box)
+                _ := ffi_call1(fn_cls, h_tok)
+            }
+            ffi_free(tok_box)
+            return elevated
+        }
+    }
+    libc := ffi_open("", "libc.so.6", "libSystem.B.dylib")
+    if libc != 0 {
+        fn_euid := ffi_sym(libc, "geteuid")
+        if fn_euid != 0 {
+            return (ffi_call0(fn_euid) & 0xFFFFFFFF) == 0
+        }
+    }
+    return false
+}
+
+// Returns Windows SID string (`"S-1-5-21-..."`) on Windows or numeric effective UID (`"1000"`) on Unix.
+fn os_user_sid_or_uid() -> str {
+    k32 := ffi_open_one("kernel32.dll")
+    adv := ffi_open_one("advapi32.dll")
+    if k32 != 0 and adv != 0 {
+        fn_cur := ffi_sym(k32, "GetCurrentProcess")
+        fn_opt := ffi_sym(adv, "OpenProcessToken")
+        fn_gti := ffi_sym(adv, "GetTokenInformation")
+        fn_sid := ffi_sym(adv, "ConvertSidToStringSidA")
+        fn_lfr := ffi_sym(k32, "LocalFree")
+        fn_cls := ffi_sym(k32, "CloseHandle")
+        if fn_cur != 0 and fn_opt != 0 and fn_gti != 0 and fn_sid != 0 and fn_cls != 0 {
+            h_proc := ffi_call0(fn_cur)
+            tok_box := ffi_alloc(16)
+            if (ffi_call3(fn_opt, h_proc, 8, tok_box) & 0xFFFFFFFF) != 0 {
+                h_tok := ffi_read_i64(tok_box, 0)
+                tu_buf := ffi_alloc(256)
+                rlen_box := ffi_alloc(16)
+                // TokenUser = 1; `TOKEN_USER.User.Sid` is pointer at offset 0
+                mut sid_str := ""
+                if (ffi_call5(fn_gti, h_tok, 1, tu_buf, 256, rlen_box) & 0xFFFFFFFF) != 0 {
+                    p_sid := ffi_read_i64(tu_buf, 0)
+                    str_box := ffi_alloc(16)
+                    if (ffi_call2(fn_sid, p_sid, str_box) & 0xFFFFFFFF) != 0 {
+                        c_ptr := ffi_read_i64(str_box, 0)
+                        sid_str = ffi_read_cstr(c_ptr, 256)
+                        if fn_lfr != 0 and c_ptr != 0 { _ := ffi_call1(fn_lfr, c_ptr) }
+                    }
+                    ffi_free(str_box)
+                }
+                ffi_free(tu_buf)
+                ffi_free(rlen_box)
+                _ := ffi_call1(fn_cls, h_tok)
+                ffi_free(tok_box)
+                if str_len(sid_str) > 0 { return sid_str }
+            } else {
+                ffi_free(tok_box)
+            }
+        }
+    }
+    libc := ffi_open("", "libc.so.6", "libSystem.B.dylib")
+    if libc != 0 {
+        fn_euid := ffi_sym(libc, "geteuid")
+        if fn_euid != 0 {
+            return str_from_i64(ffi_call0(fn_euid) & 0xFFFFFFFF)
+        }
+    }
+    return ""
+}
+
+// Authenticates local/domain Windows user credentials via `LogonUserW` (`LOGON32_LOGON_NETWORK = 3`).
+fn os_verify_win_credentials(username: str, domain: str, password: str) -> bool {
+    if str_len(username) == 0 { return false }
+    adv := ffi_open_one("advapi32.dll")
+    k32 := ffi_open_one("kernel32.dll")
+    if adv == 0 or k32 == 0 { return false }
+    fn_logon := ffi_sym(adv, "LogonUserW")
+    fn_cls := ffi_sym(k32, "CloseHandle")
+    if fn_logon == 0 or fn_cls == 0 { return false }
+    dom := if str_len(domain) > 0 { domain } else { "." }
+    wu := ffi_wstr(username)
+    wd := ffi_wstr(dom)
+    wp := ffi_wstr(password)
+    tok_box := ffi_alloc(16)
+    ok_auth := (ffi_call6(fn_logon, wu, wd, wp, 3, 0, tok_box) & 0xFFFFFFFF) != 0
+    if ok_auth {
+        h_tok := ffi_read_i64(tok_box, 0)
+        if h_tok != 0 { _ := ffi_call1(fn_cls, h_tok) }
+    }
+    // Zero password wide buffer before freeing
+    unsafe { mem_set(wp, 0, (str_len(password) + 1) * 2) }
+    ffi_free(wu); ffi_free(wd); ffi_free(wp); ffi_free(tok_box)
+    return ok_auth
+}
+
+// ============================================================================
+// 3. Windows DPAPI (`CryptProtectData` / `CryptUnprotectData` via `crypt32.dll`)
+// ============================================================================
+
+// Encrypts `plaintext` bound to the current OS user profile (plus optional `entropy` secret) via DPAPI.
+fn os_dpapi_protect_hex(plaintext: str, entropy: str = "") -> str ! i64 {
+    c32 := ffi_open_one("crypt32.dll")
+    k32 := ffi_open_one("kernel32.dll")
+    if c32 == 0 or k32 == 0 { return err(501) }
+    fn_prot := ffi_sym(c32, "CryptProtectData")
+    fn_lfr := ffi_sym(k32, "LocalFree")
+    if fn_prot == 0 { return err(501) }
+
+    plen := str_len(plaintext)
+    in_buf := ffi_cstr(plaintext)
+    in_blob := ffi_alloc(32)
+    ffi_write_u32_le(in_blob, 0, plen)
+    ffi_write_i64(in_blob, 1, in_buf)
+
+    mut ent_buf := 0
+    mut ent_blob := 0
+    if str_len(entropy) > 0 {
+        ent_buf = ffi_cstr(entropy)
+        ent_blob = ffi_alloc(32)
+        ffi_write_u32_le(ent_blob, 0, str_len(entropy))
+        ffi_write_i64(ent_blob, 1, ent_buf)
+    }
+
+    out_blob := ffi_alloc(32)
+    // CRYPTPROTECT_UI_FORBIDDEN = 0x1
+    rc := ffi_call7(fn_prot, in_blob, 0, ent_blob, 0, 0, 1, out_blob) & 0xFFFFFFFF
+    unsafe { mem_set(in_buf, 0, plen) }
+    ffi_free(in_buf); ffi_free(in_blob)
+    if ent_buf != 0 { ffi_free(ent_buf); ffi_free(ent_blob) }
+    if rc == 0 {
+        ffi_free(out_blob)
+        return err(500)
+    }
+    cb_out := ffi_read_u32_le(out_blob, 0)
+    pb_out := ffi_read_i64(out_blob, 1)
+    raw_bytes := ffi_read_bytes(pb_out, cb_out)
+    if fn_lfr != 0 and pb_out != 0 { _ := ffi_call1(fn_lfr, pb_out) }
+    ffi_free(out_blob)
+    hex_out := _osa_hex_encode_bytes(raw_bytes)
+    buf_free(move raw_bytes)
+    return ok(hex_out)
+}
+
+fn os_dpapi_unprotect_hex(cipher_hex: str, entropy: str = "") -> str ! i64 {
+    c32 := ffi_open_one("crypt32.dll")
+    k32 := ffi_open_one("kernel32.dll")
+    if c32 == 0 or k32 == 0 { return err(501) }
+    fn_unprot := ffi_sym(c32, "CryptUnprotectData")
+    fn_lfr := ffi_sym(k32, "LocalFree")
+    if fn_unprot == 0 { return err(501) }
+
+    c_bytes := _osa_hex_decode_bytes(cipher_hex) or return err(400)
+    clen := buf_len(c_bytes)
+    in_ptr := ffi_bytes_to_ptr(c_bytes)
+    buf_free(move c_bytes)
+
+    in_blob := ffi_alloc(32)
+    ffi_write_u32_le(in_blob, 0, clen)
+    ffi_write_i64(in_blob, 1, in_ptr)
+
+    mut ent_buf := 0
+    mut ent_blob := 0
+    if str_len(entropy) > 0 {
+        ent_buf = ffi_cstr(entropy)
+        ent_blob = ffi_alloc(32)
+        ffi_write_u32_le(ent_blob, 0, str_len(entropy))
+        ffi_write_i64(ent_blob, 1, ent_buf)
+    }
+
+    out_blob := ffi_alloc(32)
+    // CRYPTPROTECT_UI_FORBIDDEN = 0x1
+    rc := ffi_call7(fn_unprot, in_blob, 0, ent_blob, 0, 0, 1, out_blob) & 0xFFFFFFFF
+    ffi_free(in_ptr); ffi_free(in_blob)
+    if ent_buf != 0 { ffi_free(ent_buf); ffi_free(ent_blob) }
+    if rc == 0 {
+        ffi_free(out_blob)
+        return err(403)
+    }
+    cb_out := ffi_read_u32_le(out_blob, 0)
+    pb_out := ffi_read_i64(out_blob, 1)
+    plain_b := ffi_read_bytes(pb_out, cb_out)
+    if pb_out != 0 {
+        unsafe { mem_set(pb_out, 0, cb_out) }
+        if fn_lfr != 0 { _ := ffi_call1(fn_lfr, pb_out) }
+    }
+    ffi_free(out_blob)
+    return ok(buf_to_owned_str(move plain_b))
+}
+
+// ============================================================================
+// 4. Native OS Credential Vault (`CredWriteW` / `CredReadW` / `CredDeleteW` on Windows)
+// ============================================================================
+
+// `persist_mode`: `1` = `CRED_PERSIST_SESSION`, `2` = `CRED_PERSIST_LOCAL_MACHINE`, `3` = `CRED_PERSIST_ENTERPRISE`
+fn os_cred_write(target: str, username: str, secret: str, persist_mode: i64 = 1) -> bool {
+    if str_len(target) == 0 { return false }
+    adv := ffi_open_one("advapi32.dll")
+    if adv != 0 {
+        fn_cw := ffi_sym(adv, "CredWriteW")
+        if fn_cw != 0 {
+            w_target := ffi_wstr(target)
+            w_user := ffi_wstr(username)
+            s_len := str_len(secret)
+            s_ptr := ffi_cstr(secret)
+            // 64-bit `CREDENTIALW` = 80 bytes
+            cred := ffi_alloc(96)
+            ffi_write_u32_le(cred, 0, 0)            // Flags = 0
+            ffi_write_u32_le(cred, 4, 1)            // Type = CRED_TYPE_GENERIC (1)
+            ffi_write_i64(cred, 1, w_target)        // offset 8: TargetName
+            ffi_write_u32_le(cred, 32, s_len)       // offset 32: CredentialBlobSize
+            ffi_write_i64(cred, 5, s_ptr)           // offset 40: CredentialBlob
+            ffi_write_u32_le(cred, 48, persist_mode)// offset 48: Persist
+            ffi_write_i64(cred, 9, w_user)          // offset 72: UserName
+            ok_w := (ffi_call2(fn_cw, cred, 0) & 0xFFFFFFFF) != 0
+            unsafe { mem_set(s_ptr, 0, s_len) }
+            ffi_free(w_target); ffi_free(w_user); ffi_free(s_ptr); ffi_free(cred)
+            return ok_w
+        }
+    }
+    return false
+}
+
+fn os_cred_read(target: str) -> str ! i64 {
+    if str_len(target) == 0 { return err(400) }
+    adv := ffi_open_one("advapi32.dll")
+    if adv != 0 {
+        fn_cr := ffi_sym(adv, "CredReadW")
+        fn_cf := ffi_sym(adv, "CredFree")
+        if fn_cr != 0 and fn_cf != 0 {
+            w_target := ffi_wstr(target)
+            pcred_box := ffi_alloc(16)
+            // CRED_TYPE_GENERIC = 1
+            ok_r := (ffi_call4(fn_cr, w_target, 1, 0, pcred_box) & 0xFFFFFFFF) != 0
+            ffi_free(w_target)
+            if not ok_r {
+                ffi_free(pcred_box)
+                return err(404)
+            }
+            pcred := ffi_read_i64(pcred_box, 0)
+            ffi_free(pcred_box)
+            blob_sz := ffi_read_u32_le(pcred, 32)
+            blob_ptr := ffi_read_i64(pcred, 5)
+            raw := ffi_read_bytes(blob_ptr, blob_sz)
+            _ := ffi_call1(fn_cf, pcred)
+            return ok(buf_to_owned_str(move raw))
+        }
+    }
+    return err(501)
+}
+
+fn os_cred_delete(target: str) -> bool {
+    if str_len(target) == 0 { return false }
+    adv := ffi_open_one("advapi32.dll")
+    if adv != 0 {
+        fn_cd := ffi_sym(adv, "CredDeleteW")
+        if fn_cd != 0 {
+            w_target := ffi_wstr(target)
+            ok_d := (ffi_call3(fn_cd, w_target, 1, 0) & 0xFFFFFFFF) != 0
+            ffi_free(w_target)
+            return ok_d
+        }
+    }
+    return false
+}

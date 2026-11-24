@@ -1,0 +1,974 @@
+// Axon Standard Library — Cryptographic Authentication, Argon2id, KDFs, TOTP, PKCE & RBAC (`std/auth.ax`)
+// 100% Pure Axon, Zero External DLLs for Crypto, Constant-Time Verification (`ct_eq_str`).
+// Implements:
+//   - Binary `HMAC-SHA256` & `HMAC-SHA1` (RFC 2104)
+//   - `PBKDF2-HMAC-SHA256` (RFC 8018) & `HKDF-SHA256` (RFC 5869)
+//   - `BLAKE2b` (RFC 7693) & `Argon2id` `v=19` Password Hashing (RFC 9106)
+//   - `Base32` (RFC 4648), `HOTP` (RFC 4226) & `TOTP` Authenticator + QR URI (RFC 6238)
+//   - `OAuth2 PKCE` `S256` (RFC 7636) & `RbacPolicy` Engine
+
+use std::str
+use std::encoding
+use std::crypto
+use std::ds
+use std::os_auth
+
+struct PkcePair {
+    verifier: str
+    challenge: str
+}
+
+struct RbacPolicy {
+    role_perms: StrMap
+    user_roles: StrMap
+}
+
+fn _auth_bytes_to_hex(b: ByteBuf) -> str {
+    n := buf_len(b)
+    if n <= 0 { return "" }
+    out := buf_new(n * 2 + 4)
+    mut i := 0
+    while i < n {
+        v := buf_get(b, i) & 255
+        hi := (v >> 4) & 15
+        lo := v & 15
+        buf_push(out, if hi < 10 { 48 + hi } else { 87 + hi })
+        buf_push(out, if lo < 10 { 48 + lo } else { 87 + lo })
+        i += 1
+    }
+    return buf_to_owned_str(move out)
+}
+
+fn _auth_str_to_bytes(s: str) -> ByteBuf {
+    n := str_len(s)
+    b := buf_new(n + 8)
+    if n > 0 { buf_push_str(b, s) }
+    return b
+}
+
+fn _auth_digest_words_to_bytes(move h: IntBuf) -> ByteBuf {
+    out := buf_new(36)
+    mut i := 0
+    while i < 8 {
+        v := ibuf_get(h, i)
+        buf_push(out, (v >> 24) & 255)
+        buf_push(out, (v >> 16) & 255)
+        buf_push(out, (v >> 8) & 255)
+        buf_push(out, v & 255)
+        i += 1
+    }
+    buf_free(move h)
+    return out
+}
+
+// ============================================================================
+// 1. Binary `HMAC-SHA256`, `PBKDF2-HMAC-SHA256` (RFC 8018) & `HKDF-SHA256` (RFC 5869)
+// ============================================================================
+
+// Computes 32-byte raw `HMAC-SHA256` over arbitrary binary `key` and `msg` (safe with embedded NUL bytes!).
+fn hmac_sha256_raw(key: ByteBuf, msg: ByteBuf) -> ByteBuf {
+    klen := buf_len(key)
+    kblock := buf_new(68)
+    if klen > 64 {
+        kh := _auth_digest_words_to_bytes(sha256_raw_digest(key))
+        mut i := 0
+        while i < 32 { buf_push(kblock, buf_get(kh, i)); i += 1 }
+        buf_free(move kh)
+    } else {
+        mut i := 0
+        while i < klen { buf_push(kblock, buf_get(key, i)); i += 1 }
+    }
+    while buf_len(kblock) < 64 { buf_push(kblock, 0) }
+
+    mlen := buf_len(msg)
+    inner := buf_new(68 + mlen)
+    mut i := 0
+    while i < 64 { buf_push(inner, buf_get(kblock, i) ^ 0x36); i += 1 }
+    i = 0
+    while i < mlen { buf_push(inner, buf_get(msg, i)); i += 1 }
+    ih := _auth_digest_words_to_bytes(sha256_raw_digest(inner))
+    buf_free(move inner)
+
+    outer := buf_new(104)
+    i = 0
+    while i < 64 { buf_push(outer, buf_get(kblock, i) ^ 0x5c); i += 1 }
+    i = 0
+    while i < 32 { buf_push(outer, buf_get(ih, i)); i += 1 }
+    buf_free(move ih)
+    buf_free(move kblock)
+
+    res := _auth_digest_words_to_bytes(sha256_raw_digest(outer))
+    buf_free(move outer)
+    return res
+}
+
+// RFC 8018 Section 5.2 `PBKDF2-HMAC-SHA256` returning `dk_len` raw key bytes.
+fn pbkdf2_hmac_sha256_bytes(password: ByteBuf, salt: ByteBuf, iterations: i64, dk_len: i64) -> ByteBuf {
+    if dk_len <= 0 { return buf_new(4) }
+    iters := if iterations < 1 { 1 } else { iterations }
+    blocks := (dk_len + 31) / 32
+    dk := buf_new(blocks * 32 + 8)
+    slen := buf_len(salt)
+    mut blk := 1
+    while blk <= blocks {
+        salt_int := buf_new(slen + 8)
+        mut si := 0
+        while si < slen { buf_push(salt_int, buf_get(salt, si)); si += 1 }
+        buf_push(salt_int, (blk >> 24) & 255)
+        buf_push(salt_int, (blk >> 16) & 255)
+        buf_push(salt_int, (blk >> 8) & 255)
+        buf_push(salt_int, blk & 255)
+
+        mut u := hmac_sha256_raw(password, salt_int)
+        buf_free(move salt_int)
+        t_acc := buf_new(36)
+        mut k := 0
+        while k < 32 { buf_push(t_acc, buf_get(u, k)); k += 1 }
+
+        mut c := 2
+        while c <= iters {
+            u_next := hmac_sha256_raw(password, u)
+            buf_free(move u)
+            u = u_next
+            k = 0
+            while k < 32 {
+                buf_set(t_acc, k, buf_get(t_acc, k) ^ buf_get(u, k))
+                k += 1
+            }
+            c += 1
+        }
+        buf_free(move u)
+        k = 0
+        while k < 32 and buf_len(dk) < dk_len {
+            buf_push(dk, buf_get(t_acc, k))
+            k += 1
+        }
+        buf_free(move t_acc)
+        blk += 1
+    }
+    return dk
+}
+
+fn pbkdf2_hmac_sha256_hex(password: str, salt: str, iterations: i64 = 100000, dk_len: i64 = 32) -> str {
+    pb := _auth_str_to_bytes(password)
+    sb := _auth_str_to_bytes(salt)
+    dk := pbkdf2_hmac_sha256_bytes(pb, sb, iterations, dk_len)
+    buf_free(move pb)
+    buf_free(move sb)
+    hx := _auth_bytes_to_hex(dk)
+    buf_free(move dk)
+    return hx
+}
+
+// RFC 5869 `HKDF-Extract` + `HKDF-Expand` with HMAC-SHA256 (`out_len <= 8160`).
+fn hkdf_sha256_bytes(ikm: ByteBuf, salt: ByteBuf, info: ByteBuf, out_len: i64) -> ByteBuf {
+    if out_len <= 0 or out_len > 8160 { return buf_new(4) }
+    mut salt_eff := buf_new(64)
+    if buf_len(salt) == 0 {
+        mut z := 0
+        while z < 32 { buf_push(salt_eff, 0); z += 1 }
+    } else {
+        mut z := 0
+        while z < buf_len(salt) { buf_push(salt_eff, buf_get(salt, z)); z += 1 }
+    }
+    prk := hmac_sha256_raw(salt_eff, ikm)
+    buf_free(move salt_eff)
+
+    n_blocks := (out_len + 31) / 32
+    okm := buf_new(n_blocks * 32 + 8)
+    mut t_prev := buf_new(4)
+    ilen := buf_len(info)
+    mut i := 1
+    while i <= n_blocks {
+        msg := buf_new(buf_len(t_prev) + ilen + 8)
+        mut k := 0
+        while k < buf_len(t_prev) { buf_push(msg, buf_get(t_prev, k)); k += 1 }
+        k = 0
+        while k < ilen { buf_push(msg, buf_get(info, k)); k += 1 }
+        buf_push(msg, i & 255)
+        t_cur := hmac_sha256_raw(prk, msg)
+        buf_free(move msg)
+        buf_free(move t_prev)
+        t_prev = t_cur
+        k = 0
+        while k < 32 and buf_len(okm) < out_len {
+            buf_push(okm, buf_get(t_prev, k))
+            k += 1
+        }
+        i += 1
+    }
+    buf_free(move t_prev)
+    buf_free(move prk)
+    return okm
+}
+
+fn hkdf_sha256_hex(ikm: str, salt: str, info: str, out_len: i64 = 32) -> str {
+    bi := _auth_str_to_bytes(ikm)
+    bs := _auth_str_to_bytes(salt)
+    bn := _auth_str_to_bytes(info)
+    okm := hkdf_sha256_bytes(bi, bs, bn, out_len)
+    buf_free(move bi); buf_free(move bs); buf_free(move bn)
+    hx := _auth_bytes_to_hex(okm)
+    buf_free(move okm)
+    return hx
+}
+
+// ============================================================================
+// 2. Pure-Axon `BLAKE2b` (RFC 7693) & `Argon2id` `v=19` (RFC 9106)
+// ============================================================================
+
+@inline
+fn _b2b_rotr64(x: i64, n: i64) -> i64 {
+    return ushr64(x, n) | (x << (64 - n))
+}
+
+fn _b2b_iv(i: i64) -> i64 {
+    if i == 0 { return (0x6a09e667 << 32) | 0xf3bcc908 }
+    if i == 1 { return (0xbb67ae85 << 32) | 0x84caa73b }
+    if i == 2 { return (0x3c6ef372 << 32) | 0xfe94f82b }
+    if i == 3 { return (0xa54ff53a << 32) | 0x5f1d36f1 }
+    if i == 4 { return (0x510e527f << 32) | 0xade682d1 }
+    if i == 5 { return (0x9b05688c << 32) | 0x2b3e6c1f }
+    if i == 6 { return (0x1f83d9ab << 32) | 0xfb41bd6b }
+    return (0x5be0cd19 << 32) | 0x137e2179
+}
+
+// Exact RFC 7693 Section 2.7 `SIGMA[0..9][0..15]` using 32-bit hi/lo nibble packs.
+fn _b2b_sigma(r_mod10: i64, k: i64) -> i64 {
+    if r_mod10 == 0 { return k }
+    mut lo := 0
+    mut hi := 0
+    if r_mod10 == 1      { lo = 0x6DF984AE; hi = 0x357B20C1 }
+    else if r_mod10 == 2 { lo = 0xDF250C8B; hi = 0x491763EA }
+    else if r_mod10 == 3 { lo = 0xEBCD1397; hi = 0x8F04A562 }
+    else if r_mod10 == 4 { lo = 0xFA427509; hi = 0xD386CB1E }
+    else if r_mod10 == 5 { lo = 0x38B0A6C2; hi = 0x91EF57D4 }
+    else if r_mod10 == 6 { lo = 0xA4DEF15C; hi = 0xB8293670 }
+    else if r_mod10 == 7 { lo = 0x931CE7BD; hi = 0xA2684F05 }
+    else if r_mod10 == 8 { lo = 0x803B9EF6; hi = 0x5A417D2C }
+    else                 { lo = 0x5167482A; hi = 0x0DC3E9BF }
+    if k < 8 { return ushr64(lo, k * 4) & 15 }
+    return ushr64(hi, (k - 8) * 4) & 15
+}
+
+fn _b2b_g(v: IntBuf, a: i64, b: i64, c: i64, d: i64, x: i64, y: i64) {
+    mut va := ibuf_get(v, a) +% ibuf_get(v, b) +% x
+    mut vd := _b2b_rotr64(ibuf_get(v, d) ^ va, 32)
+    mut vc := ibuf_get(v, c) +% vd
+    mut vb := _b2b_rotr64(ibuf_get(v, b) ^ vc, 24)
+    va = va +% vb +% y
+    vd = _b2b_rotr64(vd ^ va, 16)
+    vc = vc +% vd
+    vb = _b2b_rotr64(vb ^ vc, 63)
+    ibuf_set(v, a, va); ibuf_set(v, b, vb); ibuf_set(v, c, vc); ibuf_set(v, d, vd)
+}
+
+fn _b2b_compress(h: IntBuf, m: IntBuf, t_lo: i64, is_last: bool) {
+    v := ibuf_new(16)
+    mut i := 0
+    while i < 8 { ibuf_push(v, ibuf_get(h, i)); i += 1 }
+    i = 0
+    while i < 8 { ibuf_push(v, _b2b_iv(i)); i += 1 }
+    ibuf_set(v, 12, ibuf_get(v, 12) ^ t_lo)
+    if is_last { ibuf_set(v, 14, ibuf_get(v, 14) ^ -1) }
+
+    mut r := 0
+    while r < 12 {
+        rm := r % 10
+        _b2b_g(v, 0, 4,  8, 12, ibuf_get(m, _b2b_sigma(rm,  0)), ibuf_get(m, _b2b_sigma(rm,  1)))
+        _b2b_g(v, 1, 5,  9, 13, ibuf_get(m, _b2b_sigma(rm,  2)), ibuf_get(m, _b2b_sigma(rm,  3)))
+        _b2b_g(v, 2, 6, 10, 14, ibuf_get(m, _b2b_sigma(rm,  4)), ibuf_get(m, _b2b_sigma(rm,  5)))
+        _b2b_g(v, 3, 7, 11, 15, ibuf_get(m, _b2b_sigma(rm,  6)), ibuf_get(m, _b2b_sigma(rm,  7)))
+        _b2b_g(v, 0, 5, 10, 15, ibuf_get(m, _b2b_sigma(rm,  8)), ibuf_get(m, _b2b_sigma(rm,  9)))
+        _b2b_g(v, 1, 6, 11, 12, ibuf_get(m, _b2b_sigma(rm, 10)), ibuf_get(m, _b2b_sigma(rm, 11)))
+        _b2b_g(v, 2, 7,  8, 13, ibuf_get(m, _b2b_sigma(rm, 12)), ibuf_get(m, _b2b_sigma(rm, 13)))
+        _b2b_g(v, 3, 4,  9, 14, ibuf_get(m, _b2b_sigma(rm, 14)), ibuf_get(m, _b2b_sigma(rm, 15)))
+        r += 1
+    }
+    i = 0
+    while i < 8 {
+        ibuf_set(h, i, ibuf_get(h, i) ^ ibuf_get(v, i) ^ ibuf_get(v, i + 8))
+        i += 1
+    }
+    buf_free(move v)
+}
+
+// Unkeyed RFC 7693 `BLAKE2b` (`out_len in 1..64`).
+fn blake2b_bytes(data: ByteBuf, out_len: i64 = 64) -> ByteBuf {
+    mut olen := out_len
+    if olen < 1 { olen = 1 }
+    if olen > 64 { olen = 64 }
+    h := ibuf_new(8)
+    mut i := 0
+    while i < 8 { ibuf_push(h, _b2b_iv(i)); i += 1 }
+    // Parameter block `P[0] = 0x01010000 ^ olen` (fanout=1, depth=1)
+    ibuf_set(h, 0, ibuf_get(h, 0) ^ (0x01010000 ^ olen))
+
+    dlen := buf_len(data)
+    m := ibuf_new(16)
+    i = 0
+    while i < 16 { ibuf_push(m, 0); i += 1 }
+
+    mut off := 0
+    mut t_lo := 0
+    while off + 128 < dlen {
+        mut w := 0
+        while w < 16 {
+            mut word := 0
+            mut b := 0
+            while b < 8 {
+                word = word | ((buf_get(data, off + w * 8 + b) & 255) << (b * 8))
+                b += 1
+            }
+            ibuf_set(m, w, word)
+            w += 1
+        }
+        t_lo += 128
+        _b2b_compress(h, m, t_lo, false)
+        off += 128
+    }
+    // Final block (handles `dlen == 0` too!)
+    rem := dlen - off
+    tail := buf_new(136)
+    i = 0
+    while i < rem { buf_push(tail, buf_get(data, off + i)); i += 1 }
+    while buf_len(tail) < 128 { buf_push(tail, 0) }
+    mut w := 0
+    while w < 16 {
+        mut word := 0
+        mut b := 0
+        while b < 8 {
+            word = word | ((buf_get(tail, w * 8 + b) & 255) << (b * 8))
+            b += 1
+        }
+        ibuf_set(m, w, word)
+        w += 1
+    }
+    buf_free(move tail)
+    t_lo += rem
+    _b2b_compress(h, m, t_lo, true)
+    buf_free(move m)
+
+    out := buf_new(olen + 8)
+    mut produced := 0
+    i = 0
+    while i < 8 and produced < olen {
+        wv := ibuf_get(h, i)
+        mut b := 0
+        while b < 8 and produced < olen {
+            buf_push(out, ushr64(wv, b * 8) & 255)
+            produced += 1
+            b += 1
+        }
+        i += 1
+    }
+    buf_free(move h)
+    return out
+}
+
+fn blake2b_hex(msg: str, out_len: i64 = 64) -> str {
+    mb := _auth_str_to_bytes(msg)
+    dg := blake2b_bytes(mb, out_len)
+    buf_free(move mb)
+    hx := _auth_bytes_to_hex(dg)
+    buf_free(move dg)
+    return hx
+}
+
+fn _argon2_put_u32_le(b: ByteBuf, v: i64) {
+    buf_push(b, v & 255)
+    buf_push(b, (v >> 8) & 255)
+    buf_push(b, (v >> 16) & 255)
+    buf_push(b, (v >> 24) & 255)
+}
+
+// RFC 9106 Section 3.2 Variable-Length Hash Function `H'(X, tag_len)`.
+fn _argon2_h_prime(x: ByteBuf, tag_len: i64) -> ByteBuf {
+    inp := buf_new(buf_len(x) + 12)
+    _argon2_put_u32_le(inp, tag_len)
+    mut i := 0
+    while i < buf_len(x) { buf_push(inp, buf_get(x, i)); i += 1 }
+    if tag_len <= 64 {
+        res := blake2b_bytes(inp, tag_len)
+        buf_free(move inp)
+        return res
+    }
+    out := buf_new(tag_len + 16)
+    mut v_cur := blake2b_bytes(inp, 64)
+    buf_free(move inp)
+    i = 0
+    while i < 32 { buf_push(out, buf_get(v_cur, i)); i += 1 }
+    r_blocks := ((tag_len + 31) / 32) - 2
+    mut step := 1
+    while step <= r_blocks {
+        v_next := blake2b_bytes(v_cur, 64)
+        buf_free(move v_cur)
+        v_cur = v_next
+        i = 0
+        while i < 32 { buf_push(out, buf_get(v_cur, i)); i += 1 }
+        step += 1
+    }
+    rem := tag_len - 32 * (r_blocks + 1)
+    v_last := blake2b_bytes(v_cur, rem)
+    buf_free(move v_cur)
+    i = 0
+    while i < rem { buf_push(out, buf_get(v_last, i)); i += 1 }
+    buf_free(move v_last)
+    return out
+}
+
+// RFC 9106 Section 3.6 `GB(a, b, c, d)` with 32-bit `fBlaMka(x, y) = x + y + 2 * (x & 0xFFFFFFFF) * (y & 0xFFFFFFFF)`.
+fn _argon2_gb(v: IntBuf, a: i64, b: i64, c: i64, d: i64) {
+    mut va := ibuf_get(v, a); mut vb := ibuf_get(v, b)
+    mut vc := ibuf_get(v, c); mut vd := ibuf_get(v, d)
+
+    va = va +% vb +% 2 *% ((va & 0xFFFFFFFF) *% (vb & 0xFFFFFFFF))
+    vd = _b2b_rotr64(vd ^ va, 32)
+    vc = vc +% vd +% 2 *% ((vc & 0xFFFFFFFF) *% (vd & 0xFFFFFFFF))
+    vb = _b2b_rotr64(vb ^ vc, 24)
+
+    va = va +% vb +% 2 *% ((va & 0xFFFFFFFF) *% (vb & 0xFFFFFFFF))
+    vd = _b2b_rotr64(vd ^ va, 16)
+    vc = vc +% vd +% 2 *% ((vc & 0xFFFFFFFF) *% (vd & 0xFFFFFFFF))
+    vb = _b2b_rotr64(vb ^ vc, 63)
+
+    ibuf_set(v, a, va); ibuf_set(v, b, vb); ibuf_set(v, c, vc); ibuf_set(v, d, vd)
+}
+
+fn _argon2_permute_p(w: IntBuf, i0: i64, i1: i64, i2: i64, i3: i64, i4: i64, i5: i64, i6: i64, i7: i64,
+                     i8: i64, i9: i64, i10: i64, i11: i64, i12: i64, i13: i64, i14: i64, i15: i64) {
+    _argon2_gb(w, i0, i4,  i8, i12)
+    _argon2_gb(w, i1, i5,  i9, i13)
+    _argon2_gb(w, i2, i6, i10, i14)
+    _argon2_gb(w, i3, i7, i11, i15)
+    _argon2_gb(w, i0, i5, i10, i15)
+    _argon2_gb(w, i1, i6, i11, i12)
+    _argon2_gb(w, i2, i7,  i8, i13)
+    _argon2_gb(w, i3, i4,  i9, i14)
+}
+
+// RFC 9106 Section 3.5 Compression Function `G(X, Y)` on 1024-byte (`128 x u64`) blocks inside flat `mem` (`mem_off` in u64s).
+fn _argon2_compress_block(mem: IntBuf, dst_off: i64, x_off: i64, y_off: i64, xor_mode: bool, r_work: IntBuf, z_work: IntBuf) {
+    mut i := 0
+    while i < 128 {
+        rv := ibuf_get(mem, x_off + i) ^ ibuf_get(mem, y_off + i)
+        ibuf_set(r_work, i, rv)
+        ibuf_set(z_work, i, rv)
+        i += 1
+    }
+    // Row-wise P on 8 rows of 16 u64 words (`16 * row + 0..15`)
+    mut row := 0
+    while row < 8 {
+        b := row * 16
+        _argon2_permute_p(z_work, b, b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9, b+10, b+11, b+12, b+13, b+14, b+15)
+        row += 1
+    }
+    // Column-wise P on 8 pairs of columns (`2*col`, `2*col + 1` across 8 rows)
+    mut col := 0
+    while col < 8 {
+        c0 := col * 2
+        c1 := c0 + 1
+        _argon2_permute_p(z_work,
+            c0, c1, c0+16, c1+16, c0+32, c1+32, c0+48, c1+48,
+            c0+64, c1+64, c0+80, c1+80, c0+96, c1+96, c0+112, c1+112)
+        col += 1
+    }
+    i = 0
+    while i < 128 {
+        nv := ibuf_get(r_work, i) ^ ibuf_get(z_work, i)
+        if xor_mode {
+            ibuf_set(mem, dst_off + i, ibuf_get(mem, dst_off + i) ^ nv)
+        } else {
+            ibuf_set(mem, dst_off + i, nv)
+        }
+        i += 1
+    }
+}
+
+// Single-lane (`p = 1`) RFC 9106 `Argon2id` (`type = 2`, `version = 0x13 = 19`) raw tag generator!
+fn argon2id_raw_bytes(password: ByteBuf, salt: ByteBuf, m_cost_kib: i64 = 64, t_cost: i64 = 2, tag_len: i64 = 32) -> ByteBuf {
+    // Enforce RFC 9106 minimum `m >= 8` KiB (`8` blocks = 4 slices x 2 blocks) and multiple of 4 blocks
+    mut m_blocks := if m_cost_kib < 8 { 8 } else { m_cost_kib }
+    m_blocks = (m_blocks / 4) * 4
+    seg_len := m_blocks / 4
+    passes := if t_cost < 1 { 1 } else { t_cost }
+    tlen := if tag_len < 4 { 32 } else { tag_len }
+
+    // 1. Build `H_0 = BLAKE2b-512(p=1, tau, m, t, v=0x13, y=2, |P|, P, |S|, S, 0, 0)`
+    h0_in := buf_new(64 + buf_len(password) + buf_len(salt))
+    _argon2_put_u32_le(h0_in, 1)          // lanes p = 1
+    _argon2_put_u32_le(h0_in, tlen)       // tagLength
+    _argon2_put_u32_le(h0_in, m_blocks)   // memorySizeKB
+    _argon2_put_u32_le(h0_in, passes)     // iterations t
+    _argon2_put_u32_le(h0_in, 19)         // version = 0x13
+    _argon2_put_u32_le(h0_in, 2)          // Argon2id = 2
+    _argon2_put_u32_le(h0_in, buf_len(password))
+    mut i := 0
+    while i < buf_len(password) { buf_push(h0_in, buf_get(password, i)); i += 1 }
+    _argon2_put_u32_le(h0_in, buf_len(salt))
+    i = 0
+    while i < buf_len(salt) { buf_push(h0_in, buf_get(salt, i)); i += 1 }
+    _argon2_put_u32_le(h0_in, 0)          // |K| = 0
+    _argon2_put_u32_le(h0_in, 0)          // |X| = 0
+    h0 := blake2b_bytes(h0_in, 64)
+    buf_free(move h0_in)
+
+    // Allocate memory matrix `mem`: `m_blocks` blocks + 3 scratch blocks (`zero`, `input`, `addrs`), each 128 u64s
+    total_u64 := (m_blocks + 3) * 128
+    mem := ibuf_new(total_u64 + 16)
+    i = 0
+    while i < total_u64 { ibuf_push(mem, 0); i += 1 }
+    zero_off := m_blocks * 128
+    in_off   := (m_blocks + 1) * 128
+    addr_off := (m_blocks + 2) * 128
+
+    // Initialize `B[0]` and `B[1]` via `H'(H_0 || j || 0, 1024)`
+    mut j_init := 0
+    while j_init < 2 {
+        seed_b := buf_new(80)
+        i = 0
+        while i < 64 { buf_push(seed_b, buf_get(h0, i)); i += 1 }
+        _argon2_put_u32_le(seed_b, j_init)
+        _argon2_put_u32_le(seed_b, 0)
+        blk_bytes := _argon2_h_prime(seed_b, 1024)
+        buf_free(move seed_b)
+        mut w := 0
+        while w < 128 {
+            mut word := 0
+            mut b := 0
+            while b < 8 {
+                word = word | ((buf_get(blk_bytes, w * 8 + b) & 255) << (b * 8))
+                b += 1
+            }
+            ibuf_set(mem, j_init * 128 + w, word)
+            w += 1
+        }
+        buf_free(move blk_bytes)
+        j_init += 1
+    }
+    buf_free(move h0)
+
+    r_work := ibuf_new(128); z_work := ibuf_new(128)
+    i = 0
+    while i < 128 { ibuf_push(r_work, 0); ibuf_push(z_work, 0); i += 1 }
+
+    // 2. Memory passes (`Argon2id`: pass 0 slices 0..1 use data-independent `Argon2i`; all others use `Argon2d`)
+    mut pass_idx := 0
+    while pass_idx < passes {
+        mut slice := 0
+        while slice < 4 {
+            data_indep := pass_idx == 0 and slice < 2
+            mut ctr := 0
+            start_idx := if pass_idx == 0 and slice == 0 { 2 } else { 0 }
+            mut idx := start_idx
+            while idx < seg_len {
+                cur_blk := slice * seg_len + idx
+                prev_blk := if cur_blk == 0 { m_blocks - 1 } else { cur_blk - 1 }
+
+                mut j1 := 0
+                if data_indep {
+                    if idx == start_idx or (idx % 128) == 0 {
+                        ctr += 1
+                        mut z := 0
+                        while z < 128 { ibuf_set(mem, in_off + z, 0); z += 1 }
+                        ibuf_set(mem, in_off + 0, pass_idx)
+                        ibuf_set(mem, in_off + 1, 0)         // lane = 0
+                        ibuf_set(mem, in_off + 2, slice)
+                        ibuf_set(mem, in_off + 3, m_blocks)
+                        ibuf_set(mem, in_off + 4, passes)
+                        ibuf_set(mem, in_off + 5, 2)         // Argon2id
+                        ibuf_set(mem, in_off + 6, ctr)
+                        _argon2_compress_block(mem, addr_off, zero_off, in_off, false, r_work, z_work)
+                        _argon2_compress_block(mem, addr_off, zero_off, addr_off, false, r_work, z_work)
+                    }
+                    j1 = ibuf_get(mem, addr_off + (idx % 128)) & 0xFFFFFFFF
+                } else {
+                    j1 = ibuf_get(mem, prev_blk * 128) & 0xFFFFFFFF
+                }
+
+                // Compute reference block index `z_ref` per RFC 9106 Section 3.4.2
+                w_size := if pass_idx == 0 {
+                    slice * seg_len + idx - 1
+                } else {
+                    m_blocks - seg_len + idx - 1
+                }
+                x_sq := ushr64(j1 *% j1, 32)
+                y_rel := ushr64(w_size *% x_sq, 32)
+                zz := w_size - 1 - y_rel
+                ref_start := if pass_idx == 0 { 0 } else { ((slice + 1) % 4) * seg_len }
+                z_ref := (ref_start + zz) % m_blocks
+
+                _argon2_compress_block(mem, cur_blk * 128, prev_blk * 128, z_ref * 128, pass_idx > 0, r_work, z_work)
+                idx += 1
+            }
+            slice += 1
+        }
+        pass_idx += 1
+    }
+
+    // 3. Finalize `Tag = H'(B[m_blocks - 1], tlen)`
+    last_bytes := buf_new(1032)
+    last_off := (m_blocks - 1) * 128
+    mut w := 0
+    while w < 128 {
+        wv := ibuf_get(mem, last_off + w)
+        mut b := 0
+        while b < 8 {
+            buf_push(last_bytes, ushr64(wv, b * 8) & 255)
+            b += 1
+        }
+        w += 1
+    }
+    tag := _argon2_h_prime(last_bytes, tlen)
+    buf_free(move last_bytes)
+    buf_free(move r_work); buf_free(move z_work); buf_free(move mem)
+    return tag
+}
+
+// Produces PHC-formatted Argon2id hash string: `$argon2id$v=19$m=<m>,t=<t>,p=1$<salt_hex>$<tag_hex>`
+fn argon2id_hash(password: str, salt: str, m_cost_kib: i64 = 64, t_cost: i64 = 2) -> str {
+    m_eff := ((if m_cost_kib < 8 { 8 } else { m_cost_kib }) / 4) * 4
+    t_eff := if t_cost < 1 { 1 } else { t_cost }
+    pb := _auth_str_to_bytes(password)
+    sb := _auth_str_to_bytes(salt)
+    tag := argon2id_raw_bytes(pb, sb, m_eff, t_eff, 32)
+    s_hex := _auth_bytes_to_hex(sb)
+    t_hex := _auth_bytes_to_hex(tag)
+    buf_free(move pb); buf_free(move sb); buf_free(move tag)
+    return f"$argon2id$v=19$m={m_eff},t={t_eff},p=1${s_hex}${t_hex}"
+}
+
+fn _auth_hex_to_bytes(hx: str) -> ByteBuf {
+    n := str_len(hx)
+    out := buf_new((n >> 1) + 8)
+    mut i := 0
+    while i + 1 < n {
+        c1 := str_byte(hx, i); c2 := str_byte(hx, i + 1)
+        mut h1 := 0; mut h2 := 0
+        if c1 >= 48 and c1 <= 57 { h1 = c1 - 48 } else if c1 >= 97 and c1 <= 102 { h1 = c1 - 87 } else { h1 = c1 - 55 }
+        if c2 >= 48 and c2 <= 57 { h2 = c2 - 48 } else if c2 >= 97 and c2 <= 102 { h2 = c2 - 87 } else { h2 = c2 - 55 }
+        buf_push(out, ((h1 & 15) << 4) | (h2 & 15))
+        i += 2
+    }
+    return out
+}
+
+fn _auth_parse_pos_int(s: str) -> i64 {
+    mut acc := 0
+    mut i := 0
+    while i < str_len(s) {
+        ch := str_byte(s, i)
+        if ch >= 48 and ch <= 57 { acc = acc * 10 + (ch - 48) }
+        i += 1
+    }
+    return acc
+}
+
+// Constant-time verification of PHC `$argon2id$v=19$...` encoded password hashes!
+fn argon2id_verify(password: str, encoded: str) -> bool {
+    ranges := str_split_ranges(encoded, 36) // '$' = 36
+    cnt := str_split_count(ranges)
+    if cnt != 6 { buf_free(move ranges); return false }
+    alg := str_split_at(encoded, ranges, 1)
+    ver := str_split_at(encoded, ranges, 2)
+    params := str_split_at(encoded, ranges, 3)
+    s_hex := str_split_at(encoded, ranges, 4)
+    exp_hex := str_split_at(encoded, ranges, 5)
+    buf_free(move ranges)
+    if not str_eq(alg, "argon2id") or not str_eq(ver, "v=19") { return false }
+
+    pr := str_split_ranges(params, 44)
+    if str_split_count(pr) < 2 { buf_free(move pr); return false }
+    m_val := _auth_parse_pos_int(str_split_at(params, pr, 0))
+    t_val := _auth_parse_pos_int(str_split_at(params, pr, 1))
+    buf_free(move pr)
+
+    pb := _auth_str_to_bytes(password)
+    sb := _auth_hex_to_bytes(s_hex)
+    tag := argon2id_raw_bytes(pb, sb, m_val, t_val, str_len(exp_hex) >> 1)
+    got_hex := _auth_bytes_to_hex(tag)
+    buf_free(move pb); buf_free(move sb); buf_free(move tag)
+    return ct_eq_str(got_hex, exp_hex)
+}
+
+// ============================================================================
+// 3. Base32 (RFC 4648), HMAC-SHA1, HOTP (RFC 4226) & TOTP (RFC 6238)
+// ============================================================================
+
+fn base32_encode_bytes(data: ByteBuf) -> str {
+    n := buf_len(data)
+    if n <= 0 { return "" }
+    alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    out := buf_new(((n * 8 + 4) / 5) + 8)
+    mut bit_buf := 0
+    mut bits := 0
+    mut i := 0
+    while i < n {
+        bit_buf = (bit_buf << 8) | (buf_get(data, i) & 255)
+        bits += 8
+        while bits >= 5 {
+            bits -= 5
+            idx := (bit_buf >> bits) & 31
+            buf_push(out, str_byte(alphabet, idx))
+        }
+        i += 1
+    }
+    if bits > 0 {
+        idx := (bit_buf << (5 - bits)) & 31
+        buf_push(out, str_byte(alphabet, idx))
+    }
+    return buf_to_owned_str(move out)
+}
+
+fn base32_decode_bytes(b32: str) -> ByteBuf ! i64 {
+    n := str_len(b32)
+    out := buf_new((n * 5) / 8 + 8)
+    mut bit_buf := 0
+    mut bits := 0
+    mut i := 0
+    while i < n {
+        ch := str_byte(b32, i)
+        if ch == 61 or ch == 32 or ch == 45 {
+            i += 1
+        } else {
+            mut val := -1
+            if ch >= 65 and ch <= 90 { val = ch - 65 }
+            else if ch >= 97 and ch <= 122 { val = ch - 97 }
+            else if ch >= 50 and ch <= 55 { val = ch - 50 + 26 }
+            if val < 0 { buf_free(move out); return err(400) }
+            bit_buf = (bit_buf << 5) | val
+            bits += 5
+            if bits >= 8 {
+                bits -= 8
+                buf_push(out, (bit_buf >> bits) & 255)
+            }
+            i += 1
+        }
+    }
+    return ok(out)
+}
+
+@inline
+fn _sha1_rotl32(x: i64, n: i64) -> i64 {
+    v := x & 0xFFFFFFFF
+    return ((v << n) | ushr64(v, 32 - n)) & 0xFFFFFFFF
+}
+
+// Compact FIPS 180-4 SHA-1 strictly for RFC 4226 / RFC 6238 TOTP authenticator compatibility!
+fn _auth_sha1_bytes(data: ByteBuf) -> ByteBuf {
+    dlen := buf_len(data)
+    bit_len := dlen * 8
+    padded := buf_new(dlen + 72)
+    mut i := 0
+    while i < dlen { buf_push(padded, buf_get(data, i)); i += 1 }
+    buf_push(padded, 0x80)
+    while (buf_len(padded) % 64) != 56 { buf_push(padded, 0) }
+    mut sh := 56
+    while sh >= 0 { buf_push(padded, ushr64(bit_len, sh) & 255); sh -= 8 }
+
+    mut h0 := 0x67452301
+    mut h1 := 0xEFCDAB89
+    mut h2 := 0x98BADCFE
+    mut h3 := 0x10325476
+    mut h4 := 0xC3D2E1F0
+    w := ibuf_new(80)
+    i = 0
+    while i < 80 { ibuf_push(w, 0); i += 1 }
+
+    plen := buf_len(padded)
+    mut off := 0
+    while off < plen {
+        mut t := 0
+        while t < 16 {
+            bo := off + t * 4
+            ibuf_set(w, t, (buf_get(padded, bo) << 24) | (buf_get(padded, bo+1) << 16) | (buf_get(padded, bo+2) << 8) | buf_get(padded, bo+3))
+            t += 1
+        }
+        while t < 80 {
+            x := ibuf_get(w, t-3) ^ ibuf_get(w, t-8) ^ ibuf_get(w, t-14) ^ ibuf_get(w, t-16)
+            ibuf_set(w, t, _sha1_rotl32(x, 1))
+            t += 1
+        }
+        mut a := h0; mut b := h1; mut c := h2; mut d := h3; mut e := h4
+        t = 0
+        while t < 80 {
+            mut f := 0; mut k := 0
+            if t < 20 {
+                f = (b & c) | (((b ^ 0xFFFFFFFF) & 0xFFFFFFFF) & d)
+                k = 0x5A827999
+            } else if t < 40 {
+                f = b ^ c ^ d
+                k = 0x6ED9EBA1
+            } else if t < 60 {
+                f = (b & c) | (b & d) | (c & d)
+                k = 0x8F1BBCDC
+            } else {
+                f = b ^ c ^ d
+                k = 0xCA62C1D6
+            }
+            temp := (_sha1_rotl32(a, 5) +% f +% e +% k +% ibuf_get(w, t)) & 0xFFFFFFFF
+            e = d; d = c; c = _sha1_rotl32(b, 30); b = a; a = temp
+            t += 1
+        }
+        h0 = (h0 +% a) & 0xFFFFFFFF; h1 = (h1 +% b) & 0xFFFFFFFF
+        h2 = (h2 +% c) & 0xFFFFFFFF; h3 = (h3 +% d) & 0xFFFFFFFF
+        h4 = (h4 +% e) & 0xFFFFFFFF
+        off += 64
+    }
+    buf_free(move w)
+    buf_free(move padded)
+    out := buf_new(24)
+    hs := ibuf_new(5)
+    ibuf_push(hs, h0); ibuf_push(hs, h1); ibuf_push(hs, h2); ibuf_push(hs, h3); ibuf_push(hs, h4)
+    i = 0
+    while i < 5 {
+        hv := ibuf_get(hs, i)
+        buf_push(out, (hv >> 24) & 255); buf_push(out, (hv >> 16) & 255)
+        buf_push(out, (hv >> 8) & 255);  buf_push(out, hv & 255)
+        i += 1
+    }
+    buf_free(move hs)
+    return out
+}
+
+fn _auth_hmac_sha1_raw(key: ByteBuf, msg: ByteBuf) -> ByteBuf {
+    klen := buf_len(key)
+    kblock := buf_new(68)
+    if klen > 64 {
+        kh := _auth_sha1_bytes(key)
+        mut i := 0
+        while i < 20 { buf_push(kblock, buf_get(kh, i)); i += 1 }
+        buf_free(move kh)
+    } else {
+        mut i := 0
+        while i < klen { buf_push(kblock, buf_get(key, i)); i += 1 }
+    }
+    while buf_len(kblock) < 64 { buf_push(kblock, 0) }
+    inner := buf_new(68 + buf_len(msg))
+    mut i := 0
+    while i < 64 { buf_push(inner, buf_get(kblock, i) ^ 0x36); i += 1 }
+    i = 0
+    while i < buf_len(msg) { buf_push(inner, buf_get(msg, i)); i += 1 }
+    ih := _auth_sha1_bytes(inner)
+    buf_free(move inner)
+    outer := buf_new(92)
+    i = 0
+    while i < 64 { buf_push(outer, buf_get(kblock, i) ^ 0x5c); i += 1 }
+    i = 0
+    while i < 20 { buf_push(outer, buf_get(ih, i)); i += 1 }
+    buf_free(move ih); buf_free(move kblock)
+    res := _auth_sha1_bytes(outer)
+    buf_free(move outer)
+    return res
+}
+
+// RFC 4226 `HOTP` dynamic truncation (`digits = 6` or `8`).
+fn hotp_generate(secret_b32: str, counter: i64, digits: i64 = 6) -> str ! i64 {
+    key := base32_decode_bytes(secret_b32) or return err(400)
+    msg := buf_new(12)
+    mut sh := 56
+    while sh >= 0 { buf_push(msg, ushr64(counter, sh) & 255); sh -= 8 }
+    mac := _auth_hmac_sha1_raw(key, msg)
+    buf_free(move key); buf_free(move msg)
+    offset := buf_get(mac, 19) & 15
+    bin_code := ((buf_get(mac, offset) & 0x7F) << 24)
+              | ((buf_get(mac, offset + 1) & 255) << 16)
+              | ((buf_get(mac, offset + 2) & 255) << 8)
+              | (buf_get(mac, offset + 3) & 255)
+    buf_free(move mac)
+    mut mod10 := 1
+    d_cnt := if digits == 8 { 8 } else { 6 }
+    mut k := 0
+    while k < d_cnt { mod10 = mod10 * 10; k += 1 }
+    otp := bin_code % mod10
+    raw_s := str_from_i64(otp)
+    out := buf_new(16)
+    mut pad := d_cnt - str_len(raw_s)
+    while pad > 0 { buf_push(out, 48); pad -= 1 }
+    buf_push_str(out, raw_s)
+    return ok(buf_to_owned_str(move out))
+}
+
+// RFC 6238 `TOTP` code generator (`step_sec = 30`, `digits = 6` or `8`).
+fn totp_generate(secret_b32: str, unix_time: i64, step_sec: i64 = 30, digits: i64 = 6) -> str ! i64 {
+    if step_sec <= 0 or unix_time < 0 { return err(400) }
+    return hotp_generate(secret_b32, unix_time / step_sec, digits)
+}
+
+// Constant-time TOTP verification across `[-skew_steps .. +skew_steps]`.
+fn totp_verify(secret_b32: str, code: str, unix_time: i64, skew_steps: i64 = 1, step_sec: i64 = 30, digits: i64 = 6) -> bool {
+    if step_sec <= 0 or str_len(code) != digits { return false }
+    base_ctr := unix_time / step_sec
+    mut matched := false
+    mut d := 0 - skew_steps
+    while d <= skew_steps {
+        cand := hotp_generate(secret_b32, base_ctr + d, digits) or ""
+        if str_len(cand) == digits and ct_eq_str(cand, code) {
+            matched = true
+        }
+        d += 1
+    }
+    return matched
+}
+
+fn totp_provisioning_uri(issuer: str, account: str, secret_b32: str, digits: i64 = 6, period: i64 = 30) -> str {
+    return f"otpauth://totp/{issuer}:{account}?secret={secret_b32}&issuer={issuer}&algorithm=SHA1&digits={digits}&period={period}"
+}
+
+// ============================================================================
+// 4. OAuth2 PKCE `S256` (RFC 7636) & Role-Based Access Control (`RbacPolicy`)
+// ============================================================================
+
+fn oauth2_pkce_challenge_s256(verifier: str) -> str {
+    vb := _auth_str_to_bytes(verifier)
+    dg := _auth_digest_words_to_bytes(sha256_raw_digest(vb))
+    buf_free(move vb)
+    raw_str := buf_to_owned_str(move dg)
+    return base64url_encode(raw_str)
+}
+
+fn oauth2_pkce_generate() -> PkcePair ! i64 {
+    rnd := os_csprng_bytes(32) or return err(501)
+    rnd_str := buf_to_owned_str(move rnd)
+    verifier := base64url_encode(rnd_str)
+    challenge := oauth2_pkce_challenge_s256(verifier)
+    return ok(PkcePair(verifier, challenge))
+}
+
+fn rbac_new() -> RbacPolicy {
+    return RbacPolicy(smap_new(64), smap_new(64))
+}
+
+fn rbac_free(move p: RbacPolicy) {
+    smap_free(p.role_perms)
+    smap_free(p.user_roles)
+}
+
+fn rbac_grant_perm(mut p: RbacPolicy, role: str, perm: str) {
+    smap_set_i64(mut p.role_perms, role + "::" + perm, 1)
+}
+
+fn rbac_assign_role(mut p: RbacPolicy, user: str, role: str) {
+    prev := smap_get_str(p.user_roles, user, "")
+    next := if str_len(prev) == 0 { role } else { prev + "," + role }
+    smap_set_str(mut p.user_roles, user, next)
+}
+
+fn rbac_check(p: RbacPolicy, user: str, perm: str) -> bool {
+    roles_csv := smap_get_str(p.user_roles, user, "")
+    if str_len(roles_csv) == 0 { return false }
+    ranges := str_split_ranges(roles_csv, 44)
+    cnt := str_split_count(ranges)
+    mut allowed := false
+    mut i := 0
+    while i < cnt {
+        role := str_split_at(roles_csv, ranges, i)
+        if smap_get_i64(p.role_perms, role + "::" + perm, 0) == 1 or smap_get_i64(p.role_perms, role + "::*", 0) == 1 {
+            allowed = true
+            break
+        }
+        i += 1
+    }
+    buf_free(move ranges)
+    return allowed
+}

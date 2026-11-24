@@ -15,6 +15,7 @@ use compiler_ax::c_import
 use compiler_ax::comptime
 use compiler_ax::sema_effects
 use compiler_ax::sema_perceus
+use compiler_ax::ir_opt
 use compiler_ax::linker_pe
 use compiler_ax::linker_unix_bare
 use compiler_ax::codegen_runtime
@@ -25,9 +26,9 @@ use compiler_ax::backend_gpu_wasm
 use compiler_ax::pkg_mcp
 
 fn print_axc_usage() {
-    println("Axon v1.1.1 Self-Hosted Multi-OS Native Compiler, Package Manager & AI MCP Server")
+    println("Axon v1.2.0 Self-Hosted Multi-OS Native Compiler, AxIR Optimizer, Package Manager & AI MCP Server")
     println("Usage:")
-    println("  axc build [file.ax] [-o out] [--target <tgt>] [--shared] [--shield] [--simd=scalar|avx2|avx512] [--link-lib <obj|lib>] [--emit-gpu] [--emit-map]")
+    println("  axc build [file.ax] [-o out] [-O0|-O2|-O3|-Os] [--target <tgt>] [--shared] [--shield] [--simd=scalar|avx2|avx512] [--link-lib <obj|lib>] [--emit-gpu] [--emit-map]")
     println("  axc check [file.ax] [--json]                 Verify types, Perceus FBIP, taint, @no_alloc & shapes")
     println("  axc run   [file.ax] [--simd=...]             Compile and execute immediately")
     println("  axc test  [file.ax]                          Compile and run all @test functions")
@@ -567,7 +568,7 @@ fn mcp_is_safe_args(a: str) -> bool {
         tok := str_slice(a, tok_s, i)
         if str_len(tok) > 0 and str_byte(tok, 0) == 45 {
             // Only explicitly whitelisted safe compiler runtime flags are allowed
-            is_ok_flag := (tok == "--simd=scalar" or tok == "--simd=sse2" or tok == "--simd=avx2" or tok == "--simd=avx512" or tok == "--shield" or tok == "--dce")
+            is_ok_flag := (tok == "--simd=scalar" or tok == "--simd=sse2" or tok == "--simd=avx2" or tok == "--simd=avx512" or tok == "--shield" or tok == "--dce" or tok == "-O0" or tok == "-O1" or tok == "-O2" or tok == "-O3" or tok == "-Os" or tok == "-Oz")
             if not is_ok_flag {
                 return false
             }
@@ -1241,6 +1242,12 @@ fn run_mcp_server_stdio() -> i32 {
                         }
                     } else if tname == "axon_targets" {
                         mcp_emit_tool_text_resp(raw_id, false, "Targets: win-x64, linux-x64, linux-arm64, macos-arm64, macos-x64, wasm32, unikernel-x64, freestanding-x64, freestanding-riscv64, spirv, ptx")
+                    } else if tname == "axon_port_guide" {
+                        slang := mcp_json_get_str(line, "source_lang", scratch)
+                        pg_buf := buf_new(16384)
+                        mcp_emit_port_guide(slang, pg_buf)
+                        mcp_emit_tool_text_resp(raw_id, false, buf_slice_str(pg_buf, 0, buf_len(pg_buf)))
+                        buf_free(move pg_buf)
                     } else if tname == "axon_spec" {
                         mut sp_buf := fs_read_file("AXON_LLM_SPEC.md") or buf_new(0)
                         if buf_len(sp_buf) == 0 and str_len(install_root) > 0 {
@@ -1341,7 +1348,7 @@ fn main() -> i32 {
 
     cmd := args_get(1)
     if cmd == "version" or cmd == "-v" or cmd == "--version" {
-        println("axc 1.1.1-selfhosted (100% Pure Axon Multi-OS Native Compiler: x86_64 AVX-512 / ARM64 NEON / RV64GC / WASM32 / SPIR-V / PTX)")
+        println("axc 1.2.0-selfhosted (100% Pure Axon Multi-OS Native Compiler + AxIR Optimizer: x86_64 AVX-512 / ARM64 NEON / RV64GC / WASM32 / SPIR-V / PTX)")
         return 0
     }
     if cmd == "help" or cmd == "-h" or cmd == "--help" {
@@ -1403,18 +1410,27 @@ fn main() -> i32 {
     mut emit_gpu := false
     mut emit_map := false
     mut simd_override := -1
-    mut is_dce := false
+    mut is_dce := true
+    mut opt_level := 2
     mut is_gui := false
     mut force_console := false
     test_mode := cmd == "test"
 
     pool := buf_new(4194304)
     static_libs := ibuf_new(64)
+    mut run_args_start := argc
 
     mut ai := 2
     while ai < argc {
         arg := args_get(ai)
-        if arg == "-o" and ai + 1 < argc {
+        opt_parsed := opt_parse_flag(arg)
+        if arg == "--" {
+            run_args_start = ai + 1
+            break
+        } else if opt_parsed >= 0 {
+            opt_level = opt_parsed
+            ai += 1
+        } else if arg == "-o" and ai + 1 < argc {
             out_path = args_get(ai + 1)
             ai += 2
         } else if arg == "--target" and ai + 1 < argc {
@@ -1462,6 +1478,9 @@ fn main() -> i32 {
         } else if arg == "--dce" or arg == "--strip" {
             is_dce = true
             ai += 1
+        } else if arg == "--no-dce" {
+            is_dce = false
+            ai += 1
         } else if arg == "--gui" {
             is_gui = true
             ai += 1
@@ -1487,13 +1506,16 @@ fn main() -> i32 {
         }
     }
 
+    mut is_temp_run_out := false
     if str_len(out_path) == 0 {
         if cmd == "run" or cmd == "test" {
+            run_tag := (clock_ns() ^ cpu_rdtsc()) & 0x7FFFFFFF
             s0 := buf_len(path_buf)
-            buf_push_str(path_buf, ".\\.axon_run_tmp.exe")
+            buf_push_str(path_buf, f".\\.axon_run_{run_tag}.exe")
             s1 := buf_len(path_buf)
             buf_push(path_buf, 0)
             out_path = buf_slice_str(path_buf, s0, s1)
+            is_temp_run_out = true
         } else {
             out_path = derive_output_path_v7(path_buf, in_path, target_id, is_shared)
         }
@@ -1601,6 +1623,8 @@ fn main() -> i32 {
         }
     }
 
+    ir_opt_module(pool, nodes, extra, sym, opt_level, is_shared, test_mode, force_shield)
+
     mut bout_cap := ibuf_len(nodes) * 64 + ibuf_get(sym, 8) * 2048 + buf_len(pool) * 2 + 262144
     if bout_cap < 262144 { bout_cap = 262144 }
     bin_out := buf_new(bout_cap)
@@ -1628,10 +1652,10 @@ fn main() -> i32 {
 
     if emit_map and ibuf_get(sym, 34) > 0 {
         map_path := derive_sidecar_ext_path(path_buf, out_path, ".map")
-        map_buf := buf_new(16384)
-        buf_push_str(map_buf, "# Axon Symbol Map (v1.1.1)\n# OFFSET_DEC\tSIZE\tLINE\tFUNCTION\n")
         mbase := ibuf_get(sym, 33)
         mcnt := ibuf_get(sym, 34)
+        map_buf := buf_new(mcnt * 128 + 4096)
+        buf_push_str(map_buf, "# Axon Symbol Map (v1.2.0)\n# OFFSET_DEC\tSIZE\tLINE\tFUNCTION\n")
         fb := ibuf_get(sym, 7)
         mut mi := 0
         while mi < mcnt {
@@ -1651,12 +1675,23 @@ fn main() -> i32 {
     }
 
     if cmd == "run" or cmd == "test" {
-        qbuf := buf_new(str_len(out_path) + 8)
+        qbuf := buf_new(str_len(out_path) + 2048)
         buf_push_str(qbuf, "\"")
         buf_push_str(qbuf, out_path)
         buf_push_str(qbuf, "\"")
+        mut rk := run_args_start
+        while rk < argc {
+            rarg := args_get(rk)
+            buf_push_str(qbuf, " \"")
+            buf_push_str(qbuf, rarg)
+            buf_push_str(qbuf, "\"")
+            rk += 1
+        }
         rc := ax_os_exec(buf_slice_str(qbuf, 0, buf_len(qbuf)))
         buf_free(move qbuf)
+        if is_temp_run_out {
+            ax_remove_file(out_path)
+        }
         if rc != 0 {
             return 1
         }
@@ -1664,7 +1699,7 @@ fn main() -> i32 {
     }
 
     elapsed_ms := (clock_ns() - t0) / 1000000
-    println(f"[AXC v1.1.1] Built `{out_path}` ({written} bytes, {f_cnt} units, target={target_display_name(target_id)}) in {elapsed_ms} ms")
+    println(f"[AXC v1.2.0] Built `{out_path}` ({written} bytes, {f_cnt} units, target={target_display_name(target_id)}) in {elapsed_ms} ms")
     if root_cap.token_id == 0 {
         return 1
     }

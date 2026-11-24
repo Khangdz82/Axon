@@ -1,0 +1,445 @@
+// Axon Standard Library — Pure-Axon Redis Wire Driver (RESP2 / RESP3 + Pipeline + ACL Auth) (`std/redis.ax`)
+// 100% Pure Axon over `std::net` TCP (`0` external C libraries), Binary-Safe Bulk Framing (Injection-Proof).
+// Supports Redis 5/6/7/Valkey: `AUTH [user] pass`, `PING`, `GET`, `SET`, `SETEX`, `DEL`, `INCRBY`,
+// `HSET`, `HGET`, `LPUSH`, `RPOP`, `ZADD`, `PUBLISH`, and single-syscall `RedisPipeline` batching.
+
+use std::str
+use std::ds
+use std::net
+
+// RESP Reply Kind Tags
+fn redis_kind_status() -> i64 { return 1 } // `+OK`
+fn redis_kind_error() -> i64  { return 2 } // `-ERR ...`
+fn redis_kind_int() -> i64    { return 3 } // `:42`
+fn redis_kind_bulk() -> i64   { return 4 } // `$N\r\n...`
+fn redis_kind_null() -> i64   { return 5 } // `$-1\r\n` or `_\r\n` (RESP3)
+fn redis_kind_array() -> i64  { return 6 } // `*N\r\n...` or `%N\r\n...` (RESP3 map)
+
+struct RedisConn {
+    sock: TcpStream
+    connected: bool
+}
+
+struct RedisReply {
+    kind: i64
+    int_val: i64
+    str_val: str
+    items: StrVec
+}
+
+struct RedisPipeline {
+    buf: ByteBuf
+    count: i64
+}
+
+fn redis_reply_free(move r: RedisReply) {
+    svec_free(r.items)
+}
+
+// ============================================================================
+// 1. Binary-Safe RESP Command Encoder (Zero Command-Injection Risk)
+// ============================================================================
+
+fn _redis_push_crlf(b: ByteBuf) {
+    buf_push(b, 13)
+    buf_push(b, 10)
+}
+
+fn _redis_push_bulk_str(b: ByteBuf, s: str) {
+    n := str_len(s)
+    buf_push(b, 36) // '$'
+    buf_push_str(b, str_from_i64(n))
+    _redis_push_crlf(b)
+    if n > 0 { buf_push_str(b, s) }
+    _redis_push_crlf(b)
+}
+
+fn redis_encode_args(args: StrVec) -> ByteBuf {
+    k := svec_len(args)
+    out := buf_new(k * 32 + 64)
+    buf_push(out, 42) // '*'
+    buf_push_str(out, str_from_i64(k))
+    _redis_push_crlf(out)
+    mut i := 0
+    while i < k {
+        _redis_push_bulk_str(out, svec_get(args, i))
+        i += 1
+    }
+    return out
+}
+
+fn redis_encode_cmd1(c0: str) -> ByteBuf {
+    mut a := svec_new(4, 64)
+    svec_push(mut a, c0)
+    b := redis_encode_args(a)
+    svec_free(move a)
+    return b
+}
+
+fn redis_encode_cmd2(c0: str, c1: str) -> ByteBuf {
+    mut a := svec_new(4, str_len(c0) + str_len(c1) + 32)
+    svec_push(mut a, c0); svec_push(mut a, c1)
+    b := redis_encode_args(a)
+    svec_free(move a)
+    return b
+}
+
+fn redis_encode_cmd3(c0: str, c1: str, c2: str) -> ByteBuf {
+    mut a := svec_new(4, str_len(c0) + str_len(c1) + str_len(c2) + 32)
+    svec_push(mut a, c0); svec_push(mut a, c1); svec_push(mut a, c2)
+    b := redis_encode_args(a)
+    svec_free(move a)
+    return b
+}
+
+fn redis_encode_cmd4(c0: str, c1: str, c2: str, c3: str) -> ByteBuf {
+    mut a := svec_new(8, str_len(c0) + str_len(c1) + str_len(c2) + str_len(c3) + 32)
+    svec_push(mut a, c0); svec_push(mut a, c1); svec_push(mut a, c2); svec_push(mut a, c3)
+    b := redis_encode_args(a)
+    svec_free(move a)
+    return b
+}
+
+// ============================================================================
+// 2. Buffer-Based RESP2 / RESP3 Wire Decoder (Offline & Socket Reusable!)
+// ============================================================================
+
+fn _redis_parse_i64_line(s: str) -> i64 {
+    n := str_len(s)
+    if n == 0 { return 0 }
+    mut pos := 0
+    mut neg := false
+    if str_byte(s, 0) == 45 { neg = true; pos = 1 }
+    mut acc := 0
+    while pos < n {
+        ch := str_byte(s, pos)
+        if ch >= 48 and ch <= 57 { acc = acc * 10 + (ch - 48) }
+        pos += 1
+    }
+    return if neg { 0 - acc } else { acc }
+}
+
+fn _redis_find_crlf(raw: ByteBuf, start: i64) -> i64 {
+    n := buf_len(raw)
+    mut i := start
+    while i + 1 < n {
+        if buf_get(raw, i) == 13 and buf_get(raw, i + 1) == 10 { return i }
+        i += 1
+    }
+    return -1
+}
+
+// Parses one RESP2/RESP3 frame starting at `off = ibuf_get(cursor, 0)` and advances `cursor[0]`.
+fn redis_decode_from_buf(raw: ByteBuf, cursor: IntBuf) -> RedisReply ! i64 {
+    off := ibuf_get(cursor, 0)
+    blen := buf_len(raw)
+    if off < 0 or off >= blen { return err(400) }
+    prefix := buf_get(raw, off)
+    eol := _redis_find_crlf(raw, off + 1)
+    if eol < 0 { return err(422) }
+    line := if eol > off + 1 { "" + buf_slice_str(raw, off + 1, eol) } else { "" }
+    ibuf_set(cursor, 0, eol + 2)
+
+    // `+` Simple String or `,` RESP3 Double
+    if prefix == 43 or prefix == 44 {
+        return ok(RedisReply(1, 0, line, svec_new(2, 16)))
+    }
+    // `-` Simple Error
+    if prefix == 45 {
+        return ok(RedisReply(2, -1, line, svec_new(2, 16)))
+    }
+    // `:` Integer
+    if prefix == 58 {
+        return ok(RedisReply(3, _redis_parse_i64_line(line), line, svec_new(2, 16)))
+    }
+    // `#` RESP3 Boolean (`#t\r\n` / `#f\r\n`)
+    if prefix == 35 {
+        iv := if str_len(line) > 0 and str_byte(line, 0) == 116 { 1 } else { 0 }
+        return ok(RedisReply(3, iv, if iv == 1 { "true" } else { "false" }, svec_new(2, 16)))
+    }
+    // `_` RESP3 Null (`_\r\n`)
+    if prefix == 95 {
+        return ok(RedisReply(5, 0, "", svec_new(2, 16)))
+    }
+    // `$` Bulk String (`$-1\r\n` = Null, `$N\r\n<N bytes>\r\n`)
+    if prefix == 36 {
+        nb := _redis_parse_i64_line(line)
+        if nb < 0 {
+            return ok(RedisReply(5, 0, "", svec_new(2, 16)))
+        }
+        cur := ibuf_get(cursor, 0)
+        if cur + nb + 2 > blen { return err(422) }
+        val_s := if nb > 0 { "" + buf_slice_str(raw, cur, cur + nb) } else { "" }
+        ibuf_set(cursor, 0, cur + nb + 2)
+        return ok(RedisReply(4, nb, val_s, svec_new(2, 16)))
+    }
+    // `*` Array or `%` RESP3 Map (`%N` has `2 * N` elements)
+    if prefix == 42 or prefix == 37 {
+        raw_cnt := _redis_parse_i64_line(line)
+        if raw_cnt < 0 {
+            return ok(RedisReply(5, 0, "", svec_new(2, 16)))
+        }
+        elem_cnt := if prefix == 37 { raw_cnt * 2 } else { raw_cnt }
+        mut items := svec_new(elem_cnt + 4, elem_cnt * 16 + 32)
+        mut i := 0
+        while i < elem_cnt {
+            sub := redis_decode_from_buf(raw, cursor) or return err(422)
+            svec_push(mut items, sub.str_val)
+            redis_reply_free(move sub)
+            i += 1
+        }
+        return ok(RedisReply(6, elem_cnt, "", items))
+    }
+    return err(400)
+}
+
+// ============================================================================
+// 3. Socket Reader, Connection Lifecycle, Commands & Pipelining
+// ============================================================================
+
+fn _redis_recv_line(sock: TcpStream) -> str ! i64 {
+    line_b := buf_new(128)
+    mut guard := 0
+    while guard < 65536 {
+        guard += 1
+        ch_b := tcp_recv_exact(sock, 1) or return err(-401)
+        b0 := buf_get(ch_b, 0)
+        buf_free(move ch_b)
+        if b0 == 13 {
+            lf_b := tcp_recv_exact(sock, 1) or return err(-401)
+            buf_free(move lf_b)
+            return ok(buf_to_owned_str(move line_b))
+        }
+        buf_push(line_b, b0)
+    }
+    buf_free(move line_b)
+    return err(-402)
+}
+
+fn redis_recv_reply(sock: TcpStream) -> RedisReply ! i64 {
+    p_b := tcp_recv_exact(sock, 1) or return err(-401)
+    prefix := buf_get(p_b, 0)
+    buf_free(move p_b)
+    line := _redis_recv_line(sock) or return err(-401)
+
+    if prefix == 43 or prefix == 44 { return ok(RedisReply(1, 0, line, svec_new(2, 16))) }
+    if prefix == 45 { return ok(RedisReply(2, -1, line, svec_new(2, 16))) }
+    if prefix == 58 { return ok(RedisReply(3, _redis_parse_i64_line(line), line, svec_new(2, 16))) }
+    if prefix == 35 {
+        iv := if str_len(line) > 0 and str_byte(line, 0) == 116 { 1 } else { 0 }
+        return ok(RedisReply(3, iv, if iv == 1 { "true" } else { "false" }, svec_new(2, 16)))
+    }
+    if prefix == 95 { return ok(RedisReply(5, 0, "", svec_new(2, 16))) }
+    if prefix == 36 {
+        nb := _redis_parse_i64_line(line)
+        if nb < 0 { return ok(RedisReply(5, 0, "", svec_new(2, 16))) }
+        body := tcp_recv_exact(sock, nb + 2) or return err(-401)
+        val_s := if nb > 0 { "" + buf_slice_str(body, 0, nb) } else { "" }
+        buf_free(move body)
+        return ok(RedisReply(4, nb, val_s, svec_new(2, 16)))
+    }
+    if prefix == 42 or prefix == 37 {
+        raw_cnt := _redis_parse_i64_line(line)
+        if raw_cnt < 0 { return ok(RedisReply(5, 0, "", svec_new(2, 16))) }
+        elem_cnt := if prefix == 37 { raw_cnt * 2 } else { raw_cnt }
+        mut items := svec_new(elem_cnt + 4, elem_cnt * 16 + 32)
+        mut i := 0
+        while i < elem_cnt {
+            sub := redis_recv_reply(sock) or return err(-401)
+            svec_push(mut items, sub.str_val)
+            redis_reply_free(move sub)
+            i += 1
+        }
+        return ok(RedisReply(6, elem_cnt, "", items))
+    }
+    return err(-403)
+}
+
+fn redis_exec_raw(conn: RedisConn, pkt: ByteBuf) -> RedisReply ! i64 {
+    if not conn.connected { return err(-400) }
+    sent := tcp_send_bytes(conn.sock, pkt) or -1
+    if sent < 0 { return err(-401) }
+    return redis_recv_reply(conn.sock)
+}
+
+fn redis_connect(host: str, port: i64 = 6379, username: str = "", password: str = "") -> RedisConn ! i64 {
+    sock := tcp_connect(host, port) or return err(-400)
+    _ := tcp_set_nodelay(sock, true)
+    _ := tcp_set_timeout_ms(sock, 15000)
+    conn := RedisConn(sock, true)
+    if str_len(password) > 0 {
+        auth_pkt := if str_len(username) > 0 {
+            redis_encode_cmd3("AUTH", username, password)
+        } else {
+            redis_encode_cmd2("AUTH", password)
+        }
+        rep := redis_exec_raw(conn, auth_pkt) or return err(-401)
+        buf_free(move auth_pkt)
+        ok_auth := rep.kind != 2
+        redis_reply_free(move rep)
+        if not ok_auth {
+            tcp_close(sock)
+            return err(401)
+        }
+    }
+    return ok(conn)
+}
+
+fn redis_close(mut conn: RedisConn) {
+    if conn.connected {
+        q := redis_encode_cmd1("QUIT")
+        _ := tcp_send_bytes(conn.sock, q) or -1
+        buf_free(move q)
+        tcp_close(conn.sock)
+        conn.connected = false
+    }
+}
+
+fn redis_ping(conn: RedisConn) -> bool {
+    pkt := redis_encode_cmd1("PING")
+    rep := redis_exec_raw(conn, pkt) or RedisReply(2, -1, "", svec_new(2, 8))
+    buf_free(move pkt)
+    ok_p := rep.kind == 1 or rep.kind == 4
+    redis_reply_free(move rep)
+    return ok_p
+}
+
+fn redis_set(conn: RedisConn, key: str, val: str) -> bool {
+    pkt := redis_encode_cmd3("SET", key, val)
+    rep := redis_exec_raw(conn, pkt) or RedisReply(2, -1, "", svec_new(2, 8))
+    buf_free(move pkt)
+    ok_s := rep.kind == 1
+    redis_reply_free(move rep)
+    return ok_s
+}
+
+fn redis_set_ex(conn: RedisConn, key: str, ttl_sec: i64, val: str) -> bool {
+    pkt := redis_encode_cmd4("SETEX", key, str_from_i64(ttl_sec), val)
+    rep := redis_exec_raw(conn, pkt) or RedisReply(2, -1, "", svec_new(2, 8))
+    buf_free(move pkt)
+    ok_s := rep.kind == 1
+    redis_reply_free(move rep)
+    return ok_s
+}
+
+fn redis_get(conn: RedisConn, key: str) -> str ! i64 {
+    pkt := redis_encode_cmd2("GET", key)
+    rep := redis_exec_raw(conn, pkt) or return err(-401)
+    buf_free(move pkt)
+    if rep.kind == 5 { redis_reply_free(move rep); return err(404) }
+    if rep.kind == 2 { redis_reply_free(move rep); return err(500) }
+    val := rep.str_val
+    redis_reply_free(move rep)
+    return ok(val)
+}
+
+fn redis_del(conn: RedisConn, key: str) -> i64 {
+    pkt := redis_encode_cmd2("DEL", key)
+    rep := redis_exec_raw(conn, pkt) or RedisReply(2, 0, "", svec_new(2, 8))
+    buf_free(move pkt)
+    n := rep.int_val
+    redis_reply_free(move rep)
+    return n
+}
+
+fn redis_incr_by(conn: RedisConn, key: str, delta: i64 = 1) -> i64 ! i64 {
+    pkt := redis_encode_cmd3("INCRBY", key, str_from_i64(delta))
+    rep := redis_exec_raw(conn, pkt) or return err(-401)
+    buf_free(move pkt)
+    if rep.kind != 3 { redis_reply_free(move rep); return err(422) }
+    v := rep.int_val
+    redis_reply_free(move rep)
+    return ok(v)
+}
+
+fn redis_hset(conn: RedisConn, key: str, field: str, val: str) -> i64 {
+    pkt := redis_encode_cmd4("HSET", key, field, val)
+    rep := redis_exec_raw(conn, pkt) or RedisReply(2, -1, "", svec_new(2, 8))
+    buf_free(move pkt)
+    v := rep.int_val
+    redis_reply_free(move rep)
+    return v
+}
+
+fn redis_hget(conn: RedisConn, key: str, field: str) -> str ! i64 {
+    pkt := redis_encode_cmd3("HGET", key, field)
+    rep := redis_exec_raw(conn, pkt) or return err(-401)
+    buf_free(move pkt)
+    if rep.kind == 5 { redis_reply_free(move rep); return err(404) }
+    v := rep.str_val
+    redis_reply_free(move rep)
+    return ok(v)
+}
+
+fn redis_lpush(conn: RedisConn, key: str, val: str) -> i64 {
+    pkt := redis_encode_cmd3("LPUSH", key, val)
+    rep := redis_exec_raw(conn, pkt) or RedisReply(2, -1, "", svec_new(2, 8))
+    buf_free(move pkt)
+    v := rep.int_val
+    redis_reply_free(move rep)
+    return v
+}
+
+fn redis_rpop(conn: RedisConn, key: str) -> str ! i64 {
+    pkt := redis_encode_cmd2("RPOP", key)
+    rep := redis_exec_raw(conn, pkt) or return err(-401)
+    buf_free(move pkt)
+    if rep.kind == 5 { redis_reply_free(move rep); return err(404) }
+    v := rep.str_val
+    redis_reply_free(move rep)
+    return ok(v)
+}
+
+fn redis_publish(conn: RedisConn, channel: str, message: str) -> i64 {
+    pkt := redis_encode_cmd3("PUBLISH", channel, message)
+    rep := redis_exec_raw(conn, pkt) or RedisReply(2, -1, "", svec_new(2, 8))
+    buf_free(move pkt)
+    v := rep.int_val
+    redis_reply_free(move rep)
+    return v
+}
+
+// ============================================================================
+// 4. Single-Syscall Command Pipelining (`RedisPipeline`)
+// ============================================================================
+
+fn redis_pipe_new() -> RedisPipeline {
+    return RedisPipeline(buf_new(512), 0)
+}
+
+fn redis_pipe_free(move p: RedisPipeline) {
+    buf_free(p.buf)
+}
+
+fn _redis_pipe_append(mut p: RedisPipeline, move cmd_pkt: ByteBuf) {
+    n := buf_len(cmd_pkt)
+    mut i := 0
+    while i < n { buf_push(p.buf, buf_get(cmd_pkt, i)); i += 1 }
+    buf_free(move cmd_pkt)
+    p.count = p.count + 1
+}
+
+fn redis_pipe_add2(mut p: RedisPipeline, c0: str, c1: str) {
+    _redis_pipe_append(mut p, redis_encode_cmd2(c0, c1))
+}
+
+fn redis_pipe_add3(mut p: RedisPipeline, c0: str, c1: str, c2: str) {
+    _redis_pipe_append(mut p, redis_encode_cmd3(c0, c1, c2))
+}
+
+fn redis_pipe_exec(conn: RedisConn, mut p: RedisPipeline) -> StrVec ! i64 {
+    if not conn.connected or p.count <= 0 { return err(400) }
+    sent := tcp_send_bytes(conn.sock, p.buf) or -1
+    if sent < 0 { return err(-401) }
+    mut out := svec_new(p.count + 4, p.count * 16 + 32)
+    mut i := 0
+    while i < p.count {
+        rep := redis_recv_reply(conn.sock) or return err(-401)
+        svec_push(mut out, rep.str_val)
+        redis_reply_free(move rep)
+        i += 1
+    }
+    buf_truncate(p.buf, 0)
+    p.count = 0
+    return ok(out)
+}

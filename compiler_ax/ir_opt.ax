@@ -1,0 +1,1877 @@
+// Axon v1.2 Self-Hosted Compiler - Mid-Level Flat-Arena IR Optimizer (`compiler_ax/ir_opt.ax`)
+// Combines Go-style flat integer-indexed tables, Java HotSpot C2 O(1) per-function bump-arena reset
+// (`ibuf_truncate(arena, 0)`), Scalar Replacement of Aggregates (`SRoA`), SSA-Dominance GVN/CSE,
+// Shield-Safe Constant Propagation & Algebraic Strength Reduction, Loop-Invariant Code Motion (`LICM`),
+// and Whole-Program Call-Graph Reachability (`DCE-0`) + Bottom-Up Cost-Model Auto-Inlining.
+// Peak extra memory: < 2 MB reusable `IntBuf` arena. Zero `.o`/`.bc` build artifacts on disk.
+
+use compiler_ax::tokens_ast
+use compiler_ax::comptime
+use compiler_ax::sema_perceus
+
+// Optimization levels stored in `sym[35]`:
+//   0 = `-O0` (instant dev compile, `DCE-0` still strips dead stdlib code)
+//   1 = `-O1`
+//   2 = `-O2` (default balanced production speed + compact binary)
+//   3 = `-O3` (aggressive inlining + loop unrolling + dual-accumulator SIMD)
+//   4 = `-Os` / `-Oz` (size-minimal: single-caller/tiny inline only, disables loop unrolling)
+fn opt_parse_flag(arg: str) -> i64 {
+    if arg == "-O0" or arg == "--opt=0" { return 0 }
+    if arg == "-O1" or arg == "--opt=1" { return 1 }
+    if arg == "-O2" or arg == "--opt=2" { return 2 }
+    if arg == "-O3" or arg == "--opt=3" { return 3 }
+    if arg == "-Os" or arg == "-Oz" or arg == "--opt=s" or arg == "--opt=z" { return 4 }
+    return -1
+}
+
+fn ir_copy_node_in_place(nodes: IntBuf, dst_nid: i64, src_nid: i64) {
+    if dst_nid <= 0 or src_nid <= 0 or dst_nid == src_nid { return }
+    mut s := 0
+    while s < 7 {
+        ast_set(nodes, dst_nid, s, ast_get(nodes, src_nid, s))
+        s += 1
+    }
+}
+
+// ============================================================================
+// Pass 1: Whole-Program Call-Graph Reachability (`DCE-0`) & Call-Site Frequency
+// ============================================================================
+
+fn ir_cg_enqueue(live: IntBuf, queue: IntBuf, fidx: i64) {
+    if fidx >= 0 and fidx < ibuf_len(live) and ibuf_get(live, fidx) == 0 {
+        ibuf_set(live, fidx, 1)
+        ibuf_push(queue, fidx)
+    }
+}
+
+fn ir_cg_scan_expr(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, live: IntBuf, call_cnt: IntBuf, m_tgt: IntBuf, queue: IntBuf, enid: i64) {
+    if enid <= 0 { return }
+    k := ast_kind(nodes, enid)
+    if k == nk_unary() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, enid, 2))
+        return
+    }
+    if k == nk_cast() or k == nk_field() or k == nk_tuple_idx() or k == nk_await() or k == nk_comptime_expr() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, enid, 1))
+        return
+    }
+    if k == nk_binary() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, enid, 2))
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, enid, 3))
+        return
+    }
+    if k == nk_in_range() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, enid, 2))
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, enid, 3))
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, enid, 4))
+        return
+    }
+    if k == nk_or_return() or k == nk_index() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, enid, 1))
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, enid, 2))
+        return
+    }
+    if k == nk_table_alloc() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, enid, 3))
+        return
+    }
+    if k == nk_tuple() or k == nk_fstr() {
+        off := ast_get(nodes, enid, 1)
+        cnt := ast_get(nodes, enid, 2)
+        mut i := 0
+        while i < cnt {
+            ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ibuf_get(extra, off + i))
+            i += 1
+        }
+        return
+    }
+    if k == nk_spawn() {
+        ir_cg_scan_block(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, enid, 1))
+        return
+    }
+    if k == nk_unsafe_block() {
+        ub := ast_get(nodes, enid, 1)
+        ir_cg_scan_block(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ub)
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, ub, 3))
+        return
+    }
+    if k == nk_if_expr() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, enid, 1))
+        tb := ast_get(nodes, enid, 2)
+        ir_cg_scan_block(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, tb)
+        if tb > 0 and ast_kind(nodes, tb) == nk_block() {
+            ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, tb, 3))
+        }
+        eb := ast_get(nodes, enid, 3)
+        if eb > 0 {
+            if ast_kind(nodes, eb) == nk_if_expr() {
+                ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, eb)
+            } else {
+                ir_cg_scan_block(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, eb)
+                if ast_kind(nodes, eb) == nk_block() {
+                    ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, eb, 3))
+                }
+            }
+        }
+        return
+    }
+    if k == nk_call() {
+        cs := ast_get(nodes, enid, 1)
+        cl := ast_get(nodes, enid, 2)
+        aoff := ast_get(nodes, enid, 3)
+        acnt := ast_get(nodes, enid, 4)
+        fidx := find_fn_idx(pool, sym, cs, cl)
+        if fidx >= 0 {
+            ibuf_set(call_cnt, fidx, ibuf_get(call_cnt, fidx) + 1)
+            ir_cg_enqueue(live, queue, fidx)
+        }
+        mut i := 0
+        while i < acnt {
+            ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, ibuf_get(extra, aoff + i), 4))
+            i += 1
+        }
+        return
+    }
+    if k == nk_method_call() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, enid, 1))
+        ms := ast_get(nodes, enid, 2)
+        ml := ast_get(nodes, enid, 3)
+        aoff := ast_get(nodes, enid, 4)
+        acnt := ast_get(nodes, enid, 5)
+        mut i := 0
+        while i < acnt {
+            ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, ibuf_get(extra, aoff + i), 4))
+            i += 1
+        }
+        f_base := ibuf_get(sym, 7)
+        f_cnt := ibuf_get(sym, 8)
+        mut fi := 0
+        while fi < f_cnt {
+            fo := f_base + fi * 10
+            fnoff := ibuf_get(sym, fo)
+            fnlen := ibuf_get(sym, fo + 1)
+            if fnlen > ml + 2 {
+                tail := fnoff + fnlen - ml
+                if buf_get(pool, tail - 1) == 95 and buf_get(pool, tail - 2) == 95 {
+                    if pool_str_eq2(pool, tail, ml, ms) {
+                        ibuf_set(m_tgt, fi, 1)
+                        ibuf_set(call_cnt, fi, ibuf_get(call_cnt, fi) + 1)
+                        ir_cg_enqueue(live, queue, fi)
+                    }
+                }
+            }
+            fi += 1
+        }
+    }
+}
+
+fn ir_cg_scan_stmt(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, live: IntBuf, call_cnt: IntBuf, m_tgt: IntBuf, queue: IntBuf, snid: i64) {
+    if snid <= 0 { return }
+    k := ast_kind(nodes, snid)
+    if k == nk_var_decl() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 5))
+    } else if k == nk_tuple_destruct() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 3))
+    } else if k == nk_assign() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 2))
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 3))
+    } else if k == nk_if() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 1))
+        ir_cg_scan_block(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 2))
+        eb := ast_get(nodes, snid, 3)
+        if eb > 0 {
+            if ast_kind(nodes, eb) == nk_if() {
+                ir_cg_scan_stmt(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, eb)
+            } else {
+                ir_cg_scan_block(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, eb)
+            }
+        }
+    } else if k == nk_while() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 1))
+        ir_cg_scan_block(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 2))
+    } else if k == nk_for_range() or k == nk_par_for_range() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 3))
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 4))
+        ir_cg_scan_block(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 5))
+    } else if k == nk_for_each() or k == nk_par_for_each() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 3))
+        ir_cg_scan_block(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 4))
+    } else if k == nk_unsafe_block() {
+        ir_cg_scan_block(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 1))
+    } else if k == nk_block() {
+        ir_cg_scan_block(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, snid)
+    } else if k == nk_return() or k == nk_expr_stmt() {
+        ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, snid, 1))
+    }
+}
+
+fn ir_cg_scan_block(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, live: IntBuf, call_cnt: IntBuf, m_tgt: IntBuf, queue: IntBuf, bnid: i64) {
+    if bnid <= 0 { return }
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt {
+        ir_cg_scan_stmt(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ibuf_get(extra, off + i))
+        i += 1
+    }
+}
+
+fn ir_build_callgraph(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, is_dll: bool, test_mode: bool, live: IntBuf, call_cnt: IntBuf, m_tgt: IntBuf) {
+    f_base := ibuf_get(sym, 7)
+    f_cnt := ibuf_get(sym, 8)
+    queue := ibuf_new(f_cnt + 8)
+    mut main_idx := -1
+    mut i := 0
+    while i < f_cnt {
+        ibuf_push(live, 0)
+        ibuf_push(call_cnt, 0)
+        ibuf_push(m_tgt, 0)
+        fo := f_base + i * 10
+        flags := ibuf_get(sym, fo + 9)
+        if pool_str_eq_lit(pool, ibuf_get(sym, fo), ibuf_get(sym, fo + 1), "main") {
+            main_idx = i
+        }
+        if (flags & fnflag_export()) != 0 {
+            ir_cg_enqueue(live, queue, i)
+        }
+        if test_mode and (flags & fnflag_test()) != 0 {
+            ir_cg_enqueue(live, queue, i)
+        }
+        // Keep `@gpu` / `@shader` kernels reachable for GPU/SPIR-V/PTX targets
+        if (flags & (fnflag_gpu() | fnflag_shader())) != 0 {
+            ir_cg_enqueue(live, queue, i)
+        }
+        i += 1
+    }
+    if not is_dll and not test_mode {
+        if main_idx >= 0 {
+            ir_cg_enqueue(live, queue, main_idx)
+        } else if ibuf_len(queue) == 0 {
+            i = 0
+            while i < f_cnt {
+                ir_cg_enqueue(live, queue, i)
+                i += 1
+            }
+        }
+    }
+    mut qi := 0
+    while qi < ibuf_len(queue) {
+        fidx := ibuf_get(queue, qi)
+        qi += 1
+        fo := f_base + fidx * 10
+        fnid := ibuf_get(sym, fo + 2)
+        flags := ibuf_get(sym, fo + 9)
+        if (flags & fnflag_extern()) == 0 {
+            pl_off := ast_get(nodes, fnid, 3)
+            pcnt := ast_get(nodes, fnid, 4) & 0xFFFF
+            mut pi := 0
+            while pi < pcnt {
+                pn := ibuf_get(extra, pl_off + pi)
+                ir_cg_scan_expr(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, ast_get(nodes, pn, 5))
+                pi += 1
+            }
+            body := ast_get(nodes, fnid, 6) & 0xFFFFFFFF
+            ir_cg_scan_block(pool, nodes, extra, sym, live, call_cnt, m_tgt, queue, body)
+        }
+    }
+    buf_free(move queue)
+}
+
+// ============================================================================
+// Pass 2: Bottom-Up Cost-Model Auto-Inliner (`-Os`, `-O2`, `-O3`, Single-Caller)
+// ============================================================================
+// `stats[0] = stmts, stats[1] = returns, stats[2] = cost, stats[3] = ok_flag, stats[4] = self_soff, stats[5] = self_slen`
+
+fn ir_cost_expr(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, enid: i64, stats: IntBuf) {
+    if enid <= 0 or ibuf_get(stats, 3) == 0 { return }
+    k := ast_kind(nodes, enid)
+    if k == nk_int() or k == nk_float() or k == nk_bool() or k == nk_dec() or k == nk_ident() or k == nk_move_ident() {
+        return
+    }
+    if k == nk_str() or k == nk_secret_str() {
+        ibuf_set(stats, 2, ibuf_get(stats, 2) + 1)
+        return
+    }
+    if k == nk_spawn() or k == nk_await() {
+        ibuf_set(stats, 3, 0)
+        return
+    }
+    if k == nk_unary() {
+        ibuf_set(stats, 2, ibuf_get(stats, 2) + 1)
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, enid, 2), stats)
+        return
+    }
+    if k == nk_cast() or k == nk_field() or k == nk_tuple_idx() {
+        ibuf_set(stats, 2, ibuf_get(stats, 2) + 1)
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, enid, 1), stats)
+        return
+    }
+    if k == nk_binary() {
+        ibuf_set(stats, 2, ibuf_get(stats, 2) + 1)
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, enid, 2), stats)
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, enid, 3), stats)
+        return
+    }
+    if k == nk_or_return() or k == nk_index() {
+        // `nk_or_return` emits a hidden return branch -> count toward return budget!
+        if k == nk_or_return() {
+            rc := ibuf_get(stats, 1) + 1
+            ibuf_set(stats, 1, rc)
+            if rc > 12 { ibuf_set(stats, 3, 0); return }
+        }
+        ibuf_set(stats, 2, ibuf_get(stats, 2) + 2)
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, enid, 1), stats)
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, enid, 2), stats)
+        return
+    }
+    if k == nk_if_expr() {
+        ibuf_set(stats, 2, ibuf_get(stats, 2) + 3)
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, enid, 1), stats)
+        ir_cost_block(pool, nodes, extra, ast_get(nodes, enid, 2), stats)
+        eb := ast_get(nodes, enid, 3)
+        if eb > 0 {
+            if ast_kind(nodes, eb) == nk_if_expr() { ir_cost_expr(pool, nodes, extra, eb, stats) }
+            else { ir_cost_block(pool, nodes, extra, eb, stats) }
+        }
+        return
+    }
+    if k == nk_unsafe_block() {
+        ub := ast_get(nodes, enid, 1)
+        ir_cost_block(pool, nodes, extra, ub, stats)
+        if ub > 0 { ir_cost_expr(pool, nodes, extra, ast_get(nodes, ub, 3), stats) }
+        return
+    }
+    if k == nk_call() {
+        cs := ast_get(nodes, enid, 1)
+        cl := ast_get(nodes, enid, 2)
+        // Reject direct self-recursion
+        if cl == ibuf_get(stats, 5) and pool_str_eq2(pool, cs, cl, ibuf_get(stats, 4)) {
+            ibuf_set(stats, 3, 0)
+            return
+        }
+        mut c_w := 4
+        if pool_str_eq_lit(pool, cs, cl, "ushr64") or pool_str_eq_lit(pool, cs, cl, "popcnt64") or pool_str_eq_lit(pool, cs, cl, "ibuf_get") or pool_str_eq_lit(pool, cs, cl, "buf_get") or pool_str_eq_lit(pool, cs, cl, "ibuf_len") or pool_str_eq_lit(pool, cs, cl, "buf_len") or pool_str_eq_lit(pool, cs, cl, "str_len") or pool_str_eq_lit(pool, cs, cl, "str_byte") or pool_str_eq_lit(pool, cs, cl, "ptr_read_i64") or pool_str_eq_lit(pool, cs, cl, "ptr_read_u8") or pool_str_eq_lit(pool, cs, cl, "ptr_read_f64") or pool_str_eq_lit(pool, cs, cl, "ptr_write_i64") or pool_str_eq_lit(pool, cs, cl, "ptr_write_u8") or pool_str_eq_lit(pool, cs, cl, "ptr_write_f64") or pool_str_eq_lit(pool, cs, cl, "sqrt_f64") or pool_str_eq_lit(pool, cs, cl, "abs_f64") {
+            c_w = 1
+        }
+        ibuf_set(stats, 2, ibuf_get(stats, 2) + c_w)
+        aoff := ast_get(nodes, enid, 3)
+        acnt := ast_get(nodes, enid, 4)
+        mut i := 0
+        while i < acnt {
+            ir_cost_expr(pool, nodes, extra, ast_get(nodes, ibuf_get(extra, aoff + i), 4), stats)
+            i += 1
+        }
+        return
+    }
+    ibuf_set(stats, 2, ibuf_get(stats, 2) + 4)
+}
+
+fn ir_cost_stmt(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, snid: i64, stats: IntBuf) {
+    if snid <= 0 or ibuf_get(stats, 3) == 0 { return }
+    sc := ibuf_get(stats, 0) + 1
+    ibuf_set(stats, 0, sc)
+    if sc > 30 {
+        ibuf_set(stats, 3, 0)
+        return
+    }
+    k := ast_kind(nodes, snid)
+    if k == nk_par_for_range() or k == nk_par_for_each() {
+        ibuf_set(stats, 3, 0)
+        return
+    }
+    if k == nk_var_decl() {
+        ibuf_set(stats, 2, ibuf_get(stats, 2) + 1)
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, snid, 5), stats)
+        return
+    }
+    if k == nk_assign() {
+        ibuf_set(stats, 2, ibuf_get(stats, 2) + 1)
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, snid, 2), stats)
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, snid, 3), stats)
+        return
+    }
+    if k == nk_return() {
+        rc := ibuf_get(stats, 1) + 1
+        ibuf_set(stats, 1, rc)
+        if rc > 12 {
+            ibuf_set(stats, 3, 0)
+            return
+        }
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, snid, 1), stats)
+        return
+    }
+    if k == nk_expr_stmt() {
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, snid, 1), stats)
+        return
+    }
+    if k == nk_if() {
+        ibuf_set(stats, 2, ibuf_get(stats, 2) + 3)
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, snid, 1), stats)
+        ir_cost_block(pool, nodes, extra, ast_get(nodes, snid, 2), stats)
+        eb := ast_get(nodes, snid, 3)
+        if eb > 0 {
+            if ast_kind(nodes, eb) == nk_if() { ir_cost_stmt(pool, nodes, extra, eb, stats) }
+            else { ir_cost_block(pool, nodes, extra, eb, stats) }
+        }
+        return
+    }
+    if k == nk_while() {
+        ibuf_set(stats, 2, ibuf_get(stats, 2) + 14)
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, snid, 1), stats)
+        ir_cost_block(pool, nodes, extra, ast_get(nodes, snid, 2), stats)
+        return
+    }
+    if k == nk_for_range() {
+        ibuf_set(stats, 2, ibuf_get(stats, 2) + 14)
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, snid, 3), stats)
+        ir_cost_expr(pool, nodes, extra, ast_get(nodes, snid, 4), stats)
+        ir_cost_block(pool, nodes, extra, ast_get(nodes, snid, 5), stats)
+        return
+    }
+    if k == nk_unsafe_block() {
+        ir_cost_block(pool, nodes, extra, ast_get(nodes, snid, 1), stats)
+        return
+    }
+    if k == nk_block() {
+        ir_cost_block(pool, nodes, extra, snid, stats)
+        return
+    }
+    ibuf_set(stats, 2, ibuf_get(stats, 2) + 4)
+}
+
+fn ir_cost_block(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, bnid: i64, stats: IntBuf) {
+    if bnid <= 0 or ibuf_get(stats, 3) == 0 { return }
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt and ibuf_get(stats, 3) == 1 {
+        ir_cost_stmt(pool, nodes, extra, ibuf_get(extra, off + i), stats)
+        i += 1
+    }
+}
+
+fn ir_pass_auto_inline(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, opt_level: i64, live: IntBuf, call_cnt: IntBuf, m_tgt: IntBuf, arena: IntBuf) {
+    if opt_level <= 0 { return }
+    f_base := ibuf_get(sym, 7)
+    f_cnt := ibuf_get(sym, 8)
+    disallowed := fnflag_inline() | fnflag_extern() | fnflag_export() | fnflag_async() | fnflag_shield() | fnflag_whitebox() | fnflag_nan_guard() | fnflag_frame_arena() | fnflag_comptime() | fnflag_unsafe() | fnflag_test() | fnflag_gpu() | fnflag_shader()
+
+    mut max_multi_cost := 14
+    mut max_single_cost := 26
+    if opt_level == 3 {
+        max_multi_cost = 24
+        max_single_cost = 34
+    } else if opt_level == 4 {
+        max_multi_cost = 4
+        max_single_cost = 18
+    }
+
+    mut fi := 0
+    while fi < f_cnt {
+        if ibuf_get(live, fi) == 1 {
+            fo := f_base + fi * 10
+            flags := ibuf_get(sym, fo + 9)
+            fast_abi := ibuf_get(sym, fo + 8)
+            if fast_abi == 1 and (flags & disallowed) == 0 {
+                fn_soff := ibuf_get(sym, fo)
+                fn_slen := ibuf_get(sym, fo + 1)
+                if not pool_str_eq_lit(pool, fn_soff, fn_slen, "main") {
+                    fnid := ibuf_get(sym, fo + 2)
+                    p_base := ibuf_get(sym, fo + 3)
+                    p_cnt := ibuf_get(sym, fo + 4)
+                    moff := ushr64(ast_get(nodes, fnid, 4), 16)
+                    mut all_val := (moff == 0 or ibuf_get(extra, moff + 8) == 0)
+                    mut pi := 0
+                    while all_val and pi < p_cnt {
+                        if ibuf_get(sym, p_base + pi * 6 + 2) != pmode_val() {
+                            all_val = false
+                        }
+                        pi += 1
+                    }
+                    body_nid := ast_get(nodes, fnid, 6) & 0xFFFFFFFF
+                    if all_val and body_nid > 0 {
+                        ibuf_truncate(arena, 0)
+                        ibuf_push(arena, 0)       // [0] stmts
+                        ibuf_push(arena, 0)       // [1] returns
+                        ibuf_push(arena, 0)       // [2] cost
+                        ibuf_push(arena, 1)       // [3] ok
+                        ibuf_push(arena, fn_soff) // [4] self_soff
+                        ibuf_push(arena, fn_slen) // [5] self_slen
+                        ir_cost_block(pool, nodes, extra, body_nid, arena)
+                        if ibuf_get(arena, 3) == 1 {
+                            cost := ibuf_get(arena, 2)
+                            ccnt := ibuf_get(call_cnt, fi)
+                            is_single := ccnt == 1 and ibuf_get(m_tgt, fi) == 0
+                            // Call-frequency-aware inline budget: prevents multi-callsite bloat while inlining hot/single-caller fns!
+                            mut eff_budget := max_multi_cost
+                            if opt_level == 2 or opt_level == 1 {
+                                if ccnt > 24 { eff_budget = 3 }
+                                else if ccnt > 8 { eff_budget = 6 }
+                                else if ccnt > 3 { eff_budget = 10 }
+                            } else if opt_level == 3 {
+                                if ccnt > 32 { eff_budget = 6 }
+                                else if ccnt > 10 { eff_budget = 14 }
+                            }
+                            if cost <= eff_budget or (is_single and cost <= max_single_cost) {
+                                ibuf_set(sym, fo + 9, flags | fnflag_inline())
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fi += 1
+    }
+}
+
+// ============================================================================
+// Pass 3: Scalar Replacement of Aggregates (`SRoA` for Non-Escaping Structs)
+// ============================================================================
+
+fn ir_is_scalar_sroa_struct(sym: IntBuf, sidx: i64) -> bool {
+    if sidx < 0 { return false }
+    s_off := ibuf_get(sym, 3) + sidx * 6
+    f_base := ibuf_get(sym, s_off + 3)
+    f_cnt := ibuf_get(sym, s_off + 4)
+    if f_cnt < 1 or f_cnt > 4 { return false }
+    mut fi := 0
+    while fi < f_cnt {
+        fty := ibuf_get(sym, f_base + fi * 4 + 3)
+        if fty != ty_int() and fty != ty_bool() and fty != ty_float() {
+            return false
+        }
+        fi += 1
+    }
+    return true
+}
+
+// Returns `false` if `(v_soff, v_slen)` escapes, is shadowed, or is used anywhere except as `v.field` (non-`mut` arg).
+fn ir_sroa_expr_ok(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, enid: i64, v_soff: i64, v_slen: i64) -> bool {
+    if enid <= 0 { return true }
+    k := ast_kind(nodes, enid)
+    if k == nk_ident() or k == nk_move_ident() {
+        if ast_get(nodes, enid, 2) == v_slen and pool_str_eq2(pool, ast_get(nodes, enid, 1), v_slen, v_soff) {
+            return false
+        }
+        return true
+    }
+    if k == nk_field() {
+        b := ast_get(nodes, enid, 1)
+        if b > 0 and ast_kind(nodes, b) == nk_ident() and ast_get(nodes, b, 2) == v_slen and pool_str_eq2(pool, ast_get(nodes, b, 1), v_slen, v_soff) {
+            return true
+        }
+        return ir_sroa_expr_ok(pool, nodes, extra, b, v_soff, v_slen)
+    }
+    if k == nk_int() or k == nk_float() or k == nk_bool() or k == nk_dec() or k == nk_str() or k == nk_secret_str() {
+        return true
+    }
+    if k == nk_unary() {
+        return ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, enid, 2), v_soff, v_slen)
+    }
+    if k == nk_cast() or k == nk_tuple_idx() or k == nk_await() or k == nk_comptime_expr() {
+        return ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, enid, 1), v_soff, v_slen)
+    }
+    if k == nk_binary() {
+        return ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, enid, 2), v_soff, v_slen) and ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, enid, 3), v_soff, v_slen)
+    }
+    if k == nk_in_range() {
+        return ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, enid, 2), v_soff, v_slen) and ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, enid, 3), v_soff, v_slen) and ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, enid, 4), v_soff, v_slen)
+    }
+    if k == nk_or_return() or k == nk_index() {
+        return ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, enid, 1), v_soff, v_slen) and ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, enid, 2), v_soff, v_slen)
+    }
+    if k == nk_table_alloc() {
+        return ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, enid, 3), v_soff, v_slen)
+    }
+    if k == nk_tuple() or k == nk_fstr() {
+        off := ast_get(nodes, enid, 1); cnt := ast_get(nodes, enid, 2)
+        mut i := 0
+        while i < cnt {
+            if not ir_sroa_expr_ok(pool, nodes, extra, ibuf_get(extra, off + i), v_soff, v_slen) { return false }
+            i += 1
+        }
+        return true
+    }
+    if k == nk_call() {
+        aoff := ast_get(nodes, enid, 3); acnt := ast_get(nodes, enid, 4)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            ae := ast_get(nodes, ca, 4)
+            if ast_get(nodes, ca, 1) == pmode_mut() and ae > 0 and ast_kind(nodes, ae) == nk_field() {
+                b := ast_get(nodes, ae, 1)
+                if b > 0 and ast_kind(nodes, b) == nk_ident() and ast_get(nodes, b, 2) == v_slen and pool_str_eq2(pool, ast_get(nodes, b, 1), v_slen, v_soff) {
+                    return false
+                }
+            }
+            if not ir_sroa_expr_ok(pool, nodes, extra, ae, v_soff, v_slen) { return false }
+            i += 1
+        }
+        return true
+    }
+    if k == nk_method_call() {
+        if not ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, enid, 1), v_soff, v_slen) { return false }
+        aoff := ast_get(nodes, enid, 4); acnt := ast_get(nodes, enid, 5)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            if not ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, ca, 4), v_soff, v_slen) { return false }
+            i += 1
+        }
+        return true
+    }
+    if k == nk_if_expr() {
+        if not ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, enid, 1), v_soff, v_slen) { return false }
+        tb := ast_get(nodes, enid, 2)
+        if not ir_sroa_block_ok(pool, nodes, extra, tb, v_soff, v_slen, -1) { return false }
+        if tb > 0 and ast_kind(nodes, tb) == nk_block() and not ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, tb, 3), v_soff, v_slen) { return false }
+        eb := ast_get(nodes, enid, 3)
+        if eb > 0 {
+            if ast_kind(nodes, eb) == nk_if_expr() { return ir_sroa_expr_ok(pool, nodes, extra, eb, v_soff, v_slen) }
+            if not ir_sroa_block_ok(pool, nodes, extra, eb, v_soff, v_slen, -1) { return false }
+            if ast_kind(nodes, eb) == nk_block() and not ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, eb, 3), v_soff, v_slen) { return false }
+        }
+        return true
+    }
+    if k == nk_unsafe_block() {
+        ub := ast_get(nodes, enid, 1)
+        if not ir_sroa_block_ok(pool, nodes, extra, ub, v_soff, v_slen, -1) { return false }
+        return ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, ub, 3), v_soff, v_slen)
+    }
+    return false
+}
+
+fn ir_sroa_stmt_ok(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, snid: i64, v_soff: i64, v_slen: i64, decl_nid: i64) -> bool {
+    if snid <= 0 or snid == decl_nid { return true }
+    k := ast_kind(nodes, snid)
+    if k == nk_var_decl() {
+        if ast_get(nodes, snid, 2) == v_slen and pool_str_eq2(pool, ast_get(nodes, snid, 1), v_slen, v_soff) {
+            return false // shadowed
+        }
+        return ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, snid, 5), v_soff, v_slen)
+    }
+    if k == nk_assign() {
+        return ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, snid, 2), v_soff, v_slen) and ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, snid, 3), v_soff, v_slen)
+    }
+    if k == nk_return() or k == nk_expr_stmt() {
+        return ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, snid, 1), v_soff, v_slen)
+    }
+    if k == nk_break() or k == nk_continue() { return true }
+    if k == nk_if() {
+        if not ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, snid, 1), v_soff, v_slen) { return false }
+        if not ir_sroa_block_ok(pool, nodes, extra, ast_get(nodes, snid, 2), v_soff, v_slen, decl_nid) { return false }
+        eb := ast_get(nodes, snid, 3)
+        if eb > 0 {
+            if ast_kind(nodes, eb) == nk_if() { return ir_sroa_stmt_ok(pool, nodes, extra, eb, v_soff, v_slen, decl_nid) }
+            return ir_sroa_block_ok(pool, nodes, extra, eb, v_soff, v_slen, decl_nid)
+        }
+        return true
+    }
+    if k == nk_while() {
+        return ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, snid, 1), v_soff, v_slen) and ir_sroa_block_ok(pool, nodes, extra, ast_get(nodes, snid, 2), v_soff, v_slen, decl_nid)
+    }
+    if k == nk_for_range() {
+        if ast_get(nodes, snid, 2) == v_slen and pool_str_eq2(pool, ast_get(nodes, snid, 1), v_slen, v_soff) { return false }
+        return ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, snid, 3), v_soff, v_slen) and ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, snid, 4), v_soff, v_slen) and ir_sroa_block_ok(pool, nodes, extra, ast_get(nodes, snid, 5), v_soff, v_slen, decl_nid)
+    }
+    if k == nk_unsafe_block() {
+        return ir_sroa_block_ok(pool, nodes, extra, ast_get(nodes, snid, 1), v_soff, v_slen, decl_nid)
+    }
+    if k == nk_block() {
+        return ir_sroa_block_ok(pool, nodes, extra, snid, v_soff, v_slen, decl_nid)
+    }
+    return false
+}
+
+fn ir_sroa_block_ok(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, bnid: i64, v_soff: i64, v_slen: i64, decl_nid: i64) -> bool {
+    if bnid <= 0 { return true }
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt {
+        if not ir_sroa_stmt_ok(pool, nodes, extra, ibuf_get(extra, off + i), v_soff, v_slen, decl_nid) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// Rewrites `v.fk` (`nk_field`) in-place into `nk_ident(s_soff, s_slen)` using `fmap` (`[f_soff, f_slen, s_soff, s_slen] * f_cnt`).
+fn ir_sroa_rewrite_expr(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, enid: i64, v_soff: i64, v_slen: i64, fmap: IntBuf, fm_base: i64, f_cnt: i64) {
+    if enid <= 0 { return }
+    k := ast_kind(nodes, enid)
+    if k == nk_field() {
+        b := ast_get(nodes, enid, 1)
+        if b > 0 and ast_kind(nodes, b) == nk_ident() and ast_get(nodes, b, 2) == v_slen and pool_str_eq2(pool, ast_get(nodes, b, 1), v_slen, v_soff) {
+            fsoff := ast_get(nodes, enid, 2)
+            fslen := ast_get(nodes, enid, 3)
+            mut fi := 0
+            while fi < f_cnt {
+                mo := fm_base + fi * 4
+                if ibuf_get(fmap, mo + 1) == fslen and pool_str_eq2(pool, fsoff, fslen, ibuf_get(fmap, mo)) {
+                    ast_set(nodes, enid, 0, nk_ident())
+                    ast_set(nodes, enid, 1, ibuf_get(fmap, mo + 2))
+                    ast_set(nodes, enid, 2, ibuf_get(fmap, mo + 3))
+                    ast_set(nodes, enid, 3, 0)
+                    return
+                }
+                fi += 1
+            }
+            return
+        }
+        ir_sroa_rewrite_expr(pool, nodes, extra, b, v_soff, v_slen, fmap, fm_base, f_cnt)
+        return
+    }
+    if k == nk_unary() {
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, enid, 2), v_soff, v_slen, fmap, fm_base, f_cnt)
+        return
+    }
+    if k == nk_cast() or k == nk_tuple_idx() or k == nk_await() or k == nk_comptime_expr() {
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, enid, 1), v_soff, v_slen, fmap, fm_base, f_cnt)
+        return
+    }
+    if k == nk_binary() {
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, enid, 2), v_soff, v_slen, fmap, fm_base, f_cnt)
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, enid, 3), v_soff, v_slen, fmap, fm_base, f_cnt)
+        return
+    }
+    if k == nk_in_range() {
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, enid, 2), v_soff, v_slen, fmap, fm_base, f_cnt)
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, enid, 3), v_soff, v_slen, fmap, fm_base, f_cnt)
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, enid, 4), v_soff, v_slen, fmap, fm_base, f_cnt)
+        return
+    }
+    if k == nk_or_return() or k == nk_index() {
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, enid, 1), v_soff, v_slen, fmap, fm_base, f_cnt)
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, enid, 2), v_soff, v_slen, fmap, fm_base, f_cnt)
+        return
+    }
+    if k == nk_table_alloc() {
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, enid, 3), v_soff, v_slen, fmap, fm_base, f_cnt)
+        return
+    }
+    if k == nk_tuple() or k == nk_fstr() {
+        off := ast_get(nodes, enid, 1); cnt := ast_get(nodes, enid, 2)
+        mut i := 0
+        while i < cnt {
+            ir_sroa_rewrite_expr(pool, nodes, extra, ibuf_get(extra, off + i), v_soff, v_slen, fmap, fm_base, f_cnt)
+            i += 1
+        }
+        return
+    }
+    if k == nk_call() {
+        aoff := ast_get(nodes, enid, 3); acnt := ast_get(nodes, enid, 4)
+        mut i := 0
+        while i < acnt {
+            ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, ibuf_get(extra, aoff + i), 4), v_soff, v_slen, fmap, fm_base, f_cnt)
+            i += 1
+        }
+        return
+    }
+    if k == nk_method_call() {
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, enid, 1), v_soff, v_slen, fmap, fm_base, f_cnt)
+        aoff := ast_get(nodes, enid, 4); acnt := ast_get(nodes, enid, 5)
+        mut i := 0
+        while i < acnt {
+            ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, ibuf_get(extra, aoff + i), 4), v_soff, v_slen, fmap, fm_base, f_cnt)
+            i += 1
+        }
+        return
+    }
+    if k == nk_if_expr() {
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, enid, 1), v_soff, v_slen, fmap, fm_base, f_cnt)
+        tb := ast_get(nodes, enid, 2)
+        ir_sroa_rewrite_block(pool, nodes, extra, tb, v_soff, v_slen, fmap, fm_base, f_cnt)
+        if tb > 0 and ast_kind(nodes, tb) == nk_block() {
+            ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, tb, 3), v_soff, v_slen, fmap, fm_base, f_cnt)
+        }
+        eb := ast_get(nodes, enid, 3)
+        if eb > 0 {
+            if ast_kind(nodes, eb) == nk_if_expr() {
+                ir_sroa_rewrite_expr(pool, nodes, extra, eb, v_soff, v_slen, fmap, fm_base, f_cnt)
+            } else {
+                ir_sroa_rewrite_block(pool, nodes, extra, eb, v_soff, v_slen, fmap, fm_base, f_cnt)
+                if ast_kind(nodes, eb) == nk_block() {
+                    ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, eb, 3), v_soff, v_slen, fmap, fm_base, f_cnt)
+                }
+            }
+        }
+        return
+    }
+    if k == nk_unsafe_block() {
+        ub := ast_get(nodes, enid, 1)
+        ir_sroa_rewrite_block(pool, nodes, extra, ub, v_soff, v_slen, fmap, fm_base, f_cnt)
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, ub, 3), v_soff, v_slen, fmap, fm_base, f_cnt)
+    }
+}
+
+fn ir_sroa_rewrite_stmt(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, snid: i64, v_soff: i64, v_slen: i64, fmap: IntBuf, fm_base: i64, f_cnt: i64) {
+    if snid <= 0 { return }
+    k := ast_kind(nodes, snid)
+    if k == nk_var_decl() {
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, snid, 5), v_soff, v_slen, fmap, fm_base, f_cnt)
+    } else if k == nk_assign() {
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, snid, 2), v_soff, v_slen, fmap, fm_base, f_cnt)
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, snid, 3), v_soff, v_slen, fmap, fm_base, f_cnt)
+    } else if k == nk_return() or k == nk_expr_stmt() {
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, snid, 1), v_soff, v_slen, fmap, fm_base, f_cnt)
+    } else if k == nk_if() {
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, snid, 1), v_soff, v_slen, fmap, fm_base, f_cnt)
+        ir_sroa_rewrite_block(pool, nodes, extra, ast_get(nodes, snid, 2), v_soff, v_slen, fmap, fm_base, f_cnt)
+        eb := ast_get(nodes, snid, 3)
+        if eb > 0 {
+            if ast_kind(nodes, eb) == nk_if() { ir_sroa_rewrite_stmt(pool, nodes, extra, eb, v_soff, v_slen, fmap, fm_base, f_cnt) }
+            else { ir_sroa_rewrite_block(pool, nodes, extra, eb, v_soff, v_slen, fmap, fm_base, f_cnt) }
+        }
+    } else if k == nk_while() {
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, snid, 1), v_soff, v_slen, fmap, fm_base, f_cnt)
+        ir_sroa_rewrite_block(pool, nodes, extra, ast_get(nodes, snid, 2), v_soff, v_slen, fmap, fm_base, f_cnt)
+    } else if k == nk_for_range() {
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, snid, 3), v_soff, v_slen, fmap, fm_base, f_cnt)
+        ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, snid, 4), v_soff, v_slen, fmap, fm_base, f_cnt)
+        ir_sroa_rewrite_block(pool, nodes, extra, ast_get(nodes, snid, 5), v_soff, v_slen, fmap, fm_base, f_cnt)
+    } else if k == nk_unsafe_block() {
+        ir_sroa_rewrite_block(pool, nodes, extra, ast_get(nodes, snid, 1), v_soff, v_slen, fmap, fm_base, f_cnt)
+    } else if k == nk_block() {
+        ir_sroa_rewrite_block(pool, nodes, extra, snid, v_soff, v_slen, fmap, fm_base, f_cnt)
+    }
+}
+
+fn ir_sroa_rewrite_block(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, bnid: i64, v_soff: i64, v_slen: i64, fmap: IntBuf, fm_base: i64, f_cnt: i64) {
+    if bnid <= 0 { return }
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt {
+        ir_sroa_rewrite_stmt(pool, nodes, extra, ibuf_get(extra, off + i), v_soff, v_slen, fmap, fm_base, f_cnt)
+        i += 1
+    }
+}
+
+fn ir_make_ty_named(pool: ByteBuf, nodes: IntBuf, ty: i64, sp: i64) -> i64 {
+    mut lit := "i64"
+    if ty == ty_float() { lit = "f64" }
+    else if ty == ty_bool() { lit = "bool" }
+    soff := pool_intern_str(pool, lit)
+    tn := ast_alloc(nodes, nk_ty_named(), sp)
+    ast_set(nodes, tn, 1, soff)
+    ast_set(nodes, tn, 2, str_len(lit))
+    return tn
+}
+
+fn ir_pass_sroa_block(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, bnid: i64, arena: IntBuf, uid_box: IntBuf) {
+    if bnid <= 0 or ast_kind(nodes, bnid) != nk_block() { return }
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt {
+        st := ibuf_get(extra, off + i)
+        if st > 0 {
+            sk := ast_kind(nodes, st)
+            if sk == nk_if() {
+                ir_pass_sroa_block(pool, nodes, extra, sym, ast_get(nodes, st, 2), arena, uid_box)
+                eb := ast_get(nodes, st, 3)
+                if eb > 0 and ast_kind(nodes, eb) == nk_block() {
+                    ir_pass_sroa_block(pool, nodes, extra, sym, eb, arena, uid_box)
+                }
+            } else if sk == nk_while() {
+                ir_pass_sroa_block(pool, nodes, extra, sym, ast_get(nodes, st, 2), arena, uid_box)
+            } else if sk == nk_for_range() {
+                ir_pass_sroa_block(pool, nodes, extra, sym, ast_get(nodes, st, 5), arena, uid_box)
+            } else if sk == nk_unsafe_block() {
+                ir_pass_sroa_block(pool, nodes, extra, sym, ast_get(nodes, st, 1), arena, uid_box)
+            } else if sk == nk_block() {
+                ir_pass_sroa_block(pool, nodes, extra, sym, st, arena, uid_box)
+            }
+        }
+        i += 1
+    }
+
+    // Scan statements of `bnid` for non-escaping `v := StructName(args...)`
+    mut changed := false
+    new_base := ibuf_len(arena)
+    i = 0
+    while i < cnt {
+        st := ibuf_get(extra, off + i)
+        mut replaced := false
+        if st > 0 and ast_kind(nodes, st) == nk_var_decl() and (ast_get(nodes, st, 3) & 2) == 0 and (ast_get(nodes, st, 6) & 1) == 0 {
+            ie := ast_get(nodes, st, 5)
+            if ie > 0 and ast_kind(nodes, ie) == nk_call() and ast_get(nodes, ie, 6) == 0 {
+                sidx := find_struct_idx(pool, sym, ast_get(nodes, ie, 1), ast_get(nodes, ie, 2))
+                if ir_is_scalar_sroa_struct(sym, sidx) {
+                    v_soff := ast_get(nodes, st, 1)
+                    v_slen := ast_get(nodes, st, 2)
+                    // Verify `v` does not escape anywhere in the remainder of `bnid` (nor in `bnid`'s tail expr)
+                    mut ok_esc := ast_get(nodes, bnid, 3) <= 0 or ir_sroa_expr_ok(pool, nodes, extra, ast_get(nodes, bnid, 3), v_soff, v_slen)
+                    mut j := i + 1
+                    while ok_esc and j < cnt {
+                        if not ir_sroa_stmt_ok(pool, nodes, extra, ibuf_get(extra, off + j), v_soff, v_slen, st) {
+                            ok_esc = false
+                        }
+                        j += 1
+                    }
+                    // Require positional arguments for deterministic left-to-right evaluation order
+                    aoff := ast_get(nodes, ie, 3)
+                    acnt := ast_get(nodes, ie, 4)
+                    mut pos_ok := ok_esc
+                    mut ai := 0
+                    while pos_ok and ai < acnt {
+                        if ast_get(nodes, ibuf_get(extra, aoff + ai), 2) >= 0 { pos_ok = false }
+                        ai += 1
+                    }
+                    if pos_ok {
+                        s_off := ibuf_get(sym, 3) + sidx * 6
+                        f_base := ibuf_get(sym, s_off + 3)
+                        f_cnt := ibuf_get(sym, s_off + 4)
+                        if acnt == f_cnt {
+                            is_mut := ast_get(nodes, st, 3) & 1
+                            sp := ast_span(nodes, st)
+                            uid := ibuf_get(uid_box, 0) + 1
+                            ibuf_set(uid_box, 0, uid)
+                            fmap := ibuf_new(f_cnt * 4)
+                            mut fi := 0
+                            while fi < f_cnt {
+                                fo := f_base + fi * 4
+                                fn_soff := ibuf_get(sym, fo)
+                                fn_slen := ibuf_get(sym, fo + 1)
+                                f_ty := ibuf_get(sym, fo + 3)
+                                sname := f"__ax_sr_{uid}_{fi}"
+                                s_soff := pool_intern_str(pool, sname)
+                                s_slen := str_len(sname)
+                                ibuf_push(fmap, fn_soff)
+                                ibuf_push(fmap, fn_slen)
+                                ibuf_push(fmap, s_soff)
+                                ibuf_push(fmap, s_slen)
+
+                                vd := ast_alloc(nodes, nk_var_decl(), sp)
+                                ast_set(nodes, vd, 1, s_soff)
+                                ast_set(nodes, vd, 2, s_slen)
+                                ast_set(nodes, vd, 3, is_mut)
+                                ast_set(nodes, vd, 4, ir_make_ty_named(pool, nodes, f_ty, sp))
+                                ast_set(nodes, vd, 5, ast_get(nodes, ibuf_get(extra, aoff + fi), 4))
+                                ibuf_push(arena, vd)
+                                fi += 1
+                            }
+                            j = i + 1
+                            while j < cnt {
+                                ir_sroa_rewrite_stmt(pool, nodes, extra, ibuf_get(extra, off + j), v_soff, v_slen, fmap, 0, f_cnt)
+                                j += 1
+                            }
+                            if ast_get(nodes, bnid, 3) > 0 {
+                                ir_sroa_rewrite_expr(pool, nodes, extra, ast_get(nodes, bnid, 3), v_soff, v_slen, fmap, 0, f_cnt)
+                            }
+                            buf_free(move fmap)
+                            replaced = true
+                            changed = true
+                        }
+                    }
+                }
+            }
+        }
+        if not replaced {
+            ibuf_push(arena, st)
+        }
+        i += 1
+    }
+    if changed {
+        new_cnt := ibuf_len(arena) - new_base
+        new_off := ibuf_len(extra)
+        mut k := 0
+        while k < new_cnt {
+            ibuf_push(extra, ibuf_get(arena, new_base + k))
+            k += 1
+        }
+        ast_set(nodes, bnid, 1, new_off)
+        ast_set(nodes, bnid, 2, new_cnt)
+    }
+    ibuf_truncate(arena, new_base)
+}
+
+// ============================================================================
+// Pass 4: Constant Propagation, Strength Reduction, Dead-Branch & Flat GVN/CSE
+// ============================================================================
+
+fn ir_namelist_has(pool: ByteBuf, list: IntBuf, base: i64, cnt: i64, soff: i64, slen: i64) -> bool {
+    mut i := 0
+    while i < cnt {
+        o := base + i * 2
+        if ibuf_get(list, o + 1) == slen and pool_str_eq2(pool, ibuf_get(list, o), slen, soff) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+fn ir_namelist_add(pool: ByteBuf, list: IntBuf, base: i64, soff: i64, slen: i64, max_words: i64 = 32760) {
+    if ibuf_len(list) + 2 > max_words { return }
+    cnt := (ibuf_len(list) - base) / 2
+    if not ir_namelist_has(pool, list, base, cnt, soff, slen) {
+        ibuf_push(list, soff)
+        ibuf_push(list, slen)
+    }
+}
+
+fn ir_base_ident_of_lval(nodes: IntBuf, enid: i64) -> i64 {
+    mut cur := enid
+    while cur > 0 {
+        k := ast_kind(nodes, cur)
+        if k == nk_ident() { return cur }
+        if k == nk_field() or k == nk_tuple_idx() or k == nk_index() {
+            cur = ast_get(nodes, cur, 1)
+        } else {
+            return 0
+        }
+    }
+    return 0
+}
+
+// Collects `(decls, muts)` across `bnid`: any variable mutated OR declared >= 2 times is added to `muts`!
+fn ir_collect_muts_expr(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, enid: i64, decls: IntBuf, d_base: i64, muts: IntBuf, m_base: i64) {
+    if enid <= 0 { return }
+    k := ast_kind(nodes, enid)
+    if k == nk_move_ident() {
+        ir_namelist_add(pool, muts, m_base, ast_get(nodes, enid, 1), ast_get(nodes, enid, 2))
+        return
+    }
+    if k == nk_unary() {
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, enid, 2), decls, d_base, muts, m_base)
+        return
+    }
+    if k == nk_cast() or k == nk_field() or k == nk_tuple_idx() or k == nk_await() or k == nk_comptime_expr() {
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, enid, 1), decls, d_base, muts, m_base)
+        return
+    }
+    if k == nk_binary() {
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, enid, 2), decls, d_base, muts, m_base)
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, enid, 3), decls, d_base, muts, m_base)
+        return
+    }
+    if k == nk_in_range() {
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, enid, 2), decls, d_base, muts, m_base)
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, enid, 3), decls, d_base, muts, m_base)
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, enid, 4), decls, d_base, muts, m_base)
+        return
+    }
+    if k == nk_or_return() or k == nk_index() {
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, enid, 1), decls, d_base, muts, m_base)
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, enid, 2), decls, d_base, muts, m_base)
+        return
+    }
+    if k == nk_tuple() or k == nk_fstr() {
+        off := ast_get(nodes, enid, 1); cnt := ast_get(nodes, enid, 2)
+        mut i := 0
+        while i < cnt {
+            ir_collect_muts_expr(pool, nodes, extra, ibuf_get(extra, off + i), decls, d_base, muts, m_base)
+            i += 1
+        }
+        return
+    }
+    if k == nk_call() {
+        aoff := ast_get(nodes, enid, 3); acnt := ast_get(nodes, enid, 4)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            ae := ast_get(nodes, ca, 4)
+            if ast_get(nodes, ca, 1) == pmode_mut() {
+                idn := ir_base_ident_of_lval(nodes, ae)
+                if idn > 0 { ir_namelist_add(pool, muts, m_base, ast_get(nodes, idn, 1), ast_get(nodes, idn, 2)) }
+            }
+            ir_collect_muts_expr(pool, nodes, extra, ae, decls, d_base, muts, m_base)
+            i += 1
+        }
+        return
+    }
+    if k == nk_method_call() {
+        r_id := ir_base_ident_of_lval(nodes, ast_get(nodes, enid, 1))
+        if r_id > 0 { ir_namelist_add(pool, muts, m_base, ast_get(nodes, r_id, 1), ast_get(nodes, r_id, 2)) }
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, enid, 1), decls, d_base, muts, m_base)
+        aoff := ast_get(nodes, enid, 4); acnt := ast_get(nodes, enid, 5)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, ca, 4), decls, d_base, muts, m_base)
+            i += 1
+        }
+        return
+    }
+    if k == nk_if_expr() {
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, enid, 1), decls, d_base, muts, m_base)
+        tb := ast_get(nodes, enid, 2)
+        ir_collect_muts_block(pool, nodes, extra, tb, decls, d_base, muts, m_base)
+        if tb > 0 and ast_kind(nodes, tb) == nk_block() {
+            ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, tb, 3), decls, d_base, muts, m_base)
+        }
+        eb := ast_get(nodes, enid, 3)
+        if eb > 0 {
+            if ast_kind(nodes, eb) == nk_if_expr() { ir_collect_muts_expr(pool, nodes, extra, eb, decls, d_base, muts, m_base) }
+            else {
+                ir_collect_muts_block(pool, nodes, extra, eb, decls, d_base, muts, m_base)
+                if ast_kind(nodes, eb) == nk_block() {
+                    ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, eb, 3), decls, d_base, muts, m_base)
+                }
+            }
+        }
+        return
+    }
+    if k == nk_unsafe_block() {
+        ub := ast_get(nodes, enid, 1)
+        ir_collect_muts_block(pool, nodes, extra, ub, decls, d_base, muts, m_base)
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, ub, 3), decls, d_base, muts, m_base)
+    }
+}
+
+fn ir_record_decl_name(pool: ByteBuf, decls: IntBuf, d_base: i64, muts: IntBuf, m_base: i64, soff: i64, slen: i64, is_mut: bool) {
+    dcnt := (ibuf_len(decls) - d_base) / 2
+    if is_mut or ir_namelist_has(pool, decls, d_base, dcnt, soff, slen) {
+        ir_namelist_add(pool, muts, m_base, soff, slen)
+    } else if ibuf_len(decls) + 2 <= 32760 {
+        ibuf_push(decls, soff)
+        ibuf_push(decls, slen)
+    } else {
+        ir_namelist_add(pool, muts, m_base, soff, slen)
+    }
+}
+
+fn ir_collect_muts_stmt(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, snid: i64, decls: IntBuf, d_base: i64, muts: IntBuf, m_base: i64) {
+    if snid <= 0 { return }
+    k := ast_kind(nodes, snid)
+    if k == nk_var_decl() {
+        ir_record_decl_name(pool, decls, d_base, muts, m_base, ast_get(nodes, snid, 1), ast_get(nodes, snid, 2), ast_get(nodes, snid, 3) != 0)
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, snid, 5), decls, d_base, muts, m_base)
+    } else if k == nk_tuple_destruct() {
+        noff := ast_get(nodes, snid, 1); ncnt := ast_get(nodes, snid, 2)
+        mut i := 0
+        while i < ncnt {
+            ir_namelist_add(pool, muts, m_base, ibuf_get(extra, noff + i * 2), ibuf_get(extra, noff + i * 2 + 1))
+            i += 1
+        }
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, snid, 3), decls, d_base, muts, m_base)
+    } else if k == nk_assign() {
+        idn := ir_base_ident_of_lval(nodes, ast_get(nodes, snid, 2))
+        if idn > 0 { ir_namelist_add(pool, muts, m_base, ast_get(nodes, idn, 1), ast_get(nodes, idn, 2)) }
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, snid, 2), decls, d_base, muts, m_base)
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, snid, 3), decls, d_base, muts, m_base)
+    } else if k == nk_if() {
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, snid, 1), decls, d_base, muts, m_base)
+        ir_collect_muts_block(pool, nodes, extra, ast_get(nodes, snid, 2), decls, d_base, muts, m_base)
+        eb := ast_get(nodes, snid, 3)
+        if eb > 0 {
+            if ast_kind(nodes, eb) == nk_if() { ir_collect_muts_stmt(pool, nodes, extra, eb, decls, d_base, muts, m_base) }
+            else { ir_collect_muts_block(pool, nodes, extra, eb, decls, d_base, muts, m_base) }
+        }
+    } else if k == nk_while() {
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, snid, 1), decls, d_base, muts, m_base)
+        ir_collect_muts_block(pool, nodes, extra, ast_get(nodes, snid, 2), decls, d_base, muts, m_base)
+    } else if k == nk_for_range() or k == nk_par_for_range() {
+        ir_namelist_add(pool, muts, m_base, ast_get(nodes, snid, 1), ast_get(nodes, snid, 2))
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, snid, 3), decls, d_base, muts, m_base)
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, snid, 4), decls, d_base, muts, m_base)
+        ir_collect_muts_block(pool, nodes, extra, ast_get(nodes, snid, 5), decls, d_base, muts, m_base)
+    } else if k == nk_for_each() or k == nk_par_for_each() {
+        ir_namelist_add(pool, muts, m_base, ast_get(nodes, snid, 1), ast_get(nodes, snid, 2))
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, snid, 3), decls, d_base, muts, m_base)
+        ir_collect_muts_block(pool, nodes, extra, ast_get(nodes, snid, 4), decls, d_base, muts, m_base)
+    } else if k == nk_unsafe_block() {
+        ir_collect_muts_block(pool, nodes, extra, ast_get(nodes, snid, 1), decls, d_base, muts, m_base)
+    } else if k == nk_block() {
+        ir_collect_muts_block(pool, nodes, extra, snid, decls, d_base, muts, m_base)
+    } else if k == nk_return() or k == nk_expr_stmt() {
+        ir_collect_muts_expr(pool, nodes, extra, ast_get(nodes, snid, 1), decls, d_base, muts, m_base)
+    }
+}
+
+fn ir_collect_muts_block(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, bnid: i64, decls: IntBuf, d_base: i64, muts: IntBuf, m_base: i64) {
+    if bnid <= 0 { return }
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt {
+        ir_collect_muts_stmt(pool, nodes, extra, ibuf_get(extra, off + i), decls, d_base, muts, m_base)
+        i += 1
+    }
+}
+
+fn ir_is_pure_expr(nodes: IntBuf, extra: IntBuf, enid: i64) -> bool {
+    if enid <= 0 { return true }
+    k := ast_kind(nodes, enid)
+    if k == nk_int() or k == nk_float() or k == nk_bool() or k == nk_dec() or k == nk_str() or k == nk_ident() {
+        return true
+    }
+    if k == nk_unary() { return ir_is_pure_expr(nodes, extra, ast_get(nodes, enid, 2)) }
+    if k == nk_field() or k == nk_cast() { return ir_is_pure_expr(nodes, extra, ast_get(nodes, enid, 1)) }
+    if k == nk_binary() {
+        op := ast_get(nodes, enid, 1)
+        if op == op_div() or op == op_mod() { return false }
+        return ir_is_pure_expr(nodes, extra, ast_get(nodes, enid, 2)) and ir_is_pure_expr(nodes, extra, ast_get(nodes, enid, 3))
+    }
+    return false
+}
+
+// `cmap` entries: `[soff, slen, lit_kind, lit_val]` (`4` words)
+// `gvn`  entries: `[op, l_tag, l_v1, l_v2, r_tag, r_v1, r_v2, dst_soff, dst_slen]` (`9` words)
+fn ir_operand_key(nodes: IntBuf, enid: i64, out3: IntBuf) -> bool {
+    ibuf_truncate(out3, 0)
+    if enid <= 0 { return false }
+    k := ast_kind(nodes, enid)
+    if k == nk_int() or k == nk_float() or k == nk_bool() {
+        ibuf_push(out3, k)
+        ibuf_push(out3, ast_get(nodes, enid, 1))
+        ibuf_push(out3, 0)
+        return true
+    }
+    if k == nk_ident() {
+        ibuf_push(out3, nk_ident())
+        ibuf_push(out3, ast_get(nodes, enid, 1))
+        ibuf_push(out3, ast_get(nodes, enid, 2))
+        return true
+    }
+    return false
+}
+
+fn ir_operand_eq(pool: ByteBuf, t1: i64, a1: i64, b1: i64, t2: i64, a2: i64, b2: i64) -> bool {
+    if t1 != t2 { return false }
+    if t1 == nk_ident() {
+        return b1 == b2 and pool_str_eq2(pool, a1, b1, a2)
+    }
+    return a1 == a2
+}
+
+fn ir_fold_gvn_expr(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, enid: i64, is_shield: bool, has_nan_guard: bool, cmap: IntBuf, gvn: IntBuf, muts: IntBuf, m_cnt: i64) {
+    if enid <= 0 { return }
+    k := ast_kind(nodes, enid)
+
+    // 1. Immutable SSA local constant propagation (`x -> lit`)
+    if k == nk_ident() {
+        soff := ast_get(nodes, enid, 1)
+        slen := ast_get(nodes, enid, 2)
+        ccnt := ibuf_len(cmap) / 4
+        mut ci := ccnt - 1
+        while ci >= 0 {
+            co := ci * 4
+            if ibuf_get(cmap, co + 1) == slen and pool_str_eq2(pool, ibuf_get(cmap, co), slen, soff) {
+                ast_set(nodes, enid, 0, ibuf_get(cmap, co + 2))
+                ast_set(nodes, enid, 1, ibuf_get(cmap, co + 3))
+                ast_set(nodes, enid, 2, 0)
+                return
+            }
+            ci -= 1
+        }
+        return
+    }
+
+    if k == nk_unary() {
+        sub := ast_get(nodes, enid, 2)
+        ir_fold_gvn_expr(pool, nodes, extra, sub, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        if sub <= 0 { return }
+        uop := ast_get(nodes, enid, 1)
+        sk := ast_kind(nodes, sub)
+        if uop == uop_not() and sk == nk_bool() {
+            ast_set(nodes, enid, 0, nk_bool())
+            ast_set(nodes, enid, 1, if ast_get(nodes, sub, 1) == 0 { 1 } else { 0 })
+            ast_set(nodes, enid, 2, 0)
+            return
+        }
+        if uop == uop_neg() and sk == nk_int() {
+            sv := ast_get(nodes, sub, 1)
+            if not is_shield or sv != (1 << 63) {
+                ast_set(nodes, enid, 0, nk_int())
+                ast_set(nodes, enid, 1, 0 -% sv)
+                ast_set(nodes, enid, 2, 0)
+            }
+            return
+        }
+        if uop == uop_neg() and sk == nk_float() and not has_nan_guard {
+            ast_set(nodes, enid, 0, nk_float())
+            ast_set(nodes, enid, 1, ast_get(nodes, sub, 1) ^ (1 << 63))
+            ast_set(nodes, enid, 2, 0)
+        }
+        return
+    }
+
+    if k == nk_binary() {
+        op := ast_get(nodes, enid, 1)
+        lhs := ast_get(nodes, enid, 2)
+        rhs := ast_get(nodes, enid, 3)
+        ir_fold_gvn_expr(pool, nodes, extra, lhs, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        ir_fold_gvn_expr(pool, nodes, extra, rhs, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        if lhs <= 0 or rhs <= 0 { return }
+        lk := ast_kind(nodes, lhs)
+        rk := ast_kind(nodes, rhs)
+
+        // Constant folding on `(nk_int, nk_int)`
+        if lk == nk_int() and rk == nk_int() {
+            lv := ast_get(nodes, lhs, 1)
+            rv := ast_get(nodes, rhs, 1)
+            if op == op_wrap_add() or (op == op_add() and not is_shield) {
+                ast_set(nodes, enid, 0, nk_int()); ast_set(nodes, enid, 1, lv +% rv); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return
+            }
+            if op == op_wrap_sub() or (op == op_sub() and not is_shield) {
+                ast_set(nodes, enid, 0, nk_int()); ast_set(nodes, enid, 1, lv -% rv); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return
+            }
+            if op == op_wrap_mul() or (op == op_mul() and not is_shield) {
+                ast_set(nodes, enid, 0, nk_int()); ast_set(nodes, enid, 1, lv *% rv); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return
+            }
+            if op == op_div() and rv != 0 and not (lv == (1 << 63) and rv == -1) {
+                ast_set(nodes, enid, 0, nk_int()); ast_set(nodes, enid, 1, lv / rv); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return
+            }
+            if op == op_mod() and rv != 0 and not (lv == (1 << 63) and rv == -1) {
+                ast_set(nodes, enid, 0, nk_int()); ast_set(nodes, enid, 1, lv % rv); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return
+            }
+            if op == op_bit_and() { ast_set(nodes, enid, 0, nk_int()); ast_set(nodes, enid, 1, lv & rv); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return }
+            if op == op_bit_or()  { ast_set(nodes, enid, 0, nk_int()); ast_set(nodes, enid, 1, lv | rv); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return }
+            if op == op_bit_xor() { ast_set(nodes, enid, 0, nk_int()); ast_set(nodes, enid, 1, lv ^ rv); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return }
+            if op == op_shl() and rv >= 0 and rv < 64 { ast_set(nodes, enid, 0, nk_int()); ast_set(nodes, enid, 1, lv << rv); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return }
+            if op == op_shr() and rv >= 0 and rv < 64 { ast_set(nodes, enid, 0, nk_int()); ast_set(nodes, enid, 1, lv >> rv); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return }
+            if op >= op_eq() and op <= op_gte() {
+                mut cv := 0
+                if op == op_eq() and lv == rv { cv = 1 }
+                else if op == op_neq() and lv != rv { cv = 1 }
+                else if op == op_lt() and lv < rv { cv = 1 }
+                else if op == op_lte() and lv <= rv { cv = 1 }
+                else if op == op_gt() and lv > rv { cv = 1 }
+                else if op == op_gte() and lv >= rv { cv = 1 }
+                ast_set(nodes, enid, 0, nk_bool()); ast_set(nodes, enid, 1, cv); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return
+            }
+        }
+
+        // Constant folding on `(nk_bool, nk_bool)`
+        if lk == nk_bool() and rk == nk_bool() {
+            lb := ast_get(nodes, lhs, 1) != 0
+            rb := ast_get(nodes, rhs, 1) != 0
+            if op == op_and() { ast_set(nodes, enid, 0, nk_bool()); ast_set(nodes, enid, 1, if lb and rb { 1 } else { 0 }); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return }
+            if op == op_or()  { ast_set(nodes, enid, 0, nk_bool()); ast_set(nodes, enid, 1, if lb or rb { 1 } else { 0 }); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return }
+            if op == op_eq()  { ast_set(nodes, enid, 0, nk_bool()); ast_set(nodes, enid, 1, if lb == rb { 1 } else { 0 }); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return }
+            if op == op_neq() { ast_set(nodes, enid, 0, nk_bool()); ast_set(nodes, enid, 1, if lb != rb { 1 } else { 0 }); ast_set(nodes, enid, 2, 0); ast_set(nodes, enid, 3, 0); return }
+        }
+
+        // Algebraic identities & strength reduction (type-preserving!)
+        if rk == nk_int() {
+            rv := ast_get(nodes, rhs, 1)
+            if rv == 0 and (op == op_wrap_add() or op == op_wrap_sub() or op == op_bit_or() or op == op_bit_xor() or op == op_shl() or op == op_shr()) {
+                ir_copy_node_in_place(nodes, enid, lhs)
+                return
+            }
+            if rv == 1 and (op == op_wrap_mul() or op == op_pow()) {
+                ir_copy_node_in_place(nodes, enid, lhs)
+                return
+            }
+            // `x ** 2` -> `x * x` (eliminates 15-insn `CALL h_pow_i64`!)
+            if rv == 2 and op == op_pow() and lk == nk_ident() {
+                dup := ast_alloc(nodes, nk_ident(), ast_span(nodes, lhs))
+                ast_set(nodes, dup, 1, ast_get(nodes, lhs, 1))
+                ast_set(nodes, dup, 2, ast_get(nodes, lhs, 2))
+                ast_set(nodes, enid, 1, op_mul())
+                ast_set(nodes, enid, 3, dup)
+                return
+            }
+        }
+        if lk == nk_int() and ast_get(nodes, lhs, 1) == 0 and (op == op_wrap_add() or op == op_bit_or() or op == op_bit_xor()) {
+            ir_copy_node_in_place(nodes, enid, rhs)
+            return
+        }
+
+        // Exact IEEE-754 binary64 power-of-2 reciprocal multiply (`x / 2.0 -> x * 0.5`, etc.)
+        if op == op_div() and rk == nk_float() and not has_nan_guard {
+            fbits := ast_get(nodes, rhs, 1)
+            if fbits == 0x4000000000000000 { ast_set(nodes, enid, 1, op_mul()); ast_set(nodes, rhs, 1, 0x3FE0000000000000) }      // / 2.0  -> * 0.5
+            else if fbits == 0x4010000000000000 { ast_set(nodes, enid, 1, op_mul()); ast_set(nodes, rhs, 1, 0x3FD0000000000000) } // / 4.0  -> * 0.25
+            else if fbits == 0x4020000000000000 { ast_set(nodes, enid, 1, op_mul()); ast_set(nodes, rhs, 1, 0x3FC0000000000000) } // / 8.0  -> * 0.125
+            else if fbits == 0x4030000000000000 { ast_set(nodes, enid, 1, op_mul()); ast_set(nodes, rhs, 1, 0x3FB0000000000000) } // / 16.0 -> * 0.0625
+        }
+
+        // SSA-Dominance GVN / Common Subexpression Elimination
+        gcnt := ibuf_len(gvn) / 9
+        if gcnt > 0 and ((op >= op_add() and op <= op_wrap_mul()) or (op >= op_bit_and() and op <= op_shr())) {
+            kl := ibuf_new(3)
+            kr := ibuf_new(3)
+            if ir_operand_key(nodes, ast_get(nodes, enid, 2), kl) and ir_operand_key(nodes, ast_get(nodes, enid, 3), kr) {
+                lt := ibuf_get(kl, 0); la := ibuf_get(kl, 1); lb := ibuf_get(kl, 2)
+                rt := ibuf_get(kr, 0); ra := ibuf_get(kr, 1); rb := ibuf_get(kr, 2)
+                l_ok := lt != nk_ident() or not ir_namelist_has(pool, muts, 0, m_cnt, la, lb)
+                r_ok := rt != nk_ident() or not ir_namelist_has(pool, muts, 0, m_cnt, ra, rb)
+                if l_ok and r_ok {
+                    cur_op := ast_get(nodes, enid, 1)
+                    is_comm := cur_op == op_add() or cur_op == op_wrap_add() or cur_op == op_mul() or cur_op == op_wrap_mul() or cur_op == op_bit_and() or cur_op == op_bit_or() or cur_op == op_bit_xor()
+                    mut gi := gcnt - 1
+                    while gi >= 0 {
+                        go := gi * 9
+                        if ibuf_get(gvn, go) == cur_op {
+                            gt_l := ibuf_get(gvn, go + 1); ga_l := ibuf_get(gvn, go + 2); gb_l := ibuf_get(gvn, go + 3)
+                            gt_r := ibuf_get(gvn, go + 4); ga_r := ibuf_get(gvn, go + 5); gb_r := ibuf_get(gvn, go + 6)
+                            direct_m := ir_operand_eq(pool, lt, la, lb, gt_l, ga_l, gb_l) and ir_operand_eq(pool, rt, ra, rb, gt_r, ga_r, gb_r)
+                            comm_m := is_comm and ir_operand_eq(pool, lt, la, lb, gt_r, ga_r, gb_r) and ir_operand_eq(pool, rt, ra, rb, gt_l, ga_l, gb_l)
+                            if direct_m or comm_m {
+                                ast_set(nodes, enid, 0, nk_ident())
+                                ast_set(nodes, enid, 1, ibuf_get(gvn, go + 7))
+                                ast_set(nodes, enid, 2, ibuf_get(gvn, go + 8))
+                                ast_set(nodes, enid, 3, 0)
+                                break
+                            }
+                        }
+                        gi -= 1
+                    }
+                }
+            }
+            buf_free(move kr)
+            buf_free(move kl)
+        }
+        return
+    }
+
+    if k == nk_cast() or k == nk_field() or k == nk_tuple_idx() or k == nk_await() or k == nk_comptime_expr() {
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, enid, 1), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        return
+    }
+    if k == nk_in_range() {
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, enid, 2), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, enid, 3), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, enid, 4), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        return
+    }
+    if k == nk_or_return() or k == nk_index() {
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, enid, 1), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, enid, 2), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        return
+    }
+    if k == nk_table_alloc() {
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, enid, 3), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        return
+    }
+    if k == nk_tuple() or k == nk_fstr() {
+        off := ast_get(nodes, enid, 1); cnt := ast_get(nodes, enid, 2)
+        mut i := 0
+        while i < cnt {
+            ir_fold_gvn_expr(pool, nodes, extra, ibuf_get(extra, off + i), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+            i += 1
+        }
+        return
+    }
+    if k == nk_call() {
+        aoff := ast_get(nodes, enid, 3); acnt := ast_get(nodes, enid, 4)
+        mut i := 0
+        while i < acnt {
+            ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, ibuf_get(extra, aoff + i), 4), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+            i += 1
+        }
+        return
+    }
+    if k == nk_method_call() {
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, enid, 1), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        aoff := ast_get(nodes, enid, 4); acnt := ast_get(nodes, enid, 5)
+        mut i := 0
+        while i < acnt {
+            ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, ibuf_get(extra, aoff + i), 4), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+            i += 1
+        }
+        return
+    }
+    if k == nk_if_expr() {
+        ce := ast_get(nodes, enid, 1)
+        ir_fold_gvn_expr(pool, nodes, extra, ce, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        tb := ast_get(nodes, enid, 2)
+        ir_fold_gvn_block(pool, nodes, extra, tb, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        eb := ast_get(nodes, enid, 3)
+        if eb > 0 {
+            if ast_kind(nodes, eb) == nk_if_expr() { ir_fold_gvn_expr(pool, nodes, extra, eb, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt) }
+            else { ir_fold_gvn_block(pool, nodes, extra, eb, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt) }
+        }
+        if ce > 0 and ast_kind(nodes, ce) == nk_bool() {
+            if ast_get(nodes, ce, 1) != 0 {
+                if tb > 0 and ast_kind(nodes, tb) == nk_block() and ast_get(nodes, tb, 2) == 0 and ast_get(nodes, tb, 3) > 0 {
+                    ir_copy_node_in_place(nodes, enid, ast_get(nodes, tb, 3))
+                }
+            } else if eb > 0 {
+                if ast_kind(nodes, eb) == nk_if_expr() {
+                    ir_copy_node_in_place(nodes, enid, eb)
+                } else if ast_kind(nodes, eb) == nk_block() and ast_get(nodes, eb, 2) == 0 and ast_get(nodes, eb, 3) > 0 {
+                    ir_copy_node_in_place(nodes, enid, ast_get(nodes, eb, 3))
+                }
+            }
+        }
+        return
+    }
+    if k == nk_unsafe_block() {
+        ub := ast_get(nodes, enid, 1)
+        ir_fold_gvn_block(pool, nodes, extra, ub, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+    }
+}
+
+fn ir_fold_gvn_stmt(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, snid: i64, is_shield: bool, has_nan_guard: bool, cmap: IntBuf, gvn: IntBuf, muts: IntBuf, m_cnt: i64) {
+    if snid <= 0 { return }
+    k := ast_kind(nodes, snid)
+    if k == nk_var_decl() {
+        ie := ast_get(nodes, snid, 5)
+        ir_fold_gvn_expr(pool, nodes, extra, ie, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        if ast_get(nodes, snid, 3) == 0 and ast_get(nodes, snid, 4) == 0 and (ast_get(nodes, snid, 6) & 1) == 0 and ie > 0 {
+            v_soff := ast_get(nodes, snid, 1)
+            v_slen := ast_get(nodes, snid, 2)
+            if not ir_namelist_has(pool, muts, 0, m_cnt, v_soff, v_slen) {
+                ik := ast_kind(nodes, ie)
+                if (ik == nk_int() or ik == nk_bool() or ik == nk_float()) and ibuf_len(cmap) + 4 <= 8192 {
+                    ibuf_push(cmap, v_soff)
+                    ibuf_push(cmap, v_slen)
+                    ibuf_push(cmap, ik)
+                    ibuf_push(cmap, ast_get(nodes, ie, 1))
+                } else if ik == nk_binary() and ibuf_len(gvn) < 576 {
+                    bop := ast_get(nodes, ie, 1)
+                    if (bop >= op_add() and bop <= op_wrap_mul()) or (bop >= op_bit_and() and bop <= op_shr()) {
+                        kl := ibuf_new(3)
+                        kr := ibuf_new(3)
+                        if ir_operand_key(nodes, ast_get(nodes, ie, 2), kl) and ir_operand_key(nodes, ast_get(nodes, ie, 3), kr) {
+                            lt := ibuf_get(kl, 0); la := ibuf_get(kl, 1); lb := ibuf_get(kl, 2)
+                            rt := ibuf_get(kr, 0); ra := ibuf_get(kr, 1); rb := ibuf_get(kr, 2)
+                            l_ok := lt != nk_ident() or not ir_namelist_has(pool, muts, 0, m_cnt, la, lb)
+                            r_ok := rt != nk_ident() or not ir_namelist_has(pool, muts, 0, m_cnt, ra, rb)
+                            if l_ok and r_ok {
+                                ibuf_push(gvn, bop)
+                                ibuf_push(gvn, lt); ibuf_push(gvn, la); ibuf_push(gvn, lb)
+                                ibuf_push(gvn, rt); ibuf_push(gvn, ra); ibuf_push(gvn, rb)
+                                ibuf_push(gvn, v_soff); ibuf_push(gvn, v_slen)
+                            }
+                        }
+                        buf_free(move kr)
+                        buf_free(move kl)
+                    }
+                }
+            }
+        }
+        return
+    }
+    if k == nk_tuple_destruct() {
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, snid, 3), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        return
+    }
+    if k == nk_assign() {
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, snid, 2), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, snid, 3), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        return
+    }
+    if k == nk_return() or k == nk_expr_stmt() {
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, snid, 1), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        return
+    }
+    if k == nk_if() {
+        ce := ast_get(nodes, snid, 1)
+        ir_fold_gvn_expr(pool, nodes, extra, ce, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        tb := ast_get(nodes, snid, 2)
+        eb := ast_get(nodes, snid, 3)
+        ir_fold_gvn_block(pool, nodes, extra, tb, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        if eb > 0 {
+            if ast_kind(nodes, eb) == nk_if() { ir_fold_gvn_stmt(pool, nodes, extra, eb, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt) }
+            else { ir_fold_gvn_block(pool, nodes, extra, eb, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt) }
+        }
+        // Dead-branch elimination (`if true` / `if false`)
+        if ce > 0 and ast_kind(nodes, ce) == nk_bool() {
+            if ast_get(nodes, ce, 1) != 0 {
+                if tb > 0 { ir_copy_node_in_place(nodes, snid, tb) }
+            } else {
+                if eb > 0 { ir_copy_node_in_place(nodes, snid, eb) }
+                else {
+                    ast_set(nodes, snid, 0, nk_block())
+                    ast_set(nodes, snid, 1, 0)
+                    ast_set(nodes, snid, 2, 0)
+                    ast_set(nodes, snid, 3, 0)
+                }
+            }
+        }
+        return
+    }
+    if k == nk_while() {
+        ce := ast_get(nodes, snid, 1)
+        ir_fold_gvn_expr(pool, nodes, extra, ce, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        ir_fold_gvn_block(pool, nodes, extra, ast_get(nodes, snid, 2), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        if ce > 0 and ast_kind(nodes, ce) == nk_bool() and ast_get(nodes, ce, 1) == 0 {
+            ast_set(nodes, snid, 0, nk_block())
+            ast_set(nodes, snid, 1, 0)
+            ast_set(nodes, snid, 2, 0)
+            ast_set(nodes, snid, 3, 0)
+        }
+        return
+    }
+    if k == nk_for_range() or k == nk_par_for_range() {
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, snid, 3), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, snid, 4), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        ir_fold_gvn_block(pool, nodes, extra, ast_get(nodes, snid, 5), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        return
+    }
+    if k == nk_for_each() or k == nk_par_for_each() {
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, snid, 3), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        ir_fold_gvn_block(pool, nodes, extra, ast_get(nodes, snid, 4), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        return
+    }
+    if k == nk_unsafe_block() {
+        ir_fold_gvn_block(pool, nodes, extra, ast_get(nodes, snid, 1), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        return
+    }
+    if k == nk_block() {
+        ir_fold_gvn_block(pool, nodes, extra, snid, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+    }
+}
+
+fn ir_fold_gvn_block(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, bnid: i64, is_shield: bool, has_nan_guard: bool, cmap: IntBuf, gvn: IntBuf, muts: IntBuf, m_cnt: i64) {
+    if bnid <= 0 or ast_kind(nodes, bnid) != nk_block() { return }
+    saved_c := ibuf_len(cmap)
+    saved_g := ibuf_len(gvn)
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt {
+        st := ibuf_get(extra, off + i)
+        ir_fold_gvn_stmt(pool, nodes, extra, st, is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+        if st > 0 {
+            sk := ast_kind(nodes, st)
+            if sk == nk_return() or sk == nk_break() or sk == nk_continue() {
+                if i + 1 < cnt {
+                    ast_set(nodes, bnid, 2, i + 1)
+                }
+                break
+            }
+        }
+        i += 1
+    }
+    if ast_get(nodes, bnid, 3) > 0 {
+        ir_fold_gvn_expr(pool, nodes, extra, ast_get(nodes, bnid, 3), is_shield, has_nan_guard, cmap, gvn, muts, m_cnt)
+    }
+    ibuf_truncate(cmap, saved_c)
+    ibuf_truncate(gvn, saved_g)
+}
+
+// ============================================================================
+// Pass 5: Trap-Free Loop-Invariant Code Motion (`LICM`)
+// ============================================================================
+
+fn ir_is_trap_free_invariant(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, enid: i64, loop_decls: IntBuf, ld_base: i64, loop_muts: IntBuf, lm_base: i64, is_shield: bool) -> bool {
+    if enid <= 0 { return false }
+    k := ast_kind(nodes, enid)
+    if k == nk_int() or k == nk_float() or k == nk_bool() { return true }
+    if k == nk_ident() {
+        soff := ast_get(nodes, enid, 1)
+        slen := ast_get(nodes, enid, 2)
+        ld_cnt := (ibuf_len(loop_decls) - ld_base) / 2
+        lm_cnt := (ibuf_len(loop_muts) - lm_base) / 2
+        if ir_namelist_has(pool, loop_decls, ld_base, ld_cnt, soff, slen) { return false }
+        if ir_namelist_has(pool, loop_muts, lm_base, lm_cnt, soff, slen) { return false }
+        return true
+    }
+    if k == nk_unary() {
+        if is_shield and ast_get(nodes, enid, 1) == uop_neg() { return false }
+        return ir_is_trap_free_invariant(pool, nodes, extra, ast_get(nodes, enid, 2), loop_decls, ld_base, loop_muts, lm_base, is_shield)
+    }
+    if k == nk_field() or k == nk_cast() {
+        return ir_is_trap_free_invariant(pool, nodes, extra, ast_get(nodes, enid, 1), loop_decls, ld_base, loop_muts, lm_base, is_shield)
+    }
+    if k == nk_binary() {
+        op := ast_get(nodes, enid, 1)
+        // Never hoist potentially trapping division/modulo or shielded signed arithmetic before 0-trip loops!
+        if op == op_div() or op == op_mod() or op == op_pow() { return false }
+        if is_shield and (op == op_add() or op == op_sub() or op == op_mul()) { return false }
+        return ir_is_trap_free_invariant(pool, nodes, extra, ast_get(nodes, enid, 2), loop_decls, ld_base, loop_muts, lm_base, is_shield) and ir_is_trap_free_invariant(pool, nodes, extra, ast_get(nodes, enid, 3), loop_decls, ld_base, loop_muts, lm_base, is_shield)
+    }
+    if k == nk_call() {
+        cs := ast_get(nodes, enid, 1)
+        cl := ast_get(nodes, enid, 2)
+        aoff := ast_get(nodes, enid, 3)
+        acnt := ast_get(nodes, enid, 4)
+        if acnt == 1 and pool_str_eq_lit(pool, cs, cl, "str_len") {
+            return ir_is_trap_free_invariant(pool, nodes, extra, ast_get(nodes, ibuf_get(extra, aoff), 4), loop_decls, ld_base, loop_muts, lm_base, is_shield)
+        }
+        if acnt == 2 and pool_str_eq_lit(pool, cs, cl, "ushr64") {
+            return ir_is_trap_free_invariant(pool, nodes, extra, ast_get(nodes, ibuf_get(extra, aoff), 4), loop_decls, ld_base, loop_muts, lm_base, is_shield) and ir_is_trap_free_invariant(pool, nodes, extra, ast_get(nodes, ibuf_get(extra, aoff + 1), 4), loop_decls, ld_base, loop_muts, lm_base, is_shield)
+        }
+    }
+    return false
+}
+
+fn ir_pass_licm_block(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, bnid: i64, is_shield: bool, fn_muts: IntBuf, fm_cnt: i64, arena: IntBuf) {
+    if bnid <= 0 or ast_kind(nodes, bnid) != nk_block() { return }
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+
+    // Recurse bottom-up into nested blocks first so inner-loop invariants hoist to outer loops too!
+    mut i := 0
+    while i < cnt {
+        st := ibuf_get(extra, off + i)
+        if st > 0 {
+            sk := ast_kind(nodes, st)
+            if sk == nk_if() {
+                ir_pass_licm_block(pool, nodes, extra, ast_get(nodes, st, 2), is_shield, fn_muts, fm_cnt, arena)
+                eb := ast_get(nodes, st, 3)
+                if eb > 0 and ast_kind(nodes, eb) == nk_block() {
+                    ir_pass_licm_block(pool, nodes, extra, eb, is_shield, fn_muts, fm_cnt, arena)
+                }
+            } else if sk == nk_while() {
+                ir_pass_licm_block(pool, nodes, extra, ast_get(nodes, st, 2), is_shield, fn_muts, fm_cnt, arena)
+            } else if sk == nk_for_range() {
+                ir_pass_licm_block(pool, nodes, extra, ast_get(nodes, st, 5), is_shield, fn_muts, fm_cnt, arena)
+            } else if sk == nk_unsafe_block() {
+                ir_pass_licm_block(pool, nodes, extra, ast_get(nodes, st, 1), is_shield, fn_muts, fm_cnt, arena)
+            } else if sk == nk_block() {
+                ir_pass_licm_block(pool, nodes, extra, st, is_shield, fn_muts, fm_cnt, arena)
+            }
+        }
+        i += 1
+    }
+
+    out_base := ibuf_len(arena)
+    mut did_hoist := false
+    i = 0
+    while i < cnt {
+        st := ibuf_get(extra, off + i)
+        mut lbody := 0
+        mut iv_s := 0
+        mut iv_l := 0
+        if st > 0 {
+            sk := ast_kind(nodes, st)
+            if sk == nk_while() {
+                lbody = ast_get(nodes, st, 2)
+            } else if sk == nk_for_range() {
+                lbody = ast_get(nodes, st, 5)
+                iv_s = ast_get(nodes, st, 1)
+                iv_l = ast_get(nodes, st, 2)
+            }
+        }
+        // Skip vectorizable / special-cased short loops (`<= 2` stmts or Mandelbrot 7-stmt pattern) so pattern matchers keep exact shape!
+        if lbody > 0 and ast_kind(nodes, lbody) == nk_block() and ast_get(nodes, lbody, 2) >= 3 and ast_get(nodes, lbody, 2) != 4 and ast_get(nodes, lbody, 2) != 7 {
+            l_off := ast_get(nodes, lbody, 1)
+            l_cnt := ast_get(nodes, lbody, 2)
+            ld_decls := ibuf_new(32768)
+            ld_muts := ibuf_new(32768)
+            if iv_l > 0 {
+                ibuf_push(ld_decls, iv_s); ibuf_push(ld_decls, iv_l)
+                ibuf_push(ld_muts, iv_s); ibuf_push(ld_muts, iv_l)
+            }
+            ir_collect_muts_block(pool, nodes, extra, lbody, ld_decls, 0, ld_muts, 0)
+
+            mut h_prefix := 0
+            while h_prefix + 2 <= l_cnt {
+                lst := ibuf_get(extra, l_off + h_prefix)
+                if lst <= 0 or ast_kind(nodes, lst) != nk_var_decl() { break }
+                if ast_get(nodes, lst, 3) != 0 or (ast_get(nodes, lst, 6) & 1) != 0 { break }
+                vs := ast_get(nodes, lst, 1)
+                vl := ast_get(nodes, lst, 2)
+                if ir_namelist_has(pool, fn_muts, 0, fm_cnt, vs, vl) { break }
+                ie := ast_get(nodes, lst, 5)
+                // Only hoist non-trivial expressions (binary/unary/field/call, not bare literals which already fold!)
+                if ie <= 0 { break }
+                ik := ast_kind(nodes, ie)
+                if ik == nk_int() or ik == nk_float() or ik == nk_bool() or ik == nk_ident() { break }
+                if not ir_is_trap_free_invariant(pool, nodes, extra, ie, ld_decls, 0, ld_muts, 0, is_shield) { break }
+                ibuf_push(arena, lst)
+                h_prefix += 1
+                did_hoist = true
+            }
+            if h_prefix > 0 {
+                ast_set(nodes, lbody, 1, l_off + h_prefix)
+                ast_set(nodes, lbody, 2, l_cnt - h_prefix)
+            }
+            buf_free(move ld_muts)
+            buf_free(move ld_decls)
+        }
+        ibuf_push(arena, st)
+        i += 1
+    }
+
+    if did_hoist {
+        new_cnt := ibuf_len(arena) - out_base
+        new_off := ibuf_len(extra)
+        mut k := 0
+        while k < new_cnt {
+            ibuf_push(extra, ibuf_get(arena, out_base + k))
+            k += 1
+        }
+        ast_set(nodes, bnid, 1, new_off)
+        ast_set(nodes, bnid, 2, new_cnt)
+    }
+    ibuf_truncate(arena, out_base)
+}
+
+// ============================================================================
+// Top-Level Streaming `AxIR` Module Driver
+// ============================================================================
+
+fn ir_opt_module(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, opt_level: i64, is_dll: bool, test_mode: bool, force_shield: bool) {
+    ibuf_set(sym, 35, opt_level)
+    if opt_level <= 0 {
+        return
+    }
+
+    f_base := ibuf_get(sym, 7)
+    f_cnt := ibuf_get(sym, 8)
+    live := ibuf_new(f_cnt + 8)
+    call_cnt := ibuf_new(f_cnt + 8)
+    m_tgt := ibuf_new(f_cnt + 8)
+    arena := ibuf_new(524288) // Single streaming arena reused O(1) across all functions!
+
+    // Pass 1: Whole-program call-graph reachability + call-site frequency
+    ir_build_callgraph(pool, nodes, extra, sym, is_dll, test_mode, live, call_cnt, m_tgt)
+
+    // Pass 2: Bottom-up cost-model auto-inliner (`-Os`, `-O2`, `-O3`, single-caller inline)
+    ir_pass_auto_inline(pool, nodes, extra, sym, opt_level, live, call_cnt, m_tgt, arena)
+
+    // Passes 3..5: Streaming per-function SRoA -> Fold/Strength-Reduce/DeadBranch/GVN -> LICM
+    uid_box := ibuf_new(4)
+    ibuf_push(uid_box, 0)
+    decls := ibuf_new(32768)
+    muts := ibuf_new(32768)
+    cmap := ibuf_new(8192)
+    gvn := ibuf_new(1024)
+
+    mut fi := 0
+    while fi < f_cnt {
+        if ibuf_get(live, fi) == 1 {
+            fo := f_base + fi * 10
+            fnid := ibuf_get(sym, fo + 2)
+            p_base := ibuf_get(sym, fo + 3)
+            p_cnt := ibuf_get(sym, fo + 4)
+            flags := ibuf_get(sym, fo + 9)
+            body_nid := ast_get(nodes, fnid, 6) & 0xFFFFFFFF
+            if body_nid > 0 and (flags & (fnflag_extern() | fnflag_comptime())) == 0 {
+                // O(1) bump-pointer arena reset per function (Java HotSpot C2 ResourceArea style!)
+                ibuf_truncate(arena, 0)
+                ibuf_truncate(decls, 0)
+                ibuf_truncate(muts, 0)
+                ibuf_truncate(cmap, 0)
+                ibuf_truncate(gvn, 0)
+
+                // Pass 3: SRoA for non-escaping local pure-scalar structs
+                if opt_level >= 2 and opt_level <= 3 {
+                    ir_pass_sroa_block(pool, nodes, extra, sym, body_nid, arena, uid_box)
+                }
+
+                // Collect function-wide declarations & mutations
+                mut pi := 0
+                while pi < p_cnt {
+                    po := p_base + pi * 6
+                    ir_record_decl_name(pool, decls, 0, muts, 0, ibuf_get(sym, po), ibuf_get(sym, po + 1), ibuf_get(sym, po + 2) == pmode_mut())
+                    pi += 1
+                }
+                ir_collect_muts_block(pool, nodes, extra, body_nid, decls, 0, muts, 0)
+                m_cnt := ibuf_len(muts) / 2
+                is_shd := force_shield or (flags & (fnflag_shield() | fnflag_whitebox())) != 0
+                has_ng := (flags & fnflag_nan_guard()) != 0
+
+                // Pass 4: Constant propagation, strength reduction, dead-branch pruning & SSA-dominance GVN
+                ir_fold_gvn_block(pool, nodes, extra, body_nid, is_shd, has_ng, cmap, gvn, muts, m_cnt)
+
+                // Pass 5: Trap-free Loop-Invariant Code Motion (`LICM`)
+                if opt_level >= 2 and opt_level <= 3 {
+                    ibuf_truncate(arena, 0)
+                    ir_pass_licm_block(pool, nodes, extra, body_nid, is_shd, muts, m_cnt, arena)
+                }
+            }
+        }
+        fi += 1
+    }
+
+    buf_free(move gvn)
+    buf_free(move cmap)
+    buf_free(move muts)
+    buf_free(move decls)
+    buf_free(move uid_box)
+    buf_free(move arena)
+    buf_free(move m_tgt)
+    buf_free(move call_cnt)
+    buf_free(move live)
+}

@@ -8,6 +8,15 @@
 
 use std::ffi
 use std::net
+use std::crypto
+use std::auth
+use std::os_auth
+
+struct PgScramState {
+    client_nonce: str
+    client_first_bare: str
+    expected_server_sig: str
+}
 
 struct PgConn {
     sock: TcpStream
@@ -98,6 +107,181 @@ fn pg_encode_password(pw: str) -> ByteBuf {
     return pkt
 }
 
+// Standard RFC 4648 Section 4 Base64 (`+`, `/`, `=`) required by PostgreSQL SCRAM-SHA-256 (`s=`, `p=`, `v=`).
+fn _pg_b64_encode_bytes(data: ByteBuf) -> str {
+    n := buf_len(data)
+    if n <= 0 { return "" }
+    alpha := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    out := buf_new(((n + 2) / 3) * 4 + 8)
+    mut i := 0
+    while i + 2 < n {
+        b0 := buf_get(data, i) & 255
+        b1 := buf_get(data, i + 1) & 255
+        b2 := buf_get(data, i + 2) & 255
+        v := (b0 << 16) | (b1 << 8) | b2
+        buf_push(out, str_byte(alpha, (v >> 18) & 63))
+        buf_push(out, str_byte(alpha, (v >> 12) & 63))
+        buf_push(out, str_byte(alpha, (v >> 6) & 63))
+        buf_push(out, str_byte(alpha, v & 63))
+        i += 3
+    }
+    rem := n - i
+    if rem == 1 {
+        b0 := buf_get(data, i) & 255
+        buf_push(out, str_byte(alpha, (b0 >> 2) & 63))
+        buf_push(out, str_byte(alpha, (b0 & 3) << 4))
+        buf_push(out, 61); buf_push(out, 61)
+    } else if rem == 2 {
+        b0 := buf_get(data, i) & 255
+        b1 := buf_get(data, i + 1) & 255
+        v := (b0 << 8) | b1
+        buf_push(out, str_byte(alpha, (v >> 10) & 63))
+        buf_push(out, str_byte(alpha, (v >> 4) & 63))
+        buf_push(out, str_byte(alpha, (v & 15) << 2))
+        buf_push(out, 61)
+    }
+    return buf_to_owned_str(move out)
+}
+
+fn _pg_b64_val(ch: i64) -> i64 {
+    if ch >= 65 and ch <= 90 { return ch - 65 }
+    if ch >= 97 and ch <= 122 { return ch - 97 + 26 }
+    if ch >= 48 and ch <= 57 { return ch - 48 + 52 }
+    if ch == 43 { return 62 }
+    if ch == 47 { return 63 }
+    return -1
+}
+
+fn _pg_b64_decode_bytes(s: str) -> ByteBuf ! i64 {
+    n := str_len(s)
+    out := buf_new((n * 3) / 4 + 8)
+    mut acc := 0
+    mut bits := 0
+    mut i := 0
+    while i < n {
+        ch := str_byte(s, i)
+        if ch == 61 or ch <= 32 {
+            i += 1
+        } else {
+            v := _pg_b64_val(ch)
+            if v < 0 { buf_free(move out); return err(400) }
+            acc = (acc << 6) | v
+            bits += 6
+            if bits >= 8 {
+                bits -= 8
+                buf_push(out, (acc >> bits) & 255)
+            }
+            i += 1
+        }
+    }
+    return ok(out)
+}
+
+fn pg_encode_sasl_initial(mechanism: str, client_first_msg: str) -> ByteBuf {
+    ml := str_len(mechanism)
+    cl := str_len(client_first_msg)
+    pkt := buf_new(ml + cl + 24)
+    buf_push(pkt, 112) // 'p'
+    _pg_push_be32(pkt, 4 + ml + 1 + 4 + cl)
+    _pg_push_cstr(pkt, mechanism)
+    _pg_push_be32(pkt, cl)
+    if cl > 0 { buf_push_str(pkt, client_first_msg) }
+    return pkt
+}
+
+fn pg_encode_sasl_response(client_final_msg: str) -> ByteBuf {
+    cl := str_len(client_final_msg)
+    pkt := buf_new(cl + 16)
+    buf_push(pkt, 112) // 'p'
+    _pg_push_be32(pkt, 4 + cl)
+    if cl > 0 { buf_push_str(pkt, client_final_msg) }
+    return pkt
+}
+
+// Computes RFC 5802 / PostgreSQL 14-17 `SCRAM-SHA-256` `client-final-message` + expected `ServerSignature`!
+fn pg_scram_compute_final(password: str, client_nonce: str, client_first_bare: str, server_first: str, out_server_sig: ByteBuf) -> str ! i64 {
+    // Parse `r=<r_full>,s=<salt_b64>,i=<iters>`
+    ranges := str_split_ranges(server_first, 44)
+    cnt := str_split_count(ranges)
+    mut r_full := ""
+    mut s_b64 := ""
+    mut iters := 0
+    mut k := 0
+    while k < cnt {
+        part := str_split_at(server_first, ranges, k)
+        if str_len(part) > 2 and str_byte(part, 1) == 61 {
+            tag := str_byte(part, 0)
+            val := str_slice(part, 2, str_len(part))
+            if tag == 114 { r_full = val }
+            else if tag == 115 { s_b64 = val }
+            else if tag == 105 {
+                mut p := 0
+                while p < str_len(val) {
+                    ch := str_byte(val, p)
+                    if ch >= 48 and ch <= 57 { iters = iters * 10 + (ch - 48) }
+                    p += 1
+                }
+            }
+        }
+        k += 1
+    }
+    buf_free(move ranges)
+    cn_len := str_len(client_nonce)
+    if str_len(r_full) <= cn_len or str_len(s_b64) == 0 or iters < 1 { return err(-306) }
+    if not str_eq(str_slice(r_full, 0, cn_len), client_nonce) { return err(-307) }
+
+    salt_b := _pg_b64_decode_bytes(s_b64) or return err(-306)
+    pw_b := buf_new(str_len(password) + 8)
+    if str_len(password) > 0 { buf_push_str(pw_b, password) }
+    salted_pw := pbkdf2_hmac_sha256_bytes(pw_b, salt_b, iters, 32)
+    buf_free(move pw_b); buf_free(move salt_b)
+
+    ck_label := buf_new(16); buf_push_str(ck_label, "Client Key")
+    client_key := hmac_sha256_raw(salted_pw, ck_label)
+    buf_free(move ck_label)
+
+    sk_words := sha256_raw_digest(client_key)
+    stored_key := buf_new(36)
+    mut wi := 0
+    while wi < 8 {
+        wv := ibuf_get(sk_words, wi)
+        buf_push(stored_key, (wv >> 24) & 255); buf_push(stored_key, (wv >> 16) & 255)
+        buf_push(stored_key, (wv >> 8) & 255);  buf_push(stored_key, wv & 255)
+        wi += 1
+    }
+    buf_free(move sk_words)
+
+    cf_no_proof := "c=biws,r=" + r_full
+    auth_str := client_first_bare + "," + server_first + "," + cf_no_proof
+    auth_b := buf_new(str_len(auth_str) + 8)
+    buf_push_str(auth_b, auth_str)
+
+    client_sig := hmac_sha256_raw(stored_key, auth_b)
+    buf_free(move stored_key)
+
+    proof := buf_new(36)
+    mut bi := 0
+    while bi < 32 {
+        buf_push(proof, buf_get(client_key, bi) ^ buf_get(client_sig, bi))
+        bi += 1
+    }
+    buf_free(move client_key); buf_free(move client_sig)
+    proof_b64 := _pg_b64_encode_bytes(proof)
+    buf_free(move proof)
+
+    svk_label := buf_new(16); buf_push_str(svk_label, "Server Key")
+    server_key := hmac_sha256_raw(salted_pw, svk_label)
+    buf_free(move svk_label); buf_free(move salted_pw)
+    server_sig := hmac_sha256_raw(server_key, auth_b)
+    buf_free(move server_key); buf_free(move auth_b)
+    exp_v := _pg_b64_encode_bytes(server_sig)
+    buf_free(move server_sig)
+    buf_truncate(out_server_sig, 0)
+    buf_push_str(out_server_sig, exp_v)
+
+    return ok(cf_no_proof + ",p=" + proof_b64)
+}
+
 // Build Parameterized Extended Query (`Parse` + `Bind` + `Describe` + `Execute` + `Sync`)
 // `params_csv`: NUL-separated or newline-separated parameter values (`param_vals` / `param_offs` / `param_lens`)
 fn pg_encode_extended_query(sql: str, param_buf: ByteBuf, param_offs: IntBuf, param_lens: IntBuf) -> ByteBuf {
@@ -178,6 +362,9 @@ fn pg_connect(host: str, port: i64, user: str, password: str, database: str) -> 
     if sr < 0 { tcp_close(sock); return err(-301) }
 
     mtype_box := ibuf_new(4)
+    scram_exp_sig := buf_new(128)
+    mut scram_nonce := ""
+    mut scram_cfb := ""
     mut pid := 0
     mut skey := 0
     mut tx := 73 // 'I' idle
@@ -187,13 +374,13 @@ fn pg_connect(host: str, port: i64, user: str, password: str, database: str) -> 
         guard += 1
         payload := _pg_read_msg(sock, mtype_box) or buf_new(0)
         if ibuf_len(mtype_box) == 0 or (buf_len(payload) == 0 and ibuf_get(mtype_box, 0) == 0) {
-            buf_free(move payload); buf_free(move mtype_box); tcp_close(sock)
+            buf_free(move payload); buf_free(move mtype_box); buf_free(move scram_exp_sig); tcp_close(sock)
             return err(-302)
         }
         mt := ibuf_get(mtype_box, 0)
         if mt == 82 { // 'R' Authentication
             if buf_len(payload) < 4 {
-                buf_free(move payload); buf_free(move mtype_box); tcp_close(sock)
+                buf_free(move payload); buf_free(move mtype_box); buf_free(move scram_exp_sig); tcp_close(sock)
                 return err(-303)
             }
             auth_kind := _pg_read_be32(payload, 0)
@@ -204,8 +391,36 @@ fn pg_connect(host: str, port: i64, user: str, password: str, database: str) -> 
                 pw_pkt := pg_encode_password(password)
                 _ := tcp_send_bytes(sock, pw_pkt) or -1
                 buf_free(move pw_pkt)
+            } else if auth_kind == 10 {
+                // AuthenticationSASL (`SCRAM-SHA-256`)
+                rnd_b := os_csprng_bytes(18) or buf_new(0)
+                scram_nonce = if buf_len(rnd_b) > 0 { _pg_b64_encode_bytes(rnd_b) } else { "axonScramNonce9988776655" }
+                buf_free(move rnd_b)
+                scram_cfb = "n=,r=" + scram_nonce
+                init_pkt := pg_encode_sasl_initial("SCRAM-SHA-256", "n,," + scram_cfb)
+                _ := tcp_send_bytes(sock, init_pkt) or -1
+                buf_free(move init_pkt)
+            } else if auth_kind == 11 {
+                // AuthenticationSASLContinue
+                sf_str := if buf_len(payload) > 4 { "" + buf_slice_str(payload, 4, buf_len(payload)) } else { "" }
+                cf_msg := pg_scram_compute_final(password, scram_nonce, scram_cfb, sf_str, scram_exp_sig) or ""
+                if str_len(cf_msg) == 0 {
+                    buf_free(move payload); buf_free(move mtype_box); buf_free(move scram_exp_sig); tcp_close(sock)
+                    return err(-306)
+                }
+                resp_pkt := pg_encode_sasl_response(cf_msg)
+                _ := tcp_send_bytes(sock, resp_pkt) or -1
+                buf_free(move resp_pkt)
+            } else if auth_kind == 12 {
+                // AuthenticationSASLFinal (`v=<server_sig_b64>`)
+                fin_str := if buf_len(payload) > 4 { "" + buf_slice_str(payload, 4, buf_len(payload)) } else { "" }
+                exp_v := "v=" + buf_slice_str(scram_exp_sig, 0, buf_len(scram_exp_sig))
+                if not ct_eq_str(fin_str, exp_v) {
+                    buf_free(move payload); buf_free(move mtype_box); buf_free(move scram_exp_sig); tcp_close(sock)
+                    return err(-308)
+                }
             } else {
-                buf_free(move payload); buf_free(move mtype_box); tcp_close(sock)
+                buf_free(move payload); buf_free(move mtype_box); buf_free(move scram_exp_sig); tcp_close(sock)
                 return err(-303)
             }
         } else if mt == 75 { // 'K' BackendKeyData
@@ -218,11 +433,12 @@ fn pg_connect(host: str, port: i64, user: str, password: str, database: str) -> 
             buf_free(move payload)
             break
         } else if mt == 69 { // 'E' ErrorResponse
-            buf_free(move payload); buf_free(move mtype_box); tcp_close(sock)
+            buf_free(move payload); buf_free(move mtype_box); buf_free(move scram_exp_sig); tcp_close(sock)
             return err(-304)
         }
         buf_free(move payload)
     }
+    buf_free(move scram_exp_sig)
     buf_free(move mtype_box)
     if not authed { tcp_close(sock); return err(-305) }
     return ok(PgConn(sock = sock, server_pid = pid, secret_key = skey, tx_status = tx, connected = true))

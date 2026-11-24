@@ -1,0 +1,1302 @@
+// Axon Standard Library — Columnar Arrow-Style `DataFrame` & `Series` (`std/dataframe.ax`)
+// 100% Pure Axon, Perceus 0-GC, Dictionary-Encoded Strings, Explicit Null Bitmasks,
+// RFC-4180 CSV + JSONL + Binary IPC (`AXDF`), Hash `GroupBy`, Hash `Join`, `Sort`, and `MatF64` Export.
+
+use std::str
+use std::ds
+use std::fs
+use std::fmt
+use std::linalg
+use std::numeric
+
+// Column Data Type Tags (`col_types`)
+fn df_type_i64() -> i64  { return 1 }
+fn df_type_f64() -> i64  { return 2 }
+fn df_type_bool() -> i64 { return 3 }
+fn df_type_str() -> i64  { return 4 }
+
+struct DataFrame {
+    nrows: i64
+    ncols: i64
+    col_names: StrVec
+    col_types: IntBuf
+    col_ptrs: IntBuf
+    null_ptrs: IntBuf
+    str_pool: StrVec
+}
+
+fn df_new(nrows: i64 = 0) -> DataFrame {
+    nr := if nrows < 0 { 0 } else { nrows }
+    mut pool := svec_new(32, 512)
+    svec_push(mut pool, "") // ID 0 reserved for empty string `""`
+    return DataFrame(
+        nrows = nr,
+        ncols = 0,
+        col_names = svec_new(16, 256),
+        col_types = ibuf_new(32),
+        col_ptrs = ibuf_new(32),
+        null_ptrs = ibuf_new(32),
+        str_pool = pool
+    )
+}
+
+fn df_free(move df: DataFrame) {
+    nc := ibuf_len(df.col_ptrs)
+    mut c := 0
+    while c < nc {
+        cp := ibuf_get(df.col_ptrs, c)
+        np := ibuf_get(df.null_ptrs, c)
+        unsafe {
+            if cp != 0 { mem_free_aligned(cp) }
+            if np != 0 { mem_free_aligned(np) }
+        }
+        c += 1
+    }
+    svec_free(df.col_names)
+    buf_free(df.col_types)
+    buf_free(df.col_ptrs)
+    buf_free(df.null_ptrs)
+    svec_free(df.str_pool)
+}
+
+fn df_nrows(df: DataFrame) -> i64 { return df.nrows }
+fn df_ncols(df: DataFrame) -> i64 { return df.ncols }
+
+fn df_col_name(df: DataFrame, col: i64) -> str {
+    return svec_get(df.col_names, col)
+}
+
+fn df_col_type(df: DataFrame, col: i64) -> i64 {
+    if col < 0 or col >= df.ncols { return 0 }
+    return ibuf_get(df.col_types, col)
+}
+
+fn df_col_index(df: DataFrame, name: str) -> i64 {
+    mut c := 0
+    while c < df.ncols {
+        if str_eq(svec_get(df.col_names, c), name) { return c }
+        c += 1
+    }
+    return -1
+}
+
+fn _df_intern_str(mut df: DataFrame, s: str) -> i64 {
+    if str_len(s) == 0 { return 0 }
+    n := svec_len(df.str_pool)
+    // Linear probe on small pools (`<= 128`), direct append above to stay O(1) amortized
+    if n <= 128 {
+        mut i := 1
+        while i < n {
+            if str_eq(svec_get(df.str_pool, i), s) { return i }
+            i += 1
+        }
+    }
+    id := svec_len(df.str_pool)
+    svec_push(mut df.str_pool, s)
+    return id
+}
+
+fn _df_push_col_raw(mut df: DataFrame, name: str, dtype: i64, data_ptr: i64, null_ptr: i64) {
+    if ibuf_len(df.col_types) >= df.ncols + 1 or true {
+        // Ensure IntBuf capacity if > initial 32 columns
+        cur_len := ibuf_len(df.col_types)
+        if cur_len > 0 and (cur_len & 31) == 31 {
+            nt := ibuf_new(cur_len * 2 + 16)
+            nc := ibuf_new(cur_len * 2 + 16)
+            nn := ibuf_new(cur_len * 2 + 16)
+            mut i := 0
+            while i < cur_len {
+                ibuf_push(nt, ibuf_get(df.col_types, i))
+                ibuf_push(nc, ibuf_get(df.col_ptrs, i))
+                ibuf_push(nn, ibuf_get(df.null_ptrs, i))
+                i += 1
+            }
+            buf_free(move df.col_types); buf_free(move df.col_ptrs); buf_free(move df.null_ptrs)
+            df.col_types = nt; df.col_ptrs = nc; df.null_ptrs = nn
+        }
+    }
+    svec_push(mut df.col_names, name)
+    ibuf_push(df.col_types, dtype)
+    ibuf_push(df.col_ptrs, data_ptr)
+    ibuf_push(df.null_ptrs, null_ptr)
+    df.ncols = df.ncols + 1
+}
+
+fn _df_alloc_col(nrows: i64) -> i64 {
+    cap := (if nrows > 0 { nrows } else { 1 }) * 8 + 64
+    p := unsafe { mem_alloc_aligned(cap) }
+    if p != 0 { unsafe { mem_set(p, 0, cap) } }
+    return p
+}
+
+fn _df_alloc_nulls(nrows: i64) -> i64 {
+    cap := (if nrows > 0 { nrows } else { 1 }) + 64
+    p := unsafe { mem_alloc_aligned(cap) }
+    if p != 0 { unsafe { mem_set(p, 0, cap) } }
+    return p
+}
+
+fn df_add_empty_col(mut df: DataFrame, name: str, dtype: i64) -> i64 {
+    cp := _df_alloc_col(df.nrows)
+    np := _df_alloc_nulls(df.nrows)
+    idx := df.ncols
+    _df_push_col_raw(mut df, name, dtype, cp, np)
+    return idx
+}
+
+fn df_add_col_f64(mut df: DataFrame, name: str, vec: MatF64) -> bool {
+    n := vec.rows * vec.cols
+    if df.ncols > 0 and n != df.nrows { return false }
+    if df.ncols == 0 { df.nrows = n }
+    cp := _df_alloc_col(n)
+    np := _df_alloc_nulls(n)
+    if n > 0 and vec.ptr != 0 { unsafe { mem_copy(cp, vec.ptr, n * 8) } }
+    _df_push_col_raw(mut df, name, 2, cp, np)
+    return true
+}
+
+fn df_add_col_i64(mut df: DataFrame, name: str, vals: IntBuf) -> bool {
+    n := ibuf_len(vals)
+    if df.ncols > 0 and n != df.nrows { return false }
+    if df.ncols == 0 { df.nrows = n }
+    cp := _df_alloc_col(n)
+    np := _df_alloc_nulls(n)
+    mut i := 0
+    while i < n {
+        unsafe { ptr_write_i64(cp, i, ibuf_get(vals, i)) }
+        i += 1
+    }
+    _df_push_col_raw(mut df, name, 1, cp, np)
+    return true
+}
+
+fn df_add_col_str(mut df: DataFrame, name: str, vals: StrVec) -> bool {
+    n := svec_len(vals)
+    if df.ncols > 0 and n != df.nrows { return false }
+    if df.ncols == 0 { df.nrows = n }
+    cp := _df_alloc_col(n)
+    np := _df_alloc_nulls(n)
+    mut i := 0
+    while i < n {
+        sid := _df_intern_str(mut df, svec_get(vals, i))
+        unsafe { ptr_write_i64(cp, i, sid) }
+        i += 1
+    }
+    _df_push_col_raw(mut df, name, 4, cp, np)
+    return true
+}
+
+// ============================================================================
+// Cell Accessors & Mutators
+// ============================================================================
+
+fn df_is_null(df: DataFrame, col: i64, row: i64) -> bool {
+    if col < 0 or col >= df.ncols or row < 0 or row >= df.nrows { return true }
+    np := ibuf_get(df.null_ptrs, col)
+    return unsafe { ptr_read_u8(np, row) } != 0
+}
+
+fn df_set_null(df: DataFrame, col: i64, row: i64, is_null: bool) {
+    if col < 0 or col >= df.ncols or row < 0 or row >= df.nrows { return }
+    np := ibuf_get(df.null_ptrs, col)
+    unsafe { ptr_write_u8(np, row, if is_null { 1 } else { 0 }) }
+}
+
+fn df_get_i64(df: DataFrame, col: i64, row: i64) -> i64 {
+    if col < 0 or col >= df.ncols or row < 0 or row >= df.nrows { return 0 }
+    if df_is_null(df, col, row) { return 0 }
+    dt := ibuf_get(df.col_types, col)
+    cp := ibuf_get(df.col_ptrs, col)
+    if dt == 2 { return (unsafe { ptr_read_f64(cp, row) }) as i64 }
+    return unsafe { ptr_read_i64(cp, row) }
+}
+
+fn df_get_f64(df: DataFrame, col: i64, row: i64) -> f64 {
+    if col < 0 or col >= df.ncols or row < 0 or row >= df.nrows { return 0.0 }
+    if df_is_null(df, col, row) { return 0.0 }
+    dt := ibuf_get(df.col_types, col)
+    cp := ibuf_get(df.col_ptrs, col)
+    if dt == 2 { return unsafe { ptr_read_f64(cp, row) } }
+    if dt == 1 or dt == 3 { return (unsafe { ptr_read_i64(cp, row) }) as f64 }
+    return 0.0
+}
+
+fn df_get_bool(df: DataFrame, col: i64, row: i64) -> bool {
+    return df_get_i64(df, col, row) != 0
+}
+
+fn df_get_str(df: DataFrame, col: i64, row: i64) -> str {
+    if col < 0 or col >= df.ncols or row < 0 or row >= df.nrows { return "" }
+    if df_is_null(df, col, row) { return "null" }
+    dt := ibuf_get(df.col_types, col)
+    cp := ibuf_get(df.col_ptrs, col)
+    if dt == 4 {
+        sid := unsafe { ptr_read_i64(cp, row) }
+        return "" + svec_get(df.str_pool, sid)
+    }
+    if dt == 1 { return str_from_i64(unsafe { ptr_read_i64(cp, row) }) }
+    if dt == 3 { return if unsafe { ptr_read_i64(cp, row) } != 0 { "true" } else { "false" } }
+    if dt == 2 { return fmt_f64(unsafe { ptr_read_f64(cp, row) }, 6) }
+    return ""
+}
+
+fn df_set_i64(df: DataFrame, col: i64, row: i64, val: i64) {
+    if col < 0 or col >= df.ncols or row < 0 or row >= df.nrows { return }
+    cp := ibuf_get(df.col_ptrs, col)
+    unsafe {
+        ptr_write_i64(cp, row, val)
+        ptr_write_u8(ibuf_get(df.null_ptrs, col), row, 0)
+    }
+}
+
+fn df_set_f64(df: DataFrame, col: i64, row: i64, val: f64) {
+    if col < 0 or col >= df.ncols or row < 0 or row >= df.nrows { return }
+    cp := ibuf_get(df.col_ptrs, col)
+    unsafe {
+        ptr_write_f64(cp, row, val)
+        ptr_write_u8(ibuf_get(df.null_ptrs, col), row, 0)
+    }
+}
+
+fn df_set_str(mut df: DataFrame, col: i64, row: i64, val: str) {
+    if col < 0 or col >= df.ncols or row < 0 or row >= df.nrows { return }
+    sid := _df_intern_str(mut df, val)
+    cp := ibuf_get(df.col_ptrs, col)
+    unsafe {
+        ptr_write_i64(cp, row, sid)
+        ptr_write_u8(ibuf_get(df.null_ptrs, col), row, 0)
+    }
+}
+
+// ============================================================================
+// CSV / JSONL / Binary Columnar IPC Readers & Writers
+// ============================================================================
+
+fn _df_is_missing_token(s: str) -> bool {
+    n := str_len(s)
+    if n == 0 { return true }
+    if str_eq(s, "null") or str_eq(s, "NULL") or str_eq(s, "NA") or str_eq(s, "NaN") or str_eq(s, "None") {
+        return true
+    }
+    return false
+}
+
+// Returns `1` (`i64`), `2` (`f64`), `3` (`bool`), `4` (`str`).
+fn _df_classify_token(s: str) -> i64 {
+    n := str_len(s)
+    if n == 0 { return 0 }
+    if str_eq(s, "true") or str_eq(s, "false") or str_eq(s, "TRUE") or str_eq(s, "FALSE") {
+        return 3
+    }
+    mut pos := 0
+    c0 := str_byte(s, 0)
+    if c0 == 45 or c0 == 43 { pos = 1 }
+    if pos >= n { return 4 }
+    mut has_digit := false
+    mut has_dot := false
+    mut has_exp := false
+    while pos < n {
+        ch := str_byte(s, pos)
+        if ch >= 48 and ch <= 57 {
+            has_digit = true
+        } else if ch == 46 and not has_dot and not has_exp {
+            has_dot = true
+        } else if (ch == 101 or ch == 69) and has_digit and not has_exp {
+            has_exp = true
+            has_digit = false
+            if pos + 1 < n {
+                nx := str_byte(s, pos + 1)
+                if nx == 45 or nx == 43 { pos += 1 }
+            }
+        } else {
+            return 4
+        }
+        pos += 1
+    }
+    if not has_digit { return 4 }
+    if has_dot or has_exp { return 2 }
+    if n > 18 { return 2 }
+    return 1
+}
+
+fn _df_parse_i64(s: str) -> i64 {
+    n := str_len(s)
+    if n == 0 { return 0 }
+    mut pos := 0
+    mut neg := false
+    c0 := str_byte(s, 0)
+    if c0 == 45 { neg = true; pos = 1 } else if c0 == 43 { pos = 1 }
+    mut acc := 0
+    while pos < n {
+        ch := str_byte(s, pos)
+        if ch < 48 or ch > 57 { break }
+        acc = acc * 10 + (ch - 48)
+        pos += 1
+    }
+    return if neg { 0 - acc } else { acc }
+}
+
+fn _df_parse_f64(s: str) -> f64 {
+    n := str_len(s)
+    if n == 0 { return 0.0 }
+    mut pos := 0
+    mut sign := 1.0
+    c0 := str_byte(s, 0)
+    if c0 == 45 { sign = -1.0; pos = 1 } else if c0 == 43 { pos = 1 }
+    mut int_part := 0.0
+    while pos < n {
+        ch := str_byte(s, pos)
+        if ch >= 48 and ch <= 57 {
+            int_part = int_part * 10.0 + ((ch - 48) as f64)
+            pos += 1
+        } else {
+            break
+        }
+    }
+    mut frac_part := 0.0
+    mut frac_scale := 1.0
+    if pos < n and str_byte(s, pos) == 46 {
+        pos += 1
+        while pos < n {
+            ch := str_byte(s, pos)
+            if ch >= 48 and ch <= 57 {
+                frac_part = frac_part * 10.0 + ((ch - 48) as f64)
+                frac_scale = frac_scale * 10.0
+                pos += 1
+            } else {
+                break
+            }
+        }
+    }
+    mut val := sign * (int_part + frac_part / frac_scale)
+    if pos < n and (str_byte(s, pos) == 101 or str_byte(s, pos) == 69) {
+        pos += 1
+        mut exp_neg := false
+        if pos < n and str_byte(s, pos) == 45 { exp_neg = true; pos += 1 }
+        else if pos < n and str_byte(s, pos) == 43 { pos += 1 }
+        mut exp_v := 0
+        while pos < n {
+            ch := str_byte(s, pos)
+            if ch >= 48 and ch <= 57 { exp_v = exp_v * 10 + (ch - 48); pos += 1 } else { break }
+        }
+        p10 := num_pow(10.0, exp_v as f64)
+        val = if exp_neg { val / p10 } else { val * p10 }
+    }
+    return val
+}
+
+// Splits a single CSV line respecting RFC-4180 double-quoted fields (`"a,b"`, `""`).
+fn _df_split_csv_line(line: str, sep: i64) -> StrVec {
+    mut out := svec_new(16, str_len(line) + 16)
+    n := str_len(line)
+    cell := buf_new(n + 16)
+    mut in_q := false
+    mut i := 0
+    while i < n {
+        ch := str_byte(line, i)
+        if in_q {
+            if ch == 34 {
+                if i + 1 < n and str_byte(line, i + 1) == 34 {
+                    buf_push(cell, 34)
+                    i += 1
+                } else {
+                    in_q = false
+                }
+            } else {
+                buf_push(cell, ch)
+            }
+        } else {
+            if ch == 34 and buf_len(cell) == 0 {
+                in_q = true
+            } else if ch == sep {
+                clen := buf_len(cell)
+                svec_push(mut out, if clen > 0 { str_trim(buf_slice_str(cell, 0, clen)) } else { "" })
+                buf_truncate(cell, 0)
+            } else {
+                buf_push(cell, ch)
+            }
+        }
+        i += 1
+    }
+    clen := buf_len(cell)
+    svec_push(mut out, if clen > 0 { str_trim(buf_slice_str(cell, 0, clen)) } else { "" })
+    buf_free(move cell)
+    return out
+}
+
+// Parses CSV text with automatic column schema inference (`i64`, `f64`, `bool`, `str`) + null bitmask.
+fn df_parse_csv(csv_text: str, sep: i64 = 44) -> DataFrame ! i64 {
+    ranges := str_split_ranges(csv_text, 10)
+    raw_cnt := str_split_count(ranges)
+    if raw_cnt <= 0 {
+        buf_free(move ranges)
+        return err(400)
+    }
+    mut lines := svec_new(raw_cnt + 4, str_len(csv_text) + 32)
+    mut li := 0
+    while li < raw_cnt {
+        mut ln := str_split_at(csv_text, ranges, li)
+        ll := str_len(ln)
+        if ll > 0 and str_byte(ln, ll - 1) == 13 {
+            ln = str_slice(ln, 0, ll - 1)
+        }
+        if str_len(str_trim(ln)) > 0 {
+            svec_push(mut lines, ln)
+        }
+        li += 1
+    }
+    buf_free(move ranges)
+    total_lines := svec_len(lines)
+    if total_lines <= 0 {
+        svec_free(move lines)
+        return err(400)
+    }
+    hdr := _df_split_csv_line(svec_get(lines, 0), sep)
+    ncols := svec_len(hdr)
+    nrows := total_lines - 1
+    // Flatten parsed cells `[row * ncols + col]` into one `StrVec` for 2-pass schema inference
+    mut cells := svec_new(nrows * ncols + 16, str_len(csv_text) + 64)
+    mut r := 0
+    while r < nrows {
+        row_sv := _df_split_csv_line(svec_get(lines, r + 1), sep)
+        rc := svec_len(row_sv)
+        mut c := 0
+        while c < ncols {
+            svec_push(mut cells, if c < rc { svec_get(row_sv, c) } else { "" })
+            c += 1
+        }
+        svec_free(move row_sv)
+        r += 1
+    }
+    svec_free(move lines)
+    mut df := df_new(nrows)
+    mut c := 0
+    while c < ncols {
+        // Infer column type: `0`=unknown -> `1`=`i64` -> `2`=`f64`; `3`=`bool`; `4`=`str`
+        mut inferred := 0
+        r = 0
+        while r < nrows {
+            tok := svec_get(cells, r * ncols + c)
+            if not _df_is_missing_token(tok) {
+                tk := _df_classify_token(tok)
+                if inferred == 0 {
+                    inferred = tk
+                } else if inferred != tk {
+                    if (inferred == 1 and tk == 2) or (inferred == 2 and tk == 1) {
+                        inferred = 2
+                    } else {
+                        inferred = 4
+                    }
+                }
+            }
+            r += 1
+        }
+        if inferred == 0 { inferred = 2 }
+        col_idx := df_add_empty_col(mut df, svec_get(hdr, c), inferred)
+        r = 0
+        while r < nrows {
+            tok := svec_get(cells, r * ncols + c)
+            if _df_is_missing_token(tok) {
+                df_set_null(df, col_idx, r, true)
+            } else if inferred == 1 {
+                df_set_i64(df, col_idx, r, _df_parse_i64(tok))
+            } else if inferred == 2 {
+                df_set_f64(df, col_idx, r, _df_parse_f64(tok))
+            } else if inferred == 3 {
+                bv := if str_eq(tok, "true") or str_eq(tok, "TRUE") { 1 } else { 0 }
+                df_set_i64(df, col_idx, r, bv)
+            } else {
+                df_set_str(mut df, col_idx, r, tok)
+            }
+            r += 1
+        }
+        c += 1
+    }
+    svec_free(move hdr)
+    svec_free(move cells)
+    return ok(df)
+}
+
+fn df_read_csv(path: str, sep: i64 = 44) -> DataFrame ! i64 {
+    txt := fs_read_text(path) or return err(404)
+    return df_parse_csv(txt, sep)
+}
+
+fn df_to_csv(df: DataFrame) -> str {
+    out := buf_new((df.nrows + 2) * (df.ncols * 12 + 4) + 64)
+    mut c := 0
+    while c < df.ncols {
+        if c > 0 { buf_push(out, 44) }
+        buf_push_str(out, svec_get(df.col_names, c))
+        c += 1
+    }
+    buf_push(out, 10)
+    mut r := 0
+    while r < df.nrows {
+        c = 0
+        while c < df.ncols {
+            if c > 0 { buf_push(out, 44) }
+            if not df_is_null(df, c, r) {
+                val_s := df_get_str(df, c, r)
+                if str_find(val_s, ",") >= 0 or str_find(val_s, "\"") >= 0 {
+                    buf_push(out, 34)
+                    buf_push_str(out, val_s)
+                    buf_push(out, 34)
+                } else {
+                    buf_push_str(out, val_s)
+                }
+            }
+            c += 1
+        }
+        buf_push(out, 10)
+        r += 1
+    }
+    return buf_to_owned_str(move out)
+}
+
+fn df_write_csv(df: DataFrame, path: str) -> bool {
+    return fs_write_text(path, df_to_csv(df))
+}
+
+// Binary Columnar IPC (`AXDF` v1): writes raw aligned column buffers + null masks + string pool directly to disk!
+fn _df_buf_put_u64_le(b: ByteBuf, v: i64) {
+    mut k := 0
+    while k < 8 {
+        buf_push(b, ushr64(v, k * 8) & 255)
+        k += 1
+    }
+}
+
+fn _df_buf_get_u64_le(b: ByteBuf, off: i64) -> i64 {
+    mut acc := 0
+    mut k := 0
+    while k < 8 {
+        acc = acc | ((buf_get(b, off + k) & 255) << (k * 8))
+        k += 1
+    }
+    return acc
+}
+
+fn df_write_ipc(df: DataFrame, path: str) -> bool {
+    est := 64 + df.ncols * (64 + df.nrows * 9) + svec_len(df.str_pool) * 32
+    b := buf_new(est)
+    // Magic: "AXDF\x01\x00\x00\x00"
+    buf_push(b, 65); buf_push(b, 88); buf_push(b, 68); buf_push(b, 70)
+    buf_push(b, 1);  buf_push(b, 0);  buf_push(b, 0);  buf_push(b, 0)
+    _df_buf_put_u64_le(b, df.nrows)
+    _df_buf_put_u64_le(b, df.ncols)
+    pool_n := svec_len(df.str_pool)
+    _df_buf_put_u64_le(b, pool_n)
+    mut pi := 0
+    while pi < pool_n {
+        ps := svec_get(df.str_pool, pi)
+        _df_buf_put_u64_le(b, str_len(ps))
+        if str_len(ps) > 0 { buf_push_str(b, ps) }
+        pi += 1
+    }
+    mut c := 0
+    while c < df.ncols {
+        nm := svec_get(df.col_names, c)
+        _df_buf_put_u64_le(b, str_len(nm))
+        if str_len(nm) > 0 { buf_push_str(b, nm) }
+        _df_buf_put_u64_le(b, ibuf_get(df.col_types, c))
+        cp := ibuf_get(df.col_ptrs, c)
+        np := ibuf_get(df.null_ptrs, c)
+        mut r := 0
+        while r < df.nrows {
+            _df_buf_put_u64_le(b, unsafe { ptr_read_i64(cp, r) })
+            r += 1
+        }
+        r = 0
+        while r < df.nrows {
+            buf_push(b, unsafe { ptr_read_u8(np, r) })
+            r += 1
+        }
+        c += 1
+    }
+    rc := fs_write_file(path, b)
+    buf_free(move b)
+    return rc >= 0
+}
+
+fn df_read_ipc(path: str) -> DataFrame ! i64 {
+    b := fs_read_file(path) or return err(404)
+    blen := buf_len(b)
+    if blen < 32 or buf_get(b, 0) != 65 or buf_get(b, 1) != 88 or buf_get(b, 2) != 68 or buf_get(b, 3) != 70 {
+        buf_free(move b)
+        return err(422)
+    }
+    mut off := 8
+    nrows := _df_buf_get_u64_le(b, off); off += 8
+    ncols := _df_buf_get_u64_le(b, off); off += 8
+    pool_n := _df_buf_get_u64_le(b, off); off += 8
+    mut df := df_new(nrows)
+    svec_free(df.str_pool)
+    df.str_pool = svec_new(pool_n + 8, pool_n * 16 + 64)
+    mut pi := 0
+    while pi < pool_n {
+        slen := _df_buf_get_u64_le(b, off); off += 8
+        ps := if slen > 0 { buf_slice_str(b, off, off + slen) } else { "" }
+        off += slen
+        svec_push(mut df.str_pool, ps)
+        pi += 1
+    }
+    mut c := 0
+    while c < ncols {
+        nlen := _df_buf_get_u64_le(b, off); off += 8
+        nm := if nlen > 0 { buf_slice_str(b, off, off + nlen) } else { "" }
+        off += nlen
+        dt := _df_buf_get_u64_le(b, off); off += 8
+        idx := df_add_empty_col(mut df, nm, dt)
+        cp := ibuf_get(df.col_ptrs, idx)
+        np := ibuf_get(df.null_ptrs, idx)
+        mut r := 0
+        while r < nrows {
+            unsafe { ptr_write_i64(cp, r, _df_buf_get_u64_le(b, off)) }
+            off += 8
+            r += 1
+        }
+        r = 0
+        while r < nrows {
+            unsafe { ptr_write_u8(np, r, buf_get(b, off)) }
+            off += 1
+            r += 1
+        }
+        c += 1
+    }
+    buf_free(move b)
+    return ok(df)
+}
+
+// ============================================================================
+// Relational & Analytical Engines (`gather`, `head`, `select`, `filter`, `sort`, `groupby_agg`, `join`, `describe`, `to_mat_f64`)
+// ============================================================================
+
+fn df_gather_rows(df: DataFrame, row_indices: IntBuf) -> DataFrame {
+    m := ibuf_len(row_indices)
+    mut out := df_new(m)
+    // Copy `str_pool` so string IDs remain valid O(1)
+    svec_free(out.str_pool)
+    out.str_pool = svec_new(svec_len(df.str_pool) + 8, 512)
+    mut pi := 0
+    while pi < svec_len(df.str_pool) {
+        svec_push(mut out.str_pool, svec_get(df.str_pool, pi))
+        pi += 1
+    }
+    mut c := 0
+    while c < df.ncols {
+        dt := ibuf_get(df.col_types, c)
+        oc := df_add_empty_col(mut out, svec_get(df.col_names, c), dt)
+        src_p := ibuf_get(df.col_ptrs, c)
+        src_n := ibuf_get(df.null_ptrs, c)
+        dst_p := ibuf_get(out.col_ptrs, oc)
+        dst_n := ibuf_get(out.null_ptrs, oc)
+        mut i := 0
+        while i < m {
+            sr := ibuf_get(row_indices, i)
+            if sr >= 0 and sr < df.nrows {
+                unsafe {
+                    ptr_write_i64(dst_p, i, ptr_read_i64(src_p, sr))
+                    ptr_write_u8(dst_n, i, ptr_read_u8(src_n, sr))
+                }
+            } else {
+                unsafe { ptr_write_u8(dst_n, i, 1) }
+            }
+            i += 1
+        }
+        c += 1
+    }
+    return out
+}
+
+fn df_head(df: DataFrame, n: i64 = 5) -> DataFrame {
+    cnt := if n < df.nrows { (if n < 0 { 0 } else { n }) } else { df.nrows }
+    idx := ibuf_new(cnt + 4)
+    mut i := 0
+    while i < cnt { ibuf_push(idx, i); i += 1 }
+    out := df_gather_rows(df, idx)
+    buf_free(move idx)
+    return out
+}
+
+fn df_select(df: DataFrame, cols_csv: str) -> DataFrame {
+    names := _df_split_csv_line(cols_csv, 44)
+    k := svec_len(names)
+    mut out := df_new(df.nrows)
+    svec_free(out.str_pool)
+    out.str_pool = svec_new(svec_len(df.str_pool) + 8, 512)
+    mut pi := 0
+    while pi < svec_len(df.str_pool) {
+        svec_push(mut out.str_pool, svec_get(df.str_pool, pi))
+        pi += 1
+    }
+    mut i := 0
+    while i < k {
+        sc := df_col_index(df, svec_get(names, i))
+        if sc >= 0 {
+            dt := ibuf_get(df.col_types, sc)
+            oc := df_add_empty_col(mut out, svec_get(df.col_names, sc), dt)
+            if df.nrows > 0 {
+                unsafe {
+                    mem_copy(ibuf_get(out.col_ptrs, oc), ibuf_get(df.col_ptrs, sc), df.nrows * 8)
+                    mem_copy(ibuf_get(out.null_ptrs, oc), ibuf_get(df.null_ptrs, sc), df.nrows)
+                }
+            }
+        }
+        i += 1
+    }
+    svec_free(move names)
+    return out
+}
+
+fn df_filter_f64(df: DataFrame, col_name: str, op: str, rhs: f64) -> DataFrame {
+    col := df_col_index(df, col_name)
+    keep := ibuf_new(df.nrows + 8)
+    if col >= 0 {
+        mut r := 0
+        while r < df.nrows {
+            if not df_is_null(df, col, r) {
+                v := df_get_f64(df, col, r)
+                mut hit := false
+                if str_eq(op, ">") { hit = v > rhs }
+                else if str_eq(op, ">=") { hit = v >= rhs }
+                else if str_eq(op, "<") { hit = v < rhs }
+                else if str_eq(op, "<=") { hit = v <= rhs }
+                else if str_eq(op, "==") { hit = v == rhs }
+                else if str_eq(op, "!=") { hit = v != rhs }
+                if hit { ibuf_push(keep, r) }
+            }
+            r += 1
+        }
+    }
+    out := df_gather_rows(df, keep)
+    buf_free(move keep)
+    return out
+}
+
+fn df_filter_str_eq(df: DataFrame, col_name: str, val: str) -> DataFrame {
+    col := df_col_index(df, col_name)
+    keep := ibuf_new(df.nrows + 8)
+    if col >= 0 {
+        mut r := 0
+        while r < df.nrows {
+            if not df_is_null(df, col, r) and str_eq(df_get_str(df, col, r), val) {
+                ibuf_push(keep, r)
+            }
+            r += 1
+        }
+    }
+    out := df_gather_rows(df, keep)
+    buf_free(move keep)
+    return out
+}
+
+fn _df_cmp_rows(df: DataFrame, col: i64, r1: i64, r2: i64, asc: bool) -> i64 {
+    n1 := df_is_null(df, col, r1)
+    n2 := df_is_null(df, col, r2)
+    if n1 and n2 { return 0 }
+    if n1 { return 1 }  // Nulls always sort last
+    if n2 { return -1 }
+    dt := ibuf_get(df.col_types, col)
+    mut c := 0
+    if dt == 2 {
+        v1 := df_get_f64(df, col, r1)
+        v2 := df_get_f64(df, col, r2)
+        if v1 < v2 { c = -1 } else if v1 > v2 { c = 1 } else { c = 0 }
+    } else if dt == 1 or dt == 3 {
+        v1 := df_get_i64(df, col, r1)
+        v2 := df_get_i64(df, col, r2)
+        if v1 < v2 { c = -1 } else if v1 > v2 { c = 1 } else { c = 0 }
+    } else {
+        c = str_cmp(df_get_str(df, col, r1), df_get_str(df, col, r2))
+    }
+    return if asc { c } else { 0 - c }
+}
+
+// Stable `O(N log N)` bottom-up merge sort on row index buffer!
+fn df_sort_by(df: DataFrame, col_name: str, ascending: bool = true) -> DataFrame {
+    col := df_col_index(df, col_name)
+    n := df.nrows
+    idx := ibuf_new(n + 8)
+    mut i := 0
+    while i < n { ibuf_push(idx, i); i += 1 }
+    if col < 0 or n <= 1 {
+        out := df_gather_rows(df, idx)
+        buf_free(move idx)
+        return out
+    }
+    tmp := ibuf_new(n + 8)
+    i = 0
+    while i < n { ibuf_push(tmp, 0); i += 1 }
+    mut width := 1
+    while width < n {
+        mut left := 0
+        while left < n {
+            mid := if left + width < n { left + width } else { n }
+            right := if left + 2 * width < n { left + 2 * width } else { n }
+            mut p := left
+            mut q := mid
+            mut k := left
+            while p < mid and q < right {
+                rp := ibuf_get(idx, p)
+                rq := ibuf_get(idx, q)
+                if _df_cmp_rows(df, col, rp, rq, ascending) <= 0 {
+                    ibuf_set(tmp, k, rp)
+                    p += 1
+                } else {
+                    ibuf_set(tmp, k, rq)
+                    q += 1
+                }
+                k += 1
+            }
+            while p < mid { ibuf_set(tmp, k, ibuf_get(idx, p)); p += 1; k += 1 }
+            while q < right { ibuf_set(tmp, k, ibuf_get(idx, q)); q += 1; k += 1 }
+            mut cp := left
+            while cp < right { ibuf_set(idx, cp, ibuf_get(tmp, cp)); cp += 1 }
+            left += 2 * width
+        }
+        width = width * 2
+    }
+    buf_free(move tmp)
+    out := df_gather_rows(df, idx)
+    buf_free(move idx)
+    return out
+}
+
+// `O(N)` Hash GroupBy Aggregation (`agg_op` in `"sum"`, `"mean"`, `"min"`, `"max"`, `"count"`, `"std"`).
+fn df_groupby_agg(df: DataFrame, key_col: str, val_col: str, agg_op: str) -> DataFrame {
+    kc := df_col_index(df, key_col)
+    vc := df_col_index(df, val_col)
+    if kc < 0 or vc < 0 { return df_new(0) }
+    mut gmap := smap_new(64)
+    mut keys := svec_new(32, 512)
+    // Per-group accumulators (up to `df.nrows + 8` distinct groups)
+    cap_g := df.nrows + 8
+    cnts := ibuf_new(cap_g)
+    sums := mat_zeros(cap_g, 1)
+    sum_sqs := mat_zeros(cap_g, 1)
+    mins := mat_zeros(cap_g, 1)
+    maxs := mat_zeros(cap_g, 1)
+    mut ng := 0
+    mut r := 0
+    while r < df.nrows {
+        if not df_is_null(df, kc, r) {
+            ks := df_get_str(df, kc, r)
+            mut gid := smap_get_i64(gmap, ks, -1)
+            if gid < 0 {
+                gid = ng
+                ng += 1
+                smap_set_i64(mut gmap, ks, gid)
+                svec_push(mut keys, ks)
+                ibuf_push(cnts, 0)
+                unsafe {
+                    ptr_write_f64(mins.ptr, gid, num_pow2_int(996))
+                    ptr_write_f64(maxs.ptr, gid, 0.0 - num_pow2_int(996))
+                }
+            }
+            if not df_is_null(df, vc, r) {
+                v := df_get_f64(df, vc, r)
+                c_prev := ibuf_get(cnts, gid)
+                ibuf_set(cnts, gid, c_prev + 1)
+                unsafe {
+                    ptr_write_f64(sums.ptr, gid, ptr_read_f64(sums.ptr, gid) + v)
+                    ptr_write_f64(sum_sqs.ptr, gid, ptr_read_f64(sum_sqs.ptr, gid) + v * v)
+                    if v < ptr_read_f64(mins.ptr, gid) { ptr_write_f64(mins.ptr, gid, v) }
+                    if v > ptr_read_f64(maxs.ptr, gid) { ptr_write_f64(maxs.ptr, gid, v) }
+                }
+            }
+        }
+        r += 1
+    }
+    mut out := df_new(ng)
+    k_dt := ibuf_get(df.col_types, kc)
+    oc_k := df_add_empty_col(mut out, key_col, k_dt)
+    oc_v := df_add_empty_col(mut out, val_col + "_" + agg_op, if str_eq(agg_op, "count") { 1 } else { 2 })
+    mut g := 0
+    while g < ng {
+        ks := svec_get(keys, g)
+        if k_dt == 1 { df_set_i64(out, oc_k, g, _df_parse_i64(ks)) }
+        else if k_dt == 2 { df_set_f64(out, oc_k, g, _df_parse_f64(ks)) }
+        else { df_set_str(mut out, oc_k, g, ks) }
+        c_g := ibuf_get(cnts, g)
+        if str_eq(agg_op, "count") {
+            df_set_i64(out, oc_v, g, c_g)
+        } else if c_g == 0 {
+            df_set_null(out, oc_v, g, true)
+        } else {
+            s_g := unsafe { ptr_read_f64(sums.ptr, g) }
+            if str_eq(agg_op, "sum") {
+                df_set_f64(out, oc_v, g, s_g)
+            } else if str_eq(agg_op, "mean") {
+                df_set_f64(out, oc_v, g, s_g / (c_g as f64))
+            } else if str_eq(agg_op, "min") {
+                df_set_f64(out, oc_v, g, unsafe { ptr_read_f64(mins.ptr, g) })
+            } else if str_eq(agg_op, "max") {
+                df_set_f64(out, oc_v, g, unsafe { ptr_read_f64(maxs.ptr, g) })
+            } else {
+                // Sample std (`ddof = 1` when `c_g > 1`)
+                if c_g <= 1 {
+                    df_set_f64(out, oc_v, g, 0.0)
+                } else {
+                    mean_g := s_g / (c_g as f64)
+                    ss := unsafe { ptr_read_f64(sum_sqs.ptr, g) } - (c_g as f64) * mean_g * mean_g
+                    df_set_f64(out, oc_v, g, sqrt_f64(if ss > 0.0 { ss / ((c_g - 1) as f64) } else { 0.0 }))
+                }
+            }
+        }
+        g += 1
+    }
+    smap_free(move gmap); svec_free(move keys); buf_free(move cnts)
+    mat_free(move sums); mat_free(move sum_sqs); mat_free(move mins); mat_free(move maxs)
+    return out
+}
+
+// `O(N + M)` Chained Hash Join (`how` = `"inner"` or `"left"`).
+fn df_join(left: DataFrame, right: DataFrame, left_on: str, right_on: str, how: str = "inner") -> DataFrame {
+    lc := df_col_index(left, left_on)
+    rc := df_col_index(right, right_on)
+    if lc < 0 or rc < 0 { return df_new(0) }
+    is_left := str_eq(how, "left")
+    // Build hash index on `right`: `StrMap(key -> head_r)` + `next_r` chain for 1-to-many matches!
+    mut r_heads := smap_new(right.nrows * 2 + 16)
+    r_next := ibuf_new(right.nrows + 8)
+    mut r := 0
+    while r < right.nrows {
+        if df_is_null(right, rc, r) {
+            ibuf_push(r_next, -1)
+        } else {
+            ks := df_get_str(right, rc, r)
+            prev := smap_get_i64(r_heads, ks, -1)
+            ibuf_push(r_next, prev)
+            smap_set_i64(mut r_heads, ks, r)
+        }
+        r += 1
+    }
+    mut l_pairs := dvec_new(left.nrows + 16)
+    mut r_pairs := dvec_new(left.nrows + 16)
+    mut lr := 0
+    while lr < left.nrows {
+        if df_is_null(left, lc, lr) {
+            if is_left {
+                dvec_push(mut l_pairs, lr)
+                dvec_push(mut r_pairs, -1)
+            }
+        } else {
+            ks := df_get_str(left, lc, lr)
+            mut cur := smap_get_i64(r_heads, ks, -1)
+            if cur < 0 {
+                if is_left {
+                    dvec_push(mut l_pairs, lr)
+                    dvec_push(mut r_pairs, -1)
+                }
+            } else {
+                while cur >= 0 {
+                    dvec_push(mut l_pairs, lr)
+                    dvec_push(mut r_pairs, cur)
+                    cur = ibuf_get(r_next, cur)
+                }
+            }
+        }
+        lr += 1
+    }
+    smap_free(move r_heads)
+    buf_free(move r_next)
+    m := dvec_len(l_pairs)
+    mut out := df_new(m)
+    // Copy left columns
+    mut c := 0
+    while c < left.ncols {
+        dt := ibuf_get(left.col_types, c)
+        oc := df_add_empty_col(mut out, svec_get(left.col_names, c), dt)
+        mut i := 0
+        while i < m {
+            sr := dvec_get(l_pairs, i)
+            if df_is_null(left, c, sr) {
+                df_set_null(out, oc, i, true)
+            } else if dt == 4 {
+                df_set_str(mut out, oc, i, df_get_str(left, c, sr))
+            } else {
+                unsafe { ptr_write_i64(ibuf_get(out.col_ptrs, oc), i, ptr_read_i64(ibuf_get(left.col_ptrs, c), sr)) }
+            }
+            i += 1
+        }
+        c += 1
+    }
+    // Copy non-key right columns (suffix `_right` if name collides)
+    c = 0
+    while c < right.ncols {
+        if c != rc {
+            rname := svec_get(right.col_names, c)
+            oname := if df_col_index(left, rname) >= 0 { rname + "_right" } else { rname }
+            dt := ibuf_get(right.col_types, c)
+            oc := df_add_empty_col(mut out, oname, dt)
+            mut i := 0
+            while i < m {
+                sr := dvec_get(r_pairs, i)
+                if sr < 0 or df_is_null(right, c, sr) {
+                    df_set_null(out, oc, i, true)
+                } else if dt == 4 {
+                    df_set_str(mut out, oc, i, df_get_str(right, c, sr))
+                } else {
+                    unsafe { ptr_write_i64(ibuf_get(out.col_ptrs, oc), i, ptr_read_i64(ibuf_get(right.col_ptrs, c), sr)) }
+                }
+                i += 1
+            }
+        }
+        c += 1
+    }
+    dvec_free(move l_pairs)
+    dvec_free(move r_pairs)
+    return out
+}
+
+fn df_drop_nulls(df: DataFrame) -> DataFrame {
+    keep := ibuf_new(df.nrows + 8)
+    mut r := 0
+    while r < df.nrows {
+        mut any_null := false
+        mut c := 0
+        while c < df.ncols {
+            if df_is_null(df, c, r) { any_null = true; break }
+            c += 1
+        }
+        if not any_null { ibuf_push(keep, r) }
+        r += 1
+    }
+    out := df_gather_rows(df, keep)
+    buf_free(move keep)
+    return out
+}
+
+fn df_fill_null_f64(df: DataFrame, col_name: str, fill_val: f64) -> DataFrame {
+    all_idx := ibuf_new(df.nrows + 4)
+    mut r := 0
+    while r < df.nrows { ibuf_push(all_idx, r); r += 1 }
+    out := df_gather_rows(df, all_idx)
+    buf_free(move all_idx)
+    col := df_col_index(out, col_name)
+    if col < 0 { return out }
+    dt := ibuf_get(out.col_types, col)
+    r = 0
+    while r < out.nrows {
+        if df_is_null(out, col, r) {
+            if dt == 2 { df_set_f64(out, col, r, fill_val) }
+            else if dt == 1 { df_set_i64(out, col, r, fill_val as i64) }
+        }
+        r += 1
+    }
+    return out
+}
+
+// Summary table (`column`, `count`, `nulls`, `mean`, `std`, `min`, `max`) for all numeric columns.
+fn df_describe(df: DataFrame) -> DataFrame {
+    mut num_cols := ibuf_new(df.ncols + 4)
+    mut c := 0
+    while c < df.ncols {
+        dt := ibuf_get(df.col_types, c)
+        if dt == 1 or dt == 2 { ibuf_push(num_cols, c) }
+        c += 1
+    }
+    k := ibuf_len(num_cols)
+    mut out := df_new(k)
+    c_name := df_add_empty_col(mut out, "column", 4)
+    c_cnt  := df_add_empty_col(mut out, "count", 1)
+    c_null := df_add_empty_col(mut out, "nulls", 1)
+    c_mean := df_add_empty_col(mut out, "mean", 2)
+    c_std  := df_add_empty_col(mut out, "std", 2)
+    c_min  := df_add_empty_col(mut out, "min", 2)
+    c_max  := df_add_empty_col(mut out, "max", 2)
+    mut i := 0
+    while i < k {
+        sc := ibuf_get(num_cols, i)
+        df_set_str(mut out, c_name, i, svec_get(df.col_names, sc))
+        mut cnt := 0
+        mut nulls := 0
+        mut mean := 0.0
+        mut m2 := 0.0
+        mut vmin := num_pow2_int(996)
+        mut vmax := 0.0 - num_pow2_int(996)
+        mut r := 0
+        while r < df.nrows {
+            if df_is_null(df, sc, r) {
+                nulls += 1
+            } else {
+                v := df_get_f64(df, sc, r)
+                cnt += 1
+                delta := v - mean
+                mean += delta / (cnt as f64)
+                m2 += delta * (v - mean)
+                if v < vmin { vmin = v }
+                if v > vmax { vmax = v }
+            }
+            r += 1
+        }
+        df_set_i64(out, c_cnt, i, cnt)
+        df_set_i64(out, c_null, i, nulls)
+        if cnt > 0 {
+            df_set_f64(out, c_mean, i, mean)
+            df_set_f64(out, c_std, i, if cnt > 1 { sqrt_f64(m2 / ((cnt - 1) as f64)) } else { 0.0 })
+            df_set_f64(out, c_min, i, vmin)
+            df_set_f64(out, c_max, i, vmax)
+        } else {
+            df_set_null(out, c_mean, i, true)
+            df_set_null(out, c_std, i, true)
+            df_set_null(out, c_min, i, true)
+            df_set_null(out, c_max, i, true)
+        }
+        i += 1
+    }
+    buf_free(move num_cols)
+    return out
+}
+
+// Extracts selected numeric columns into a dense row-major `[nrows x k]` `MatF64` matrix for `std::stats` & `std::ml`.
+fn df_to_mat_f64(df: DataFrame, cols_csv: str) -> MatF64 {
+    names := _df_split_csv_line(cols_csv, 44)
+    k := svec_len(names)
+    if k <= 0 or df.nrows <= 0 {
+        svec_free(move names)
+        return MatF64(0, 0, 0)
+    }
+    col_ids := ibuf_new(k + 4)
+    mut j := 0
+    while j < k {
+        ibuf_push(col_ids, df_col_index(df, svec_get(names, j)))
+        j += 1
+    }
+    svec_free(move names)
+    m := mat_zeros(df.nrows, k)
+    mut r := 0
+    while r < df.nrows {
+        j = 0
+        while j < k {
+            cid := ibuf_get(col_ids, j)
+            v := if cid >= 0 { df_get_f64(df, cid, r) } else { 0.0 }
+            unsafe { ptr_write_f64(m.ptr, r * k + j, v) }
+            j += 1
+        }
+        r += 1
+    }
+    buf_free(move col_ids)
+    return m
+}
+
+// ============================================================================
+// JSON Lines (`JSONL`) Flat Record Reader (`df_parse_jsonl`, `df_read_jsonl`)
+// ============================================================================
+
+fn _df_jsonl_extract_kv(line: str, mut row_map: StrMap, mut col_order: StrVec, mut col_seen: StrMap) {
+    n := str_len(line)
+    mut i := 0
+    while i < n {
+        while i < n and str_byte(line, i) != 34 { i += 1 }
+        if i >= n { break }
+        i += 1
+        k_start := i
+        while i < n and str_byte(line, i) != 34 {
+            if str_byte(line, i) == 92 { i += 1 }
+            i += 1
+        }
+        if i >= n { break }
+        key := str_slice(line, k_start, i)
+        i += 1
+        while i < n and str_byte(line, i) != 58 { i += 1 }
+        if i >= n { break }
+        i += 1
+        while i < n and str_byte(line, i) <= 32 { i += 1 }
+        if i >= n { break }
+        mut val := ""
+        if str_byte(line, i) == 34 {
+            i += 1
+            v_start := i
+            while i < n and str_byte(line, i) != 34 {
+                if str_byte(line, i) == 92 { i += 1 }
+                i += 1
+            }
+            val = str_slice(line, v_start, i)
+            if i < n { i += 1 }
+        } else {
+            v_start := i
+            while i < n and str_byte(line, i) != 44 and str_byte(line, i) != 125 {
+                i += 1
+            }
+            val = str_trim(str_slice(line, v_start, i))
+        }
+        if not smap_has(col_seen, key) {
+            smap_set_i64(mut col_seen, key, svec_len(col_order))
+            svec_push(mut col_order, key)
+        }
+        smap_set_str(mut row_map, key, val)
+    }
+}
+
+fn df_parse_jsonl(jsonl_text: str) -> DataFrame ! i64 {
+    ranges := str_split_ranges(jsonl_text, 10)
+    raw_cnt := str_split_count(ranges)
+    if raw_cnt <= 0 { buf_free(move ranges); return err(400) }
+    mut lines := svec_new(raw_cnt + 4, str_len(jsonl_text) + 32)
+    mut li := 0
+    while li < raw_cnt {
+        ln := str_trim(str_split_at(jsonl_text, ranges, li))
+        if str_len(ln) > 1 and str_byte(ln, 0) == 123 { svec_push(mut lines, ln) }
+        li += 1
+    }
+    buf_free(move ranges)
+    nrows := svec_len(lines)
+    if nrows <= 0 { svec_free(move lines); return err(400) }
+    mut col_order := svec_new(16, 256)
+    mut col_seen := smap_new(32)
+    // First pass: discover union of column names in appearance order
+    mut r := 0
+    while r < nrows {
+        mut dummy := smap_new(16)
+        _df_jsonl_extract_kv(svec_get(lines, r), mut dummy, mut col_order, mut col_seen)
+        smap_free(move dummy)
+        r += 1
+    }
+    ncols := svec_len(col_order)
+    if ncols <= 0 {
+        svec_free(move lines); svec_free(move col_order); smap_free(move col_seen)
+        return err(400)
+    }
+    // Convert into CSV buffer or cell grid and reuse schema-inferring column loader
+    csv_b := buf_new(str_len(jsonl_text) + ncols * 16 + 64)
+    mut c := 0
+    while c < ncols {
+        if c > 0 { buf_push(csv_b, 44) }
+        buf_push_str(csv_b, svec_get(col_order, c))
+        c += 1
+    }
+    buf_push(csv_b, 10)
+    r = 0
+    while r < nrows {
+        mut rmap := smap_new(ncols * 2 + 8)
+        _df_jsonl_extract_kv(svec_get(lines, r), mut rmap, mut col_order, mut col_seen)
+        c = 0
+        while c < ncols {
+            if c > 0 { buf_push(csv_b, 44) }
+            k := svec_get(col_order, c)
+            if smap_has(rmap, k) {
+                vs := smap_get_str(rmap, k, "")
+                if str_find(vs, ",") >= 0 {
+                    buf_push(csv_b, 34); buf_push_str(csv_b, vs); buf_push(csv_b, 34)
+                } else {
+                    buf_push_str(csv_b, vs)
+                }
+            }
+            c += 1
+        }
+        buf_push(csv_b, 10)
+        smap_free(move rmap)
+        r += 1
+    }
+    svec_free(move lines); svec_free(move col_order); smap_free(move col_seen)
+    csv_str := buf_to_owned_str(move csv_b)
+    return df_parse_csv(csv_str, 44)
+}
+
+fn df_read_jsonl(path: str) -> DataFrame ! i64 {
+    txt := fs_read_text(path) or return err(404)
+    return df_parse_jsonl(txt)
+}
+

@@ -523,6 +523,10 @@ fn try_emit_v7_domain_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, bre
     if pool_str_eq_lit(p, csoff, cslen, "cpu_threads") and acnt == 0 {
         dst := cg_alloc_slots(cg, 1)
         cg_mov_rax_data(cg, data_off_cpu_threads())
+        mc_b3(c, 0x48, 0x85, 0xC0)
+        jnz_ct := mc_jcc8(c, 0x75)
+        mc_b1(c, 0xB8); mc_u32(c, 1)
+        mc_patch_jcc8(c, jnz_ct, buf_len(c))
         mc_store_rax(c, dst, 0)
         return er_pack(dst, ty_int())
     }
@@ -1459,11 +1463,20 @@ fn try_emit_v7_domain_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, bre
         return er_pack(cg_unit_slot(cg), ty_unit())
     }
     if pool_str_eq_lit(p, csoff, cslen, "atomic_load_i64") and acnt == 2 {
-        br := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4))
-        ir := emit_expr_ax(cg, vars, drops, breaks, ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4))
-        mc_load_rcx(c, er_slot(br), 0)
-        mc_load_rdx(c, er_slot(ir), 0)
-        mc_b4(c, 0x48, 0x8B, 0x04, 0xD1) // MOV RAX, [RCX + RDX*8] (x86_64 hardware acquire load)
+        e0 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4)
+        e1 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4)
+        pr := emit_expr_ax(cg, vars, drops, breaks, e0)
+        s1 := emit_fast_val_arg(cg, vars, drops, breaks, e1)
+        mc_load_rcx(c, er_slot(pr), 0)
+        if s1 < 0 {
+            idx := eval_const_int_val(p, cg.nodes, cg.sym, e1)
+            if idx == 0 { mc_b3(c, 0x48, 0x8B, 0x01) }
+            else if idx >= -15 and idx <= 15 { mc_b4(c, 0x48, 0x8B, 0x41, (idx * 8) & 255) }
+            else { mc_mov_reg_imm(c, 1, idx); mc_b4(c, 0x48, 0x8B, 0x04, 0xD1) }
+        } else {
+            mc_load_rdx(c, s1, 0)
+            mc_b4(c, 0x48, 0x8B, 0x04, 0xD1)
+        }
         dst := cg_alloc_slots(cg, 1)
         mc_store_rax(c, dst, 0)
         return er_pack(dst, ty_int())
@@ -1484,6 +1497,17 @@ fn try_emit_v7_domain_intrinsic(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, bre
         e0 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff), 4)
         e1 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 1), 4)
         e2 := ast_get(cg.nodes, ibuf_get(cg.extra, aoff + 2), 4)
+        psl := local_scalar_slot_ax(cg, vars, e0)
+        if psl > 0 and pure_i64_ty_ax(cg, vars, e2) == ty_int() and is_folded_const_int_ax(cg, vars, e1) {
+            idx_c := eval_folded_const_int_ax(cg, vars, e1)
+            emit_int_expr_to_rax(cg, vars, drops, breaks, e2)
+            pr_p := cg_slot_reg(cg, psl)
+            if pr_p > 0 { mc_mov_rcx_gpreg(c, pr_p) } else { mc_load_rcx(c, psl, 0) }
+            if idx_c == 0 { mc_b3(c, 0x48, 0x89, 0x01) }
+            else if idx_c >= -15 and idx_c <= 15 { mc_b4(c, 0x48, 0x89, 0x41, (idx_c * 8) & 255) }
+            else { mc_mov_reg_imm(c, 1, idx_c); mc_b4(c, 0x48, 0x89, 0x04, 0xD1) }
+            return er_pack(cg_unit_slot(cg), ty_unit())
+        }
         br := emit_expr_ax(cg, vars, drops, breaks, e0)
         s1 := emit_fast_val_arg(cg, vars, drops, breaks, e1)
         vr := emit_expr_ax(cg, vars, drops, breaks, e2)
@@ -3674,6 +3698,10 @@ fn check_inline_stmt_ax(nodes: IntBuf, extra: IntBuf, snid: i64, stats: IntBuf) 
     }
     if k == nk_for_each() {
         check_inline_block_ax(nodes, extra, ast_get(nodes, snid, 4), stats)
+        return
+    }
+    if k == nk_unsafe_block() {
+        check_inline_block_ax(nodes, extra, ast_get(nodes, snid, 1), stats)
     }
 }
 
@@ -3819,8 +3847,16 @@ fn try_emit_inline_call_ax(cg: CodegenCtx, ev: IntBuf, fidx: i64, ret_dst: i64) 
         emit_wipe_secrets_ax(cg, c_drops)
     }
 
-    inline_end := buf_len(c)
-    jcnt := ibuf_get(cg.state, 30 + prev_depth)
+    mut inline_end := buf_len(c)
+    mut jcnt := ibuf_get(cg.state, 30 + prev_depth)
+    if jcnt > 0 {
+        last_jp := ibuf_get(cg.state, 34 + prev_depth * 16 + jcnt - 1)
+        if last_jp >= 1 and last_jp + 4 == inline_end and buf_get(c, last_jp - 1) == 0xE9 {
+            buf_truncate(c, last_jp - 1)
+            inline_end = last_jp - 1
+            jcnt -= 1
+        }
+    }
     mut ji := 0
     while ji < jcnt {
         mc_patch_rel32(c, ibuf_get(cg.state, 34 + prev_depth * 16 + ji), inline_end)
@@ -3912,7 +3948,7 @@ fn emit_direct_fn_call(cg: CodegenCtx, vars: IntBuf, drops: IntBuf, breaks: IntB
         }
         mi_chk += 1
     }
-    ev := ibuf_new(64)
+    ev := ibuf_new(p_cnt * 6 + 64)
     mut pi := 0
     while pi < p_cnt {
         po := p_base + pi * 6

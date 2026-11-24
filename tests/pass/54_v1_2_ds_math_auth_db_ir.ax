@@ -1,0 +1,372 @@
+// Axon v1.2.0 Comprehensive Verification Suite (`tests/pass/54_v1_2_ds_math_auth_db_ir.ax`)
+// Simultaneously imports and verifies all 12 new v1.2.0 stdlib modules + SQLite/Postgres upgrades + AxIR passes!
+
+use std::str
+use std::sys
+use std::linalg
+use std::numeric
+use std::prob
+use std::bigint
+use std::dataframe
+use std::stats
+use std::ml
+use std::os_auth
+use std::auth
+use std::redis
+use std::kv_acid
+use std::db_pool
+use std::sqlite
+use std::postgres
+
+fn near(a: f64, b: f64, eps: f64) -> bool {
+    return num_abs(a - b) <= eps
+}
+
+fn test_axir_passes() -> bool {
+    // 1. Pass 6: MagicDiv signed 64-bit constant division & modulo
+    x_pos := 1234567890123
+    x_neg := -97
+    if (x_pos / 10) != 123456789012 { return false }
+    if (x_pos % 10) != 3 { return false }
+    if (x_neg / 10) != -9 { return false }
+    if (x_neg % 10) != -7 { return false }
+    big_p := 1000000019
+    if (big_p % 1000000007) != 12 { return false }
+
+    // 2. Pass 3: SRoA on 2-field scalar aggregate `Complex`
+    z1 := cplx_new(3.0, 4.0)
+    z2 := cplx_new(1.0, -2.0)
+    zp := cplx_mul(z1, z2)
+    if not near(zp.re, 11.0, 0.000000001) or not near(zp.im, -2.0, 0.000000001) { return false }
+
+    // 3. Pass 7 (RCE) + Pass 8 (Auto-SIMD loop reduction)
+    arr := ibuf_new(128)
+    mut i := 0
+    while i < 100 { ibuf_push(arr, i + 1); i += 1 }
+    mut total := 0
+    i = 0
+    while i < 100 {
+        total += ibuf_get(arr, i)
+        i += 1
+    }
+    buf_free(move arr)
+    return total == 5050
+}
+
+fn test_math_suite() -> bool {
+    // 1. Dense & Sparse Linear Algebra (`std::linalg`)
+    a := mat_zeros(2, 2)
+    mat_set(a, 0, 0, 4.0); mat_set(a, 0, 1, 2.0)
+    mat_set(a, 1, 0, 2.0); mat_set(a, 1, 1, 3.0)
+    b := mat_zeros(2, 1)
+    mat_set(b, 0, 0, 8.0); mat_set(b, 1, 0, 7.0)
+
+    if not near(mat_det(a), 8.0, 0.000001) { println("M1_det"); return false }
+    x_lu := lu_solve(a, b) or return false
+    x_ch := cholesky_solve(a, b) or return false
+    if not near(mat_get(x_lu, 0, 0), 1.25, 0.000001) or not near(mat_get(x_lu, 1, 0), 1.5, 0.000001) { println("M2_lu"); return false }
+    if not near(mat_get(x_ch, 0, 0), 1.25, 0.000001) or not near(mat_get(x_ch, 1, 0), 1.5, 0.000001) { println("M3_chol"); return false }
+    mat_free(move x_lu); mat_free(move x_ch)
+
+    eig := eigen_sym_jacobi(a) or return false
+    // Eigenvalues of [4, 2; 2, 3]: trace = 7, det = 8 -> (7 +- sqrt(17)) / 2
+    ev0 := mat_get(eig.values, 0, 0)
+    ev1 := mat_get(eig.values, 1, 0)
+    mat_free(eig.values); mat_free(eig.vectors)
+    if not near(ev0 + ev1, 7.0, 0.00001) or not near(ev0 * ev1, 8.0, 0.00001) { println("M4_eig"); return false }
+
+    sv := svd_jacobi(a) or return false
+    rnk := mat_rank(a)
+    mat_free(sv.u); mat_free(sv.s); mat_free(sv.vt)
+    if rnk != 2 { println("M5_svd"); return false }
+
+    sp := csr_from_dense(a)
+    x_cg := csr_cg_solve(sp, b) or return false
+    x_bi := csr_bicgstab_solve(sp, b) or return false
+    ok_sp := near(mat_get(x_cg, 0, 0), 1.25, 0.0001) and near(mat_get(x_bi, 1, 0), 1.5, 0.0001)
+    csr_free(move sp); mat_free(move x_cg); mat_free(move x_bi)
+    mat_free(move a); mat_free(move b)
+    if not ok_sp { println("M6_csr"); return false }
+
+    // 2. Numerical Analysis (`std::numeric`: FFT, GL16 Quadrature, Brent Root, Simplex LP)
+    re := mat_zeros(8, 1); im := mat_zeros(8, 1)
+    mut k := 0
+    while k < 8 { mat_set(re, k, 0, (k + 1) as f64); k += 1 }
+    if not fft_radix2_inplace(re, im, false) { println("M7_fft1"); return false }
+    if not fft_radix2_inplace(re, im, true) { println("M7_fft2"); return false }
+    if not near(mat_get(re, 5, 0), 6.0, 0.00000001) { println("M7_fft3"); return false }
+    mat_free(move re); mat_free(move im)
+
+    mut gl_int := 0.0
+    k = 0
+    while k < 16 {
+        nd := quad_gl16_node(k, 0.0, num_pi())
+        wt := quad_gl16_weight(k, 0.0, num_pi())
+        gl_int += wt * num_sin(nd)
+        k += 1
+    }
+    if not near(gl_int, 2.0, 0.00000000001) { println("M8_gl16"); return false }
+
+    // Root of x^3 - x - 2 = 0 in [1, 2] -> 1.5213797068045676
+    mut br := brent_init(1.0, -2.0, 2.0, 4.0) or return false
+    mut guard := 0
+    while not br.converged and guard < 64 {
+        xv := br.x_eval
+        _ := brent_step(mut br, xv * xv * xv - xv - 2.0)
+        guard += 1
+    }
+    if not near(br.b, 1.5213797068, 0.000001) { println(f"M9_brent got={br.b}"); return false }
+
+    // Simplex LP: max 3*x0 + 2*x1 s.t. 2*x0 + x1 <= 18, 2*x0 + 3*x1 <= 42, 3*x0 + x1 <= 24 -> obj = 33 at (3, 12)
+    lp_a := mat_zeros(3, 2)
+    mat_set(lp_a, 0, 0, 2.0); mat_set(lp_a, 0, 1, 1.0)
+    mat_set(lp_a, 1, 0, 2.0); mat_set(lp_a, 1, 1, 3.0)
+    mat_set(lp_a, 2, 0, 3.0); mat_set(lp_a, 2, 1, 1.0)
+    lp_b := mat_zeros(3, 1)
+    mat_set(lp_b, 0, 0, 18.0); mat_set(lp_b, 1, 0, 42.0); mat_set(lp_b, 2, 0, 24.0)
+    lp_c := mat_zeros(2, 1)
+    mat_set(lp_c, 0, 0, 3.0); mat_set(lp_c, 1, 0, 2.0)
+    lp_res := linprog_simplex_max(lp_a, lp_b, lp_c)
+    ok_lp := lp_res.status == 0 and near(lp_res.obj, 33.0, 0.0001)
+    mat_free(lp_res.x); mat_free(move lp_a); mat_free(move lp_b); mat_free(move lp_c)
+    if not ok_lp { println(f"M10_lp st={lp_res.status} obj={lp_res.obj}"); return false }
+
+    // 3. Probability (`std::prob`) & Arbitrary-Precision `BigInt` (`std::bigint`)
+    if not near(prob_tgamma(5.0), 24.0, 0.00000001) { println("M11_gamma"); return false }
+    if not near(norm_ppf(0.975, 0.0, 1.0), 1.9599639845, 0.000001) { println("M12_ppf"); return false }
+    if not near(chi2_cdf(chi2_ppf(0.95, 4.0), 4.0), 0.95, 0.00001) { println("M13_chi2"); return false }
+
+    bi_a := bi_from_str("123456789012345678901234567890") or return false
+    bi_b := bi_from_str("98765432109876543210") or return false
+    bi_prod := bi_mul(bi_a, bi_b)
+    dm := bi_div_mod(bi_prod, bi_b) or return false
+    ok_bi := bi_cmp(dm.quot, bi_a) == 0 and bi_is_zero(dm.rem)
+    bi_free(move bi_a); bi_free(move bi_b); bi_free(move bi_prod)
+    bi_free(dm.quot); bi_free(dm.rem)
+    if not ok_bi { println("M14_bigint"); return false }
+
+    p_true := bi_from_i64(999999999989)
+    p_comp := bi_from_i64(999999999993)
+    ok_pr := bi_is_prime(p_true) and not bi_is_prime(p_comp)
+    bi_free(move p_true); bi_free(move p_comp)
+    if not ok_pr { println("M15_prime"); return false }
+
+    r1 := rat_new(1, 3) or return false
+    r2 := rat_new(1, 6) or return false
+    r_sum := rat_add(r1, r2)
+    return str_eq(rat_to_str(r_sum), "1/2")
+}
+
+fn test_data_science_suite() -> bool {
+    csv := "dept,emp,salary\nAI,Alice,120.0\nAI,Bob,140.0\nDB,Carol,100.0\nDB,Dan,110.0\n"
+    df := df_parse_csv(csv) or return false
+    if df_nrows(df) != 4 or df_ncols(df) != 3 { df_free(move df); return false }
+
+    ipc_file := f".axon_test_ipc_{sys_pid()}.axdf"
+    if not df_write_ipc(df, ipc_file) { df_free(move df); return false }
+    df2 := df_read_ipc(ipc_file) or return false
+    _ := sys_fs_remove(ipc_file)
+    agg := df_groupby_agg(df2, "dept", "salary", "mean")
+    ok_df := df_nrows(agg) == 2 and near(df_get_f64(agg, 1, 0), 130.0, 0.001)
+    df_free(move df); df_free(move df2); df_free(move agg)
+    if not ok_df { return false }
+
+    // Welch two-sample t-test & OLS Econometrics (`std::stats`)
+    s1 := mat_zeros(5, 1); s2 := mat_zeros(5, 1)
+    mut i := 0
+    while i < 5 {
+        mat_set(s1, i, 0, 10.0 + (i as f64) * 0.2)
+        mat_set(s2, i, 0, 20.0 + (i as f64) * 0.2)
+        i += 1
+    }
+    wt := welch_ttest(s1, s2)
+    mat_free(move s1); mat_free(move s2)
+    if wt.p_value >= 0.001 { return false }
+
+    // ML (`std::ml`): RandomForest + GBDT + KMeans++ + ROC-AUC on separable 2-cluster dataset
+    x_tr := mat_zeros(12, 2)
+    y_tr := mat_zeros(12, 1)
+    i = 0
+    while i < 6 {
+        mat_set(x_tr, i, 0, -2.0 - (i as f64) * 0.1)
+        mat_set(x_tr, i, 1, -1.5)
+        mat_set(y_tr, i, 0, 0.0)
+        mat_set(x_tr, 6 + i, 0, 2.0 + (i as f64) * 0.1)
+        mat_set(x_tr, 6 + i, 1, 1.5)
+        mat_set(y_tr, 6 + i, 0, 1.0)
+        i += 1
+    }
+    rf := ml_rf_fit(x_tr, y_tr, 9, 3, true, 42)
+    rf_pred := ml_rf_predict(rf, x_tr)
+    acc := ml_accuracy(y_tr, rf_pred)
+    gb := ml_gbdt_fit(x_tr, y_tr, 15, 0.2, 2, true)
+    gb_prob := ml_gbdt_predict(gb, x_tr)
+    auc := ml_roc_auc_score(y_tr, gb_prob)
+    km := ml_kmeans_pp(x_tr, 2, 50, 7)
+    db_lbls := ml_dbscan(x_tr, 1.0, 3)
+    ok_ml := acc >= 0.99 and auc >= 0.99 and ibuf_get(db_lbls, 0) != ibuf_get(db_lbls, 6)
+    ml_rf_free(move rf); mat_free(move rf_pred)
+    ml_gbdt_free(move gb); mat_free(move gb_prob)
+    ml_kmeans_free(move km); buf_free(move db_lbls)
+    mat_free(move x_tr); mat_free(move y_tr)
+    return ok_ml
+}
+
+fn test_auth_and_os_security() -> bool {
+    // 1. OS CSPRNG + Identity + Win32 DPAPI + Win32 Session Credential Vault (`std::os_auth`)
+    rnd := os_csprng_bytes(32) or return false
+    n_rnd := buf_len(rnd)
+    buf_free(move rnd)
+    if n_rnd != 32 { return false }
+    if str_len(os_current_user()) == 0 { return false }
+    if str_len(os_user_sid_or_uid()) == 0 { return false }
+
+    // DPAPI roundtrip on Windows (gracefully skipped if error 501 on non-Windows)
+    dp_enc := os_dpapi_protect_hex("axon-secret-master-key", "ctx-v1") or "SKIP_NON_WIN"
+    if not str_eq(dp_enc, "SKIP_NON_WIN") {
+        dp_dec := os_dpapi_unprotect_hex(dp_enc, "ctx-v1") or ""
+        if not str_eq(dp_dec, "axon-secret-master-key") { println(f"A1_dpapi got={dp_dec}"); return false }
+        bad_dec := os_dpapi_unprotect_hex(dp_enc, "wrong-entropy") or "DENIED"
+        if not str_eq(bad_dec, "DENIED") { println("A2_dpapi_bad"); return false }
+
+        cred_name := f"AxonTestVault_{sys_pid()}"
+        if os_cred_write(cred_name, "axon_bot", "vault-token-99", 1) {
+            got_sec := os_cred_read(cred_name) or ""
+            _ := os_cred_delete(cred_name)
+            if not str_eq(got_sec, "vault-token-99") { println(f"A3_cred got={got_sec}"); return false }
+        }
+    }
+
+    // 2. RFC Cryptographic Vectors (`std::auth`)
+    // RFC 6070 PBKDF2-HMAC-SHA256("password", "salt", c=1, dkLen=32)
+    pbk := pbkdf2_hmac_sha256_hex("password", "salt", 1, 32)
+    if not str_eq(pbk, "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b") { println(f"A4_pbkdf2 got={pbk}"); return false }
+
+    // RFC 7693 BLAKE2b-512("abc")
+    b2b := blake2b_hex("abc", 64)
+    if not str_eq(b2b, "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923") {
+        println(f"A5_b2b got={b2b}")
+        return false
+    }
+
+    // RFC 9106 Argon2id v=19 hash & constant-time verify
+    phc := argon2id_hash("CorrectHorseBatteryStaple!", "AxonSalt2026", 32, 2)
+    if not argon2id_verify("CorrectHorseBatteryStaple!", phc) { println(f"A6_argon phc={phc}"); return false }
+    if argon2id_verify("WrongPassword!", phc) { println("A7_argon_wrong"); return false }
+
+    // RFC 6238 Official TOTP SHA-1 Test Vector (Secret = ASCII "12345678901234567890" = Base32 "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", t = 59 -> "94287082")
+    totp8 := totp_generate("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", 59, 30, 8) or ""
+    if not str_eq(totp8, "94287082") { println(f"A8_totp got={totp8}"); return false }
+    if not totp_verify("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", "94287082", 59, 1, 30, 8) { return false }
+
+    pkce := oauth2_pkce_generate() or return false
+    if str_len(pkce.verifier) < 32 or str_len(pkce.challenge) < 32 { return false }
+
+    mut pol := rbac_new()
+    rbac_grant_perm(mut pol, "data_scientist", "models:train")
+    rbac_assign_role(mut pol, "alice", "data_scientist")
+    ok_rbac := rbac_check(pol, "alice", "models:train") and not rbac_check(pol, "alice", "users:delete")
+    rbac_free(move pol)
+    return ok_rbac
+}
+
+fn test_database_suite() -> bool {
+    // 1. Redis RESP2 / RESP3 Codec (`std::redis`)
+    set_pkt := redis_encode_cmd3("SET", "k1", "hello")
+    buf_free(move set_pkt)
+    resp_wire := buf_new(128)
+    buf_push_str(resp_wire, "*3\r\n+OK\r\n:42\r\n$5\r\nworld\r\n")
+    cur := ibuf_new(4); ibuf_push(cur, 0)
+    rep := redis_decode_from_buf(resp_wire, cur) or return false
+    ok_red := rep.kind == 6 and svec_len(rep.items) == 3 and str_eq(svec_get(rep.items, 2), "world")
+    redis_reply_free(move rep); buf_free(move resp_wire); buf_free(move cur)
+    if not ok_red { println("D1_redis"); return false }
+
+    // 2. Embedded ACID KV Store with CRC32 WAL (`std::kv_acid`)
+    kv_file := f".axon_test_kv_{sys_pid()}.axkv"
+    mut kv := kv_open(kv_file) or return false
+    _ := kv_put(mut kv, "user:1", "Alice")
+    _ := kv_begin(mut kv)
+    _ := kv_put(mut kv, "user:1", "TempRollback")
+    ryow := kv_get(kv, "user:1") or ""
+    _ := kv_rollback(mut kv)
+    after_rb := kv_get(kv, "user:1") or ""
+    _ := kv_begin(mut kv)
+    _ := kv_put(mut kv, "user:2", "Bob")
+    _ := kv_commit(mut kv)
+    _ := kv_compact(mut kv)
+    kv_close(move kv)
+
+    kv_reopened := kv_open(kv_file) or return false
+    v1 := kv_get(kv_reopened, "user:1") or ""
+    v2 := kv_get(kv_reopened, "user:2") or ""
+    kv_close(move kv_reopened)
+    _ := sys_fs_remove(kv_file)
+    if not str_eq(ryow, "TempRollback") or not str_eq(after_rb, "Alice") or not str_eq(v1, "Alice") or not str_eq(v2, "Bob") {
+        println(f"D2_kv ryow={ryow} rb={after_rb} v1={v1} v2={v2}")
+        return false
+    }
+
+    // 3. SQLite3 (`f64`/`blob`/`col_type`) + `SqlBuilder` + `SqlitePool` + `db_migrate_sqlite` (`std::sqlite`, `std::db_pool`)
+    mut pool := db_pool_open_sqlite(":memory:", 1) or return false
+    db := db_pool_acquire(pool) or return false
+    if not db_migrate_sqlite(db, 1, "init_metrics", "CREATE TABLE metrics (name TEXT, val REAL, raw BLOB);") {
+        println("D3_mig")
+        db_pool_close(move pool)
+        return false
+    }
+    ins_st := sqlite_prepare(db, "INSERT INTO metrics (name, val, raw) VALUES (?, ?, ?);") or return false
+    blob_in := buf_new(8); buf_push(blob_in, 0xDE); buf_push(blob_in, 0xAD); buf_push(blob_in, 0xBE); buf_push(blob_in, 0xEF)
+    _ := sqlite_bind_text(ins_st, 1, "loss")
+    _ := sqlite_bind_f64(ins_st, 2, 0.125)
+    _ := sqlite_bind_blob(ins_st, 3, blob_in)
+    buf_free(move blob_in)
+    _ := sqlite_step(ins_st)
+    sqlite_finalize(ins_st)
+
+    mut qb := sqlb_select("metrics", "name, val, raw", 1)
+    sqlb_where_str(mut qb, "name", "=", "loss")
+    q_st := sqlb_prepare_sqlite(db, qb) or return false
+    sqlb_free(move qb)
+    rc_s := sqlite_step(q_st)
+    got_f := sqlite_col_f64(q_st, 1)
+    got_b := sqlite_col_blob(q_st, 2)
+    b_ok := buf_len(got_b) == 4 and buf_get(got_b, 0) == 0xDE and buf_get(got_b, 3) == 0xEF
+    buf_free(move got_b)
+    sqlite_finalize(q_st)
+    db_pool_release(pool, db)
+    db_pool_close(move pool)
+    if rc_s != 100 or not near(got_f, 0.125, 0.00001) or not b_ok { println(f"D4_sql rc={rc_s} f={got_f} bok={b_ok}"); return false }
+
+    // Reject SQLi table identifier in `SqlBuilder`
+    bad_qb := sqlb_select("users; DROP TABLE users;--")
+    bad_sql := sqlb_build_sql(bad_qb) or "BLOCKED"
+    sqlb_free(move bad_qb)
+    if not str_eq(bad_sql, "BLOCKED") { println("D5_sqli"); return false }
+
+    // 4. PostgreSQL 14-17 Official RFC 7677 SCRAM-SHA-256 Vector (`user` / `pencil`)!
+    srv_sig := buf_new(128)
+    cf := pg_scram_compute_final(
+        "pencil",
+        "rOprNGfwEbeRWgbNEkqO",
+        "n=user,r=rOprNGfwEbeRWgbNEkqO",
+        "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+        srv_sig
+    ) or ""
+    got_srv_sig := buf_to_owned_str(move srv_sig)
+    exp_cf := "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+    if not str_eq(cf, exp_cf) { println(f"D6_scram_cf got={cf}"); return false }
+    if not str_eq(got_srv_sig, "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=") { println(f"D7_scram_sv got={got_srv_sig}"); return false }
+
+    return true
+}
+
+fn main() -> i32 {
+    if not test_axir_passes() { println("FAIL: test_axir_passes"); return 1 }
+    if not test_math_suite() { println("FAIL: test_math_suite"); return 2 }
+    if not test_data_science_suite() { println("FAIL: test_data_science_suite"); return 3 }
+    if not test_auth_and_os_security() { println("FAIL: test_auth_and_os_security"); return 4 }
+    if not test_database_suite() { println("FAIL: test_database_suite"); return 5 }
+    println("ALL_V1_2_SUITES_PASSED")
+    return 0
+}

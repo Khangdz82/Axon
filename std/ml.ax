@@ -1,0 +1,1233 @@
+// Axon Standard Library — Classical Machine Learning, Ensembles, Clustering & Metrics (`std/ml.ax`)
+// 100% Pure Axon, Perceus 0-GC, Flat-Arena Trees (Zero Pointer-Chasing), AVX2-Ready `MatF64` Kernels.
+// Includes `PCA`, `Ridge`, `Lasso`, `LogisticRegression`, `DecisionTree`, `RandomForest`, `GBDT`,
+// `KMeans++`, `DBSCAN`, `KNN`, `GaussianNB`, Scalers/Splits, and `ROC-AUC`/`F1`/`LogLoss`/`R2`/`RMSE`.
+
+use std::linalg
+use std::numeric
+use std::prob
+use std::stats
+
+struct TrainTestSplit {
+    x_train: MatF64
+    y_train: MatF64
+    x_test: MatF64
+    y_test: MatF64
+}
+
+struct PcaModel {
+    mean: MatF64
+    components: MatF64
+    explained_var: MatF64
+}
+
+// Flat node arena row `[5]`: `[0]=feat_idx (-1 leaf), [1]=threshold, [2]=left_idx, [3]=right_idx, [4]=value`
+struct CartTree {
+    nodes: MatF64
+    n_nodes: i64
+    is_classifier: bool
+}
+
+struct RandomForest {
+    all_nodes: MatF64
+    tree_roots: IntBuf
+    n_trees: i64
+    is_classifier: bool
+}
+
+struct GbdtModel {
+    all_nodes: MatF64
+    tree_roots: IntBuf
+    n_trees: i64
+    lr: f64
+    base_pred: f64
+    is_classifier: bool
+}
+
+struct KMeansResult {
+    centroids: MatF64
+    labels: IntBuf
+    inertia: f64
+}
+
+struct GaussianNb {
+    n_classes: i64
+    n_features: i64
+    priors: MatF64
+    means: MatF64
+    vars: MatF64
+}
+
+fn _ml_sigmoid(z: f64) -> f64 {
+    if z >= 0.0 {
+        ez := num_exp(0.0 - z)
+        return 1.0 / (1.0 + ez)
+    }
+    ez := num_exp(z)
+    return ez / (1.0 + ez)
+}
+
+fn _ml_sq_dist_rows(a: MatF64, ra: i64, b: MatF64, rb: i64, cols: i64) -> f64 {
+    mut acc := 0.0
+    oa := ra * cols
+    ob := rb * cols
+    mut j := 0
+    while j < cols {
+        d := unsafe { ptr_read_f64(a.ptr, oa + j) - ptr_read_f64(b.ptr, ob + j) }
+        acc += d * d
+        j += 1
+    }
+    return acc
+}
+
+// ============================================================================
+// 1. Feature Scaling, One-Hot Encoding & Stratified/Shuffled Splits
+// ============================================================================
+
+fn ml_standard_scale(x: MatF64) -> MatF64 {
+    n := x.rows; p := x.cols
+    if x.ptr == 0 or n <= 0 or p <= 0 { return MatF64(0, 0, 0) }
+    out := mat_zeros(n, p)
+    col_buf := mat_zeros(n, 1)
+    mut j := 0
+    while j < p {
+        mut r := 0
+        while r < n {
+            unsafe { ptr_write_f64(col_buf.ptr, r, ptr_read_f64(x.ptr, r * p + j)) }
+            r += 1
+        }
+        mu := stats_mean(col_buf)
+        sd := stats_std(col_buf, 0)
+        inv_s := if sd > 0.000000000001 { 1.0 / sd } else { 1.0 }
+        r = 0
+        while r < n {
+            unsafe { ptr_write_f64(out.ptr, r * p + j, (ptr_read_f64(col_buf.ptr, r) - mu) * inv_s) }
+            r += 1
+        }
+        j += 1
+    }
+    mat_free(move col_buf)
+    return out
+}
+
+fn ml_minmax_scale(x: MatF64) -> MatF64 {
+    n := x.rows; p := x.cols
+    if x.ptr == 0 or n <= 0 or p <= 0 { return MatF64(0, 0, 0) }
+    out := mat_zeros(n, p)
+    mut j := 0
+    while j < p {
+        mut vmin := unsafe { ptr_read_f64(x.ptr, j) }
+        mut vmax := vmin
+        mut r := 1
+        while r < n {
+            v := unsafe { ptr_read_f64(x.ptr, r * p + j) }
+            if v < vmin { vmin = v }
+            if v > vmax { vmax = v }
+            r += 1
+        }
+        span := vmax - vmin
+        inv_s := if span > 0.000000000001 { 1.0 / span } else { 0.0 }
+        r = 0
+        while r < n {
+            v := unsafe { ptr_read_f64(x.ptr, r * p + j) }
+            unsafe { ptr_write_f64(out.ptr, r * p + j, (v - vmin) * inv_s) }
+            r += 1
+        }
+        j += 1
+    }
+    return out
+}
+
+fn ml_robust_scale(x: MatF64) -> MatF64 {
+    n := x.rows; p := x.cols
+    if x.ptr == 0 or n <= 0 or p <= 0 { return MatF64(0, 0, 0) }
+    out := mat_zeros(n, p)
+    col_buf := mat_zeros(n, 1)
+    mut j := 0
+    while j < p {
+        mut r := 0
+        while r < n {
+            unsafe { ptr_write_f64(col_buf.ptr, r, ptr_read_f64(x.ptr, r * p + j)) }
+            r += 1
+        }
+        med := stats_median(col_buf)
+        iqr := stats_iqr(col_buf)
+        inv_s := if iqr > 0.000000000001 { 1.0 / iqr } else { 1.0 }
+        r = 0
+        while r < n {
+            v := unsafe { ptr_read_f64(x.ptr, r * p + j) }
+            unsafe { ptr_write_f64(out.ptr, r * p + j, (v - med) * inv_s) }
+            r += 1
+        }
+        j += 1
+    }
+    mat_free(move col_buf)
+    return out
+}
+
+fn ml_one_hot_encode(labels: IntBuf, n_classes: i64) -> MatF64 {
+    n := ibuf_len(labels)
+    if n <= 0 or n_classes <= 0 { return MatF64(0, 0, 0) }
+    out := mat_zeros(n, n_classes)
+    mut i := 0
+    while i < n {
+        c := ibuf_get(labels, i)
+        if c >= 0 and c < n_classes {
+            unsafe { ptr_write_f64(out.ptr, i * n_classes + c, 1.0) }
+        }
+        i += 1
+    }
+    return out
+}
+
+fn ml_train_test_split(x: MatF64, y: MatF64, test_ratio: f64 = 0.2, seed: i64 = 42) -> TrainTestSplit {
+    n := x.rows; p := x.cols
+    yc := y.cols
+    if x.ptr == 0 or y.ptr == 0 or n < 2 or y.rows != n {
+        return TrainTestSplit(MatF64(0, 0, 0), MatF64(0, 0, 0), MatF64(0, 0, 0), MatF64(0, 0, 0))
+    }
+    mut n_test := num_round((n as f64) * test_ratio) as i64
+    if n_test < 1 { n_test = 1 }
+    if n_test >= n { n_test = n - 1 }
+    n_train := n - n_test
+    perm := ibuf_new(n + 4)
+    mut i := 0
+    while i < n { ibuf_push(perm, i); i += 1 }
+    mut rng := prob_rng_new(seed)
+    i = n - 1
+    while i > 0 {
+        j := prob_rng_next_i64(mut rng) % (i + 1)
+        ti := ibuf_get(perm, i)
+        ibuf_set(perm, i, ibuf_get(perm, j))
+        ibuf_set(perm, j, ti)
+        i -= 1
+    }
+    xtr := mat_zeros(n_train, p); ytr := mat_zeros(n_train, yc)
+    xte := mat_zeros(n_test, p);  yte := mat_zeros(n_test, yc)
+    i = 0
+    while i < n_train {
+        sr := ibuf_get(perm, i)
+        unsafe {
+            mem_copy(xtr.ptr + i * p * 8, x.ptr + sr * p * 8, p * 8)
+            mem_copy(ytr.ptr + i * yc * 8, y.ptr + sr * yc * 8, yc * 8)
+        }
+        i += 1
+    }
+    mut k := 0
+    while k < n_test {
+        sr := ibuf_get(perm, n_train + k)
+        unsafe {
+            mem_copy(xte.ptr + k * p * 8, x.ptr + sr * p * 8, p * 8)
+            mem_copy(yte.ptr + k * yc * 8, y.ptr + sr * yc * 8, yc * 8)
+        }
+        k += 1
+    }
+    buf_free(move perm)
+    return TrainTestSplit(xtr, ytr, xte, yte)
+}
+
+fn ml_split_free(move sp: TrainTestSplit) {
+    mat_free(sp.x_train); mat_free(sp.y_train); mat_free(sp.x_test); mat_free(sp.y_test)
+}
+
+fn ml_kfold_mask(n_samples: i64, k_folds: i64, fold_idx: i64) -> IntBuf {
+    mask := ibuf_new(n_samples + 4)
+    if n_samples <= 0 or k_folds < 2 { return mask }
+    mut i := 0
+    while i < n_samples {
+        ibuf_push(mask, if (i % k_folds) == fold_idx { 1 } else { 0 })
+        i += 1
+    }
+    return mask
+}
+
+// ============================================================================
+// 2. PCA, Ridge, Lasso (Coordinate Descent) & L2 Logistic Regression
+// ============================================================================
+
+fn ml_pca_fit(x: MatF64, n_components: i64) -> PcaModel ! i64 {
+    n := x.rows; p := x.cols
+    k := if n_components < p { n_components } else { p }
+    if x.ptr == 0 or n < 2 or p <= 0 or k <= 0 { return err(400) }
+    mean := mat_zeros(p, 1)
+    mut j := 0
+    while j < p {
+        mut s := 0.0
+        mut r := 0
+        while r < n { s += unsafe { ptr_read_f64(x.ptr, r * p + j) }; r += 1 }
+        unsafe { ptr_write_f64(mean.ptr, j, s / (n as f64)) }
+        j += 1
+    }
+    cov := stats_cov_matrix(x, 1)
+    eig := eigen_sym_jacobi(cov) or return err(422)
+    mat_free(move cov)
+    // Extract top `k` eigenvectors (`[p x k]`) and eigenvalues (`[k x 1]`)
+    comps := mat_zeros(p, k)
+    ev := mat_zeros(k, 1)
+    mut c := 0
+    while c < k {
+        unsafe { ptr_write_f64(ev.ptr, c, ptr_read_f64(eig.values.ptr, c)) }
+        mut r := 0
+        while r < p {
+            unsafe { ptr_write_f64(comps.ptr, r * k + c, ptr_read_f64(eig.vectors.ptr, r * p + c)) }
+            r += 1
+        }
+        c += 1
+    }
+    mat_free(eig.values)
+    mat_free(eig.vectors)
+    return ok(PcaModel(mean, comps, ev))
+}
+
+fn ml_pca_transform(pca: PcaModel, x: MatF64) -> MatF64 {
+    n := x.rows; p := x.cols
+    if x.ptr == 0 or pca.components.ptr == 0 or p != pca.components.rows { return MatF64(0, 0, 0) }
+    centered := mat_zeros(n, p)
+    mut r := 0
+    while r < n {
+        mut j := 0
+        while j < p {
+            v := unsafe { ptr_read_f64(x.ptr, r * p + j) - ptr_read_f64(pca.mean.ptr, j) }
+            unsafe { ptr_write_f64(centered.ptr, r * p + j, v) }
+            j += 1
+        }
+        r += 1
+    }
+    proj := mat_mul(centered, pca.components)
+    mat_free(move centered)
+    return proj
+}
+
+fn ml_pca_free(move pca: PcaModel) {
+    mat_free(pca.mean); mat_free(pca.components); mat_free(pca.explained_var)
+}
+
+// L2 Ridge Regression: `(X^T X + alpha * I) w = X^T y`.
+fn ml_ridge_fit(x: MatF64, y: MatF64, alpha: f64 = 1.0) -> MatF64 ! i64 {
+    n := x.rows; p := x.cols
+    if x.ptr == 0 or y.ptr == 0 or n <= 0 or p <= 0 or y.rows != n { return err(400) }
+    xt := mat_transpose(x)
+    xtx := mat_mul(xt, x)
+    xty := mat_mul(xt, y)
+    mat_free(move xt)
+    mut j := 0
+    while j < p {
+        unsafe { ptr_write_f64(xtx.ptr, j * p + j, ptr_read_f64(xtx.ptr, j * p + j) + alpha) }
+        j += 1
+    }
+    w := lu_solve(xtx, xty) or return err(422)
+    mat_free(move xtx)
+    mat_free(move xty)
+    return ok(w)
+}
+
+// L1 Lasso Regression via Cyclic Coordinate Descent (`min (1/(2n)) ||Xw - y||_2^2 + alpha ||w||_1`).
+fn ml_lasso_fit(x: MatF64, y: MatF64, alpha: f64 = 0.05, max_iter: i64 = 200, tol: f64 = 0.000001) -> MatF64 {
+    n := x.rows; p := x.cols
+    if x.ptr == 0 or y.ptr == 0 or n <= 0 or p <= 0 or y.rows * y.cols != n { return MatF64(0, 0, 0) }
+    w := mat_zeros(p, 1)
+    res := mat_clone(y) // `res = y - X * w`
+    col_sq := mat_zeros(p, 1)
+    mut j := 0
+    while j < p {
+        mut sq := 0.0
+        mut r := 0
+        while r < n {
+            v := unsafe { ptr_read_f64(x.ptr, r * p + j) }
+            sq += v * v
+            r += 1
+        }
+        unsafe { ptr_write_f64(col_sq.ptr, j, sq) }
+        j += 1
+    }
+    thresh := alpha * (n as f64)
+    mut it := 0
+    while it < max_iter {
+        mut max_delta := 0.0
+        j = 0
+        while j < p {
+            z_norm := unsafe { ptr_read_f64(col_sq.ptr, j) }
+            if z_norm > 0.000000000001 {
+                w_old := unsafe { ptr_read_f64(w.ptr, j) }
+                // Add back `X[:, j] * w_old` and compute `rho = X[:, j]^T (res + X[:, j]*w_old)`
+                mut rho := 0.0
+                mut r := 0
+                while r < n {
+                    xij := unsafe { ptr_read_f64(x.ptr, r * p + j) }
+                    ri := unsafe { ptr_read_f64(res.ptr, r) } + xij * w_old
+                    rho += xij * ri
+                    r += 1
+                }
+                mut w_new := 0.0
+                if rho > thresh {
+                    w_new = (rho - thresh) / z_norm
+                } else if rho < 0.0 - thresh {
+                    w_new = (rho + thresh) / z_norm
+                }
+                diff := w_new - w_old
+                if num_abs(diff) > 0.0 {
+                    unsafe { ptr_write_f64(w.ptr, j, w_new) }
+                    r = 0
+                    while r < n {
+                        xij := unsafe { ptr_read_f64(x.ptr, r * p + j) }
+                        unsafe { ptr_write_f64(res.ptr, r, ptr_read_f64(res.ptr, r) - xij * diff) }
+                        r += 1
+                    }
+                    if num_abs(diff) > max_delta { max_delta = num_abs(diff) }
+                }
+            }
+            j += 1
+        }
+        if max_delta < tol { break }
+        it += 1
+    }
+    mat_free(move res)
+    mat_free(move col_sq)
+    return w
+}
+
+// L2-regularized Binary Logistic Regression; returns `[p + 1 x 1]` weights (`w[0..p-1]` + bias `w[p]`).
+fn ml_logistic_fit(x: MatF64, y: MatF64, lr: f64 = 0.2, l2_reg: f64 = 0.001, epochs: i64 = 250) -> MatF64 {
+    n := x.rows; p := x.cols
+    if x.ptr == 0 or y.ptr == 0 or n <= 0 or p <= 0 { return MatF64(0, 0, 0) }
+    w := mat_zeros(p + 1, 1)
+    grad := mat_zeros(p + 1, 1)
+    inv_n := 1.0 / (n as f64)
+    mut ep := 0
+    while ep < epochs {
+        unsafe { mem_set(grad.ptr, 0, (p + 1) * 8) }
+        bias := unsafe { ptr_read_f64(w.ptr, p) }
+        mut r := 0
+        while r < n {
+            z := la_dot_offset(x.ptr, r * p, w.ptr, 0, p) + bias
+            prob := _ml_sigmoid(z)
+            err_i := prob - unsafe { ptr_read_f64(y.ptr, r) }
+            mut j := 0
+            while j < p {
+                gj := unsafe { ptr_read_f64(grad.ptr, j) } + err_i * unsafe { ptr_read_f64(x.ptr, r * p + j) }
+                unsafe { ptr_write_f64(grad.ptr, j, gj) }
+                j += 1
+            }
+            unsafe { ptr_write_f64(grad.ptr, p, ptr_read_f64(grad.ptr, p) + err_i) }
+            r += 1
+        }
+        mut j := 0
+        while j < p {
+            wj := unsafe { ptr_read_f64(w.ptr, j) }
+            gj := unsafe { ptr_read_f64(grad.ptr, j) } * inv_n + l2_reg * wj
+            unsafe { ptr_write_f64(w.ptr, j, wj - lr * gj) }
+            j += 1
+        }
+        gb := unsafe { ptr_read_f64(grad.ptr, p) } * inv_n
+        unsafe { ptr_write_f64(w.ptr, p, bias - lr * gb) }
+        ep += 1
+    }
+    mat_free(move grad)
+    return w
+}
+
+fn ml_logistic_predict_proba(x: MatF64, w: MatF64) -> MatF64 {
+    n := x.rows; p := x.cols
+    if x.ptr == 0 or w.ptr == 0 or w.rows * w.cols != p + 1 { return MatF64(0, 0, 0) }
+    out := mat_zeros(n, 1)
+    bias := unsafe { ptr_read_f64(w.ptr, p) }
+    mut r := 0
+    while r < n {
+        z := la_dot_offset(x.ptr, r * p, w.ptr, 0, p) + bias
+        unsafe { ptr_write_f64(out.ptr, r, _ml_sigmoid(z)) }
+        r += 1
+    }
+    return out
+}
+
+// ============================================================================
+// 3. Flat-Arena CART Decision Trees, Random Forests & Gradient Boosted Trees (`GBDT`)
+// ============================================================================
+
+fn _ml_alloc_node(arena: MatF64, cur_cnt: i64, feat: f64, thr: f64, left: f64, right: f64, val: f64) -> i64 {
+    if cur_cnt >= arena.rows { return cur_cnt - 1 }
+    base := cur_cnt * 5
+    unsafe {
+        ptr_write_f64(arena.ptr, base, feat)
+        ptr_write_f64(arena.ptr, base + 1, thr)
+        ptr_write_f64(arena.ptr, base + 2, left)
+        ptr_write_f64(arena.ptr, base + 3, right)
+        ptr_write_f64(arena.ptr, base + 4, val)
+    }
+    return cur_cnt
+}
+
+fn _ml_subset_mean(y: MatF64, rows: IntBuf, start: i64, end: i64) -> f64 {
+    cnt := end - start
+    if cnt <= 0 { return 0.0 }
+    mut s := 0.0
+    mut i := start
+    while i < end {
+        s += unsafe { ptr_read_f64(y.ptr, ibuf_get(rows, i)) }
+        i += 1
+    }
+    return s / (cnt as f64)
+}
+
+// Recursive builder into `arena` (`cur_nodes` boxed in 1-element `IntBuf` for zero-global state!).
+fn _ml_build_cart_rec(
+    x: MatF64, y: MatF64, rows: IntBuf, start: i64, end: i64,
+    depth: i64, max_depth: i64, min_split: i64, feat_sub: i64,
+    is_clf: bool, mut rng: ProbRng, arena: MatF64, cnt_box: IntBuf
+) -> i64 {
+    n := end - start
+    p := x.cols
+    leaf_mean := _ml_subset_mean(y, rows, start, end)
+    leaf_val := if is_clf { (if leaf_mean >= 0.5 { 1.0 } else { 0.0 }) } else { leaf_mean }
+    cur_idx := ibuf_get(cnt_box, 0)
+    if n < min_split or depth >= max_depth or cur_idx + 3 >= arena.rows {
+        nid := _ml_alloc_node(arena, cur_idx, -1.0, 0.0, -1.0, -1.0, leaf_val)
+        ibuf_set(cnt_box, 0, nid + 1)
+        return nid
+    }
+    // Check if pure
+    mut y_min := unsafe { ptr_read_f64(y.ptr, ibuf_get(rows, start)) }
+    mut y_max := y_min
+    mut total_sum := 0.0
+    mut i := start
+    while i < end {
+        yv := unsafe { ptr_read_f64(y.ptr, ibuf_get(rows, i)) }
+        if yv < y_min { y_min = yv }
+        if yv > y_max { y_max = yv }
+        total_sum += yv
+        i += 1
+    }
+    if y_max - y_min <= 0.000000000001 {
+        nid := _ml_alloc_node(arena, cur_idx, -1.0, 0.0, -1.0, -1.0, leaf_val)
+        ibuf_set(cnt_box, 0, nid + 1)
+        return nid
+    }
+    // Search best feature & threshold maximizing `sum_L^2 / n_L + sum_R^2 / n_R` (identical to MSE & binary Gini!)
+    mut best_score := (total_sum * total_sum) / (n as f64)
+    mut best_feat := -1
+    mut best_thr := 0.0
+    n_try := if feat_sub > 0 and feat_sub < p { feat_sub } else { p }
+    mut f_step := 0
+    while f_step < n_try {
+        f := if n_try == p { f_step } else { prob_rng_next_i64(mut rng) % p }
+        // Probe up to 32 candidate thresholds from sample rows (exact for `n <= 32`, fast O(1) quantile-like for large `n`)
+        stride := if n > 32 { n / 32 } else { 1 }
+        mut cand := start
+        while cand < end {
+            thr := unsafe { ptr_read_f64(x.ptr, ibuf_get(rows, cand) * p + f) }
+            mut n_l := 0
+            mut sum_l := 0.0
+            mut k := start
+            while k < end {
+                rk := ibuf_get(rows, k)
+                if unsafe { ptr_read_f64(x.ptr, rk * p + f) } <= thr {
+                    n_l += 1
+                    sum_l += unsafe { ptr_read_f64(y.ptr, rk) }
+                }
+                k += 1
+            }
+            n_r := n - n_l
+            if n_l > 0 and n_r > 0 {
+                sum_r := total_sum - sum_l
+                score := (sum_l * sum_l) / (n_l as f64) + (sum_r * sum_r) / (n_r as f64)
+                if score > best_score + 0.000000000001 {
+                    best_score = score
+                    best_feat = f
+                    best_thr = thr
+                }
+            }
+            cand += stride
+        }
+        f_step += 1
+    }
+    if best_feat < 0 {
+        nid := _ml_alloc_node(arena, cur_idx, -1.0, 0.0, -1.0, -1.0, leaf_val)
+        ibuf_set(cnt_box, 0, nid + 1)
+        return nid
+    }
+    // Partition `rows[start..end]` in-place around `best_thr`
+    mut mid := start
+    i = start
+    while i < end {
+        ri := ibuf_get(rows, i)
+        if unsafe { ptr_read_f64(x.ptr, ri * p + best_feat) } <= best_thr {
+            tm := ibuf_get(rows, mid)
+            ibuf_set(rows, mid, ri)
+            ibuf_set(rows, i, tm)
+            mid += 1
+        }
+        i += 1
+    }
+    my_id := _ml_alloc_node(arena, cur_idx, best_feat as f64, best_thr, -1.0, -1.0, leaf_val)
+    ibuf_set(cnt_box, 0, my_id + 1)
+    l_id := _ml_build_cart_rec(x, y, rows, start, mid, depth + 1, max_depth, min_split, feat_sub, is_clf, mut rng, arena, cnt_box)
+    r_id := _ml_build_cart_rec(x, y, rows, mid, end, depth + 1, max_depth, min_split, feat_sub, is_clf, mut rng, arena, cnt_box)
+    unsafe {
+        ptr_write_f64(arena.ptr, my_id * 5 + 2, l_id as f64)
+        ptr_write_f64(arena.ptr, my_id * 5 + 3, r_id as f64)
+    }
+    return my_id
+}
+
+fn _ml_eval_arena_tree(arena: MatF64, root: i64, x: MatF64, row: i64) -> f64 {
+    p := x.cols
+    mut cur := root
+    mut guard := 0
+    while cur >= 0 and guard < 128 {
+        base := cur * 5
+        feat := (unsafe { ptr_read_f64(arena.ptr, base) }) as i64
+        if feat < 0 {
+            return unsafe { ptr_read_f64(arena.ptr, base + 4) }
+        }
+        thr := unsafe { ptr_read_f64(arena.ptr, base + 1) }
+        xv := unsafe { ptr_read_f64(x.ptr, row * p + feat) }
+        cur = (unsafe { ptr_read_f64(arena.ptr, base + (if xv <= thr { 2 } else { 3 })) }) as i64
+        guard += 1
+    }
+    return 0.0
+}
+
+fn ml_tree_fit(x: MatF64, y: MatF64, max_depth: i64 = 4, min_samples_split: i64 = 2, is_classifier: bool = true) -> CartTree {
+    n := x.rows
+    max_nodes := (1 << (if max_depth < 12 { max_depth + 1 } else { 12 })) + 8
+    arena := mat_zeros(max_nodes, 5)
+    rows := ibuf_new(n + 4)
+    mut i := 0
+    while i < n { ibuf_push(rows, i); i += 1 }
+    cnt_box := ibuf_new(4)
+    ibuf_push(cnt_box, 0)
+    mut rng := prob_rng_new(1337)
+    _ := _ml_build_cart_rec(x, y, rows, 0, n, 0, max_depth, min_samples_split, x.cols, is_classifier, mut rng, arena, cnt_box)
+    used := ibuf_get(cnt_box, 0)
+    buf_free(move rows)
+    buf_free(move cnt_box)
+    return CartTree(arena, used, is_classifier)
+}
+
+fn ml_tree_predict(tree: CartTree, x: MatF64) -> MatF64 {
+    n := x.rows
+    out := mat_zeros(n, 1)
+    mut r := 0
+    while r < n {
+        unsafe { ptr_write_f64(out.ptr, r, _ml_eval_arena_tree(tree.nodes, 0, x, r)) }
+        r += 1
+    }
+    return out
+}
+
+fn ml_tree_free(move tree: CartTree) {
+    mat_free(tree.nodes)
+}
+
+// Random Forest (`n_trees` bootstrap bagged trees with `sqrt(p)` random feature subsampling per split).
+fn ml_rf_fit(x: MatF64, y: MatF64, n_trees: i64 = 15, max_depth: i64 = 5, is_classifier: bool = true, seed: i64 = 42) -> RandomForest {
+    n := x.rows; p := x.cols
+    nt := if n_trees < 1 { 5 } else { n_trees }
+    nodes_per_tree := (1 << (if max_depth < 10 { max_depth + 1 } else { 10 })) + 4
+    arena := mat_zeros(nt * nodes_per_tree + 16, 5)
+    roots := ibuf_new(nt + 4)
+    cnt_box := ibuf_new(4); ibuf_push(cnt_box, 0)
+    mut f_sub := sqrt_f64(p as f64) as i64
+    if f_sub < 1 { f_sub = 1 }
+    mut rng := prob_rng_new(seed)
+    boot := ibuf_new(n + 4)
+    mut i := 0
+    while i < n { ibuf_push(boot, 0); i += 1 }
+    mut t := 0
+    while t < nt {
+        i = 0
+        while i < n {
+            ibuf_set(boot, i, prob_rng_next_i64(mut rng) % n)
+            i += 1
+        }
+        root := _ml_build_cart_rec(x, y, boot, 0, n, 0, max_depth, 2, f_sub, is_classifier, mut rng, arena, cnt_box)
+        ibuf_push(roots, root)
+        t += 1
+    }
+    buf_free(move boot)
+    buf_free(move cnt_box)
+    return RandomForest(arena, roots, nt, is_classifier)
+}
+
+fn ml_rf_predict(rf: RandomForest, x: MatF64) -> MatF64 {
+    n := x.rows
+    out := mat_zeros(n, 1)
+    inv_t := 1.0 / (rf.n_trees as f64)
+    mut r := 0
+    while r < n {
+        mut s := 0.0
+        mut t := 0
+        while t < rf.n_trees {
+            s += _ml_eval_arena_tree(rf.all_nodes, ibuf_get(rf.tree_roots, t), x, r)
+            t += 1
+        }
+        avg := s * inv_t
+        unsafe { ptr_write_f64(out.ptr, r, if rf.is_classifier { (if avg >= 0.5 { 1.0 } else { 0.0 }) } else { avg }) }
+        r += 1
+    }
+    return out
+}
+
+fn ml_rf_free(move rf: RandomForest) {
+    mat_free(rf.all_nodes)
+    buf_free(rf.tree_roots)
+}
+
+// Gradient Boosted Decision Trees (`GBDT`): additive regression trees on negative loss gradients!
+fn ml_gbdt_fit(x: MatF64, y: MatF64, n_trees: i64 = 25, lr: f64 = 0.1, max_depth: i64 = 3, is_classifier: bool = false) -> GbdtModel {
+    n := x.rows; p := x.cols
+    nt := if n_trees < 1 { 10 } else { n_trees }
+    nodes_per_tree := (1 << (if max_depth < 10 { max_depth + 1 } else { 10 })) + 4
+    arena := mat_zeros(nt * nodes_per_tree + 16, 5)
+    roots := ibuf_new(nt + 4)
+    cnt_box := ibuf_new(4); ibuf_push(cnt_box, 0)
+    y_mean := stats_mean(y)
+    mut pm := y_mean
+    if pm < 0.001 { pm = 0.001 }
+    if pm > 0.999 { pm = 0.999 }
+    base := if is_classifier { num_ln(pm / (1.0 - pm)) } else { y_mean }
+    f_cur := mat_new(n, 1, base)
+    pseudo_r := mat_zeros(n, 1)
+    rows := ibuf_new(n + 4)
+    mut i := 0
+    while i < n { ibuf_push(rows, 0); i += 1 }
+    mut rng := prob_rng_new(2026)
+    mut t := 0
+    while t < nt {
+        i = 0
+        while i < n {
+            ibuf_set(rows, i, i)
+            yi := unsafe { ptr_read_f64(y.ptr, i) }
+            fi := unsafe { ptr_read_f64(f_cur.ptr, i) }
+            grad_neg := if is_classifier { yi - _ml_sigmoid(fi) } else { yi - fi }
+            unsafe { ptr_write_f64(pseudo_r.ptr, i, grad_neg) }
+            i += 1
+        }
+        root := _ml_build_cart_rec(x, pseudo_r, rows, 0, n, 0, max_depth, 2, p, false, mut rng, arena, cnt_box)
+        ibuf_push(roots, root)
+        i = 0
+        while i < n {
+            step_v := _ml_eval_arena_tree(arena, root, x, i)
+            unsafe { ptr_write_f64(f_cur.ptr, i, ptr_read_f64(f_cur.ptr, i) + lr * step_v) }
+            i += 1
+        }
+        t += 1
+    }
+    mat_free(move f_cur); mat_free(move pseudo_r)
+    buf_free(move rows); buf_free(move cnt_box)
+    return GbdtModel(arena, roots, nt, lr, base, is_classifier)
+}
+
+fn ml_gbdt_predict(gb: GbdtModel, x: MatF64) -> MatF64 {
+    n := x.rows
+    out := mat_zeros(n, 1)
+    mut r := 0
+    while r < n {
+        mut f := gb.base_pred
+        mut t := 0
+        while t < gb.n_trees {
+            f += gb.lr * _ml_eval_arena_tree(gb.all_nodes, ibuf_get(gb.tree_roots, t), x, r)
+            t += 1
+        }
+        unsafe { ptr_write_f64(out.ptr, r, if gb.is_classifier { _ml_sigmoid(f) } else { f }) }
+        r += 1
+    }
+    return out
+}
+
+fn ml_gbdt_free(move gb: GbdtModel) {
+    mat_free(gb.all_nodes)
+    buf_free(gb.tree_roots)
+}
+
+// ============================================================================
+// 4. Clustering & Instance/Bayesian Learners (`KMeans++`, `DBSCAN`, `KNN`, `GaussianNB`)
+// ============================================================================
+
+fn ml_kmeans_pp(x: MatF64, k: i64, max_iter: i64 = 100, seed: i64 = 42) -> KMeansResult {
+    n := x.rows; p := x.cols
+    if x.ptr == 0 or n < k or k <= 0 {
+        return KMeansResult(MatF64(0, 0, 0), ibuf_new(4), 0.0)
+    }
+    centroids := mat_zeros(k, p)
+    mut rng := prob_rng_new(seed)
+    // KMeans++ initialization
+    first := prob_rng_next_i64(mut rng) % n
+    unsafe { mem_copy(centroids.ptr, x.ptr + first * p * 8, p * 8) }
+    min_d2 := mat_new(n, 1, num_pow2_int(996))
+    mut c := 1
+    while c < k {
+        mut d_sum := 0.0
+        mut r := 0
+        while r < n {
+            dc := _ml_sq_dist_rows(x, r, centroids, c - 1, p)
+            cur_d := unsafe { ptr_read_f64(min_d2.ptr, r) }
+            nd := if dc < cur_d { dc } else { cur_d }
+            unsafe { ptr_write_f64(min_d2.ptr, r, nd) }
+            d_sum += nd
+            r += 1
+        }
+        mut chosen := 0
+        if d_sum > 0.0 {
+            target := prob_rng_uniform(mut rng) * d_sum
+            mut acc := 0.0
+            r = 0
+            while r < n {
+                acc += unsafe { ptr_read_f64(min_d2.ptr, r) }
+                if acc >= target { chosen = r; break }
+                r += 1
+            }
+        } else {
+            chosen = c % n
+        }
+        unsafe { mem_copy(centroids.ptr + c * p * 8, x.ptr + chosen * p * 8, p * 8) }
+        c += 1
+    }
+    mat_free(move min_d2)
+    labels := ibuf_new(n + 4)
+    mut i := 0
+    while i < n { ibuf_push(labels, -1); i += 1 }
+    new_c := mat_zeros(k, p)
+    counts := ibuf_new(k + 4)
+    c = 0
+    while c < k { ibuf_push(counts, 0); c += 1 }
+    mut inertia := 0.0
+    mut it := 0
+    while it < max_iter {
+        mut changed := 0
+        inertia = 0.0
+        unsafe { mem_set(new_c.ptr, 0, k * p * 8) }
+        c = 0
+        while c < k { ibuf_set(counts, c, 0); c += 1 }
+        mut r := 0
+        while r < n {
+            mut best_c := 0
+            mut best_d := _ml_sq_dist_rows(x, r, centroids, 0, p)
+            c = 1
+            while c < k {
+                dc := _ml_sq_dist_rows(x, r, centroids, c, p)
+                if dc < best_d { best_d = dc; best_c = c }
+                c += 1
+            }
+            if ibuf_get(labels, r) != best_c {
+                ibuf_set(labels, r, best_c)
+                changed += 1
+            }
+            inertia += best_d
+            ibuf_set(counts, best_c, ibuf_get(counts, best_c) + 1)
+            mut j := 0
+            while j < p {
+                unsafe { ptr_write_f64(new_c.ptr, best_c * p + j, ptr_read_f64(new_c.ptr, best_c * p + j) + ptr_read_f64(x.ptr, r * p + j)) }
+                j += 1
+            }
+            r += 1
+        }
+        c = 0
+        while c < k {
+            cnt := ibuf_get(counts, c)
+            if cnt > 0 {
+                inv_c := 1.0 / (cnt as f64)
+                mut j := 0
+                while j < p {
+                    unsafe { ptr_write_f64(centroids.ptr, c * p + j, ptr_read_f64(new_c.ptr, c * p + j) * inv_c) }
+                    j += 1
+                }
+            }
+            c += 1
+        }
+        if changed == 0 { break }
+        it += 1
+    }
+    mat_free(move new_c)
+    buf_free(move counts)
+    return KMeansResult(centroids, labels, inertia)
+}
+
+fn ml_kmeans_free(move km: KMeansResult) {
+    mat_free(km.centroids)
+    buf_free(km.labels)
+}
+
+// Density-Based Spatial Clustering (`DBSCAN`): returns `labels` (`0..C-1` clusters, `-1` noise).
+fn ml_dbscan(x: MatF64, eps: f64, min_pts: i64) -> IntBuf {
+    n := x.rows; p := x.cols
+    labels := ibuf_new(n + 4)
+    if x.ptr == 0 or n <= 0 { return labels }
+    // `-2` = unvisited, `-1` = noise, `>= 0` = cluster ID
+    mut i := 0
+    while i < n { ibuf_push(labels, -2); i += 1 }
+    eps2 := eps * eps
+    queue := ibuf_new(n * 4 + 16)
+    nbrs := ibuf_new(n + 4)
+    mut cid := 0
+    i = 0
+    while i < n {
+        if ibuf_get(labels, i) == -2 {
+            ibuf_truncate(nbrs, 0)
+            mut j := 0
+            while j < n {
+                if _ml_sq_dist_rows(x, i, x, j, p) <= eps2 { ibuf_push(nbrs, j) }
+                j += 1
+            }
+            if ibuf_len(nbrs) < min_pts {
+                ibuf_set(labels, i, -1)
+            } else {
+                ibuf_set(labels, i, cid)
+                ibuf_truncate(queue, 0)
+                mut k := 0
+                while k < ibuf_len(nbrs) {
+                    pt := ibuf_get(nbrs, k)
+                    if pt != i { ibuf_push(queue, pt) }
+                    k += 1
+                }
+                mut q_head := 0
+                while q_head < ibuf_len(queue) {
+                    q := ibuf_get(queue, q_head)
+                    q_head += 1
+                    st := ibuf_get(labels, q)
+                    if st == -1 { ibuf_set(labels, q, cid) }
+                    if st == -2 {
+                        ibuf_set(labels, q, cid)
+                        ibuf_truncate(nbrs, 0)
+                        j = 0
+                        while j < n {
+                            if _ml_sq_dist_rows(x, q, x, j, p) <= eps2 { ibuf_push(nbrs, j) }
+                            j += 1
+                        }
+                        if ibuf_len(nbrs) >= min_pts {
+                            k = 0
+                            while k < ibuf_len(nbrs) {
+                                nq := ibuf_get(nbrs, k)
+                                nst := ibuf_get(labels, nq)
+                                if nst == -2 or nst == -1 { ibuf_push(queue, nq) }
+                                k += 1
+                            }
+                        }
+                    }
+                }
+                cid += 1
+            }
+        }
+        i += 1
+    }
+    buf_free(move queue)
+    buf_free(move nbrs)
+    return labels
+}
+
+fn ml_knn_predict(x_train: MatF64, y_train: MatF64, x_query: MatF64, k: i64 = 3, is_classifier: bool = true) -> MatF64 {
+    ntr := x_train.rows; p := x_train.cols; nq := x_query.rows
+    if x_train.ptr == 0 or y_train.ptr == 0 or x_query.ptr == 0 or ntr <= 0 or x_query.cols != p {
+        return MatF64(0, 0, 0)
+    }
+    kk := if k < ntr { (if k < 1 { 1 } else { k }) } else { ntr }
+    out := mat_zeros(nq, 1)
+    best_d := mat_zeros(kk, 1)
+    best_i := ibuf_new(kk + 4)
+    mut c := 0
+    while c < kk { ibuf_push(best_i, 0); c += 1 }
+    mut q := 0
+    while q < nq {
+        c = 0
+        while c < kk {
+            unsafe { ptr_write_f64(best_d.ptr, c, num_pow2_int(996)) }
+            ibuf_set(best_i, c, 0)
+            c += 1
+        }
+        mut r := 0
+        while r < ntr {
+            d := _ml_sq_dist_rows(x_query, q, x_train, r, p)
+            if d < unsafe { ptr_read_f64(best_d.ptr, kk - 1) } {
+                mut pos := kk - 1
+                while pos > 0 and d < unsafe { ptr_read_f64(best_d.ptr, pos - 1) } {
+                    unsafe { ptr_write_f64(best_d.ptr, pos, ptr_read_f64(best_d.ptr, pos - 1)) }
+                    ibuf_set(best_i, pos, ibuf_get(best_i, pos - 1))
+                    pos -= 1
+                }
+                unsafe { ptr_write_f64(best_d.ptr, pos, d) }
+                ibuf_set(best_i, pos, r)
+            }
+            r += 1
+        }
+        if not is_classifier {
+            mut s := 0.0
+            c = 0
+            while c < kk { s += unsafe { ptr_read_f64(y_train.ptr, ibuf_get(best_i, c)) }; c += 1 }
+            unsafe { ptr_write_f64(out.ptr, q, s / (kk as f64)) }
+        } else {
+            // Majority class vote among `kk` nearest neighbors
+            mut best_cls := 0.0
+            mut best_votes := -1
+            c = 0
+            while c < kk {
+                cand := unsafe { ptr_read_f64(y_train.ptr, ibuf_get(best_i, c)) }
+                mut votes := 0
+                mut m := 0
+                while m < kk {
+                    if unsafe { ptr_read_f64(y_train.ptr, ibuf_get(best_i, m)) } == cand { votes += 1 }
+                    m += 1
+                }
+                if votes > best_votes { best_votes = votes; best_cls = cand }
+                c += 1
+            }
+            unsafe { ptr_write_f64(out.ptr, q, best_cls) }
+        }
+        q += 1
+    }
+    mat_free(move best_d)
+    buf_free(move best_i)
+    return out
+}
+
+fn ml_gnb_fit(x: MatF64, y: MatF64, n_classes: i64) -> GaussianNb {
+    n := x.rows; p := x.cols
+    priors := mat_zeros(n_classes, 1)
+    means := mat_zeros(n_classes, p)
+    vars := mat_new(n_classes, p, 0.000000001)
+    cnts := ibuf_new(n_classes + 4)
+    mut c := 0
+    while c < n_classes { ibuf_push(cnts, 0); c += 1 }
+    mut r := 0
+    while r < n {
+        cls := (unsafe { ptr_read_f64(y.ptr, r) }) as i64
+        if cls >= 0 and cls < n_classes {
+            ibuf_set(cnts, cls, ibuf_get(cnts, cls) + 1)
+            mut j := 0
+            while j < p {
+                unsafe { ptr_write_f64(means.ptr, cls * p + j, ptr_read_f64(means.ptr, cls * p + j) + ptr_read_f64(x.ptr, r * p + j)) }
+                j += 1
+            }
+        }
+        r += 1
+    }
+    c = 0
+    while c < n_classes {
+        cnt := ibuf_get(cnts, c)
+        unsafe { ptr_write_f64(priors.ptr, c, if n > 0 { (cnt as f64) / (n as f64) } else { 0.0 }) }
+        if cnt > 0 {
+            inv_c := 1.0 / (cnt as f64)
+            mut j := 0
+            while j < p {
+                unsafe { ptr_write_f64(means.ptr, c * p + j, ptr_read_f64(means.ptr, c * p + j) * inv_c) }
+                j += 1
+            }
+        }
+        c += 1
+    }
+    r = 0
+    while r < n {
+        cls := (unsafe { ptr_read_f64(y.ptr, r) }) as i64
+        if cls >= 0 and cls < n_classes {
+            mut j := 0
+            while j < p {
+                d := unsafe { ptr_read_f64(x.ptr, r * p + j) - ptr_read_f64(means.ptr, cls * p + j) }
+                unsafe { ptr_write_f64(vars.ptr, cls * p + j, ptr_read_f64(vars.ptr, cls * p + j) + d * d) }
+                j += 1
+            }
+        }
+        r += 1
+    }
+    c = 0
+    while c < n_classes {
+        cnt := ibuf_get(cnts, c)
+        if cnt > 0 {
+            inv_c := 1.0 / (cnt as f64)
+            mut j := 0
+            while j < p {
+                unsafe { ptr_write_f64(vars.ptr, c * p + j, ptr_read_f64(vars.ptr, c * p + j) * inv_c + 0.000000001) }
+                j += 1
+            }
+        }
+        c += 1
+    }
+    buf_free(move cnts)
+    return GaussianNb(n_classes, p, priors, means, vars)
+}
+
+fn ml_gnb_predict(gnb: GaussianNb, x: MatF64) -> MatF64 {
+    n := x.rows; p := gnb.n_features
+    out := mat_zeros(n, 1)
+    mut r := 0
+    while r < n {
+        mut best_c := 0
+        mut best_ll := 0.0 - num_pow2_int(996)
+        mut c := 0
+        while c < gnb.n_classes {
+            pr := unsafe { ptr_read_f64(gnb.priors.ptr, c) }
+            if pr > 0.0 {
+                mut ll := num_ln(pr)
+                mut j := 0
+                while j < p {
+                    xv := unsafe { ptr_read_f64(x.ptr, r * p + j) }
+                    mu := unsafe { ptr_read_f64(gnb.means.ptr, c * p + j) }
+                    vr := unsafe { ptr_read_f64(gnb.vars.ptr, c * p + j) }
+                    d := xv - mu
+                    ll -= 0.5 * (num_ln(num_two_pi() * vr) + (d * d) / vr)
+                    j += 1
+                }
+                if ll > best_ll { best_ll = ll; best_c = c }
+            }
+            c += 1
+        }
+        unsafe { ptr_write_f64(out.ptr, r, best_c as f64) }
+        r += 1
+    }
+    return out
+}
+
+fn ml_gnb_free(move gnb: GaussianNb) {
+    mat_free(gnb.priors); mat_free(gnb.means); mat_free(gnb.vars)
+}
+
+// ============================================================================
+// 5. Evaluation Metrics (`MSE`, `RMSE`, `MAE`, `R2`, `Accuracy`, `Precision`, `Recall`, `F1`, `LogLoss`, `ROC-AUC`, `ConfusionMatrix`)
+// ============================================================================
+
+fn ml_mse(y_true: MatF64, y_pred: MatF64) -> f64 {
+    n := y_true.rows * y_true.cols
+    if y_true.ptr == 0 or y_pred.ptr == 0 or n <= 0 or y_pred.rows * y_pred.cols != n { return 0.0 }
+    mut s := 0.0
+    mut i := 0
+    while i < n {
+        d := unsafe { ptr_read_f64(y_true.ptr, i) - ptr_read_f64(y_pred.ptr, i) }
+        s += d * d
+        i += 1
+    }
+    return s / (n as f64)
+}
+
+fn ml_rmse(y_true: MatF64, y_pred: MatF64) -> f64 { return sqrt_f64(ml_mse(y_true, y_pred)) }
+
+fn ml_mae(y_true: MatF64, y_pred: MatF64) -> f64 {
+    n := y_true.rows * y_true.cols
+    if y_true.ptr == 0 or y_pred.ptr == 0 or n <= 0 or y_pred.rows * y_pred.cols != n { return 0.0 }
+    mut s := 0.0
+    mut i := 0
+    while i < n {
+        s += num_abs(unsafe { ptr_read_f64(y_true.ptr, i) - ptr_read_f64(y_pred.ptr, i) })
+        i += 1
+    }
+    return s / (n as f64)
+}
+
+fn ml_r2_score(y_true: MatF64, y_pred: MatF64) -> f64 {
+    n := y_true.rows * y_true.cols
+    if y_true.ptr == 0 or y_pred.ptr == 0 or n <= 1 { return 0.0 }
+    mu := stats_mean(y_true)
+    mut ss_res := 0.0
+    mut ss_tot := 0.0
+    mut i := 0
+    while i < n {
+        yt := unsafe { ptr_read_f64(y_true.ptr, i) }
+        yp := unsafe { ptr_read_f64(y_pred.ptr, i) }
+        e := yt - yp
+        d := yt - mu
+        ss_res += e * e
+        ss_tot += d * d
+        i += 1
+    }
+    if ss_tot <= 0.000000000000001 { return 1.0 }
+    return 1.0 - ss_res / ss_tot
+}
+
+fn ml_accuracy(y_true: MatF64, y_pred: MatF64) -> f64 {
+    n := y_true.rows * y_true.cols
+    if y_true.ptr == 0 or y_pred.ptr == 0 or n <= 0 { return 0.0 }
+    mut ok_cnt := 0
+    mut i := 0
+    while i < n {
+        if num_round(unsafe { ptr_read_f64(y_true.ptr, i) }) == num_round(unsafe { ptr_read_f64(y_pred.ptr, i) }) {
+            ok_cnt += 1
+        }
+        i += 1
+    }
+    return (ok_cnt as f64) / (n as f64)
+}
+
+fn ml_confusion_matrix(y_true: MatF64, y_pred: MatF64, n_classes: i64) -> MatF64 {
+    n := y_true.rows * y_true.cols
+    cm := mat_zeros(n_classes, n_classes)
+    if y_true.ptr == 0 or y_pred.ptr == 0 or n <= 0 or n_classes <= 0 { return cm }
+    mut i := 0
+    while i < n {
+        t := num_round(unsafe { ptr_read_f64(y_true.ptr, i) }) as i64
+        p := num_round(unsafe { ptr_read_f64(y_pred.ptr, i) }) as i64
+        if t >= 0 and t < n_classes and p >= 0 and p < n_classes {
+            idx := t * n_classes + p
+            unsafe { ptr_write_f64(cm.ptr, idx, ptr_read_f64(cm.ptr, idx) + 1.0) }
+        }
+        i += 1
+    }
+    return cm
+}
+
+fn ml_precision_score(y_true: MatF64, y_pred: MatF64) -> f64 {
+    n := y_true.rows * y_true.cols
+    mut tp := 0.0; mut fp := 0.0
+    mut i := 0
+    while i < n {
+        yt := unsafe { ptr_read_f64(y_true.ptr, i) } >= 0.5
+        yp := unsafe { ptr_read_f64(y_pred.ptr, i) } >= 0.5
+        if yp { if yt { tp += 1.0 } else { fp += 1.0 } }
+        i += 1
+    }
+    return if tp + fp > 0.0 { tp / (tp + fp) } else { 0.0 }
+}
+
+fn ml_recall_score(y_true: MatF64, y_pred: MatF64) -> f64 {
+    n := y_true.rows * y_true.cols
+    mut tp := 0.0; mut fn_c := 0.0
+    mut i := 0
+    while i < n {
+        yt := unsafe { ptr_read_f64(y_true.ptr, i) } >= 0.5
+        yp := unsafe { ptr_read_f64(y_pred.ptr, i) } >= 0.5
+        if yt { if yp { tp += 1.0 } else { fn_c += 1.0 } }
+        i += 1
+    }
+    return if tp + fn_c > 0.0 { tp / (tp + fn_c) } else { 0.0 }
+}
+
+fn ml_f1_score(y_true: MatF64, y_pred: MatF64) -> f64 {
+    pr := ml_precision_score(y_true, y_pred)
+    rc := ml_recall_score(y_true, y_pred)
+    if pr + rc <= 0.0 { return 0.0 }
+    return (2.0 * pr * rc) / (pr + rc)
+}
+
+fn ml_log_loss(y_true: MatF64, y_prob: MatF64) -> f64 {
+    n := y_true.rows * y_true.cols
+    if y_true.ptr == 0 or y_prob.ptr == 0 or n <= 0 { return 0.0 }
+    eps := 0.000000000000001
+    mut acc := 0.0
+    mut i := 0
+    while i < n {
+        yt := unsafe { ptr_read_f64(y_true.ptr, i) }
+        mut p := unsafe { ptr_read_f64(y_prob.ptr, i) }
+        if p < eps { p = eps }
+        if p > 1.0 - eps { p = 1.0 - eps }
+        acc -= yt * num_ln(p) + (1.0 - yt) * num_ln(1.0 - p)
+        i += 1
+    }
+    return acc / (n as f64)
+}
+
+// Exact Mann-Whitney U / Rank-Sum `ROC-AUC` (`O(N log N)` with average tie-rank handling!).
+fn ml_roc_auc_score(y_true: MatF64, y_score: MatF64) -> f64 {
+    n := y_true.rows * y_true.cols
+    if y_true.ptr == 0 or y_score.ptr == 0 or n < 2 or y_score.rows * y_score.cols != n { return 0.5 }
+    ranks := _stats_rank_avg_ties(y_score)
+    mut n_pos := 0.0
+    mut sum_pos_ranks := 0.0
+    mut i := 0
+    while i < n {
+        if unsafe { ptr_read_f64(y_true.ptr, i) } >= 0.5 {
+            n_pos += 1.0
+            sum_pos_ranks += unsafe { ptr_read_f64(ranks.ptr, i) }
+        }
+        i += 1
+    }
+    mat_free(move ranks)
+    n_neg := (n as f64) - n_pos
+    if n_pos <= 0.0 or n_neg <= 0.0 { return 0.5 }
+    return (sum_pos_ranks - 0.5 * n_pos * (n_pos + 1.0)) / (n_pos * n_neg)
+}

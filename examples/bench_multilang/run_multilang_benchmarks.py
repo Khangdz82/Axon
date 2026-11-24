@@ -52,8 +52,12 @@ def main():
 
     # 4. Java
     print("[4/9] Compiling and running Java (JDK 21 LTS)...")
+    import shutil
     javac = r"G:\RE\tools\jdk-21.0.13+9\bin\javac.EXE"
     java = r"G:\RE\tools\jdk-21.0.13+9\bin\java.EXE"
+    if not os.path.exists(javac):
+        javac = shutil.which("javac") or javac
+        java = shutil.which("java") or java
     run_command([javac, "-d", "examples/bench_multilang", "examples/bench_multilang/java_bench/Main.java"])
     out_java = run_command([java, "-cp", "examples/bench_multilang", "java_bench.Main"])
     data_java = extract_json(out_java) if out_java else None

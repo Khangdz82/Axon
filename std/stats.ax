@@ -1,0 +1,769 @@
+// Axon Standard Library — Statistical Inference, Hypothesis Tests, Econometrics & Time-Series (`std/stats.ax`)
+// 100% Pure Axon, Perceus 0-GC, Welford Numerically-Stable Moments, O(N) Quickselect Quantiles,
+// Exact `t` / `Welch-t` / `Chi-Square` / `ANOVA` / `KS` P-Values, `OLS` Econometrics, and `Holt-Winters`.
+
+use std::linalg
+use std::numeric
+use std::prob
+
+struct TestResult {
+    stat: f64
+    p_value: f64
+    df: f64
+}
+
+struct OlsSummary {
+    coef: MatF64
+    std_err: MatF64
+    t_stats: MatF64
+    p_values: MatF64
+    r2: f64
+    adj_r2: f64
+    f_stat: f64
+    aic: f64
+    bic: f64
+}
+
+// ============================================================================
+// 1. Welford Descriptive Statistics & O(N) Quickselect Quantiles
+// ============================================================================
+
+fn stats_mean(x: MatF64) -> f64 {
+    n := x.rows * x.cols
+    if x.ptr == 0 or n <= 0 { return 0.0 }
+    mut mean := 0.0
+    mut i := 0
+    while i < n {
+        v := unsafe { ptr_read_f64(x.ptr, i) }
+        mean += (v - mean) / ((i + 1) as f64)
+        i += 1
+    }
+    return mean
+}
+
+fn stats_var(x: MatF64, ddof: i64 = 1) -> f64 {
+    n := x.rows * x.cols
+    if x.ptr == 0 or n <= ddof { return 0.0 }
+    mut mean := 0.0
+    mut m2 := 0.0
+    mut i := 0
+    while i < n {
+        v := unsafe { ptr_read_f64(x.ptr, i) }
+        delta := v - mean
+        mean += delta / ((i + 1) as f64)
+        m2 += delta * (v - mean)
+        i += 1
+    }
+    return m2 / ((n - ddof) as f64)
+}
+
+fn stats_std(x: MatF64, ddof: i64 = 1) -> f64 {
+    return sqrt_f64(stats_var(x, ddof))
+}
+
+fn stats_skewness(x: MatF64) -> f64 {
+    n := x.rows * x.cols
+    if x.ptr == 0 or n < 3 { return 0.0 }
+    mu := stats_mean(x)
+    mut m2 := 0.0
+    mut m3 := 0.0
+    mut i := 0
+    while i < n {
+        d := unsafe { ptr_read_f64(x.ptr, i) } - mu
+        d2 := d * d
+        m2 += d2
+        m3 += d2 * d
+        i += 1
+    }
+    nf := n as f64
+    v := m2 / nf
+    if v <= 0.000000000000001 { return 0.0 }
+    return (m3 / nf) / (v * sqrt_f64(v))
+}
+
+// Fisher excess kurtosis (`0.0` for Normal distribution).
+fn stats_kurtosis(x: MatF64) -> f64 {
+    n := x.rows * x.cols
+    if x.ptr == 0 or n < 4 { return 0.0 }
+    mu := stats_mean(x)
+    mut m2 := 0.0
+    mut m4 := 0.0
+    mut i := 0
+    while i < n {
+        d := unsafe { ptr_read_f64(x.ptr, i) } - mu
+        d2 := d * d
+        m2 += d2
+        m4 += d2 * d2
+        i += 1
+    }
+    nf := n as f64
+    v := m2 / nf
+    if v <= 0.000000000000001 { return 0.0 }
+    return (m4 / nf) / (v * v) - 3.0
+}
+
+// O(N) Hoare/Lomuto median-of-3 Quickselect returning the `k`-th smallest element in `work`.
+fn _stats_quickselect_inplace(p: i64, n: i64, k: i64) -> f64 {
+    mut lo := 0
+    mut hi := n - 1
+    while lo < hi {
+        mid := (lo + hi) >> 1
+        // Median-of-three pivot
+        a := unsafe { ptr_read_f64(p, lo) }
+        b := unsafe { ptr_read_f64(p, mid) }
+        c := unsafe { ptr_read_f64(p, hi) }
+        if b < a { unsafe { ptr_write_f64(p, lo, b); ptr_write_f64(p, mid, a) } }
+        a2 := unsafe { ptr_read_f64(p, lo) }
+        b2 := unsafe { ptr_read_f64(p, mid) }
+        if c < a2 {
+            unsafe { ptr_write_f64(p, hi, b2); ptr_write_f64(p, mid, a2); ptr_write_f64(p, lo, c) }
+        } else if c < b2 {
+            unsafe { ptr_write_f64(p, hi, b2); ptr_write_f64(p, mid, c) }
+        }
+        // Place pivot at `hi`
+        piv := unsafe { ptr_read_f64(p, mid) }
+        unsafe {
+            ptr_write_f64(p, mid, ptr_read_f64(p, hi))
+            ptr_write_f64(p, hi, piv)
+        }
+        mut store := lo
+        mut i := lo
+        while i < hi {
+            vi := unsafe { ptr_read_f64(p, i) }
+            if vi < piv {
+                vs := unsafe { ptr_read_f64(p, store) }
+                unsafe { ptr_write_f64(p, store, vi); ptr_write_f64(p, i, vs) }
+                store += 1
+            }
+            i += 1
+        }
+        unsafe {
+            ptr_write_f64(p, hi, ptr_read_f64(p, store))
+            ptr_write_f64(p, store, piv)
+        }
+        if k == store { return piv }
+        if k < store { hi = store - 1 } else { lo = store + 1 }
+    }
+    return unsafe { ptr_read_f64(p, lo) }
+}
+
+// Type-7 linear-interpolated quantile (`q in [0.0, 1.0]`) in O(N) expected time!
+fn stats_quantile(x: MatF64, q: f64) -> f64 {
+    n := x.rows * x.cols
+    if x.ptr == 0 or n <= 0 { return 0.0 }
+    if n == 1 { return unsafe { ptr_read_f64(x.ptr, 0) } }
+    mut qc := q
+    if qc < 0.0 { qc = 0.0 }
+    if qc > 1.0 { qc = 1.0 }
+    work := mat_clone(x)
+    pos := qc * ((n - 1) as f64)
+    k_lo := pos as i64
+    frac := pos - (k_lo as f64)
+    v_lo := _stats_quickselect_inplace(work.ptr, n, k_lo)
+    mut out := v_lo
+    if frac > 0.0 and k_lo + 1 < n {
+        // Minimum of elements `> k_lo` in already-partitioned `work[k_lo+1 .. n-1]`!
+        mut v_hi := unsafe { ptr_read_f64(work.ptr, k_lo + 1) }
+        mut i := k_lo + 2
+        while i < n {
+            vi := unsafe { ptr_read_f64(work.ptr, i) }
+            if vi < v_hi { v_hi = vi }
+            i += 1
+        }
+        out = v_lo + frac * (v_hi - v_lo)
+    }
+    mat_free(move work)
+    return out
+}
+
+fn stats_median(x: MatF64) -> f64 {
+    return stats_quantile(x, 0.5)
+}
+
+fn stats_iqr(x: MatF64) -> f64 {
+    return stats_quantile(x, 0.75) - stats_quantile(x, 0.25)
+}
+
+fn stats_mad(x: MatF64) -> f64 {
+    n := x.rows * x.cols
+    if x.ptr == 0 or n <= 0 { return 0.0 }
+    med := stats_median(x)
+    dev := mat_zeros(n, 1)
+    mut i := 0
+    while i < n {
+        unsafe { ptr_write_f64(dev.ptr, i, num_abs(ptr_read_f64(x.ptr, i) - med)) }
+        i += 1
+    }
+    res := stats_median(dev)
+    mat_free(move dev)
+    return res
+}
+
+// ============================================================================
+// 2. Covariance, Pearson & Spearman Rank Correlation
+// ============================================================================
+
+fn stats_cov(x: MatF64, y: MatF64, ddof: i64 = 1) -> f64 {
+    n := x.rows * x.cols
+    if x.ptr == 0 or y.ptr == 0 or n <= ddof or y.rows * y.cols != n { return 0.0 }
+    mx := stats_mean(x)
+    my := stats_mean(y)
+    mut acc := 0.0
+    mut i := 0
+    while i < n {
+        acc += (unsafe { ptr_read_f64(x.ptr, i) } - mx) * (unsafe { ptr_read_f64(y.ptr, i) } - my)
+        i += 1
+    }
+    return acc / ((n - ddof) as f64)
+}
+
+fn stats_pearson(x: MatF64, y: MatF64) -> f64 {
+    n := x.rows * x.cols
+    if x.ptr == 0 or y.ptr == 0 or n < 2 or y.rows * y.cols != n { return 0.0 }
+    mx := stats_mean(x)
+    my := stats_mean(y)
+    mut sxy := 0.0
+    mut sxx := 0.0
+    mut syy := 0.0
+    mut i := 0
+    while i < n {
+        dx := unsafe { ptr_read_f64(x.ptr, i) } - mx
+        dy := unsafe { ptr_read_f64(y.ptr, i) } - my
+        sxy += dx * dy
+        sxx += dx * dx
+        syy += dy * dy
+        i += 1
+    }
+    den := sqrt_f64(sxx * syy)
+    if den <= 0.000000000000001 { return 0.0 }
+    return sxy / den
+}
+
+fn _stats_sort_f64_with_idx(vals: MatF64, idx: IntBuf) {
+    n := vals.rows * vals.cols
+    tmp_v := mat_zeros(n, 1)
+    tmp_i := ibuf_new(n + 4)
+    mut z := 0
+    while z < n { ibuf_push(tmp_i, 0); z += 1 }
+    mut width := 1
+    while width < n {
+        mut left := 0
+        while left < n {
+            mid := if left + width < n { left + width } else { n }
+            right := if left + 2 * width < n { left + 2 * width } else { n }
+            mut p := left; mut q := mid; mut k := left
+            while p < mid and q < right {
+                vp := unsafe { ptr_read_f64(vals.ptr, p) }
+                vq := unsafe { ptr_read_f64(vals.ptr, q) }
+                if vp <= vq {
+                    unsafe { ptr_write_f64(tmp_v.ptr, k, vp) }
+                    ibuf_set(tmp_i, k, ibuf_get(idx, p))
+                    p += 1
+                } else {
+                    unsafe { ptr_write_f64(tmp_v.ptr, k, vq) }
+                    ibuf_set(tmp_i, k, ibuf_get(idx, q))
+                    q += 1
+                }
+                k += 1
+            }
+            while p < mid {
+                unsafe { ptr_write_f64(tmp_v.ptr, k, ptr_read_f64(vals.ptr, p)) }
+                ibuf_set(tmp_i, k, ibuf_get(idx, p)); p += 1; k += 1
+            }
+            while q < right {
+                unsafe { ptr_write_f64(tmp_v.ptr, k, ptr_read_f64(vals.ptr, q)) }
+                ibuf_set(tmp_i, k, ibuf_get(idx, q)); q += 1; k += 1
+            }
+            mut c := left
+            while c < right {
+                unsafe { ptr_write_f64(vals.ptr, c, ptr_read_f64(tmp_v.ptr, c)) }
+                ibuf_set(idx, c, ibuf_get(tmp_i, c))
+                c += 1
+            }
+            left += 2 * width
+        }
+        width = width * 2
+    }
+    mat_free(move tmp_v)
+    buf_free(move tmp_i)
+}
+
+fn _stats_rank_avg_ties(x: MatF64) -> MatF64 {
+    n := x.rows * x.cols
+    sv := mat_clone(x)
+    idx := ibuf_new(n + 4)
+    mut i := 0
+    while i < n { ibuf_push(idx, i); i += 1 }
+    _stats_sort_f64_with_idx(sv, idx)
+    ranks := mat_zeros(n, 1)
+    i = 0
+    while i < n {
+        mut j := i + 1
+        vi := unsafe { ptr_read_f64(sv.ptr, i) }
+        while j < n and unsafe { ptr_read_f64(sv.ptr, j) } == vi { j += 1 }
+        // Average 1-based rank of `[i .. j-1]` is `0.5 * (i + 1 + j)`
+        avg_r := 0.5 * ((i + 1 + j) as f64)
+        mut k := i
+        while k < j {
+            orig := ibuf_get(idx, k)
+            unsafe { ptr_write_f64(ranks.ptr, orig, avg_r) }
+            k += 1
+        }
+        i = j
+    }
+    mat_free(move sv)
+    buf_free(move idx)
+    return ranks
+}
+
+fn stats_spearman(x: MatF64, y: MatF64) -> f64 {
+    n := x.rows * x.cols
+    if x.ptr == 0 or y.ptr == 0 or n < 2 or y.rows * y.cols != n { return 0.0 }
+    rx := _stats_rank_avg_ties(x)
+    ry := _stats_rank_avg_ties(y)
+    r := stats_pearson(rx, ry)
+    mat_free(move rx)
+    mat_free(move ry)
+    return r
+}
+
+fn stats_cov_matrix(data: MatF64, ddof: i64 = 1) -> MatF64 {
+    n := data.rows
+    p := data.cols
+    if data.ptr == 0 or n <= ddof or p <= 0 { return MatF64(0, 0, 0) }
+    means := mat_zeros(p, 1)
+    mut j := 0
+    while j < p {
+        mut s := 0.0
+        mut r := 0
+        while r < n {
+            s += unsafe { ptr_read_f64(data.ptr, r * p + j) }
+            r += 1
+        }
+        unsafe { ptr_write_f64(means.ptr, j, s / (n as f64)) }
+        j += 1
+    }
+    cov := mat_zeros(p, p)
+    inv_df := 1.0 / ((n - ddof) as f64)
+    mut a := 0
+    while a < p {
+        ma := unsafe { ptr_read_f64(means.ptr, a) }
+        mut b := a
+        while b < p {
+            mb := unsafe { ptr_read_f64(means.ptr, b) }
+            mut acc := 0.0
+            mut r := 0
+            while r < n {
+                da := unsafe { ptr_read_f64(data.ptr, r * p + a) } - ma
+                db := unsafe { ptr_read_f64(data.ptr, r * p + b) } - mb
+                acc += da * db
+                r += 1
+            }
+            cv := acc * inv_df
+            unsafe {
+                ptr_write_f64(cov.ptr, a * p + b, cv)
+                ptr_write_f64(cov.ptr, b * p + a, cv)
+            }
+            b += 1
+        }
+        a += 1
+    }
+    mat_free(move means)
+    return cov
+}
+
+// ============================================================================
+// 3. Hypothesis Testing (`ttest_1samp`, `ttest_ind`, `welch_ttest`, `chi2`, `anova_1way`, `ks_2samp`)
+// ============================================================================
+
+fn ttest_1samp(x: MatF64, popmean: f64) -> TestResult {
+    n := x.rows * x.cols
+    if x.ptr == 0 or n < 2 { return TestResult(0.0, 1.0, 0.0) }
+    mu := stats_mean(x)
+    sd := stats_std(x, 1)
+    df := (n - 1) as f64
+    if sd <= 0.000000000000001 { return TestResult(0.0, if mu == popmean { 1.0 } else { 0.0 }, df) }
+    se := sd / sqrt_f64(n as f64)
+    t := (mu - popmean) / se
+    pval := 2.0 * (1.0 - student_t_cdf(num_abs(t), df))
+    return TestResult(t, pval, df)
+}
+
+fn ttest_ind(x: MatF64, y: MatF64) -> TestResult {
+    nx := x.rows * x.cols
+    ny := y.rows * y.cols
+    if x.ptr == 0 or y.ptr == 0 or nx < 2 or ny < 2 { return TestResult(0.0, 1.0, 0.0) }
+    mx := stats_mean(x); my := stats_mean(y)
+    vx := stats_var(x, 1); vy := stats_var(y, 1)
+    df := (nx + ny - 2) as f64
+    sp2 := (((nx - 1) as f64) * vx + ((ny - 1) as f64) * vy) / df
+    se := sqrt_f64(sp2 * (1.0 / (nx as f64) + 1.0 / (ny as f64)))
+    if se <= 0.000000000000001 { return TestResult(0.0, 1.0, df) }
+    t := (mx - my) / se
+    pval := 2.0 * (1.0 - student_t_cdf(num_abs(t), df))
+    return TestResult(t, pval, df)
+}
+
+// Welch-Satterthwaite unequal-variance two-sample t-test.
+fn welch_ttest(x: MatF64, y: MatF64) -> TestResult {
+    nx := x.rows * x.cols
+    ny := y.rows * y.cols
+    if x.ptr == 0 or y.ptr == 0 or nx < 2 or ny < 2 { return TestResult(0.0, 1.0, 0.0) }
+    mx := stats_mean(x); my := stats_mean(y)
+    vx := stats_var(x, 1); vy := stats_var(y, 1)
+    sx := vx / (nx as f64)
+    sy := vy / (ny as f64)
+    se2 := sx + sy
+    if se2 <= 0.000000000000001 { return TestResult(0.0, 1.0, (nx + ny - 2) as f64) }
+    df := (se2 * se2) / ((sx * sx) / ((nx - 1) as f64) + (sy * sy) / ((ny - 1) as f64))
+    t := (mx - my) / sqrt_f64(se2)
+    pval := 2.0 * (1.0 - student_t_cdf(num_abs(t), df))
+    return TestResult(t, pval, df)
+}
+
+fn chi2_gof_test(observed: MatF64, expected: MatF64) -> TestResult {
+    n := observed.rows * observed.cols
+    if observed.ptr == 0 or expected.ptr == 0 or n < 2 or expected.rows * expected.cols != n {
+        return TestResult(0.0, 1.0, 0.0)
+    }
+    mut stat := 0.0
+    mut i := 0
+    while i < n {
+        o := unsafe { ptr_read_f64(observed.ptr, i) }
+        e := unsafe { ptr_read_f64(expected.ptr, i) }
+        if e > 0.000000000000001 {
+            d := o - e
+            stat += (d * d) / e
+        }
+        i += 1
+    }
+    df := (n - 1) as f64
+    return TestResult(stat, chi2_sf(stat, df), df)
+}
+
+fn chi2_independence_test(table: MatF64) -> TestResult {
+    r := table.rows
+    c := table.cols
+    if table.ptr == 0 or r < 2 or c < 2 { return TestResult(0.0, 1.0, 0.0) }
+    row_sums := mat_zeros(r, 1)
+    col_sums := mat_zeros(c, 1)
+    mut grand := 0.0
+    mut i := 0
+    while i < r {
+        mut j := 0
+        while j < c {
+            v := unsafe { ptr_read_f64(table.ptr, i * c + j) }
+            unsafe {
+                ptr_write_f64(row_sums.ptr, i, ptr_read_f64(row_sums.ptr, i) + v)
+                ptr_write_f64(col_sums.ptr, j, ptr_read_f64(col_sums.ptr, j) + v)
+            }
+            grand += v
+            j += 1
+        }
+        i += 1
+    }
+    if grand <= 0.0 {
+        mat_free(move row_sums); mat_free(move col_sums)
+        return TestResult(0.0, 1.0, 0.0)
+    }
+    mut stat := 0.0
+    i = 0
+    while i < r {
+        ri := unsafe { ptr_read_f64(row_sums.ptr, i) }
+        mut j := 0
+        while j < c {
+            cj := unsafe { ptr_read_f64(col_sums.ptr, j) }
+            exp_v := (ri * cj) / grand
+            if exp_v > 0.000000000000001 {
+                diff := unsafe { ptr_read_f64(table.ptr, i * c + j) } - exp_v
+                stat += (diff * diff) / exp_v
+            }
+            j += 1
+        }
+        i += 1
+    }
+    mat_free(move row_sums); mat_free(move col_sums)
+    df := ((r - 1) * (c - 1)) as f64
+    return TestResult(stat, chi2_sf(stat, df), df)
+}
+
+fn anova_1way(values: MatF64, group_ids: IntBuf, n_groups: i64) -> TestResult {
+    n := values.rows * values.cols
+    if values.ptr == 0 or n <= n_groups or n_groups < 2 or ibuf_len(group_ids) != n {
+        return TestResult(0.0, 1.0, 0.0)
+    }
+    grand_mean := stats_mean(values)
+    g_cnt := ibuf_new(n_groups + 4)
+    g_sum := mat_zeros(n_groups, 1)
+    mut g := 0
+    while g < n_groups { ibuf_push(g_cnt, 0); g += 1 }
+    mut i := 0
+    while i < n {
+        gid := ibuf_get(group_ids, i)
+        if gid >= 0 and gid < n_groups {
+            ibuf_set(g_cnt, gid, ibuf_get(g_cnt, gid) + 1)
+            unsafe { ptr_write_f64(g_sum.ptr, gid, ptr_read_f64(g_sum.ptr, gid) + ptr_read_f64(values.ptr, i)) }
+        }
+        i += 1
+    }
+    mut ssb := 0.0
+    g = 0
+    while g < n_groups {
+        cg := ibuf_get(g_cnt, g)
+        if cg > 0 {
+            mg := unsafe { ptr_read_f64(g_sum.ptr, g) } / (cg as f64)
+            d := mg - grand_mean
+            ssb += (cg as f64) * d * d
+        }
+        g += 1
+    }
+    mut ssw := 0.0
+    i = 0
+    while i < n {
+        gid := ibuf_get(group_ids, i)
+        if gid >= 0 and gid < n_groups and ibuf_get(g_cnt, gid) > 0 {
+            mg := unsafe { ptr_read_f64(g_sum.ptr, gid) } / (ibuf_get(g_cnt, gid) as f64)
+            d := unsafe { ptr_read_f64(values.ptr, i) } - mg
+            ssw += d * d
+        }
+        i += 1
+    }
+    buf_free(move g_cnt)
+    mat_free(move g_sum)
+    df1 := (n_groups - 1) as f64
+    df2 := (n - n_groups) as f64
+    if ssw <= 0.000000000000001 { return TestResult(0.0, 1.0, df1) }
+    f_stat := (ssb / df1) / (ssw / df2)
+    return TestResult(f_stat, fdist_sf(f_stat, df1, df2), df1)
+}
+
+// Two-sample Kolmogorov-Smirnov test (`D = max |F_x(t) - F_y(t)|` + Smirnov asymptotic p-value).
+fn ks_2samp(x: MatF64, y: MatF64) -> TestResult {
+    nx := x.rows * x.cols
+    ny := y.rows * y.cols
+    if x.ptr == 0 or y.ptr == 0 or nx < 1 or ny < 1 { return TestResult(0.0, 1.0, 0.0) }
+    sx := mat_clone(x); ix := ibuf_new(nx + 4)
+    sy := mat_clone(y); iy := ibuf_new(ny + 4)
+    mut k := 0
+    while k < nx { ibuf_push(ix, k); k += 1 }
+    k = 0
+    while k < ny { ibuf_push(iy, k); k += 1 }
+    _stats_sort_f64_with_idx(sx, ix)
+    _stats_sort_f64_with_idx(sy, iy)
+    buf_free(move ix); buf_free(move iy)
+    mut i := 0
+    mut j := 0
+    mut d_max := 0.0
+    nxf := nx as f64
+    nyf := ny as f64
+    while i < nx and j < ny {
+        vx := unsafe { ptr_read_f64(sx.ptr, i) }
+        vy := unsafe { ptr_read_f64(sy.ptr, j) }
+        if vx <= vy { i += 1 }
+        if vy <= vx { j += 1 }
+        d := num_abs((i as f64) / nxf - (j as f64) / nyf)
+        if d > d_max { d_max = d }
+    }
+    mat_free(move sx); mat_free(move sy)
+    en := sqrt_f64((nxf * nyf) / (nxf + nyf))
+    lam := (en + 0.12 + 0.11 / en) * d_max
+    if lam <= 0.0001 { return TestResult(d_max, 1.0, nxf + nyf) }
+    mut psum := 0.0
+    mut m := 1
+    while m <= 64 {
+        mf := m as f64
+        term := 2.0 * num_exp(-2.0 * mf * mf * lam * lam)
+        if (m & 1) != 0 { psum += term } else { psum -= term }
+        if term < 0.00000000000001 { break }
+        m += 1
+    }
+    if psum < 0.0 { psum = 0.0 }
+    if psum > 1.0 { psum = 1.0 }
+    return TestResult(d_max, psum, nxf + nyf)
+}
+
+// ============================================================================
+// 4. Econometrics: Ordinary Least Squares (`OLS` Summary with SE, t, p, R2, F, AIC, BIC)
+// ============================================================================
+
+fn ols_fit_summary(x_design: MatF64, y: MatF64) -> OlsSummary ! i64 {
+    n := x_design.rows
+    p := x_design.cols
+    if x_design.ptr == 0 or y.ptr == 0 or n <= p or p <= 0 or y.rows * y.cols != n {
+        return err(400)
+    }
+    coef := lstsq_solve(x_design, y) or return err(422)
+    y_hat := mat_dot_vec(x_design, coef)
+    y_mean := stats_mean(y)
+    mut rss := 0.0
+    mut tss := 0.0
+    mut i := 0
+    while i < n {
+        yi := unsafe { ptr_read_f64(y.ptr, i) }
+        yhi := unsafe { ptr_read_f64(y_hat.ptr, i) }
+        e := yi - yhi
+        d := yi - y_mean
+        rss += e * e
+        tss += d * d
+        i += 1
+    }
+    mat_free(move y_hat)
+    df_res := (n - p) as f64
+    sigma2 := rss / df_res
+    xt := mat_transpose(x_design)
+    xtx := mat_mul(xt, x_design)
+    mat_free(move xt)
+    xtx_inv := mat_inv(xtx) or return err(422)
+    mat_free(move xtx)
+    se := mat_zeros(p, 1)
+    t_st := mat_zeros(p, 1)
+    p_vl := mat_zeros(p, 1)
+    mut j := 0
+    while j < p {
+        v_jj := sigma2 * unsafe { ptr_read_f64(xtx_inv.ptr, j * p + j) }
+        se_j := if v_jj > 0.0 { sqrt_f64(v_jj) } else { 0.0 }
+        cj := unsafe { ptr_read_f64(coef.ptr, j) }
+        tj := if se_j > 0.000000000000001 { cj / se_j } else { 0.0 }
+        pj := 2.0 * (1.0 - student_t_cdf(num_abs(tj), df_res))
+        unsafe {
+            ptr_write_f64(se.ptr, j, se_j)
+            ptr_write_f64(t_st.ptr, j, tj)
+            ptr_write_f64(p_vl.ptr, j, pj)
+        }
+        j += 1
+    }
+    mat_free(move xtx_inv)
+    r2 := if tss > 0.000000000000001 { 1.0 - rss / tss } else { 0.0 }
+    adj_r2 := 1.0 - (1.0 - r2) * ((n - 1) as f64) / df_res
+    f_stat := if p > 1 and sigma2 > 0.0 { ((tss - rss) / ((p - 1) as f64)) / sigma2 } else { 0.0 }
+    nf := n as f64
+    // Gaussian log-likelihood based AIC & BIC
+    s2_mle := if rss > 0.000000000000001 { rss / nf } else { 0.000000000000001 }
+    ll := -0.5 * nf * (num_ln(num_two_pi() * s2_mle) + 1.0)
+    k_params := (p + 1) as f64
+    aic := 2.0 * k_params - 2.0 * ll
+    bic := k_params * num_ln(nf) - 2.0 * ll
+    return ok(OlsSummary(coef, se, t_st, p_vl, r2, adj_r2, f_stat, aic, bic))
+}
+
+fn ols_free(move s: OlsSummary) {
+    mat_free(s.coef); mat_free(s.std_err); mat_free(s.t_stats); mat_free(s.p_values)
+}
+
+// ============================================================================
+// 5. Time-Series Analysis (`rolling_mean`, `ewma`, `acf`, `holt_winters_additive`)
+// ============================================================================
+
+fn ts_rolling_mean(x: MatF64, window: i64) -> MatF64 {
+    n := x.rows * x.cols
+    if x.ptr == 0 or n <= 0 or window <= 0 { return MatF64(0, 0, 0) }
+    out := mat_zeros(n, 1)
+    mut run_sum := 0.0
+    mut i := 0
+    while i < n {
+        run_sum += unsafe { ptr_read_f64(x.ptr, i) }
+        if i >= window {
+            run_sum -= unsafe { ptr_read_f64(x.ptr, i - window) }
+            unsafe { ptr_write_f64(out.ptr, i, run_sum / (window as f64)) }
+        } else {
+            unsafe { ptr_write_f64(out.ptr, i, run_sum / ((i + 1) as f64)) }
+        }
+        i += 1
+    }
+    return out
+}
+
+fn ts_ewma(x: MatF64, alpha: f64) -> MatF64 {
+    n := x.rows * x.cols
+    if x.ptr == 0 or n <= 0 { return MatF64(0, 0, 0) }
+    out := mat_zeros(n, 1)
+    mut s := unsafe { ptr_read_f64(x.ptr, 0) }
+    unsafe { ptr_write_f64(out.ptr, 0, s) }
+    mut i := 1
+    while i < n {
+        xi := unsafe { ptr_read_f64(x.ptr, i) }
+        s = alpha * xi + (1.0 - alpha) * s
+        unsafe { ptr_write_f64(out.ptr, i, s) }
+        i += 1
+    }
+    return out
+}
+
+fn ts_acf(x: MatF64, max_lag: i64) -> MatF64 {
+    n := x.rows * x.cols
+    if x.ptr == 0 or n < 2 or max_lag < 0 { return MatF64(0, 0, 0) }
+    ml := if max_lag < n { max_lag } else { n - 1 }
+    out := mat_zeros(ml + 1, 1)
+    mu := stats_mean(x)
+    mut c0 := 0.0
+    mut i := 0
+    while i < n {
+        d := unsafe { ptr_read_f64(x.ptr, i) } - mu
+        c0 += d * d
+        i += 1
+    }
+    if c0 <= 0.000000000000001 {
+        unsafe { ptr_write_f64(out.ptr, 0, 1.0) }
+        return out
+    }
+    mut lag := 0
+    while lag <= ml {
+        mut ck := 0.0
+        mut t := 0
+        while t < n - lag {
+            d1 := unsafe { ptr_read_f64(x.ptr, t) } - mu
+            d2 := unsafe { ptr_read_f64(x.ptr, t + lag) } - mu
+            ck += d1 * d2
+            t += 1
+        }
+        unsafe { ptr_write_f64(out.ptr, lag, ck / c0) }
+        lag += 1
+    }
+    return out
+}
+
+// Triple exponential smoothing (Additive Holt-Winters) returning `[horizon x 1]` multi-step forecast!
+fn ts_holt_winters_additive(x: MatF64, season_len: i64, alpha: f64, beta: f64, gamma: f64, horizon: i64) -> MatF64 {
+    n := x.rows * x.cols
+    if x.ptr == 0 or season_len < 2 or n < season_len * 2 or horizon <= 0 {
+        return MatF64(0, 0, 0)
+    }
+    s_vec := mat_zeros(season_len, 1)
+    mut s0_sum := 0.0
+    mut s1_sum := 0.0
+    mut k := 0
+    while k < season_len {
+        s0_sum += unsafe { ptr_read_f64(x.ptr, k) }
+        s1_sum += unsafe { ptr_read_f64(x.ptr, season_len + k) }
+        k += 1
+    }
+    sf := season_len as f64
+    mut level := s0_sum / sf
+    mut trend := (s1_sum - s0_sum) / (sf * sf)
+    k = 0
+    while k < season_len {
+        unsafe { ptr_write_f64(s_vec.ptr, k, ptr_read_f64(x.ptr, k) - level) }
+        k += 1
+    }
+    mut t := 0
+    while t < n {
+        xt := unsafe { ptr_read_f64(x.ptr, t) }
+        si := t % season_len
+        st_old := unsafe { ptr_read_f64(s_vec.ptr, si) }
+        prev_level := level
+        level = alpha * (xt - st_old) + (1.0 - alpha) * (level + trend)
+        trend = beta * (level - prev_level) + (1.0 - beta) * trend
+        unsafe { ptr_write_f64(s_vec.ptr, si, gamma * (xt - level) + (1.0 - gamma) * st_old) }
+        t += 1
+    }
+    fc := mat_zeros(horizon, 1)
+    mut h := 1
+    while h <= horizon {
+        si := (n + h - 1) % season_len
+        y_hat := level + (h as f64) * trend + unsafe { ptr_read_f64(s_vec.ptr, si) }
+        unsafe { ptr_write_f64(fc.ptr, h - 1, y_hat) }
+        h += 1
+    }
+    mat_free(move s_vec)
+    return fc
+}

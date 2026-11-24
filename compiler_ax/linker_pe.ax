@@ -127,10 +127,44 @@ fn pool_lex_cmp(pool: ByteBuf, off1: i64, len1: i64, off2: i64, len2: i64) -> i6
     return len1 - len2
 }
 
-// Builds `.rdata` Multi-DLL `.idata` + optional `.edata` + `.xdata` + 16-byte `@shield` MAC prefix!
-// `ext_imports`: 4 words per external fn `[dll_soff, dll_slen, fn_soff, fn_slen]` (receives IAT slots `20 + k`).
+fn k32_slot_name(slot: i64) -> str {
+    if slot == 0 { return "GetStdHandle" }
+    if slot == 1 { return "WriteFile" }
+    if slot == 2 { return "ExitProcess" }
+    if slot == 3 { return "QueryPerformanceCounter" }
+    if slot == 4 { return "QueryPerformanceFrequency" }
+    if slot == 5 { return "VirtualAlloc" }
+    if slot == 6 { return "VirtualFree" }
+    if slot == 7 { return "CreateFileA" }
+    if slot == 8 { return "ReadFile" }
+    if slot == 9 { return "CloseHandle" }
+    if slot == 10 { return "GetFileSizeEx" }
+    if slot == 11 { return "GetCommandLineA" }
+    if slot == 12 { return "CreateThread" }
+    if slot == 13 { return "WaitForMultipleObjects" }
+    if slot == 14 { return "GetSystemInfo" }
+    if slot == 15 { return "CreateIoCompletionPort" }
+    if slot == 16 { return "PostQueuedCompletionStatus" }
+    if slot == 17 { return "GetQueuedCompletionStatus" }
+    if slot == 18 { return "Sleep" }
+    if slot == 19 { return "IsDebuggerPresent" }
+    if slot == 20 { return "CreateProcessA" }
+    if slot == 21 { return "WaitForSingleObject" }
+    if slot == 22 { return "GetExitCodeProcess" }
+    if slot == 23 { return "GetProcessHeap" }
+    if slot == 24 { return "HeapAlloc" }
+    if slot == 25 { return "HeapFree" }
+    if slot == 26 { return "LoadLibraryA" }
+    if slot == 27 { return "GetProcAddress" }
+    if slot == 28 { return "FreeLibrary" }
+    if slot == 29 { return "CreateEventA" }
+    return "SetEvent"
+}
+
+// Builds `.rdata` Multi-DLL `.idata` (pruned on-demand via `fixups`) + optional `.edata` + `.xdata` + 16-byte `@shield` MAC prefix!
+// `ext_imports`: 4 words per external fn `[dll_soff, dll_slen, fn_soff, fn_slen]` (receives IAT slots `31 + k`).
 // `exports`: 3 words per exported fn `[name_soff, name_slen, code_off]`.
-fn prepare_pe_rdata_v7(pool: ByteBuf, rdata_rva: i64, ext_imports: IntBuf, exports: IntBuf, prefix: ByteBuf, info: IntBuf) {
+fn prepare_pe_rdata_v7(pool: ByteBuf, rdata_rva: i64, fixups: IntBuf, ext_imports: IntBuf, exports: IntBuf, prefix: ByteBuf, info: IntBuf) {
     mut z := 0
     while z < 16 {
         ibuf_push(info, 0)
@@ -139,6 +173,36 @@ fn prepare_pe_rdata_v7(pool: ByteBuf, rdata_rva: i64, ext_imports: IntBuf, expor
 
     k32_cnt := iat_total_count()
     ext_cnt := ibuf_len(ext_imports) / 4
+
+    // Scan `fixups` (`fx_iat == 1`) so unreferenced `KERNEL32.dll` imports are omitted from `.rdata`!
+    used_k32 := ibuf_new(k32_cnt + 4)
+    mut ui := 0
+    while ui < k32_cnt {
+        ibuf_push(used_k32, 0)
+        ui += 1
+    }
+    fxc := ibuf_len(fixups) / 4
+    mut fxi := 0
+    while fxi < fxc {
+        fb := fxi * 4
+        if ibuf_get(fixups, fb + 2) == 1 {
+            slt := ibuf_get(fixups, fb + 3)
+            if slt >= 0 and slt < k32_cnt {
+                ibuf_set(used_k32, slt, 1)
+            }
+        }
+        fxi += 1
+    }
+    mut active_k32_cnt := 0
+    ui = 0
+    while ui < k32_cnt {
+        if ibuf_get(used_k32, ui) == 1 { active_k32_cnt += 1 }
+        ui += 1
+    }
+    if active_k32_cnt == 0 {
+        ibuf_set(used_k32, iat_exit_process(), 1)
+        active_k32_cnt = 1
+    }
 
     // Group `ext_imports` by case-insensitive DLL name -> `dll_groups` (`[dll_soff, dll_slen, fn_count]`)
     dll_groups := ibuf_new(ext_cnt * 3 + 16)
@@ -172,7 +236,7 @@ fn prepare_pe_rdata_v7(pool: ByteBuf, rdata_rva: i64, ext_imports: IntBuf, expor
     num_ext_dlls := ibuf_len(dll_groups) / 3
     total_dlls := 1 + num_ext_dlls
     // Total qwords across all IAT slices (each DLL has `fn_count + 1` qwords for null terminator)
-    total_iat_qwords := (k32_cnt + 1) + ext_cnt + num_ext_dlls
+    total_iat_qwords := (active_k32_cnt + 1) + ext_cnt + num_ext_dlls
     iat_base_off := 0
     ilt_base_off := total_iat_qwords * 8
     emit_zeros(prefix, total_iat_qwords * 16)
@@ -188,60 +252,31 @@ fn prepare_pe_rdata_v7(pool: ByteBuf, rdata_rva: i64, ext_imports: IntBuf, expor
         si += 1
     }
 
-    // 1. Emit `KERNEL32.dll` Descriptor (`IDT[0]`) + Hint/Names
+    // 1. Emit `KERNEL32.dll` Descriptor (`IDT[0]`) + referenced Hint/Names only
     k32_name_rva := rdata_rva + buf_len(prefix)
     buf_push_str(prefix, "KERNEL32.dll")
     buf_push(prefix, 0)
 
-    k32_thunks := ibuf_new(32)
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "GetStdHandle"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "WriteFile"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "ExitProcess"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "QueryPerformanceCounter"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "QueryPerformanceFrequency"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "VirtualAlloc"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "VirtualFree"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "CreateFileA"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "ReadFile"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "CloseHandle"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "GetFileSizeEx"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "GetCommandLineA"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "CreateThread"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "WaitForMultipleObjects"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "GetSystemInfo"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "CreateIoCompletionPort"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "PostQueuedCompletionStatus"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "GetQueuedCompletionStatus"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "Sleep"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "IsDebuggerPresent"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "CreateProcessA"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "WaitForSingleObject"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "GetExitCodeProcess"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "GetProcessHeap"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "HeapAlloc"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "HeapFree"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "LoadLibraryA"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "GetProcAddress"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "FreeLibrary"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "CreateEventA"))
-    ibuf_push(k32_thunks, append_hint_name(prefix, rdata_rva, "SetEvent"))
-
+    mut k_out := 0
     mut idx := 0
     while idx < k32_cnt {
-        trva := ibuf_get(k32_thunks, idx)
-        buf_put_u64(prefix, iat_base_off + idx * 8, trva)
-        buf_put_u64(prefix, ilt_base_off + idx * 8, trva)
-        ibuf_set(info, 16 + idx, rdata_rva + iat_base_off + idx * 8)
+        if ibuf_get(used_k32, idx) == 1 {
+            trva := append_hint_name(prefix, rdata_rva, k32_slot_name(idx))
+            buf_put_u64(prefix, iat_base_off + k_out * 8, trva)
+            buf_put_u64(prefix, ilt_base_off + k_out * 8, trva)
+            ibuf_set(info, 16 + idx, rdata_rva + iat_base_off + k_out * 8)
+            k_out += 1
+        }
         idx += 1
     }
-    buf_free(move k32_thunks)
+    buf_free(move used_k32)
 
     buf_put_u32(prefix, idt_off + 0, rdata_rva + ilt_base_off)
     buf_put_u32(prefix, idt_off + 12, k32_name_rva)
     buf_put_u32(prefix, idt_off + 16, rdata_rva + iat_base_off)
 
     // 2. Emit External DLL Descriptors (`IDT[1 .. num_ext_dlls]`)
-    mut cur_qword := k32_cnt + 1
+    mut cur_qword := active_k32_cnt + 1
     mut gi := 0
     while gi < num_ext_dlls {
         gb := gi * 3
@@ -468,137 +503,56 @@ fn append_padded_section(out: ByteBuf, sec_data: ByteBuf, target_raw_size: i64) 
     }
 }
 
-fn is_pe_safety_trap_range(text_code: ByteBuf, s_off: i64, e_off: i64) -> bool {
-    if s_off < 0 or e_off > buf_len(text_code) or e_off <= s_off { return false }
-    rlen := e_off - s_off
-    if rlen >= 5 {
-        mut p := s_off
-        if rlen >= 9 and buf_get(text_code, p) == 0xF3 and buf_get(text_code, p + 1) == 0x0F {
-            p += 4
-        }
-        if p + 5 <= e_off {
-            op := buf_get(text_code, p)
-            if op == 0xB9 or op == 0xBF {
-                code := buf_get(text_code, p + 1) | (buf_get(text_code, p + 2) << 8) | (buf_get(text_code, p + 3) << 16) | (buf_get(text_code, p + 4) << 24)
-                if code == 101 or code == 254 or code == 255 {
-                    return true
-                }
-            }
-        }
+fn pe_nonzero_len(buf: ByteBuf) -> i64 {
+    mut n := buf_len(buf)
+    while n > 0 {
+        if buf_get(buf, n - 1) != 0 { return n }
+        n -= 1
     }
-    if rlen >= 20 {
-        mut p := s_off
-        while p + 8 <= e_off {
-            if buf_get(text_code, p) == 0x15 and buf_get(text_code, p + 1) == 0x7C and buf_get(text_code, p + 2) == 0x4A and buf_get(text_code, p + 3) == 0x7F {
-                return true
-            }
-            p += 1
-        }
-    }
-    return false
+    return 0
 }
 
-// Dead-Code Elimination (DCE) & Symbol Stripping Analysis for PE32+
-fn pe_dce_strip_analysis(text_code: ByteBuf, fn_ranges: IntBuf, is_dce: bool) -> i64 {
-    t_len := buf_len(text_code)
+// Appends Win64 SEH `.pdata` (`RUNTIME_FUNCTION` table) and High-Entropy ASLR `BaseReloc` block directly into `.rdata`!
+fn append_pe_pdata_and_reloc(rdata_full: ByteBuf, rdata_rva: i64, fn_ranges: IntBuf, text_len: i64, info: IntBuf) {
+    while (buf_len(rdata_full) & 3) != 0 {
+        buf_push(rdata_full, 0)
+    }
+    unwind_rva := ibuf_get(info, 1)
+    pdata_start := buf_len(rdata_full)
+    pdata_rva := rdata_rva + pdata_start
     rcnt := ibuf_len(fn_ranges) / 2
-    if rcnt <= 0 or not is_dce { return 0 }
-
-    live_ranges := ibuf_new(rcnt + 8)
-    scanned_ranges := ibuf_new(rcnt + 8)
-    mut i := 0
-    while i < rcnt {
-        ibuf_push(live_ranges, 0)
-        ibuf_push(scanned_ranges, 0)
-        i += 1
-    }
-    ibuf_set(live_ranges, 0, 1) // Entry function is always retained
-
-    // Mark safety trap routines permanently live
-    i = 0
-    while i < rcnt {
-        s_off := ibuf_get(fn_ranges, i * 2)
-        e_off := ibuf_get(fn_ranges, i * 2 + 1)
-        if is_pe_safety_trap_range(text_code, s_off, e_off) {
-            ibuf_set(live_ranges, i, 1)
-        }
-        i += 1
-    }
-
-    // Fixed-point iteration until no new ranges are marked live
-    mut changed := true
-    while changed {
-        changed = false
+    if rcnt == 0 {
+        buf_push_u32(rdata_full, pe_text_rva())
+        buf_push_u32(rdata_full, pe_text_rva() + text_len)
+        buf_push_u32(rdata_full, unwind_rva)
+    } else {
         mut ri := 0
         while ri < rcnt {
-            if ibuf_get(live_ranges, ri) == 1 and ibuf_get(scanned_ranges, ri) == 0 {
-                ibuf_set(scanned_ranges, ri, 1)
-                f_start := ibuf_get(fn_ranges, ri * 2)
-                f_end := ibuf_get(fn_ranges, ri * 2 + 1)
-                mut p := f_start
-                while p < f_end {
-                    b := buf_get(text_code, p)
-                    mut target_off := -1
-
-                    // 0xE8 (CALL rel32) or 0xE9 (JMP rel32)
-                    if (b == 0xE8 or b == 0xE9) and p + 5 <= f_end {
-                        disp := buf_get(text_code, p + 1) | (buf_get(text_code, p + 2) << 8) | (buf_get(text_code, p + 3) << 16) | (buf_get(text_code, p + 4) << 24)
-                        mut s_disp := disp
-                        if (s_disp & 0x80000000) != 0 { s_disp = s_disp - 0x100000000 }
-                        target_off = p + 5 + s_disp
-                    } else if b == 0x0F and p + 6 <= f_end {
-                        b2 := buf_get(text_code, p + 1)
-                        // 0x0F 0x80 .. 0x8F (Jcc near rel32)
-                        if b2 >= 0x80 and b2 <= 0x8F {
-                            disp := buf_get(text_code, p + 2) | (buf_get(text_code, p + 3) << 8) | (buf_get(text_code, p + 4) << 16) | (buf_get(text_code, p + 5) << 24)
-                            mut s_disp := disp
-                            if (s_disp & 0x80000000) != 0 { s_disp = s_disp - 0x100000000 }
-                            target_off = p + 6 + s_disp
-                        }
-                    }
-
-                    if target_off >= 0 and target_off < t_len {
-                        mut k := 0
-                        while k < rcnt {
-                            if ibuf_get(live_ranges, k) == 0 {
-                                s_off := ibuf_get(fn_ranges, k * 2)
-                                e_off := ibuf_get(fn_ranges, k * 2 + 1)
-                                if target_off >= s_off and target_off < e_off {
-                                    ibuf_set(live_ranges, k, 1)
-                                    changed = true
-                                    break
-                                }
-                            }
-                            k += 1
-                        }
-                    }
-                    p += 1
-                }
-            }
+            s_off := ibuf_get(fn_ranges, ri * 2)
+            e_off := ibuf_get(fn_ranges, ri * 2 + 1)
+            buf_push_u32(rdata_full, pe_text_rva() + s_off)
+            buf_push_u32(rdata_full, pe_text_rva() + e_off)
+            buf_push_u32(rdata_full, unwind_rva)
             ri += 1
         }
     }
+    pdata_vsize := buf_len(rdata_full) - pdata_start
 
-    mut stripped_count := 0
-    i = 0
-    while i < rcnt {
-        if ibuf_get(live_ranges, i) == 0 {
-            stripped_count += 1
-        }
-        i += 1
+    while (buf_len(rdata_full) & 3) != 0 {
+        buf_push(rdata_full, 0)
     }
-    buf_free(move live_ranges)
-    buf_free(move scanned_ranges)
-    return stripped_count
+    reloc_rva := rdata_rva + buf_len(rdata_full)
+    buf_push_u32(rdata_full, pe_text_rva())
+    buf_push_u32(rdata_full, 12)
+    buf_push_u32(rdata_full, 0)
+
+    ibuf_set(info, 13, pdata_rva)
+    ibuf_set(info, 14, pdata_vsize)
+    ibuf_set(info, 15, reloc_rva)
 }
 
-// Emits standalone Win64 PE32+ `.exe` (`is_dll == false`) or `.dll`/`.pyd` (`is_dll == true`)!
-fn build_pe32_binary_v7(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBuf, data_sec: ByteBuf, info: IntBuf, fn_ranges: IntBuf, is_dll: bool, pe_out: ByteBuf, is_gui: bool = false) {
-    // Perform DCE analysis if enabled in info[13]
-    is_dce_mode := ibuf_get(info, 13) != 0
-    if is_dce_mode {
-        _pruned := pe_dce_strip_analysis(text_code, fn_ranges, true)
-    }
+// Emits compact 3-section Win64 PE32+ `.exe` (`is_dll == false`) or `.dll`/`.pyd` (`is_dll == true`)!
+fn build_pe32_binary_v7(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBuf, data_sec: ByteBuf, info: IntBuf, _fn_ranges: IntBuf, is_dll: bool, pe_out: ByteBuf, is_gui: bool = false) {
     poly_seed := ibuf_get(info, 12)
     mac := compute_poly_shield_mac(text_code, shield_len, poly_seed)
     mask := (poly_seed *% 0xBF58476D1CE4E5B9) ^ 0x55AA55AA33CC33CC
@@ -606,33 +560,14 @@ fn build_pe32_binary_v7(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBuf
     buf_put_u64(rdata_full, sh_off, mac ^ mask)
     buf_put_u64(rdata_full, sh_off + 8, mask)
 
-    unwind_rva := ibuf_get(info, 1)
-    rcnt := ibuf_len(fn_ranges) / 2
-    pdata := buf_new(rcnt * 12 + 256)
-    if rcnt == 0 {
-        buf_push_u32(pdata, pe_text_rva())
-        buf_push_u32(pdata, pe_text_rva() + buf_len(text_code))
-        buf_push_u32(pdata, unwind_rva)
-    } else {
-        mut ri := 0
-        while ri < rcnt {
-            s_off := ibuf_get(fn_ranges, ri * 2)
-            e_off := ibuf_get(fn_ranges, ri * 2 + 1)
-            buf_push_u32(pdata, pe_text_rva() + s_off)
-            buf_push_u32(pdata, pe_text_rva() + e_off)
-            buf_push_u32(pdata, unwind_rva)
-            ri += 1
-        }
-    }
-
-    reloc := buf_new(256)
-    buf_push_u32(reloc, pe_text_rva())
-    buf_push_u32(reloc, 12)
-    buf_push_u32(reloc, 0)
+    pdata_rva := ibuf_get(info, 13)
+    pdata_vsize := ibuf_get(info, 14)
+    reloc_rva := ibuf_get(info, 15)
+    reloc_vsize := 12
 
     file_align := 0x200
     sect_align := 0x1000
-    headers_size := 0x400
+    headers_size := 0x200 // Compact 512B PE32+ header (`64 + 4 + 20 + 240 + 3*40 = 448 <= 512`)!
 
     text_vsize := buf_len(text_code)
     mut text_v_nz := text_vsize
@@ -650,22 +585,19 @@ fn build_pe32_binary_v7(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBuf
     if buf_len(data_sec) > data_vsize {
         data_vsize = buf_len(data_sec)
     }
-    mut data_raw_len := buf_len(data_sec)
-    if data_raw_len < 64 { data_raw_len = 64 }
-    data_raw_size := align_up(data_raw_len, file_align)
-    data_raw_ptr := rdata_raw_ptr + rdata_raw_size
+    nz_data := pe_nonzero_len(data_sec)
+    mut data_raw_size := 0
+    mut data_raw_ptr := 0
+    mut data_chars := 0xC0000080 // MEM_READ | MEM_WRITE | CNT_UNINITIALIZED_DATA (zero disk bytes!)
+    mut uninit_size := align_up(data_vsize, file_align)
+    if nz_data > 0 {
+        data_raw_size = align_up(nz_data, file_align)
+        data_raw_ptr = rdata_raw_ptr + rdata_raw_size
+        data_chars = 0xC0000040
+        uninit_size = 0
+    }
 
-    pdata_rva := data_rva + align_up(data_vsize, sect_align)
-    pdata_vsize := buf_len(pdata)
-    pdata_raw_size := align_up(pdata_vsize, file_align)
-    pdata_raw_ptr := data_raw_ptr + data_raw_size
-
-    reloc_rva := pdata_rva + align_up(pdata_vsize, sect_align)
-    reloc_vsize := buf_len(reloc)
-    reloc_raw_size := align_up(reloc_vsize, file_align)
-    reloc_raw_ptr := pdata_raw_ptr + pdata_raw_size
-
-    size_of_image := reloc_rva + align_up(reloc_vsize, sect_align)
+    size_of_image := data_rva + align_up(data_vsize, sect_align)
 
     // DOS Header (`e_lfanew = 0x40`)
     buf_push(pe_out, 77)
@@ -673,13 +605,13 @@ fn build_pe32_binary_v7(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBuf
     emit_zeros(pe_out, 0x3A)
     buf_push_u32(pe_out, 0x40)
 
-    // PE Signature + COFF File Header (5 sections: `.text`, `.rdata`, `.data`, `.pdata`, `.reloc`)
+    // PE Signature + COFF File Header (3 W^X sections: `.text` RX, `.rdata` RO, `.data`/`.bss` RW NX)
     buf_push(pe_out, 80)
     buf_push(pe_out, 69)
     buf_push(pe_out, 0)
     buf_push(pe_out, 0)
     buf_push_u16(pe_out, 0x8664)
-    buf_push_u16(pe_out, 5)
+    buf_push_u16(pe_out, 3)
     buf_push_u32(pe_out, 0x67350000)
     buf_push_u32(pe_out, 0)
     buf_push_u32(pe_out, 0)
@@ -695,8 +627,8 @@ fn build_pe32_binary_v7(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBuf
     buf_push(pe_out, 7)
     buf_push(pe_out, 0)
     buf_push_u32(pe_out, text_raw_size)
-    buf_push_u32(pe_out, rdata_raw_size + data_raw_size + pdata_raw_size + reloc_raw_size)
-    buf_push_u32(pe_out, 0)
+    buf_push_u32(pe_out, rdata_raw_size + data_raw_size)
+    buf_push_u32(pe_out, uninit_size)
     buf_push_u32(pe_out, pe_text_rva())
     buf_push_u32(pe_out, pe_text_rva())
     if is_dll {
@@ -738,12 +670,12 @@ fn build_pe32_binary_v7(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBuf
     buf_push_u32(pe_out, ibuf_get(info, 7))
     // [2] Resource
     buf_push_u64(pe_out, 0)
-    // [3] Exception (`.pdata`)
+    // [3] Exception (`.pdata` inside `.rdata`)
     buf_push_u32(pe_out, pdata_rva)
     buf_push_u32(pe_out, pdata_vsize)
     // [4] Certificate
     buf_push_u64(pe_out, 0)
-    // [5] Base Relocation (`.reloc`)
+    // [5] Base Relocation (inside `.rdata`)
     buf_push_u32(pe_out, reloc_rva)
     buf_push_u32(pe_out, reloc_vsize)
     // [6..11]
@@ -754,12 +686,10 @@ fn build_pe32_binary_v7(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBuf
     // [13..15]
     emit_zeros(pe_out, 3 * 8)
 
-    // Strict W^X Section Headers (`.text` RX, `.rdata`/`.pdata`/`.reloc` RO, `.data` RW NX!)
+    // Strict W^X Section Headers (`.text` RX, `.rdata` RO, `.data` RW NX)
     emit_section_header(pe_out, ".text",  text_vsize,  pe_text_rva(), text_raw_size,  text_raw_ptr,  0x60000020)
     emit_section_header(pe_out, ".rdata", rdata_vsize, rdata_rva,     rdata_raw_size, rdata_raw_ptr, 0x40000040)
-    emit_section_header(pe_out, ".data",  data_vsize,  data_rva,      data_raw_size,  data_raw_ptr,  0xC0000040)
-    emit_section_header(pe_out, ".pdata", pdata_vsize, pdata_rva,     pdata_raw_size, pdata_raw_ptr, 0x40000040)
-    emit_section_header(pe_out, ".reloc", reloc_vsize, reloc_rva,     reloc_raw_size, reloc_raw_ptr, 0x42000040)
+    emit_section_header(pe_out, ".data",  data_vsize,  data_rva,      data_raw_size,  data_raw_ptr,  data_chars)
 
     if buf_len(pe_out) < headers_size {
         emit_zeros(pe_out, headers_size - buf_len(pe_out))
@@ -767,12 +697,16 @@ fn build_pe32_binary_v7(text_code: ByteBuf, shield_len: i64, rdata_full: ByteBuf
 
     append_padded_section(pe_out, text_code, text_raw_size)
     append_padded_section(pe_out, rdata_full, rdata_raw_size)
-    append_padded_section(pe_out, data_sec, data_raw_size)
-    append_padded_section(pe_out, pdata, pdata_raw_size)
-    append_padded_section(pe_out, reloc, reloc_raw_size)
-
-    buf_free(move pdata)
-    buf_free(move reloc)
+    if data_raw_size > 0 {
+        mut di := 0
+        while di < nz_data {
+            buf_push(pe_out, buf_get(data_sec, di))
+            di += 1
+        }
+        if data_raw_size > nz_data {
+            emit_zeros(pe_out, data_raw_size - nz_data)
+        }
+    }
 }
 
 // --- Direct Win64 COFF `.obj` and `!<arch>\n` `.lib` Static Linker (`--link-lib`) ---

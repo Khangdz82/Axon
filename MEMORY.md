@@ -1,120 +1,129 @@
-# MEMORY.md — Persistent Architecture, Compiler, Perceus & Stdlib Reference (`axc` v1.1.1)
+# MEMORY.md — Persistent Architecture, Compiler, `AxIR`, Perceus & Stdlib Reference (`axc` v1.2.0)
 
-> Canonical engineering memory bank for **Humans** and **AI Coding Agents** working on the Axon compiler (`compiler_ax/`), standard library (`std/`), desktop UI engine, and native applications.
+> Canonical engineering memory bank for **Humans** and **AI Coding Agents** working on the Axon compiler (`compiler_ax/`), standard library (`std/`), `axon-anything` porting suite, and native applications.
 
 ---
 
 ## 1. Golden Project Invariants
 
-1. **100% Pure Axon Self-Hosting:** Every compiler pass (`compiler_ax/*.ax`, `18` files, `37,570` lines) and standard library module (`std/*.ax`, `103` files, `39,719` lines) is written in pure `.ax` with zero C/C++/Rust/LLVM/Python runtime or build dependencies.
+1. **100% Pure Axon Self-Hosting:** Every compiler pass ([`compiler_ax/*.ax`](file:///c:/Users/Admin/Downloads/Languague/compiler_ax) — **`19` files, `40,878` LOC**) and standard library module ([`std/*.ax`](file:///c:/Users/Admin/Downloads/Languague/std) — **`115` files, `48,817` LOC**) is written in pure `.ax` with zero C/C++/Rust/LLVM/Python runtime or build dependencies and **zero build/run temp garbage** (`0` `.o`/`.obj`/`target/` or leaked `.axon_run_*` files).
 2. **Deterministic 3-Stage Bootstrap Gate:** Any edit to `compiler_ax/*.ax` MUST pass:
-   - `bin/axc.exe build compiler_ax/main.ax -o axc_s1.exe`
-   - `axc_s1.exe build compiler_ax/main.ax -o axc_s2.exe`
-   - `axc_s2.exe build compiler_ax/main.ax -o axc_s3.exe`
-   - `SHA256(axc_s2.exe) == SHA256(axc_s3.exe)` (`2,357,248` bytes; current verified hash: `D6064066AD2600074A31C52158E73BE2BFA09761B56BD164475F4C7C6DE01A96`).
-3. **Full Regression Gate:** `76/76` `tests/pass/*.ax` + `37/37` `tests/fail_compile/*.ax` must pass before promoting changes.
+   ```powershell
+   .\bin\axc.exe build compiler_ax/main.ax -o axc_s1.exe
+   .\axc_s1.exe build compiler_ax/main.ax -o axc_s2.exe
+   .\axc_s2.exe build compiler_ax/main.ax -o axc_s3.exe
+   ```
+   - Verified `SHA256(axc_s2.exe) == SHA256(axc_s3.exe) == 129366ABCC3124DFBC09D3794916178F5000B6A9C3B2792902BE5380A2E52300` (`2,639,872` bytes `win-x64`).
+   - Cross-compiled outputs: `bin/axc-linux-x64` (`2,591,032` bytes), `bin/axc-macos-arm64` (`1,474,624` bytes).
+3. **Full Regression Gate:** **`77/77`** [`tests/pass/*.ax`](file:///c:/Users/Admin/Downloads/Languague/tests/pass) + **`37/37`** [`tests/fail_compile/*.ax`](file:///c:/Users/Admin/Downloads/Languague/tests/fail_compile) + `--shield` / `--simd=scalar` / `-O3` / `-Os` / `wasm32` WASI suites must pass before promoting changes.
 
 ---
 
-## 2. Compiler Architecture (`compiler_ax/` — 18 Modules)
+## 2. Compiler Architecture (`compiler_ax/` — 19 Modules)
 
 | Module | Responsibility |
 | :--- | :--- |
 | `tokens_ast.ax` | Token IDs (`tk_*`), AST node kinds (`nk_*`, `100..165`), operator IDs (`op_*`, `aop_*`), type tags (`ty_*`), target IDs (`tgt_*`, `0..10`), `ushr64`/`popcnt64`/span packing |
 | `lexer.ax` | Single-pass UTF-8 / indent-tolerant / brace-delimited tokenizer, f-string interpolation, hex/bin/oct/float/dec literals |
-| `parser.ax` | Recursive-descent + Pratt precedence parser (max recursion depth `256` -> `E0020` guard against stack overflow) |
+| `parser.ax` | Recursive-descent + Pratt precedence parser (max recursion depth `256` -> `E0020` guard) |
 | `c_import.ax` | Built-in `.h` C header parser for `@cimport` zero-wrapper C struct/function binding |
 | `generics.ax` | Zero-cost generic struct/function (`Box[T]`, `Option[T]`, `Pair[A,B]`) AST cloner & monomorphizer |
 | `comptime.ax` | Compile-time constant evaluator, `comptime_assert` (`E0604`), and LUT synthesizer |
 | `sema_perceus.ax` | Type checker, Perceus linear ownership (`E0201`–`E0204`), `&T` escape blocker (`E0101`–`E0102`), immutability (`E0301`) |
 | `sema_effects.ax` | Capability attenuation (`E0501`), taint flow (`E0502`), strict `unsafe` boundary (`E0503`), `@no_alloc` (`E0601`), symbolic tensor shapes (`E0602`) |
+| `ir_opt.ax` | **`AxIR` Mid-Level Optimizer (`-O0\|-O1\|-O2\|-O3\|-Os` in `sym[35]`):** BFS Call-Graph `DCE-0`, frequency-weighted bottom-up auto-inliner, `SRoA`, Shield-safe `ConstProp`/`GVN`/`CSE`, dead-branch pruning, and trap-free `LICM` |
 | `diagnostics.ax` | Human & structured `--json` error formatter (`E0001..E0604`), static advisor (`axc advise`), source snippet renderer |
 | `codegen_runtime.ax` | Multi-OS x86-64 emitters, runtime helpers (`h_alloc_mem`, `h_free_mem`, `h_str_eq`, `h_sec_trap` PIE stack backtrace, `h_shield_verify`), `.rdata` interning, `.data` layout |
-| `codegen_calls.ax` | Intrinsics (`ptr_read_*`, `ptr_write_*`, `buf_*`, `ibuf_*`, `mem_stride_zero_u8`, `str_eq`), 16-arg Win64/SysV `c_call_v` FFI, SIMD `math3d`, AI tensor/pool intrinsics |
-| `codegen_x86_64.ax` | Function prolog/epilog, GPR/XMM local promotion, scalar/CMOV peepholes, SoA `Table[T]` SSE2/AVX2/AVX-512 codegen, `par_for` work-stealing, `8×i64` & `64B VPSADBW` AVX2 loop auto-vectorizers |
-| `codegen_arm64_rv64.ax` | Native AArch64 (`linux-arm64`, `macos-arm64` + NEON) and `RV64GC` (`freestanding-riscv64`) machine-code backends |
-| `backend_gpu_wasm.ax` | Direct WebAssembly (`wasm32` WASI + `0xFD` SIMD128), Khronos `SPIR-V 1.6`, and NVIDIA `PTX 8.0` GPU emitters |
-| `linker_pe.ax` | In-memory Win64 `PE32+` `.exe`/`.dll` + COFF `.obj`/`.lib` linker (unlimited dynamic DLL `.idata` IAT/ILT, `.edata`, `.pdata` SEH unwind, strict `W^X`) |
+| `codegen_calls.ax` | Intrinsics (`ptr_read_*`, `ptr_write_*`, `buf_*`, `ibuf_*`, `str_eq`), 16-arg Win64/SysV `c_call_v` FFI, SIMD `math3d`, AI tensor/pool intrinsics |
+| `codegen_x86_64.ax` | Function prolog/epilog, GPR/XMM promotion, `MagicDiv` signed 64-bit `IMUL` lowering, `RCE` loop bounds elimination, SoA `Table[T]` & `8×i64` / `8×f64` AVX2+FMA3 (`VFMADD231PD`) / `64B VPSADBW` vectorizers, `-Os` unroll gate |
+| `codegen_arm64_rv64.ax` | Native AArch64 (`linux-arm64`, `macos-arm64` + 128-bit `NEON` `ADD V0.2D` + helper/fn DCE) and `RV64GC` (`freestanding-riscv64` + DCE) backends |
+| `backend_gpu_wasm.ax` | Direct WebAssembly (`wasm32` WASI + `0xFD SIMD128` `i64x2.add` vectorizer), Khronos `SPIR-V 1.6`, and NVIDIA `PTX 8.0` GPU emitters |
+| `linker_pe.ax` | In-memory Win64 `PE32+` `.exe`/`.dll` + COFF `.obj`/`.lib` linker (unlimited `.idata` IAT, `.edata`, `.pdata` SEH, strict `W^X`) |
 | `linker_unix_bare.ax` | Linux/FreeBSD `ELF64`, Apple `Mach-O 64` (16 KB page-aligned), and `Multiboot2` Unikernel linkers |
-| `pkg_mcp.ax` | Package manager (`axon.toml`/`axon.lock`) & built-in MCP JSON-RPC server (`axc mcp`: `axon_check`, `axon_docs`, `axon_spec`, `axon_fix`) |
-| `main.ax` | Top-level CLI driver (`check`, `run`, `build`, `test`, `advise`, `fmt`, `init`, `mcp`), transitive module loader, and `.map` symbol emitter |
+| `pkg_mcp.ax` | Package manager (`axon.toml`/`axon.lock`), `axc fmt`/`advise`/`lsp`, and MCP JSON-RPC server (`axon_check`, `axon_docs`, `axon_port_guide`, `axon_fix`, `axon_spec`, etc.) |
+| `main.ax` | Top-level CLI driver (`check`, `run`, `build`, `test`, `mcp`, `repl`), `--` runtime arg forwarding, auto-cleaned `.axon_run_<tag>.exe`, `.map` symbol emitter |
 
 ---
 
-## 3. Memory Model: Perceus 0-GC + 8-Class Slab Allocator
+## 3. `AxIR` Optimization Pipeline & Compiler State Layout
 
-### 3.1 Perceus Ownership Rules (Compile-Time Enforced)
-- **Owned linear types:** `ByteBuf`, `IntBuf`, `Table[T]`, and any `struct` containing an owned field (e.g., `DynIntVec`, `StrVec`, `DynMap`, `StrMap`, `IntDeque`, `BitSet`, `Graph`, `UiDoc`).
-- **Scope exit:** Every owned variable MUST either be consumed via `move` (e.g., `buf_free(move b)`, `buf_to_owned_str(move b)`, `smap_free(move m)`) or returned (`return b`).
-- **Loop move ban (`E0203`):** Moving an outer owned variable inside a `while`/`for` loop is rejected at compile time (prevents use-after-free on iteration 2).
-- **Second-class borrows (`E0101`/`E0102`):** `&T` references cannot be stored inside structs or returned from functions, guaranteeing zero dangling pointers without Rust lifetime annotations.
-
-### 3.2 Native Runtime Slab Allocator (`codegen_runtime.ax`)
-- **8 size classes (`tag = 1..8`):** `64 B`, `128 B`, `256 B`, `512 B`, `1 KB`, `2 KB`, `4 KB`, `64 KB` (up to `64` cached blocks per class in `.data` freelists; larger allocations route directly to `HeapAlloc` / `mmap`).
-- **Metadata header (64-byte aligned user pointer `RDX`):**
-  - `[RDX - 8]`: raw OS base pointer (for `HeapFree`)
-  - `[RDX - 16]`: slab `class_tag` (`1..8`, or `0` for direct OS block)
-  - `[RDX - 24]`: live canary (`1` = allocated, `0` = freed -> traps immediately on double-free or unaligned free!).
-- **Zero-LOCK single-thread fastpath (`data_off_mt_active = 0x104`):**
-  - `mt_active` starts at `0` (ordinary `MOV`/`CMP` slab pop/push -> `1 ms` for `200,000 × 4 KB` alloc+free!).
-  - Set to `1` BEFORE `CreateThread` / `clone` in `par_for`, `ai_pool`, and `spawn`, automatically activating `XCHG` acquire / `MOV` release spinlocks (`data_off_slab_lock = 0x100`) for thread-safe multi-core allocation.
-- **Important Pitfall for `unsafe` Raw Buffers:** Blocks popped from the slab freelist reuse prior memory; `buf_new`/`ibuf_new` track initialized `len` (`[ptr + 0]`), whereas raw `mem_alloc_aligned` callers that rely on zeroed memory (such as radix-sort histograms!) MUST explicitly call `mem_set(ptr, 0, bytes)`.
-
----
-
-## 4. x86-64 Codegen & AVX2 Register Conventions
-
-- **Promoted Local GPRs (`pr = 1..10`):**
-  - `1=RBX`, `2=R12`, `3=R13`, `4=R14`, `5=R15`, `6=RSI`, `7=RDI`, `8=R10`, `9=R11`, `10=R8`.
-  - **`RAX`, `RCX`, `RDX`, `R9` are NEVER assigned to promoted locals!** Any inline intrinsic or loop kernel using ONLY `{RAX, RCX, RDX, R9}` is guaranteed zero promoted-GPR collisions.
-- **Promoted Local `f64` XMMs (`fr = 1..8`):**
-  - Assigned to `XMM6..XMM13` (which are callee-saved on Win64!).
-  - **`XMM0..XMM5` (`YMM0..YMM5`) are caller-saved volatile on BOTH Win64 and SysV!**
-  - Any AVX2 kernel using `YMM6..YMM15` (such as `try_emit_avx2_nbody_while_ax` or 2x-interleaved `8×i64` `try_emit_avx2_for_range_ax`) MUST save/restore `XMM6..XMM15` in RBP stack slots around the loop, and MUST emit **`VZEROUPPER` (`C5 F8 77`)** on every exit from 256-bit `YMM` state.
-- **`.rdata` Intern Record Tags (`cg.interns`, stride 4 `[tag, f1, f2, roff]`):**
-  - `1`: Pool string slice `(soff, slen)`
-  - `3`: External DLL import symbol
-  - `4`: Comptime LUT
-  - `5`: Scalar `u64`/`f64` constant (`align16` optional)
-  - `7`: 32-byte aligned `4×u64` broadcast vector `[bits, bits, bits, bits]` (`cg_intern_u64x4_rdata`)
-  - `8`: 32-byte aligned `4×u64` linear sequence `[base, base+step, base+2*step, base+3*step]` (`cg_intern_vec4_seq_rdata`)
-- **Active compiler loop/string fastpaths:**
-  1. `try_emit_fast_rec_fn_ax`: Leaf shrink-wraps `fib`-like binary recursion up to `n <= 7` (`LEA` base formulas, `0` stack frames for `n <= 7`, `--shield` `JO` preserved).
-  2. `try_emit_avx2_u8_sum_while_ax` & `nk_for_range` `u8` sum: `64 B/iter` `2 × VMOVDQU + 2 × VPSADBW + 2 × VPADDQ` + scalar tail.
-  3. `try_emit_avx2_for_range_ax`: `8×i64` (`2×YMM` interleaved) auto-vectorizer for `for i in start..end` supporting both direct `iv` expressions and `z = z +% C0` linear recurrences (`+`, `-`, `* C`, pow2 `/` & `%`, `<<`, exact 64-bit signed `>>`, `ushr64`, `&`, `|`, `^`).
-  4. `h_str_eq`: Inline `len`/`ptr` check at call site + single-shot dual-YMM `32..64 B` `VPCMPEQB + VPAND + VPMOVMSKB` + `>64 B` 32B/iter loop + overlapped tail.
+- **Optimization Flags (`sym[35]` via `opt_parse_flag`):**
+  - `0` = `-O0` (unoptimized fast debug)
+  - `1` = `-O1`
+  - `2` = `-O2` (default balanced production)
+  - `3` = `-O3` (aggressive inlining + unrolling + AVX2/NEON/SIMD128)
+  - `4` = `-Os` / `-Oz` (minimum binary size; disables loop unrolling in `codegen_x86_64.ax`)
+- **5 `AxIR` Passes (`run_axir_passes` in `ir_opt.ax`, single reusable `IntBuf` arena):**
+  1. `ir_build_callgraph`: Whole-program BFS reachability (`DCE-0`) + exact call-site counts + method-target flags.
+  2. `ir_pass_auto_inline`: Call-frequency-weighted bottom-up cost-model auto-inliner (`ccnt > 24 -> cost <= 3`, `ccnt > 8 -> cost <= 6`, `ccnt > 3 -> cost <= 10`, single-caller `ccnt == 1 -> cost <= 26`).
+  3. `ir_pass_sroa_block`: Scalar Replacement of Aggregates (`SRoA`) for non-escaping 1..4-field scalar structs (`Complex`, `Rational`, `Vec3`, `Pair`).
+  4. `ir_fold_gvn_block`: Shield-safe constant folding, SSA constant propagation, strength reduction (`x ** 2 -> x * x`, exact power-of-2 float reciprocal `x / 2.0 -> x * 0.5`), dead-branch pruning, and dominance-sound `GVN`/`CSE`.
+  5. `ir_pass_licm_block`: Trap-free Loop-Invariant Code Motion hoisting pure invariant locals out of `while`/`for`.
+  - **Capacity Invariant:** `ir_collect_muts_stmt` uses `32768`-slot declaration/mut buffers (`16,384` locals) to safely handle giant compiler functions like `emit_expr_ax`.
+- **`MagicDiv` & `RCE` (`codegen_x86_64.ax`):**
+  - `magic64_signed_div` lowers signed 64-bit `/` and `%` by any positive constant `1..2^62` (`x / 10`, `x % 1000000007`) to 4-cycle `IMUL` + `SAR`.
+  - `cg.state[cg_fpromo_base(cg) + 140..143]` holds `RCE` state (`rce_iv_slot`, `rce_buf_slot1`, `rce_buf_slot2`, `last_nonneg_iv_slot`, `state_need = f_cnt + 432`), stripping per-iteration bounds checks on read-only `ibuf_get`/`buf_get` inside `0..len` loops.
 
 ---
 
-## 5. Critical Axon Syntax & Pitfalls (Never Forget!)
+## 4. Memory Model: Perceus 0-GC + 8-Class Slab Allocator
 
-1. **Reserved Keywords:** `fn`, `mut`, `move`, `if`, `else`, `while`, `for`, `in`, `par_for`, `return`, `break`, `continue`, **`pass`**, `struct`, `interface`, `use`, `as`, `and`, `or`, `not`, `true`, `false`, `ok`, `err`, `spawn`, `await`, `comptime`, `unsafe`, `isolated`.
-   - **Pitfall:** NEVER name a variable or parameter `pass` (it is `tk_pass`, Python-style no-op statement -> `E0020`!). Use `bp`, `step`, or `round`.
-2. **Boolean Operators:** Always write `and`, `or`, `not` (NEVER `&&`, `||`, `!`).
-3. **If-Expressions:** `x := if cond { a } else { b }` requires braces `{ ... }` on BOTH branches; for chained conditions in expression position write `else { if c2 { b } else { d } }` (statement `if ... else if ...` works without outer braces).
-4. **Error Unions (`T ! i64`):**
-   - Return `ok(v)` or `err(code)`.
-   - Unwrap with `v := call() or return`, `v := call() or return -1`, or `v := call() or fallback_expr` (NEVER `or { block }`).
-5. **Wrapping vs Checked Arithmetic:**
-   - Standard `+`, `-`, `*` trap on signed 64-bit overflow when compiled with `--shield` (including `INT64_MIN - 1`!).
-   - For intentional modular/hash/PRNG wrap-around (`SplitMix64`, `FNV-1a`, `INT64_MIN -% 1`), ALWAYS use `+%`, `-%`, `*%` so code runs identically under both normal and `--shield` builds!
-6. **Struct Construction & Named Args:** Use `=` (NEVER `:`): `Url(scheme = "https", userinfo = "", host = "example.com", port = 443, path = "/", query = "", fragment = "")`.
-7. **Mutable & Move Call Sites:** Caller MUST annotate `mut` and `move` explicitly (`dvec_push(mut v, 10)`, `dvec_free(move v)`).
+- **Owned Linear Types:** `ByteBuf`, `IntBuf`, `Table[T]`, `MatF64`, `CsrMat`, `BigInt`, `DataFrame`, `KvStore`, and any `struct` containing an owned field (`DynIntVec`, `StrVec`, `DynMap`, `StrMap`, `IntDeque`, `BitSet`, `Graph`, `UiDoc`, `RandomForest`, `GbdtModel`).
+- **Scope Exit & Loop Ban (`E0203`):** Every owned variable MUST be consumed via `move` (`buf_free(move b)`, `mat_free(move m)`, `df_free(move df)`) or returned. Moving an outer owned variable inside a `while`/`for` loop is rejected (`E0203`), and `&T` references cannot be stored in structs or returned (`E0101`/`E0102`).
+- **8-Class Slab Allocator (`codegen_runtime.ax`):** `64 B`, `128 B`, `256 B`, `512 B`, `1 KB`, `2 KB`, `4 KB`, `64 KB` (`data_off_mt_active = 0x104` skips `LOCK` on single-threaded paths; double-free canary at `[RDX - 24]`). Raw `mem_alloc_aligned` callers requiring zeroed memory MUST call `mem_set(ptr, 0, bytes)`.
 
 ---
 
-## 6. Standard Verification Commands
+## 5. x86-64 Codegen & AVX2 Register Conventions
+
+- **Promoted Local GPRs (`pr = 1..10`):** `RBX`, `R12`, `R13`, `R14`, `R15`, `RSI`, `RDI`, `R10`, `R11`, `R8`.
+  - **`RAX`, `RCX`, `RDX`, `R9` are NEVER assigned to promoted locals.**
+- **Promoted Local `f64` XMMs (`fr = 1..8`):** Assigned to callee-saved `XMM6..XMM13` (Win64). `XMM0..XMM5` (`YMM0..YMM5`) are caller-saved volatile on both Win64 and SysV. Any kernel touching `YMM6..YMM15` MUST save/restore them around the loop and emit `VZEROUPPER` (`C5 F8 77`).
+- **Active Vectorizers & Fastpaths:** `try_emit_fast_rec_fn_ax` (`n <= 7`), `try_emit_avx2_u8_sum_while_ax` (`64 B/iter` `VPSADBW`), `try_emit_avx2_for_range_ax` (`8×i64`), `try_emit_avx2_f64_dot_sum_while_ax` (`8×f64` `VFMADD231PD` / `VADDPD`), `try_emit_avx2_mandel_while_ax` (`4×f64`), `h_ai_gemm_f32` (`4×16` AVX2+FMA3), `h_str_eq` (`VPCMPEQB`), plus ARM64 NEON (`2×i64`) and WASM SIMD128 (`i64x2.add`).
+
+---
+
+## 6. `std/` 115-Module Ecosystem & Symbol Namespace Rules
+
+Because `load_and_merge_program_v7` merges imported modules into a single flat namespace, **new modules MUST use module-prefixed helper names** (`la_*`, `num_*`, `prob_*`, `bi_*`, `rat_*`, `df_*`, `stats_*`, `ml_*`, `os_auth_*`, `auth_*`, `redis_*`, `kv_*`, `dbp_*`) to guarantee `0` symbol collisions when all 115 modules are imported together.
+
+Key `v1.2.0` additions:
+- **Math:** `linalg.ax`, `numeric.ax` (Reverse-Communication `BrentSolver`/`Rk4State`/`LbfgsState` + `Simplex`), `prob.ax`, `bigint.ax` (base-$10^9$ limbs).
+- **Data Science:** `dataframe.ax` (CSV/JSONL/`AXDF` IPC), `stats.ax` (Welford/Quickselect/`OLS`/`Holt-Winters`), `ml.ax` (Flat-Arena `CartTree`/`RandomForest`/`GBDT`/`PCA`/`Lasso`/`KMeans++`/`DBSCAN`).
+- **OS Auth & Security:** `os_auth.ax` (`std::ffi` Win32 `bcrypt`/`advapi32`/`crypt32` + Unix `libc` with graceful static fallback), `auth.ax` (RFC 9106 `Argon2id` `v=19`, `BLAKE2b`, `PBKDF2`, `HKDF`, `TOTP`, `PKCE`, `RBAC`).
+- **Databases:** `redis.ax`, `kv_acid.ax`, `db_pool.ax`, plus `postgres.ax` (`SCRAM-SHA-256`) and `sqlite.ax` (`f64`/`blob`/`null`/`col_type`).
+
+---
+
+## 7. Critical Axon Syntax & Pitfalls (Never Forget!)
+
+1. **Reserved Keywords:** NEVER name a variable `pass` (`tk_pass` -> `E0020`). Always use `and`, `or`, `not` (NEVER `&&`, `||`, `!`).
+2. **Float Literals:** Write decimal floats (`0.000000000001` or `num_pow2_int(-40)`), NEVER scientific notation `1e-12` (`E0020`).
+3. **Hex 64-bit Constants with Bit 63 Set:** Write `(0xbb67ae85 << 32) | 0x84caa73b` or negative signed `i64` rather than unsigned literals `>= 2^63` in expressions if MSB precision matters.
+4. **If-Expressions:** `x := if cond { a } else { b }` requires `{ ... }` on BOTH branches; for chained expressions, write `else { if c2 { b } else { d } }` or use statement `if ... else if ...`.
+5. **Error Unions (`T ! i64`):** Unwrap with `v := call() or return`, `v := call() or return -1`, or `v := call() or fallback_expr` (NEVER `or { block }`).
+6. **Wrapping vs `--shield` Arithmetic:** Use `+%`, `-%`, `*%`, and `ushr64` for hashes, PRNGs, Argon2id/BLAKE2b, and modular wrap-around.
+7. **Heap Strings from `StrVec`/`StrMap`:** When returning a slice backed by a mutable `StrVec` or `StrMap` (`svec_get`, `smap_get_str`) across mutations or moves, materialize an independent owned string via `"" + svec_get(...)`.
+8. **Struct Construction & Call Sites:** Use `=` for named fields (`Point(x = 1, y = 2)`), and annotate `mut` and `move` explicitly at call sites.
+
+---
+
+## 8. Standard Verification Commands
 
 ```powershell
 # 1. Fast static JSON check (< 35 ms)
 .\bin\axc.exe check --json path/to/file.ax
 
-# 2. Hostile v1.2 stdlib + AVX2 differential + security suite (AVX2, --shield, and --simd=scalar)
-.\bin\axc.exe run tests/pass/53_stdlib_v2_and_avx2_hostile.ax
-.\bin\axc.exe run tests/pass/52_hostile_zero_trust_suite.ax
-.\bin\axc.exe run tests/pass/51_desktop_ui_v2_and_sec.ax
+# 2. Comprehensive v1.2.0 suite across -O2, -O3, -Os, --shield, and --simd=scalar
+.\bin\axc.exe run tests/pass/54_v1_2_ds_math_auth_db_ir.ax
+.\bin\axc.exe run --shield tests/pass/54_v1_2_ds_math_auth_db_ir.ax
+.\bin\axc.exe run --simd=scalar tests/pass/54_v1_2_ds_math_auth_db_ir.ax
 
-# 3. Full regression sweep (76 pass + 37 fail_compile)
+# 3. `axon-anything` porting harness (Analyze + Gate + Size Matrix)
+.\bin\axc.exe run .agents/skills/axon-anything/scripts/axon_anything.ax -- analyze std/ml.ax
+.\bin\axc.exe run .agents/skills/axon-anything/scripts/axon_anything.ax -- gate tests/pass/54_v1_2_ds_math_auth_db_ir.ax
+
+# 4. Full regression sweep (77 pass + 37 fail_compile)
 Get-ChildItem tests\pass\*.ax | ForEach-Object { .\bin\axc.exe run $_.FullName }
 Get-ChildItem tests\fail_compile\*.ax | ForEach-Object { .\bin\axc.exe check $_.FullName }
 ```

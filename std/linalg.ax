@@ -1,0 +1,1164 @@
+// Axon Standard Library — Double-Precision Dense & Sparse Linear Algebra (`std/linalg.ax`)
+// 100% Pure Axon, Perceus 0-GC, AVX2+FMA3 Auto-Vectorized Inner Loops (`VFMADD231PD` / `VADDPD`).
+// Provides `MatF64` (BLAS-1/2/3, LU with partial pivoting, Cholesky, Householder QR, Least-Squares,
+// Symmetric Jacobi Eigensolver, One-Sided Hestenes-Jacobi SVD, Inverse, Determinant, Rank, Condition)
+// and `CsrMat` (Compressed Sparse Row SpMV, Conjugate Gradient `csr_cg_solve`, `csr_bicgstab_solve`).
+
+struct MatF64 {
+    ptr: i64
+    rows: i64
+    cols: i64
+}
+
+struct CsrMat {
+    rows: i64
+    cols: i64
+    nnz: i64
+    row_ptr: IntBuf
+    col_idx: IntBuf
+    vals_ptr: i64
+}
+
+fn la_abs(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mat_zeros(rows: i64, cols: i64) -> MatF64 {
+    if rows <= 0 or cols <= 0 or rows > 67108864 or cols > 67108864 {
+        return MatF64(0, 0, 0)
+    }
+    if cols > (134217728 / rows) {
+        return MatF64(0, 0, 0)
+    }
+    n := rows * cols
+    unsafe {
+        p := mem_alloc_aligned(n * 8 + 64)
+        if p == 0 { return MatF64(0, 0, 0) }
+        mem_set(p, 0, n * 8)
+        return MatF64(p, rows, cols)
+    }
+}
+
+fn mat_new(rows: i64, cols: i64, fill: f64 = 0.0) -> MatF64 {
+    m := mat_zeros(rows, cols)
+    if m.ptr == 0 or fill == 0.0 { return m }
+    n := rows * cols
+    p := m.ptr
+    mut i := 0
+    while i < n {
+        unsafe { ptr_write_f64(p, i, fill) }
+        i += 1
+    }
+    return m
+}
+
+fn mat_eye(n: i64) -> MatF64 {
+    m := mat_zeros(n, n)
+    if m.ptr == 0 { return m }
+    p := m.ptr
+    mut i := 0
+    while i < n {
+        unsafe { ptr_write_f64(p, i * n + i, 1.0) }
+        i += 1
+    }
+    return m
+}
+
+fn mat_free(move m: MatF64) {
+    if m.ptr != 0 {
+        unsafe { mem_free_aligned(m.ptr) }
+    }
+}
+
+fn mat_clone(a: MatF64) -> MatF64 {
+    if a.ptr == 0 or a.rows <= 0 or a.cols <= 0 { return MatF64(0, 0, 0) }
+    out := mat_zeros(a.rows, a.cols)
+    if out.ptr == 0 { return out }
+    n := a.rows * a.cols
+    unsafe { mem_copy(out.ptr, a.ptr, n * 8) }
+    return out
+}
+
+fn mat_get(m: MatF64, r: i64, c: i64) -> f64 {
+    if m.ptr == 0 or r < 0 or r >= m.rows or c < 0 or c >= m.cols { return 0.0 }
+    return unsafe { ptr_read_f64(m.ptr, r * m.cols + c) }
+}
+
+fn mat_set(m: MatF64, r: i64, c: i64, val: f64) {
+    if m.ptr == 0 or r < 0 or r >= m.rows or c < 0 or c >= m.cols { return }
+    unsafe { ptr_write_f64(m.ptr, r * m.cols + c, val) }
+}
+
+fn mat_add(a: MatF64, b: MatF64) -> MatF64 {
+    if a.ptr == 0 or b.ptr == 0 or a.rows != b.rows or a.cols != b.cols {
+        return MatF64(0, 0, 0)
+    }
+    out := mat_zeros(a.rows, a.cols)
+    if out.ptr == 0 { return out }
+    n := a.rows * a.cols
+    pa := a.ptr; pb := b.ptr; po := out.ptr
+    mut i := 0
+    while i < n {
+        unsafe { ptr_write_f64(po, i, ptr_read_f64(pa, i) + ptr_read_f64(pb, i)) }
+        i += 1
+    }
+    return out
+}
+
+fn mat_sub(a: MatF64, b: MatF64) -> MatF64 {
+    if a.ptr == 0 or b.ptr == 0 or a.rows != b.rows or a.cols != b.cols {
+        return MatF64(0, 0, 0)
+    }
+    out := mat_zeros(a.rows, a.cols)
+    if out.ptr == 0 { return out }
+    n := a.rows * a.cols
+    pa := a.ptr; pb := b.ptr; po := out.ptr
+    mut i := 0
+    while i < n {
+        unsafe { ptr_write_f64(po, i, ptr_read_f64(pa, i) - ptr_read_f64(pb, i)) }
+        i += 1
+    }
+    return out
+}
+
+fn mat_scale(a: MatF64, alpha: f64) -> MatF64 {
+    if a.ptr == 0 { return MatF64(0, 0, 0) }
+    out := mat_zeros(a.rows, a.cols)
+    if out.ptr == 0 { return out }
+    n := a.rows * a.cols
+    pa := a.ptr; po := out.ptr
+    mut i := 0
+    while i < n {
+        unsafe { ptr_write_f64(po, i, ptr_read_f64(pa, i) * alpha) }
+        i += 1
+    }
+    return out
+}
+
+fn mat_transpose(a: MatF64) -> MatF64 {
+    if a.ptr == 0 { return MatF64(0, 0, 0) }
+    out := mat_zeros(a.cols, a.rows)
+    if out.ptr == 0 { return out }
+    rows := a.rows; cols := a.cols
+    pa := a.ptr; po := out.ptr
+    mut r := 0
+    while r < rows {
+        roff := r * cols
+        mut c := 0
+        while c < cols {
+            unsafe { ptr_write_f64(po, c * rows + r, ptr_read_f64(pa, roff + c)) }
+            c += 1
+        }
+        r += 1
+    }
+    return out
+}
+
+fn mat_trace(a: MatF64) -> f64 {
+    if a.ptr == 0 { return 0.0 }
+    n := if a.rows < a.cols { a.rows } else { a.cols }
+    cols := a.cols
+    pa := a.ptr
+    mut tr := 0.0
+    mut i := 0
+    while i < n {
+        tr += unsafe { ptr_read_f64(pa, i * cols + i) }
+        i += 1
+    }
+    return tr
+}
+
+fn mat_frobenius_norm(a: MatF64) -> f64 {
+    if a.ptr == 0 { return 0.0 }
+    n := a.rows * a.cols
+    pa := a.ptr
+    mut sum_sq := 0.0
+    mut i := 0
+    while i < n {
+        sum_sq += unsafe { ptr_read_f64(pa, i) } * unsafe { ptr_read_f64(pa, i) }
+        i += 1
+    }
+    return sqrt_f64(sum_sq)
+}
+
+fn mat_inf_norm(a: MatF64) -> f64 {
+    if a.ptr == 0 { return 0.0 }
+    rows := a.rows; cols := a.cols; pa := a.ptr
+    mut best := 0.0
+    mut r := 0
+    while r < rows {
+        roff := r * cols
+        mut rsum := 0.0
+        mut c := 0
+        while c < cols {
+            rsum += la_abs(unsafe { ptr_read_f64(pa, roff + c) })
+            c += 1
+        }
+        if rsum > best { best = rsum }
+        r += 1
+    }
+    return best
+}
+
+// AVX2+FMA3 auto-vectorized (`try_emit_avx2_f64_dot_sum_while_ax`) vector dot product
+fn la_dot_offset(pa: i64, o1: i64, pb: i64, o2: i64, n: i64) -> f64 {
+    mut acc := 0.0
+    mut j := 0
+    while j < n {
+        acc += unsafe { ptr_read_f64(pa, o1 + j) } * unsafe { ptr_read_f64(pb, o2 + j) }
+        j += 1
+    }
+    return acc
+}
+
+// Matrix-Vector Multiply (`y = A * x`, where `x` has `cols` elements; returns `[rows x 1]` `MatF64`)
+fn mat_dot_vec(a: MatF64, x: MatF64) -> MatF64 {
+    if a.ptr == 0 or x.ptr == 0 or a.cols != x.rows * x.cols {
+        return MatF64(0, 0, 0)
+    }
+    rows := a.rows; cols := a.cols
+    y := mat_zeros(rows, 1)
+    if y.ptr == 0 { return y }
+    pa := a.ptr; px := x.ptr; py := y.ptr
+    mut r := 0
+    while r < rows {
+        s := la_dot_offset(pa, r * cols, px, 0, cols)
+        unsafe { ptr_write_f64(py, r, s) }
+        r += 1
+    }
+    return y
+}
+
+// Cache-friendly `ikj` Matrix Multiply (`C = A * B`): inner loop triggers 8-wide AVX2+FMA3 `try_emit_avx2_f64_axpy_while_ax`!
+fn mat_mul(a: MatF64, b: MatF64) -> MatF64 {
+    if a.ptr == 0 or b.ptr == 0 or a.cols != b.rows {
+        return MatF64(0, 0, 0)
+    }
+    m := a.rows; k_dim := a.cols; n := b.cols
+    out := mat_zeros(m, n)
+    if out.ptr == 0 { return out }
+    pa := a.ptr; pb := b.ptr; pc := out.ptr
+    mut i := 0
+    while i < m {
+        o1 := i * n
+        ia := i * k_dim
+        mut k := 0
+        while k < k_dim {
+            aik := unsafe { ptr_read_f64(pa, ia + k) }
+            if aik != 0.0 {
+                o2 := k * n
+                mut j := 0
+                while j < n {
+                    cv := unsafe { ptr_read_f64(pc, o1 + j) }
+                    bv := unsafe { ptr_read_f64(pb, o2 + j) }
+                    unsafe { ptr_write_f64(pc, o1 + j, cv + aik * bv) }
+                    j += 1
+                }
+            }
+            k += 1
+        }
+        i += 1
+    }
+    return out
+}
+
+// In-place LU decomposition with partial pivoting; writes pivot indices into `piv` (`ibuf_len == n`), returns sign (`+1`, `-1`, or `0` if singular).
+fn la_lu_factor_inplace(lu: MatF64, piv: IntBuf, tol: f64 = 0.00000000000001) -> i64 {
+    n := lu.rows
+    if lu.ptr == 0 or n <= 0 or lu.cols != n { return 0 }
+    p := lu.ptr
+    ibuf_truncate(piv, 0)
+    mut i := 0
+    while i < n { ibuf_push(piv, i); i += 1 }
+    mut sign := 1
+    mut k := 0
+    while k < n {
+        mut max_r := k
+        mut max_v := la_abs(unsafe { ptr_read_f64(p, k * n + k) })
+        mut r := k + 1
+        while r < n {
+            av := la_abs(unsafe { ptr_read_f64(p, r * n + k) })
+            if av > max_v {
+                max_v = av
+                max_r = r
+            }
+            r += 1
+        }
+        if max_v <= tol { return 0 }
+        if max_r != k {
+            // Swap rows `k` and `max_r`
+            mut c := 0
+            while c < n {
+                tk := unsafe { ptr_read_f64(p, k * n + c) }
+                tm := unsafe { ptr_read_f64(p, max_r * n + c) }
+                unsafe {
+                    ptr_write_f64(p, k * n + c, tm)
+                    ptr_write_f64(p, max_r * n + c, tk)
+                }
+                c += 1
+            }
+            tp := ibuf_get(piv, k)
+            ibuf_set(piv, k, ibuf_get(piv, max_r))
+            ibuf_set(piv, max_r, tp)
+            sign = 0 - sign
+        }
+        inv_diag := 1.0 / unsafe { ptr_read_f64(p, k * n + k) }
+        i = k + 1
+        while i < n {
+            lik := unsafe { ptr_read_f64(p, i * n + k) } * inv_diag
+            unsafe { ptr_write_f64(p, i * n + k, lik) }
+            if lik != 0.0 {
+                o1 := i * n
+                o2 := k * n
+                neg_lik := 0.0 - lik
+                mut j := k + 1
+                while j < n {
+                    cv := unsafe { ptr_read_f64(p, o1 + j) }
+                    bv := unsafe { ptr_read_f64(p, o2 + j) }
+                    unsafe { ptr_write_f64(p, o1 + j, cv + neg_lik * bv) }
+                    j += 1
+                }
+            }
+            i += 1
+        }
+        k += 1
+    }
+    return sign
+}
+
+// Solves `A * X = B` (`A` is `[n x n]`, `B` is `[n x nrhs]`) via partial-pivoting LU.
+fn lu_solve(a: MatF64, b: MatF64) -> MatF64 ! i64 {
+    n := a.rows
+    if a.ptr == 0 or b.ptr == 0 or n <= 0 or a.cols != n or b.rows != n {
+        return err(400)
+    }
+    nrhs := b.cols
+    lu := mat_clone(a)
+    piv := ibuf_new(n + 4)
+    sign := la_lu_factor_inplace(lu, piv)
+    if sign == 0 {
+        buf_free(move piv)
+        mat_free(move lu)
+        return err(422)
+    }
+    x := mat_zeros(n, nrhs)
+    plu := lu.ptr; pb := b.ptr; px := x.ptr
+    // Permute `B` into `X`
+    mut i := 0
+    while i < n {
+        src_r := ibuf_get(piv, i)
+        mut c := 0
+        while c < nrhs {
+            unsafe { ptr_write_f64(px, i * nrhs + c, ptr_read_f64(pb, src_r * nrhs + c)) }
+            c += 1
+        }
+        i += 1
+    }
+    // Forward substitution: `L * Y = P * B`
+    i = 1
+    while i < n {
+        mut k := 0
+        while k < i {
+            lik := unsafe { ptr_read_f64(plu, i * n + k) }
+            mut c := 0
+            while c < nrhs {
+                cur := unsafe { ptr_read_f64(px, i * nrhs + c) }
+                yk := unsafe { ptr_read_f64(px, k * nrhs + c) }
+                unsafe { ptr_write_f64(px, i * nrhs + c, cur - lik * yk) }
+                c += 1
+            }
+            k += 1
+        }
+        i += 1
+    }
+    // Back substitution: `U * X = Y`
+    i = n - 1
+    while i >= 0 {
+        inv_u := 1.0 / unsafe { ptr_read_f64(plu, i * n + i) }
+        mut k := i + 1
+        while k < n {
+            uik := unsafe { ptr_read_f64(plu, i * n + k) }
+            mut c := 0
+            while c < nrhs {
+                cur := unsafe { ptr_read_f64(px, i * nrhs + c) }
+                xk := unsafe { ptr_read_f64(px, k * nrhs + c) }
+                unsafe { ptr_write_f64(px, i * nrhs + c, cur - uik * xk) }
+                c += 1
+            }
+            k += 1
+        }
+        mut c2 := 0
+        while c2 < nrhs {
+            unsafe { ptr_write_f64(px, i * nrhs + c2, ptr_read_f64(px, i * nrhs + c2) * inv_u) }
+            c2 += 1
+        }
+        i -= 1
+    }
+    buf_free(move piv)
+    mat_free(move lu)
+    return ok(x)
+}
+
+fn mat_det(a: MatF64) -> f64 {
+    n := a.rows
+    if a.ptr == 0 or n <= 0 or a.cols != n { return 0.0 }
+    lu := mat_clone(a)
+    piv := ibuf_new(n + 4)
+    sign := la_lu_factor_inplace(lu, piv)
+    if sign == 0 {
+        buf_free(move piv)
+        mat_free(move lu)
+        return 0.0
+    }
+    mut det := sign as f64
+    mut i := 0
+    while i < n {
+        det = det * unsafe { ptr_read_f64(lu.ptr, i * n + i) }
+        i += 1
+    }
+    buf_free(move piv)
+    mat_free(move lu)
+    return det
+}
+
+struct QrResult {
+    q: MatF64
+    r: MatF64
+}
+
+struct EigenResult {
+    values: MatF64
+    vectors: MatF64
+}
+
+struct SvdResult {
+    u: MatF64
+    s: MatF64
+    vt: MatF64
+}
+
+fn mat_inv(a: MatF64) -> MatF64 ! i64 {
+    if a.ptr == 0 or a.rows <= 0 or a.rows != a.cols { return err(400) }
+    id := mat_eye(a.rows)
+    res := lu_solve(a, id) or MatF64(0, 0, 0)
+    mat_free(move id)
+    if res.ptr == 0 { return err(422) }
+    return ok(res)
+}
+
+// Cholesky decomposition `A = L * L^T` for symmetric positive-definite `[n x n]` matrix `A`.
+fn cholesky_decomp(a: MatF64) -> MatF64 ! i64 {
+    n := a.rows
+    if a.ptr == 0 or n <= 0 or a.cols != n { return err(400) }
+    l := mat_zeros(n, n)
+    pa := a.ptr
+    pl := l.ptr
+    mut i := 0
+    while i < n {
+        mut j := 0
+        while j <= i {
+            mut sum := la_dot_offset(pl, i * n, pl, j * n, j)
+            aij := unsafe { ptr_read_f64(pa, i * n + j) }
+            diff := aij - sum
+            if i == j {
+                if diff <= 0.00000000000001 {
+                    mat_free(move l)
+                    return err(422)
+                }
+                unsafe { ptr_write_f64(pl, i * n + j, sqrt_f64(diff)) }
+            } else {
+                ljj := unsafe { ptr_read_f64(pl, j * n + j) }
+                unsafe { ptr_write_f64(pl, i * n + j, diff / ljj) }
+            }
+            j += 1
+        }
+        i += 1
+    }
+    return ok(l)
+}
+
+// Solves `A * X = B` for symmetric positive-definite `A` via Cholesky `L * L^T * X = B`.
+fn cholesky_solve(a: MatF64, b: MatF64) -> MatF64 ! i64 {
+    n := a.rows
+    if a.ptr == 0 or b.ptr == 0 or n <= 0 or a.cols != n or b.rows != n { return err(400) }
+    l := cholesky_decomp(a) or return err(422)
+    nrhs := b.cols
+    x := mat_clone(b)
+    pl := l.ptr
+    px := x.ptr
+    // Forward substitution: `L * Y = B`
+    mut i := 0
+    while i < n {
+        inv_lii := 1.0 / unsafe { ptr_read_f64(pl, i * n + i) }
+        mut k := 0
+        while k < i {
+            lik := unsafe { ptr_read_f64(pl, i * n + k) }
+            mut c := 0
+            while c < nrhs {
+                cur := unsafe { ptr_read_f64(px, i * nrhs + c) }
+                yk := unsafe { ptr_read_f64(px, k * nrhs + c) }
+                unsafe { ptr_write_f64(px, i * nrhs + c, cur - lik * yk) }
+                c += 1
+            }
+            k += 1
+        }
+        mut c2 := 0
+        while c2 < nrhs {
+            unsafe { ptr_write_f64(px, i * nrhs + c2, ptr_read_f64(px, i * nrhs + c2) * inv_lii) }
+            c2 += 1
+        }
+        i += 1
+    }
+    // Back substitution: `L^T * X = Y`
+    i = n - 1
+    while i >= 0 {
+        inv_lii := 1.0 / unsafe { ptr_read_f64(pl, i * n + i) }
+        mut k := i + 1
+        while k < n {
+            lki := unsafe { ptr_read_f64(pl, k * n + i) }
+            mut c := 0
+            while c < nrhs {
+                cur := unsafe { ptr_read_f64(px, i * nrhs + c) }
+                xk := unsafe { ptr_read_f64(px, k * nrhs + c) }
+                unsafe { ptr_write_f64(px, i * nrhs + c, cur - lki * xk) }
+                c += 1
+            }
+            k += 1
+        }
+        mut c2 := 0
+        while c2 < nrhs {
+            unsafe { ptr_write_f64(px, i * nrhs + c2, ptr_read_f64(px, i * nrhs + c2) * inv_lii) }
+            c2 += 1
+        }
+        i -= 1
+    }
+    mat_free(move l)
+    return ok(x)
+}
+
+// Householder QR decomposition `A = Q * R`, where `Q` is `[m x m]` orthogonal and `R` is `[m x n]` upper-trapezoidal.
+fn qr_decomp(a: MatF64) -> QrResult ! i64 {
+    m := a.rows
+    n := a.cols
+    if a.ptr == 0 or m <= 0 or n <= 0 { return err(400) }
+    q := mat_eye(m)
+    r := mat_clone(a)
+    v := mat_zeros(m, 1)
+    pq := q.ptr
+    pr := r.ptr
+    pv := v.ptr
+    k_lim := if m - 1 < n { m - 1 } else { n }
+    // If m == n, we reflect up to n - 1; if m > n, we reflect all n columns!
+    steps := if m > n { n } else { k_lim }
+    mut k := 0
+    while k < steps {
+        mut norm_sq := 0.0
+        mut i := k
+        while i < m {
+            val := unsafe { ptr_read_f64(pr, i * n + k) }
+            unsafe { ptr_write_f64(pv, i, val) }
+            norm_sq += val * val
+            i += 1
+        }
+        norm_x := sqrt_f64(norm_sq)
+        if norm_x > 0.000000000000001 {
+            x0 := unsafe { ptr_read_f64(pv, k) }
+            alpha := if x0 >= 0.0 { 0.0 - norm_x } else { norm_x }
+            v0 := x0 - alpha
+            unsafe { ptr_write_f64(pv, k, v0) }
+            // Recompute ||v||^2
+            v_norm_sq := norm_sq - x0 * x0 + v0 * v0
+            if v_norm_sq > 0.000000000000000000000001 {
+                beta := 2.0 / v_norm_sq
+                // Apply `R := (I - beta * v * v^T) * R` to columns `j = k..n-1`
+                mut j := k
+                while j < n {
+                    mut dot := 0.0
+                    i = k
+                    while i < m {
+                        dot += unsafe { ptr_read_f64(pv, i) } * unsafe { ptr_read_f64(pr, i * n + j) }
+                        i += 1
+                    }
+                    scale := beta * dot
+                    i = k
+                    while i < m {
+                        cur := unsafe { ptr_read_f64(pr, i * n + j) }
+                        unsafe { ptr_write_f64(pr, i * n + j, cur - scale * unsafe { ptr_read_f64(pv, i) }) }
+                        i += 1
+                    }
+                    j += 1
+                }
+                // Apply `Q := Q * (I - beta * v * v^T)` to rows `r_idx = 0..m-1`
+                mut r_idx := 0
+                while r_idx < m {
+                    mut dot := 0.0
+                    i = k
+                    while i < m {
+                        dot += unsafe { ptr_read_f64(pq, r_idx * m + i) } * unsafe { ptr_read_f64(pv, i) }
+                        i += 1
+                    }
+                    scale := beta * dot
+                    i = k
+                    while i < m {
+                        cur := unsafe { ptr_read_f64(pq, r_idx * m + i) }
+                        unsafe { ptr_write_f64(pq, r_idx * m + i, cur - scale * unsafe { ptr_read_f64(pv, i) }) }
+                        i += 1
+                    }
+                    r_idx += 1
+                }
+            }
+        }
+        k += 1
+    }
+    mat_free(move v)
+    return ok(QrResult(q, r))
+}
+
+// Solves overdetermined/square linear least squares `min ||A * X - B||_F` (`m >= n`) via Householder QR.
+fn lstsq_solve(a: MatF64, b: MatF64, tol: f64 = 0.000000000001) -> MatF64 ! i64 {
+    m := a.rows
+    n := a.cols
+    if a.ptr == 0 or b.ptr == 0 or m <= 0 or n <= 0 or m < n or b.rows != m {
+        return err(400)
+    }
+    qr := qr_decomp(a) or return err(422)
+    qt := mat_transpose(qr.q)
+    qtb := mat_mul(qt, b)
+    mat_free(move qt)
+    mat_free(qr.q)
+    nrhs := b.cols
+    x := mat_zeros(n, nrhs)
+    pr := qr.r.ptr
+    pqtb := qtb.ptr
+    px := x.ptr
+    // Back-substitute top `[n x n]` upper-triangular block of `R * X = (Q^T * B)[0..n]`
+    mut i := n - 1
+    while i >= 0 {
+        rii := unsafe { ptr_read_f64(pr, i * n + i) }
+        if la_abs(rii) <= tol {
+            mat_free(qr.r)
+            mat_free(move qtb)
+            mat_free(move x)
+            return err(422)
+        }
+        inv_rii := 1.0 / rii
+        mut c := 0
+        while c < nrhs {
+            mut rhs := unsafe { ptr_read_f64(pqtb, i * nrhs + c) }
+            mut k := i + 1
+            while k < n {
+                rhs -= unsafe { ptr_read_f64(pr, i * n + k) } * unsafe { ptr_read_f64(px, k * nrhs + c) }
+                k += 1
+            }
+            unsafe { ptr_write_f64(px, i * nrhs + c, rhs * inv_rii) }
+            c += 1
+        }
+        i -= 1
+    }
+    mat_free(qr.r)
+    mat_free(move qtb)
+    return ok(x)
+}
+
+// Cyclic Jacobi symmetric eigensolver (`A = V * diag(values) * V^T`), sorted descending by eigenvalue.
+fn eigen_sym_jacobi(a: MatF64, max_sweeps: i64 = 64, tol: f64 = 0.000000000001) -> EigenResult ! i64 {
+    n := a.rows
+    if a.ptr == 0 or n <= 0 or a.cols != n { return err(400) }
+    d := mat_clone(a)
+    v := mat_eye(n)
+    pd := d.ptr
+    pv := v.ptr
+    mut sweep := 0
+    while sweep < max_sweeps {
+        mut off_norm := 0.0
+        mut p := 0
+        while p < n - 1 {
+            mut q := p + 1
+            while q < n {
+                apq := unsafe { ptr_read_f64(pd, p * n + q) }
+                off_norm += apq * apq
+                q += 1
+            }
+            p += 1
+        }
+        if sqrt_f64(off_norm) <= tol { break }
+        p = 0
+        while p < n - 1 {
+            mut q := p + 1
+            while q < n {
+                apq := unsafe { ptr_read_f64(pd, p * n + q) }
+                if la_abs(apq) > tol * 0.01 {
+                    app := unsafe { ptr_read_f64(pd, p * n + p) }
+                    aqq := unsafe { ptr_read_f64(pd, q * n + q) }
+                    tau := (aqq - app) / (2.0 * apq)
+                    t := if tau >= 0.0 {
+                        1.0 / (tau + sqrt_f64(1.0 + tau * tau))
+                    } else {
+                        0.0 - 1.0 / ((0.0 - tau) + sqrt_f64(1.0 + tau * tau))
+                    }
+                    c := 1.0 / sqrt_f64(1.0 + t * t)
+                    s := t * c
+                    unsafe {
+                        ptr_write_f64(pd, p * n + p, app - t * apq)
+                        ptr_write_f64(pd, q * n + q, aqq + t * apq)
+                        ptr_write_f64(pd, p * n + q, 0.0)
+                        ptr_write_f64(pd, q * n + p, 0.0)
+                    }
+                    mut k := 0
+                    while k < n {
+                        if k != p and k != q {
+                            akp := unsafe { ptr_read_f64(pd, k * n + p) }
+                            akq := unsafe { ptr_read_f64(pd, k * n + q) }
+                            nkp := c * akp - s * akq
+                            nkq := s * akp + c * akq
+                            unsafe {
+                                ptr_write_f64(pd, k * n + p, nkp)
+                                ptr_write_f64(pd, p * n + k, nkp)
+                                ptr_write_f64(pd, k * n + q, nkq)
+                                ptr_write_f64(pd, q * n + k, nkq)
+                            }
+                        }
+                        vkp := unsafe { ptr_read_f64(pv, k * n + p) }
+                        vkq := unsafe { ptr_read_f64(pv, k * n + q) }
+                        unsafe {
+                            ptr_write_f64(pv, k * n + p, c * vkp - s * vkq)
+                            ptr_write_f64(pv, k * n + q, s * vkp + c * vkq)
+                        }
+                        k += 1
+                    }
+                }
+                q += 1
+            }
+            p += 1
+        }
+        sweep += 1
+    }
+    vals := mat_zeros(n, 1)
+    pvals := vals.ptr
+    mut i := 0
+    while i < n {
+        unsafe { ptr_write_f64(pvals, i, ptr_read_f64(pd, i * n + i)) }
+        i += 1
+    }
+    mat_free(move d)
+    // Sort eigenvalues descending and permute eigenvector columns accordingly
+    i = 0
+    while i < n - 1 {
+        mut best := i
+        mut best_v := unsafe { ptr_read_f64(pvals, i) }
+        mut j := i + 1
+        while j < n {
+            jv := unsafe { ptr_read_f64(pvals, j) }
+            if jv > best_v {
+                best_v = jv
+                best = j
+            }
+            j += 1
+        }
+        if best != i {
+            unsafe {
+                ptr_write_f64(pvals, best, ptr_read_f64(pvals, i))
+                ptr_write_f64(pvals, i, best_v)
+            }
+            mut r := 0
+            while r < n {
+                vi := unsafe { ptr_read_f64(pv, r * n + i) }
+                vb := unsafe { ptr_read_f64(pv, r * n + best) }
+                unsafe {
+                    ptr_write_f64(pv, r * n + i, vb)
+                    ptr_write_f64(pv, r * n + best, vi)
+                }
+                r += 1
+            }
+        }
+        i += 1
+    }
+    return ok(EigenResult(vals, v))
+}
+
+// Internal thin SVD for `m >= n` via One-Sided Hestenes-Jacobi column orthogonalization (`A = U * diag(S) * V^T`).
+fn la_svd_tall_jacobi(a: MatF64, max_sweeps: i64, tol: f64) -> SvdResult {
+    m := a.rows
+    n := a.cols
+    w := mat_clone(a)
+    v := mat_eye(n)
+    pw := w.ptr
+    pv := v.ptr
+    mut sweep := 0
+    while sweep < max_sweeps {
+        mut converged := true
+        mut p := 0
+        while p < n - 1 {
+            mut q := p + 1
+            while q < n {
+                mut alpha := 0.0
+                mut beta := 0.0
+                mut gamma := 0.0
+                mut r := 0
+                while r < m {
+                    wp := unsafe { ptr_read_f64(pw, r * n + p) }
+                    wq := unsafe { ptr_read_f64(pw, r * n + q) }
+                    alpha += wp * wp
+                    beta += wq * wq
+                    gamma += wp * wq
+                    r += 1
+                }
+                if la_abs(gamma) > tol * sqrt_f64(alpha * beta) and la_abs(gamma) > 0.000000000000001 {
+                    converged = false
+                    zeta := (beta - alpha) / (2.0 * gamma)
+                    t := if zeta >= 0.0 {
+                        1.0 / (zeta + sqrt_f64(1.0 + zeta * zeta))
+                    } else {
+                        0.0 - 1.0 / ((0.0 - zeta) + sqrt_f64(1.0 + zeta * zeta))
+                    }
+                    c := 1.0 / sqrt_f64(1.0 + t * t)
+                    s := t * c
+                    r = 0
+                    while r < m {
+                        wp := unsafe { ptr_read_f64(pw, r * n + p) }
+                        wq := unsafe { ptr_read_f64(pw, r * n + q) }
+                        unsafe {
+                            ptr_write_f64(pw, r * n + p, c * wp - s * wq)
+                            ptr_write_f64(pw, r * n + q, s * wp + c * wq)
+                        }
+                        r += 1
+                    }
+                    mut k := 0
+                    while k < n {
+                        vp := unsafe { ptr_read_f64(pv, k * n + p) }
+                        vq := unsafe { ptr_read_f64(pv, k * n + q) }
+                        unsafe {
+                            ptr_write_f64(pv, k * n + p, c * vp - s * vq)
+                            ptr_write_f64(pv, k * n + q, s * vp + c * vq)
+                        }
+                        k += 1
+                    }
+                }
+                q += 1
+            }
+            p += 1
+        }
+        if converged { break }
+        sweep += 1
+    }
+    s_vec := mat_zeros(n, 1)
+    ps := s_vec.ptr
+    mut j := 0
+    while j < n {
+        mut col_sq := 0.0
+        mut r := 0
+        while r < m {
+            wv := unsafe { ptr_read_f64(pw, r * n + j) }
+            col_sq += wv * wv
+            r += 1
+        }
+        sj := sqrt_f64(col_sq)
+        unsafe { ptr_write_f64(ps, j, sj) }
+        if sj > 0.000000000000001 {
+            inv_sj := 1.0 / sj
+            r = 0
+            while r < m {
+                unsafe { ptr_write_f64(pw, r * n + j, ptr_read_f64(pw, r * n + j) * inv_sj) }
+                r += 1
+            }
+        }
+        j += 1
+    }
+    // Sort singular values descending
+    mut i := 0
+    while i < n - 1 {
+        mut best := i
+        mut best_s := unsafe { ptr_read_f64(ps, i) }
+        mut k := i + 1
+        while k < n {
+            sk := unsafe { ptr_read_f64(ps, k) }
+            if sk > best_s {
+                best_s = sk
+                best = k
+            }
+            k += 1
+        }
+        if best != i {
+            unsafe {
+                ptr_write_f64(ps, best, ptr_read_f64(ps, i))
+                ptr_write_f64(ps, i, best_s)
+            }
+            mut r := 0
+            while r < m {
+                ui := unsafe { ptr_read_f64(pw, r * n + i) }
+                ub := unsafe { ptr_read_f64(pw, r * n + best) }
+                unsafe {
+                    ptr_write_f64(pw, r * n + i, ub)
+                    ptr_write_f64(pw, r * n + best, ui)
+                }
+                r += 1
+            }
+            mut r2 := 0
+            while r2 < n {
+                vi := unsafe { ptr_read_f64(pv, r2 * n + i) }
+                vb := unsafe { ptr_read_f64(pv, r2 * n + best) }
+                unsafe {
+                    ptr_write_f64(pv, r2 * n + i, vb)
+                    ptr_write_f64(pv, r2 * n + best, vi)
+                }
+                r2 += 1
+            }
+        }
+        i += 1
+    }
+    vt := mat_transpose(v)
+    mat_free(move v)
+    return SvdResult(w, s_vec, vt)
+}
+
+// Thin Singular Value Decomposition `A = U * diag(S) * Vt` for any `[m x n]` matrix `A`.
+// `U` is `[m x k]`, `S` is `[k x 1]` (descending >= 0), `Vt` is `[k x n]`, where `k = min(m, n)`.
+fn svd_jacobi(a: MatF64, max_sweeps: i64 = 64, tol: f64 = 0.000000000001) -> SvdResult ! i64 {
+    if a.ptr == 0 or a.rows <= 0 or a.cols <= 0 { return err(400) }
+    if a.rows >= a.cols {
+        return ok(la_svd_tall_jacobi(a, max_sweeps, tol))
+    }
+    // Wide matrix (`m < n`): decompose `A^T = U_t * diag(S) * Vt_t`, so `A = Vt_t^T * diag(S) * U_t^T`
+    at := mat_transpose(a)
+    sv_t := la_svd_tall_jacobi(at, max_sweeps, tol)
+    mat_free(move at)
+    u := mat_transpose(sv_t.vt)
+    vt := mat_transpose(sv_t.u)
+    mat_free(sv_t.vt)
+    mat_free(sv_t.u)
+    return ok(SvdResult(u, sv_t.s, vt))
+}
+
+fn mat_rank(a: MatF64, tol: f64 = 0.0000000001) -> i64 {
+    if a.ptr == 0 or a.rows <= 0 or a.cols <= 0 { return 0 }
+    sv := svd_jacobi(a) or return 0
+    k := sv.s.rows
+    mut rnk := 0
+    mut i := 0
+    while i < k {
+        if unsafe { ptr_read_f64(sv.s.ptr, i) } > tol { rnk += 1 }
+        i += 1
+    }
+    mat_free(sv.u)
+    mat_free(sv.s)
+    mat_free(sv.vt)
+    return rnk
+}
+
+fn mat_cond(a: MatF64) -> f64 {
+    if a.ptr == 0 or a.rows <= 0 or a.cols <= 0 { return 0.0 }
+    sv := svd_jacobi(a) or return 0.0
+    k := sv.s.rows
+    s_max := unsafe { ptr_read_f64(sv.s.ptr, 0) }
+    s_min := unsafe { ptr_read_f64(sv.s.ptr, k - 1) }
+    mat_free(sv.u)
+    mat_free(sv.s)
+    mat_free(sv.vt)
+    if s_min <= 0.000000000000001 { return 999999999999999.0 }
+    return s_max / s_min
+}
+
+// ============================================================================
+// Compressed Sparse Row (`CsrMat`) & Iterative Krylov Solvers (CG, BiCGSTAB)
+// ============================================================================
+
+fn csr_from_dense(a: MatF64, drop_tol: f64 = 0.0) -> CsrMat {
+    if a.ptr == 0 or a.rows <= 0 or a.cols <= 0 {
+        return CsrMat(0, 0, 0, ibuf_new(4), ibuf_new(4), 0)
+    }
+    rows := a.rows
+    cols := a.cols
+    pa := a.ptr
+    mut nnz := 0
+    n := rows * cols
+    mut i := 0
+    while i < n {
+        if la_abs(unsafe { ptr_read_f64(pa, i) }) > drop_tol { nnz += 1 }
+        i += 1
+    }
+    row_ptr := ibuf_new(rows + 4)
+    col_idx := ibuf_new(nnz + 8)
+    vp := unsafe { mem_alloc_aligned((nnz + 4) * 8 + 64) }
+    mut cur := 0
+    mut r := 0
+    while r < rows {
+        ibuf_push(row_ptr, cur)
+        mut c := 0
+        while c < cols {
+            v := unsafe { ptr_read_f64(pa, r * cols + c) }
+            if la_abs(v) > drop_tol {
+                ibuf_push(col_idx, c)
+                unsafe { ptr_write_f64(vp, cur, v) }
+                cur += 1
+            }
+            c += 1
+        }
+        r += 1
+    }
+    ibuf_push(row_ptr, cur)
+    return CsrMat(rows, cols, cur, row_ptr, col_idx, vp)
+}
+
+fn csr_free(move m: CsrMat) {
+    buf_free(m.row_ptr)
+    buf_free(m.col_idx)
+    if m.vals_ptr != 0 {
+        unsafe { mem_free_aligned(m.vals_ptr) }
+    }
+}
+
+fn csr_spmv_into(a: CsrMat, px: i64, py: i64) {
+    rows := a.rows
+    vp := a.vals_ptr
+    mut r := 0
+    while r < rows {
+        start := ibuf_get(a.row_ptr, r)
+        end := ibuf_get(a.row_ptr, r + 1)
+        mut acc := 0.0
+        mut idx := start
+        while idx < end {
+            col := ibuf_get(a.col_idx, idx)
+            acc += unsafe { ptr_read_f64(vp, idx) } * unsafe { ptr_read_f64(px, col) }
+            idx += 1
+        }
+        unsafe { ptr_write_f64(py, r, acc) }
+        r += 1
+    }
+}
+
+fn csr_spmv(a: CsrMat, x: MatF64) -> MatF64 {
+    if a.vals_ptr == 0 or x.ptr == 0 or a.cols != x.rows * x.cols {
+        return MatF64(0, 0, 0)
+    }
+    y := mat_zeros(a.rows, 1)
+    csr_spmv_into(a, x.ptr, y.ptr)
+    return y
+}
+
+// Sparse Conjugate Gradient (`A * x = b`) for symmetric positive-definite `CsrMat`.
+fn csr_cg_solve(a: CsrMat, b: MatF64, max_iter: i64 = 1000, tol: f64 = 0.0000000001) -> MatF64 ! i64 {
+    n := a.rows
+    if a.vals_ptr == 0 or b.ptr == 0 or n <= 0 or a.cols != n or b.rows * b.cols != n {
+        return err(400)
+    }
+    x := mat_zeros(n, 1)
+    r := mat_clone(b)
+    p := mat_clone(b)
+    ap := mat_zeros(n, 1)
+    px := x.ptr; pr := r.ptr; pp := p.ptr; pap := ap.ptr
+    mut rs_old := la_dot_offset(pr, 0, pr, 0, n)
+    if sqrt_f64(rs_old) <= tol {
+        mat_free(move r); mat_free(move p); mat_free(move ap)
+        return ok(x)
+    }
+    mut it := 0
+    while it < max_iter {
+        csr_spmv_into(a, pp, pap)
+        pap_dot := la_dot_offset(pp, 0, pap, 0, n)
+        if la_abs(pap_dot) <= 0.00000000000000000001 { break }
+        alpha := rs_old / pap_dot
+        mut i := 0
+        while i < n {
+            unsafe {
+                ptr_write_f64(px, i, ptr_read_f64(px, i) + alpha * ptr_read_f64(pp, i))
+                ptr_write_f64(pr, i, ptr_read_f64(pr, i) - alpha * ptr_read_f64(pap, i))
+            }
+            i += 1
+        }
+        rs_new := la_dot_offset(pr, 0, pr, 0, n)
+        if sqrt_f64(rs_new) <= tol {
+            rs_old = rs_new
+            break
+        }
+        beta := rs_new / rs_old
+        i = 0
+        while i < n {
+            unsafe { ptr_write_f64(pp, i, ptr_read_f64(pr, i) + beta * ptr_read_f64(pp, i)) }
+            i += 1
+        }
+        rs_old = rs_new
+        it += 1
+    }
+    mat_free(move r); mat_free(move p); mat_free(move ap)
+    return ok(x)
+}
+
+// Sparse BiCGSTAB (`A * x = b`) for general non-symmetric `CsrMat`.
+fn csr_bicgstab_solve(a: CsrMat, b: MatF64, max_iter: i64 = 1000, tol: f64 = 0.0000000001) -> MatF64 ! i64 {
+    n := a.rows
+    if a.vals_ptr == 0 or b.ptr == 0 or n <= 0 or a.cols != n or b.rows * b.cols != n {
+        return err(400)
+    }
+    x := mat_zeros(n, 1)
+    r := mat_clone(b)
+    r_hat := mat_clone(b)
+    p := mat_zeros(n, 1)
+    v := mat_zeros(n, 1)
+    s := mat_zeros(n, 1)
+    t := mat_zeros(n, 1)
+    px := x.ptr; pr := r.ptr; prh := r_hat.ptr; pp := p.ptr; pv := v.ptr; ps := s.ptr; pt := t.ptr
+    mut rho_old := 1.0
+    mut alpha := 1.0
+    mut omega := 1.0
+    if sqrt_f64(la_dot_offset(pr, 0, pr, 0, n)) <= tol {
+        mat_free(move r); mat_free(move r_hat); mat_free(move p)
+        mat_free(move v); mat_free(move s); mat_free(move t)
+        return ok(x)
+    }
+    mut it := 0
+    while it < max_iter {
+        rho_new := la_dot_offset(prh, 0, pr, 0, n)
+        if la_abs(rho_new) <= 0.00000000000000000001 { break }
+        if it == 0 {
+            unsafe { mem_copy(pp, pr, n * 8) }
+        } else {
+            beta := (rho_new / rho_old) * (alpha / omega)
+            mut i := 0
+            while i < n {
+                ri := unsafe { ptr_read_f64(pr, i) }
+                pi := unsafe { ptr_read_f64(pp, i) }
+                vi := unsafe { ptr_read_f64(pv, i) }
+                unsafe { ptr_write_f64(pp, i, ri + beta * (pi - omega * vi)) }
+                i += 1
+            }
+        }
+        csr_spmv_into(a, pp, pv)
+        denom := la_dot_offset(prh, 0, pv, 0, n)
+        if la_abs(denom) <= 0.00000000000000000001 { break }
+        alpha = rho_new / denom
+        mut i := 0
+        while i < n {
+            unsafe { ptr_write_f64(ps, i, ptr_read_f64(pr, i) - alpha * ptr_read_f64(pv, i)) }
+            i += 1
+        }
+        if sqrt_f64(la_dot_offset(ps, 0, ps, 0, n)) <= tol {
+            i = 0
+            while i < n {
+                unsafe { ptr_write_f64(px, i, ptr_read_f64(px, i) + alpha * ptr_read_f64(pp, i)) }
+                i += 1
+            }
+            break
+        }
+        csr_spmv_into(a, ps, pt)
+        tt := la_dot_offset(pt, 0, pt, 0, n)
+        if la_abs(tt) <= 0.00000000000000000001 { break }
+        omega = la_dot_offset(pt, 0, ps, 0, n) / tt
+        i = 0
+        while i < n {
+            unsafe {
+                ptr_write_f64(px, i, ptr_read_f64(px, i) + alpha * ptr_read_f64(pp, i) + omega * ptr_read_f64(ps, i))
+                ptr_write_f64(pr, i, ptr_read_f64(ps, i) - omega * ptr_read_f64(pt, i))
+            }
+            i += 1
+        }
+        if sqrt_f64(la_dot_offset(pr, 0, pr, 0, n)) <= tol { break }
+        if la_abs(omega) <= 0.00000000000000000001 { break }
+        rho_old = rho_new
+        it += 1
+    }
+    mat_free(move r); mat_free(move r_hat); mat_free(move p)
+    mat_free(move v); mat_free(move s); mat_free(move t)
+    return ok(x)
+}
+

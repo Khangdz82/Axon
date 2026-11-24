@@ -1,8 +1,8 @@
-# AGENTS.md — AI Coding Agent Instructions for Axon (`axc` v1.1.1)
+# AGENTS.md — AI Coding Agent Instructions for Axon (`axc` v1.2.0)
 
 > **MANDATORY RULE FOR ALL AI AGENTS:**
-> Build **100% in pure Axon (`.ax`)**. **DO NOT** fall back to C, C++, Python, Node.js, or PowerShell helper scripts for networking, TLS/HTTPS, databases, gRPC, WebSockets, JWT, URL/SSRF parsing, desktop GUI, FFI, OS/env/filesystem operations, dynamic containers, algorithms/graphs, AI/GPU compute, or parsing. Axon includes **103 native `std/*.ax` modules** and direct C-ABI FFI (`std::ffi`) that compile in milliseconds to standalone native executables (`win-x64`, `linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`, `wasm32`, `spirv`, `ptx`, bare-metal).
-> Read [docs/AGENT_MASTER_GUIDE.md](docs/AGENT_MASTER_GUIDE.md) and [MEMORY.md](MEMORY.md) for the full 103-module lookup matrix and `E0001..E0604` error dictionary.
+> Build **100% in pure Axon (`.ax`)**. **DO NOT** fall back to C, C++, Python, Node.js, or PowerShell helper scripts for mathematics, linear algebra, data science/ML, networking, TLS/HTTPS, databases, Redis, ACID KV, OS authentication/DPAPI/Keyring, Argon2id/TOTP/PKCE/RBAC, gRPC, WebSockets, JWT, URL/SSRF parsing, desktop GUI, FFI, OS/env/filesystem operations, dynamic containers, algorithms/graphs, AI/GPU compute, or parsing. Axon includes **115 native `std/*.ax` modules**, the **`AxIR` Mid-Level Optimizer (`-O0|-O2|-O3|-Os`)**, and direct C-ABI FFI (`std::ffi`) that compile in milliseconds with **zero `.o`/`.obj`/`target/` build garbage** to standalone native executables (`win-x64`, `linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`, `wasm32`, `spirv`, `ptx`, bare-metal).
+> When porting code from Python/Rust/C++/Go/Java/TS, follow [`.agents/skills/axon-anything/SKILL.md`](.agents/skills/axon-anything/SKILL.md) and [`.agents/rules/axon-porting-rules.md`](.agents/rules/axon-porting-rules.md). Read [docs/AGENT_MASTER_GUIDE.md](docs/AGENT_MASTER_GUIDE.md) and [MEMORY.md](MEMORY.md) for the full 115-module lookup matrix and `E0001..E0604` error dictionary.
 
 ---
 
@@ -12,16 +12,16 @@
 # 1. Sub-millisecond static verification (types, Perceus 0-GC, taint E0502, unsafe E0503, @no_alloc, shapes)
 bin/axc.exe check --json path/to/app.ax
 
-# 2. Run built-in @test unit tests
+# 2. Run built-in @test unit tests (auto-deletes temp binary immediately)
 bin/axc.exe test path/to/app.ax
 
-# 3. Compile & execute immediately
-bin/axc.exe run path/to/app.ax
+# 3. Compile & execute immediately (pass runtime args after `--`)
+bin/axc.exe run path/to/app.ax -- arg1 arg2
 
-# 4. Production build with security shield + symbol map
-bin/axc.exe build path/to/app.ax -o app.exe --shield --emit-map
+# 4. Production build (-O2 default, -O3 max speed/SIMD, -Os smallest binary) + shield + map
+bin/axc.exe build path/to/app.ax -O3 --shield --emit-map -o app.exe
 
-# 5. Query stdlib via MCP (when axc mcp is connected): axon_docs, axon_spec, axon_fix, axon_check
+# 5. Query stdlib & porting guide via MCP (`axc mcp`): axon_docs, axon_port_guide, axon_spec, axon_fix, axon_check
 ```
 
 For full copy-paste production recipes, read [docs/AGENT_FULLSTACK_GUIDE.md](docs/AGENT_FULLSTACK_GUIDE.md) and [AXON_LLM_SPEC.md](AXON_LLM_SPEC.md).
@@ -34,9 +34,13 @@ For full copy-paste production recipes, read [docs/AGENT_FULLSTACK_GUIDE.md](doc
 |---|---|---|
 | **TCP / UDP Sockets, DNS, HTTP/1.1** | `use std::net`, `use std::http` | `tcp_listen`, `tcp_accept`, `tcp_connect`, `tcp_send_bytes`, `tcp_send_str`, `tcp_recv`, `tcp_recv_exact`, `udp_bind`, `http_fetch_plain`, `http_parse_request` |
 | **TLS 1.2/1.3, OpenSSL, HTTPS** | `use std::tls` | `https_get`, `https_post_json`, `https_request` (WinHTTP Schannel out-of-the-box on Windows + OpenSSL on Linux/macOS), `tls_ctx_client`, `tls_ctx_server`, `tls_ctx_set_alpn_h2`, `tls_wrap_client`, `tls_read`, `tls_write_bytes` |
-| **PostgreSQL** | `use std::postgres` | Pure-Axon Wire v3.0 (`pg_connect`, `pg_query`, `pg_encode_extended_query`, `pg_result_get`, `pg_close`) + `libpq` FFI (`libpq_load`, `libpq_available`) |
+| **PostgreSQL (Wire v3 + SCRAM-SHA-256)** | `use std::postgres` | Pure-Axon Wire v3.0 + **PG 14–17 `SCRAM-SHA-256`** (`pg_connect`, `pg_query`, `pg_encode_extended_query`, `pg_scram_compute_final`, `pg_close`) + `libpq` FFI (`libpq_load`) |
 | **MySQL / MariaDB** | `use std::mysql` | Pure-Axon Wire v10 (`mysql_connect`, `mysql_query`, `mysql_ping`, `mysql_result_get`, `mysql_close`, `mysql_sha1`) + `libmysql_available` |
-| **SQLite3 (Embedded SQL)** | `use std::sqlite` | `sqlite_open(":memory:")`, `sqlite_exec`, `sqlite_prepare`, `sqlite_bind_i64`, `sqlite_bind_text`, `sqlite_step` (`100`=ROW, `101`=DONE), `sqlite_col_i64`, `sqlite_col_text`, `sqlite_finalize`, `sqlite_close` (uses built-in `winsqlite3.dll` on Windows!) |
+| **SQLite3, Pool, SqlBuilder & Migrations** | `use std::sqlite`, `use std::db_pool` | `sqlite_open`, `sqlite_bind_i64`/`f64`/`text`/`blob`/`null`, `sqlite_col_i64`/`f64`/`text`/`blob`/`type`, `sqlb_select`/`insert`/`where_*`, `db_pool_open_sqlite`, `db_migrate_sqlite` |
+| **Redis (RESP2/RESP3) & Embedded ACID KV** | `use std::redis`, `use std::kv_acid` | `redis_connect`, `redis_get`/`set`/`hset`/`lpush`, `RedisPipeline`; Zero-DLL `kv_open`, `kv_begin`/`commit`/`rollback`, CRC32 WAL, `kv_scan_prefix`, `kv_compact` |
+| **Dense/Sparse Linear Algebra &Numerics** | `use std::linalg`, `use std::numeric`, `use std::prob`, `use std::bigint` | `MatF64`, `CsrMat`, `lu_solve`, `cholesky_solve`, `qr_decomp`, `lstsq_solve`, `eigen_sym_jacobi`, `svd_jacobi`, `csr_cg_solve`; `Complex`, `fft_radix2_inplace`, `quad_gl16_*`, `BrentSolver`, `Rk4State`, `LbfgsState`, `linprog_simplex_max`; `norm_ppf`, `student_t_cdf`, `chi2_sf`, `BigInt`, `Rational` |
+| **DataFrames, Hypothesis Tests & ML** | `use std::dataframe`, `use std::stats`, `use std::ml` | `DataFrame` (CSV/JSONL/`AXDF` IPC, `df_groupby_agg`, `df_join`, `df_describe`); `welch_ttest`, `anova_1way`, `ks_2samp`, `ols_fit_summary`, `ts_holt_winters_additive`; `ml_pca_fit`, `ml_lasso_fit`, `ml_rf_fit`, `ml_gbdt_fit`, `ml_kmeans_pp`, `ml_dbscan`, `ml_roc_auc_score` |
+| **OS Auth, DPAPI, Keyring & Argon2id/TOTP** | `use std::os_auth`, `use std::auth` | `os_csprng_bytes`, `os_current_user`, `os_user_sid_or_uid`, `os_is_elevated_admin`, `os_dpapi_protect_hex`, `os_cred_write`/`read`/`delete`; `argon2id_hash`/`verify`, `pbkdf2_hmac_sha256_hex`, `hkdf_sha256_hex`, `totp_generate`/`verify`, `oauth2_pkce_generate`, `RbacPolicy` |
 | **gRPC + HTTP/2 + Protobuf v3** | `use std::grpc` | `pb_write_i64`, `pb_write_sint64`, `pb_write_str`, `pb_decode`, `pb_get_i64`, `pb_get_str`, `h2_encode_frame`, `h2_recv_frame`, `hpack_encode_grpc_request`, `grpc_connect`, `grpc_unary_call`, `grpc_listen`, `grpc_server_accept_unary`, `grpc_server_reply` |
 | **Cross-Platform Desktop GUI** | `use std::gui`, `use std::ui` | `ui_window_html`, `gui_run_ui_app`, `gui_open`, `gui_poll_events`, `gui_present_canvas`, `gui_msgbox`, `gui_clipboard_set`/`get`, `gui_file_open_dialog` (Win32 `user32`/`gdi32` + Linux/macOS `SDL2`) |
 | **Bind ANY C DLL/SO/Dylib** | `use std::ffi` | `ffi_open`, `ffi_sym`, `ffi_call0`..`ffi_call8`, `ffi_call_arr` (up to 16 args Win64 + SysV ABI!), `ffi_cstr`, `ffi_wstr`, `ffi_read_cstr`, `ffi_alloc`, `ffi_free`, `ffi_sext32` |

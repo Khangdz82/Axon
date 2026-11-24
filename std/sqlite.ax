@@ -4,6 +4,7 @@
 // Supports in-memory (`":memory:"`) and persistent databases with SQL-injection-proof prepared statements.
 
 use std::ffi
+use std::fmt
 
 struct SqliteApi {
     lib: i64
@@ -12,12 +13,17 @@ struct SqliteApi {
     fn_close_v2: i64
     fn_exec: i64
     fn_prepare_v2: i64
+    fn_bind_null: i64
     fn_bind_int64: i64
     fn_bind_text: i64
+    fn_bind_blob: i64
     fn_step: i64
+    fn_reset: i64
     fn_col_count: i64
+    fn_col_type: i64
     fn_col_int64: i64
     fn_col_text: i64
+    fn_col_blob: i64
     fn_col_bytes: i64
     fn_col_name: i64
     fn_finalize: i64
@@ -48,12 +54,17 @@ fn sqlite_load() -> SqliteApi ! i64 {
         fn_close_v2 = ffi_sym(lib, "sqlite3_close_v2"),
         fn_exec = ffi_sym(lib, "sqlite3_exec"),
         fn_prepare_v2 = ffi_sym(lib, "sqlite3_prepare_v2"),
+        fn_bind_null = ffi_sym(lib, "sqlite3_bind_null"),
         fn_bind_int64 = ffi_sym(lib, "sqlite3_bind_int64"),
         fn_bind_text = ffi_sym(lib, "sqlite3_bind_text"),
+        fn_bind_blob = ffi_sym(lib, "sqlite3_bind_blob"),
         fn_step = ffi_sym(lib, "sqlite3_step"),
+        fn_reset = ffi_sym(lib, "sqlite3_reset"),
         fn_col_count = ffi_sym(lib, "sqlite3_column_count"),
+        fn_col_type = ffi_sym(lib, "sqlite3_column_type"),
         fn_col_int64 = ffi_sym(lib, "sqlite3_column_int64"),
         fn_col_text = ffi_sym(lib, "sqlite3_column_text"),
+        fn_col_blob = ffi_sym(lib, "sqlite3_column_blob"),
         fn_col_bytes = ffi_sym(lib, "sqlite3_column_bytes"),
         fn_col_name = ffi_sym(lib, "sqlite3_column_name"),
         fn_finalize = ffi_sym(lib, "sqlite3_finalize"),
@@ -122,9 +133,18 @@ fn sqlite_prepare(db: SqliteDb, sql: str) -> SqliteStmt ! i64 {
     return ok(SqliteStmt(handle = sh, api = db.api))
 }
 
+fn sqlite_bind_null(stmt: SqliteStmt, idx_1based: i64) -> bool {
+    if stmt.handle == 0 or stmt.api.fn_bind_null == 0 { return false }
+    return ffi_sext32(ffi_call2(stmt.api.fn_bind_null, stmt.handle, idx_1based)) == 0
+}
+
 fn sqlite_bind_i64(stmt: SqliteStmt, idx_1based: i64, val: i64) -> bool {
     if stmt.handle == 0 { return false }
     return ffi_sext32(ffi_call3(stmt.api.fn_bind_int64, stmt.handle, idx_1based, val)) == 0
+}
+
+fn sqlite_bind_f64(stmt: SqliteStmt, idx_1based: i64, val: f64) -> bool {
+    return sqlite_bind_text(stmt, idx_1based, fmt_f64(val, 10))
 }
 
 fn sqlite_bind_text(stmt: SqliteStmt, idx_1based: i64, text: str) -> bool {
@@ -137,10 +157,31 @@ fn sqlite_bind_text(stmt: SqliteStmt, idx_1based: i64, text: str) -> bool {
     return rc == 0
 }
 
+fn sqlite_bind_blob(stmt: SqliteStmt, idx_1based: i64, data: ByteBuf) -> bool {
+    n := buf_len(data)
+    if stmt.handle == 0 or stmt.api.fn_bind_blob == 0 or n > 0x7FFFFFFF { return false }
+    if n == 0 {
+        empty_p := ffi_alloc(8)
+        rc0 := ffi_sext32(ffi_call5(stmt.api.fn_bind_blob, stmt.handle, idx_1based, empty_p, 0, -1))
+        ffi_free(empty_p)
+        return rc0 == 0
+    }
+    bp := ffi_bytes_to_ptr(data)
+    if bp == 0 { return false }
+    rc := ffi_sext32(ffi_call5(stmt.api.fn_bind_blob, stmt.handle, idx_1based, bp, n, -1))
+    ffi_free(bp)
+    return rc == 0
+}
+
 // Returns `100` (`SQLITE_ROW`) when a row is ready, `101` (`SQLITE_DONE`) when finished
 fn sqlite_step(stmt: SqliteStmt) -> i64 {
     if stmt.handle == 0 { return -202 }
     return ffi_sext32(ffi_call1(stmt.api.fn_step, stmt.handle))
+}
+
+fn sqlite_reset(stmt: SqliteStmt) -> bool {
+    if stmt.handle == 0 or stmt.api.fn_reset == 0 { return false }
+    return ffi_sext32(ffi_call1(stmt.api.fn_reset, stmt.handle)) == 0
 }
 
 fn sqlite_col_count(stmt: SqliteStmt) -> i64 {
@@ -148,9 +189,49 @@ fn sqlite_col_count(stmt: SqliteStmt) -> i64 {
     return ffi_sext32(ffi_call1(stmt.api.fn_col_count, stmt.handle))
 }
 
+// Column affinity type: `1=SQLITE_INTEGER, 2=SQLITE_FLOAT, 3=SQLITE_TEXT, 4=SQLITE_BLOB, 5=SQLITE_NULL`
+fn sqlite_col_type(stmt: SqliteStmt, col_0based: i64) -> i64 {
+    if stmt.handle == 0 or col_0based < 0 or stmt.api.fn_col_type == 0 { return 5 }
+    return ffi_sext32(ffi_call2(stmt.api.fn_col_type, stmt.handle, col_0based))
+}
+
 fn sqlite_col_i64(stmt: SqliteStmt, col_0based: i64) -> i64 {
     if stmt.handle == 0 or col_0based < 0 { return 0 }
     return ffi_call2(stmt.api.fn_col_int64, stmt.handle, col_0based)
+}
+
+fn sqlite_col_f64(stmt: SqliteStmt, col_0based: i64) -> f64 {
+    s := sqlite_col_text(stmt, col_0based)
+    n := str_len(s)
+    if n == 0 { return 0.0 }
+    mut pos := 0
+    mut sign := 1.0
+    if str_byte(s, 0) == 45 { sign = -1.0; pos = 1 } else if str_byte(s, 0) == 43 { pos = 1 }
+    mut int_p := 0.0
+    while pos < n {
+        ch := str_byte(s, pos)
+        if ch >= 48 and ch <= 57 { int_p = int_p * 10.0 + ((ch - 48) as f64); pos += 1 } else { break }
+    }
+    mut frac_p := 0.0
+    mut scale := 1.0
+    if pos < n and str_byte(s, pos) == 46 {
+        pos += 1
+        while pos < n {
+            ch := str_byte(s, pos)
+            if ch >= 48 and ch <= 57 { frac_p = frac_p * 10.0 + ((ch - 48) as f64); scale = scale * 10.0; pos += 1 } else { break }
+        }
+    }
+    return sign * (int_p + frac_p / scale)
+}
+
+fn sqlite_col_blob(stmt: SqliteStmt, col_0based: i64) -> ByteBuf {
+    if stmt.handle == 0 or col_0based < 0 or stmt.api.fn_col_blob == 0 or stmt.api.fn_col_bytes == 0 {
+        return buf_new(0)
+    }
+    p := ffi_call2(stmt.api.fn_col_blob, stmt.handle, col_0based)
+    nb := ffi_sext32(ffi_call2(stmt.api.fn_col_bytes, stmt.handle, col_0based))
+    if p == 0 or nb <= 0 { return buf_new(0) }
+    return ffi_read_bytes(p, nb)
 }
 
 fn sqlite_col_text(stmt: SqliteStmt, col_0based: i64) -> str {
