@@ -19,16 +19,20 @@ use std::fs
 
 @no_alloc
 fn sec_log2_f64(x_in: f64) -> f64 {
-    if x_in <= 0.0 { return 0.0 }
+    // Guard NaN, <= 0, and +Inf (`+Inf - +Inf == NaN != 0.0`, prevents infinite halving loop!)
+    if x_in <= 0.0 or (x_in - x_in) != 0.0 { return 0.0 }
     mut m := x_in
     mut e := 0.0
-    while m >= 2.0 {
+    mut steps := 0
+    while m >= 2.0 and steps < 2048 {
         m = m * 0.5
         e += 1.0
+        steps += 1
     }
-    while m < 1.0 {
+    while m < 1.0 and steps < 4096 {
         m = m * 2.0
         e -= 1.0
+        steps += 1
     }
     // ln(m) = 2 * (y + y^3/3 + y^5/5 + y^7/7 + y^9/9), y = (m-1)/(m+1)
     y := (m - 1.0) / (m + 1.0)
@@ -256,7 +260,7 @@ fn complexity_analyze(c: ComplexityCtx, warn_exp: f64 = 1.55, crit_exp: f64 = 2.
     mut ui := 0
     while ui < u_len {
         sz := ibuf_get(uniq, ui)
-        tr := ibuf_new(32)
+        tr := ibuf_new(n + 4)
         mut j := 0
         while j < n {
             if dvec_get(c.sizes, j, 0) == sz {
@@ -293,7 +297,9 @@ fn complexity_analyze(c: ComplexityCtx, warn_exp: f64 = 1.55, crit_exp: f64 = 2.
             if ratio > max_ratio { max_ratio = ratio }
             dn := sec_log2_f64((n2 as f64) / (n1 as f64))
             if dn > 0.01 and ratio > 1.0 {
-                exp_v := sec_log2_f64(ratio) / dn
+                mut exp_v := sec_log2_f64(ratio) / dn
+                if exp_v != exp_v or exp_v < 0.0 { exp_v = 0.0 }
+                if exp_v > 1000.0 { exp_v = 1000.0 }
                 ibuf_push(exps_milli, (exp_v * 1000.0) as i64)
             } else {
                 ibuf_push(exps_milli, 0)
@@ -444,31 +450,42 @@ fn _rz_find_idx(g: RedzoneGuard, user_ptr: i64) -> i64 {
     return -1
 }
 
-fn _rz_check_record(g: RedzoneGuard, idx: i64) -> i64 {
+fn _rz_check_record_mask(g: RedzoneGuard, idx: i64) -> i64 {
     base := idx * 5
     user_ptr := dvec_get(g.recs, base, 0)
     raw := dvec_get(g.recs, base + 1, 0)
     sz := dvec_get(g.recs, base + 2, 0)
     state := dvec_get(g.recs, base + 3, 0)
     key := dvec_get(g.recs, base + 4, 0)
-    if state != 1 { return RZ_DOUBLE_FREE() }
+    if state != 1 { return 4 }
+    mut mask := 0
     unsafe {
         mut i := 0
         while i < 64 {
             if ptr_read_u8(raw, i) != _rz_canary_byte(key, i, 0) {
-                return RZ_HEAD_UNDERFLOW()
+                mask = mask | 1
+                break
             }
             i += 1
         }
         i = 0
         while i < 64 {
             if ptr_read_u8(user_ptr + sz, i) != _rz_canary_byte(key, i, 1) {
-                return RZ_TAIL_OVERFLOW()
+                mask = mask | 2
+                break
             }
             i += 1
         }
-        return RZ_OK()
     }
+    return mask
+}
+
+fn _rz_check_record(g: RedzoneGuard, idx: i64) -> i64 {
+    m := _rz_check_record_mask(g, idx)
+    if (m & 4) != 0 { return RZ_DOUBLE_FREE() }
+    if (m & 1) != 0 { return RZ_HEAD_UNDERFLOW() }
+    if (m & 2) != 0 { return RZ_TAIL_OVERFLOW() }
+    return RZ_OK()
 }
 
 // Verifies head & tail redzone canaries for `user_ptr` without freeing it.
@@ -491,9 +508,12 @@ fn rz_free(mut g: RedzoneGuard, user_ptr: i64) -> i64 {
         g.double_frees = g.double_frees + 1
         return RZ_DOUBLE_FREE()
     }
-    status := _rz_check_record(g, idx)
-    if status == RZ_HEAD_UNDERFLOW() { g.underflows = g.underflows + 1 }
-    if status == RZ_TAIL_OVERFLOW() { g.overflows = g.overflows + 1 }
+    mask := _rz_check_record_mask(g, idx)
+    if (mask & 1) != 0 { g.underflows = g.underflows + 1 }
+    if (mask & 2) != 0 { g.overflows = g.overflows + 1 }
+    mut status := RZ_OK()
+    if (mask & 1) != 0 { status = RZ_HEAD_UNDERFLOW() }
+    else if (mask & 2) != 0 { status = RZ_TAIL_OVERFLOW() }
     raw := dvec_get(g.recs, base + 1, 0)
     sz := dvec_get(g.recs, base + 2, 0)
     unsafe {
@@ -513,9 +533,9 @@ fn rz_verify_all(g: RedzoneGuard) -> RedzoneReport {
     mut i := 0
     while i < g.count {
         if dvec_get(g.recs, i * 5 + 3, 0) == 1 {
-            st := _rz_check_record(g, i)
-            if st == RZ_HEAD_UNDERFLOW() { live_uf += 1 }
-            if st == RZ_TAIL_OVERFLOW() { live_of += 1 }
+            m := _rz_check_record_mask(g, i)
+            if (m & 1) != 0 { live_uf += 1 }
+            if (m & 2) != 0 { live_of += 1 }
         }
         i += 1
     }
@@ -591,9 +611,32 @@ fn _sec_has_nul(s: str) -> bool {
     return false
 }
 
+fn _sec_is_safe_path(p: str) -> bool {
+    n := str_len(p)
+    if n == 0 or n > 1024 { return false }
+    if str_byte(p, n - 1) == 92 { return false }
+    mut i := 0
+    while i < n {
+        b := str_byte(p, i)
+        if b < 32 or b == 127 or b == 34 or b == 39 or b == 96 or b == 59 or b == 124
+            or b == 38 or b == 36 or b == 60 or b == 62 {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
 fn _sec_tmp_name(tag: str, ext: str) -> str {
     nonce := (clock_ns() ^ cpu_rdtsc() ^ (sys_pid() *% 0x9E3779B9)) & 0x7FFFFFFF
     return f".axon_sec_{tag}_{sys_pid()}_{nonce}{ext}"
+}
+
+fn _sec_exe_cmd(exe_name: str) -> str {
+    if ffi_open("kernel32.dll", "", "") != 0 {
+        return f"\"{exe_name}\""
+    }
+    return f"./{exe_name}"
 }
 
 // Executes `cmd` directly in an isolated child process with a strict millisecond timeout.
@@ -627,6 +670,18 @@ fn sec_exec_timeout(cmd: str, timeout_ms: i64 = 5000) -> ProcOutcome {
             ec_ptr := ffi_alloc(16)
             c_out := ffi_cstr(tmp_out)
             c_cmd := ffi_cstr(cmd)
+            if sa == 0 or si == 0 or pi == 0 or ec_ptr == 0 or c_out == 0 or c_cmd == 0 {
+                if sa != 0 { ffi_free(sa) }
+                if si != 0 { ffi_free(si) }
+                if pi != 0 { ffi_free(pi) }
+                if ec_ptr != 0 { ffi_free(ec_ptr) }
+                if c_out != 0 { ffi_free(c_out) }
+                if c_cmd != 0 { ffi_free(c_cmd) }
+                return ProcOutcome(
+                    exit_code = -1, timed_out = false, crashed = false, is_sec_trap = false,
+                    signal_name = "ALLOC_FAILED", elapsed_ms = 0, output = ""
+                )
+            }
 
             // SECURITY_ATTRIBUTES (24B): +0 nLength=24, +16 bInheritHandle=1
             ffi_write_u32_le(sa, 0, 24)
@@ -705,14 +760,16 @@ fn sec_exec_timeout(cmd: str, timeout_ms: i64 = 5000) -> ProcOutcome {
         }
     }
 
-    // Portable non-Windows fallback via `os_exec`
-    rc := os_exec(f"{cmd} > {tmp_out} 2>&1")
+    // Portable non-Windows fallback via POSIX `timeout` when available (enforces timeout_ms!)
+    tmo_s := (tmo + 999) / 1000
+    rc := os_exec(f"timeout {tmo_s}s {cmd} > '{tmp_out}' 2>&1")
     out_txt := fs_read_text(tmp_out) or ""
     _ := sys_fs_remove(tmp_out)
     el_ms := (clock_ns() - t0) / 1000000
-    (crashed, is_trap, sig_name) := _sec_classify_exit(rc, false)
+    is_tmo := rc == 124
+    (crashed, is_trap, sig_name) := _sec_classify_exit(rc, is_tmo)
     return ProcOutcome(
-        exit_code = rc, timed_out = false, crashed = crashed,
+        exit_code = rc, timed_out = is_tmo, crashed = crashed,
         is_sec_trap = is_trap, signal_name = sig_name, elapsed_ms = el_ms, output = out_txt
     )
 }
@@ -727,11 +784,14 @@ struct CheckFailResult {
 }
 
 fn sec_check_must_fail(axc_path: str, source_code: str, expected_err_code: str, timeout_ms: i64 = 5000) -> CheckFailResult {
+    if not _sec_is_safe_path(axc_path) {
+        return CheckFailResult(passed = false, exit_code = -1, expected_code = expected_err_code, output = "invalid axc_path")
+    }
     tmp_ax := _sec_tmp_name("neg", ".ax")
     if not fs_write_text(tmp_ax, source_code) {
         return CheckFailResult(passed = false, exit_code = -1, expected_code = expected_err_code, output = "failed to write temp source")
     }
-    res := sec_exec_timeout(f"{axc_path} check --json {tmp_ax}", timeout_ms)
+    res := sec_exec_timeout(f"\"{axc_path}\" check --json \"{tmp_ax}\"", timeout_ms)
     _ := sys_fs_remove(tmp_ax)
     ok_fail := (not res.timed_out) and (res.exit_code != 0) and str_contains(res.output, expected_err_code)
     return CheckFailResult(passed = ok_fail, exit_code = res.exit_code, expected_code = expected_err_code, output = res.output)
@@ -749,13 +809,19 @@ struct DiffBuildResult {
 }
 
 fn sec_diff_build_run(axc_path: str, file_path: str, timeout_ms: i64 = 10000) -> DiffBuildResult {
+    if not _sec_is_safe_path(axc_path) or not _sec_is_safe_path(file_path) {
+        return DiffBuildResult(
+            passed = false, avx2_rc = -1, scalar_rc = -1, shield_rc = -1,
+            outputs_match = false, summary = "BUILD_DIFF_INVALID_PATH"
+        )
+    }
     exe_avx := _sec_tmp_name("avx2", ".exe")
     exe_sca := _sec_tmp_name("scalar", ".exe")
     exe_shd := _sec_tmp_name("shield", ".exe")
 
-    b_avx := sec_exec_timeout(f"{axc_path} build {file_path} --simd=avx2 -o {exe_avx}", timeout_ms)
-    b_sca := sec_exec_timeout(f"{axc_path} build {file_path} --simd=scalar -o {exe_sca}", timeout_ms)
-    b_shd := sec_exec_timeout(f"{axc_path} build {file_path} --shield -o {exe_shd}", timeout_ms)
+    b_avx := sec_exec_timeout(f"\"{axc_path}\" build \"{file_path}\" --simd=avx2 -o \"{exe_avx}\"", timeout_ms)
+    b_sca := sec_exec_timeout(f"\"{axc_path}\" build \"{file_path}\" --simd=scalar -o \"{exe_sca}\"", timeout_ms)
+    b_shd := sec_exec_timeout(f"\"{axc_path}\" build \"{file_path}\" --shield -o \"{exe_shd}\"", timeout_ms)
 
     if b_avx.exit_code != 0 or b_sca.exit_code != 0 or b_shd.exit_code != 0 {
         _ := sys_fs_remove(exe_avx)
@@ -768,9 +834,9 @@ fn sec_diff_build_run(axc_path: str, file_path: str, timeout_ms: i64 = 10000) ->
         )
     }
 
-    r_avx := sec_exec_timeout(exe_avx, timeout_ms)
-    r_sca := sec_exec_timeout(exe_sca, timeout_ms)
-    r_shd := sec_exec_timeout(exe_shd, timeout_ms)
+    r_avx := sec_exec_timeout(_sec_exe_cmd(exe_avx), timeout_ms)
+    r_sca := sec_exec_timeout(_sec_exe_cmd(exe_sca), timeout_ms)
+    r_shd := sec_exec_timeout(_sec_exe_cmd(exe_shd), timeout_ms)
 
     _ := sys_fs_remove(exe_avx)
     _ := sys_fs_remove(exe_sca)
@@ -808,16 +874,17 @@ fn sec_backtrace_signature(output: str, fallback_sig: str = "CRASH") -> str {
         if end_l > pos and str_byte(output, end_l - 1) == 13 { end_l -= 1 }
         line := str_trim(str_slice(output, pos, end_l))
         if str_starts_with(line, "#0") or str_starts_with(line, "#1") or str_starts_with(line, "#2") {
-            if frames > 0 { buf_push_str(b, "|") }
-            // Compact spaces inside `#0  fn_name`
+            if frames > 0 and buf_len(b) + 1 <= 252 { buf_push_str(b, "|") }
+            // Compact spaces inside `#0  fn_name`, clamped to 78B per frame so 256B buf never traps!
             mut sp := str_find_byte(line, 32, 0)
+            mut piece := line
             if sp > 0 {
                 tag := str_slice(line, 0, sp)
                 fn_name := str_trim(str_slice(line, sp + 1, str_len(line)))
-                buf_push_str(b, tag + ":" + fn_name)
-            } else {
-                buf_push_str(b, line)
+                piece = tag + ":" + fn_name
             }
+            if str_len(piece) > 78 { piece = str_slice(piece, 0, 78) }
+            if buf_len(b) + str_len(piece) <= 252 { buf_push_str(b, piece) }
             frames += 1
         }
         if nl >= n { break }
@@ -900,8 +967,9 @@ fn sec_vault_load_hex_dir(vault_dir: str) -> StrVec {
         name := svec_get(entries, i)
         if str_ends_with(name, ".hex") {
             hx := fs_read_text(f"{vault_dir}/{name}") or ""
-            if str_len(hx) >= 0 {
-                dec := str_from_hex(str_trim(hx)) or ""
+            hx_t := str_trim(hx)
+            if str_len(hx_t) > 0 {
+                dec := str_from_hex(hx_t) or ""
                 svec_push(mut out, dec)
             }
         }

@@ -145,23 +145,40 @@ fn _sast_strip_comment(line: str) -> str {
     return line
 }
 
-// Replaces quoted string literal interiors with spaces so code-pattern rules NEVER match text inside string literals!
+// Replaces quoted string literal interiors with spaces while preserving `f"..."` `{expr}` code interiors!
 fn _sast_mask_strings(code: str) -> str {
     n := str_len(code)
     b := buf_new(n + 8)
     mut in_str := false
+    mut is_fstr := false
+    mut f_depth := 0
     mut esc := false
     mut i := 0
     while i < n {
         ch := str_byte(code, i)
         if in_str {
-            if esc { esc = false; buf_push(b, 32) }
-            else if ch == 92 { esc = true; buf_push(b, 32) }
-            else if ch == 34 { in_str = false; buf_push(b, 34) }
-            else { buf_push(b, 32) }
+            if f_depth > 0 {
+                if ch == 123 { f_depth += 1; buf_push(b, ch) }
+                else if ch == 125 { f_depth -= 1; buf_push(b, ch) }
+                else { buf_push(b, ch) }
+            } else {
+                if esc { esc = false; buf_push(b, 32) }
+                else if ch == 92 { esc = true; buf_push(b, 32) }
+                else if ch == 34 { in_str = false; is_fstr = false; buf_push(b, 34) }
+                else if is_fstr and ch == 123 {
+                    if i + 1 < n and str_byte(code, i + 1) == 123 {
+                        buf_push(b, 32); buf_push(b, 32); i += 2; continue
+                    }
+                    f_depth = 1
+                    buf_push(b, 123)
+                } else { buf_push(b, 32) }
+            }
         } else {
-            if ch == 34 { in_str = true; buf_push(b, 34) }
-            else { buf_push(b, ch) }
+            if ch == 34 {
+                in_str = true
+                is_fstr = (i > 0 and str_byte(code, i - 1) == 102 and (i == 1 or not _sast_is_id_char(str_byte(code, i - 2))))
+                buf_push(b, 34)
+            } else { buf_push(b, ch) }
         }
         i += 1
     }
@@ -300,7 +317,7 @@ fn _sast_parse_fn_params(fn_line: str, mut vt: StrMap, mut fn_params: StrVec) {
 }
 
 // Updates `vt` based on guards and sanitizers visible on the current statement line.
-fn _sast_update_guards(masked: str, raw_code: str, mut vt: StrMap) {
+fn _sast_update_guards(masked: str, raw_code: str, mut vt: StrMap, fn_brace_depth: i64) {
     // 1. Track constant assignments (`x := 128`, `x := 2048 * 8`)
     avar := _sast_extract_assign_var(masked)
     if str_len(avar) > 0 {
@@ -320,25 +337,27 @@ fn _sast_update_guards(masked: str, raw_code: str, mut vt: StrMap) {
         }
     }
 
-    // 2. Track ALL free calls on the line (handles `;`-separated `ffi_free(a); ffi_free(b); ffi_free(c)`)
-    mut fp_pos := 0
-    while true {
-        p_mf := str_find(masked, "mem_free_aligned(", fp_pos)
-        if p_mf < 0 { break }
-        fp := str_trim(_sast_extract_call_args(str_slice(masked, p_mf, str_len(masked)), "mem_free_aligned("))
-        _vt_add(mut vt, fp, _VT_RAW_FREED())
-        fp_pos = p_mf + 17
-    }
-    fp_pos = 0
-    while true {
-        p_ff := str_find(masked, "ffi_free(", fp_pos)
-        if p_ff < 0 { break }
-        fp := str_trim(_sast_extract_call_args(str_slice(masked, p_ff, str_len(masked)), "ffi_free("))
-        _vt_add(mut vt, fp, _VT_RAW_FREED())
-        fp_pos = p_ff + 9
+    // 2. Track top-level free calls ONLY (fn_brace_depth <= 1) so early-return error branch frees don't hide leaks!
+    if fn_brace_depth <= 1 and not str_starts_with(masked, "if ") {
+        mut fp_pos := 0
+        while true {
+            p_mf := str_find(masked, "mem_free_aligned(", fp_pos)
+            if p_mf < 0 { break }
+            fp := str_trim(_sast_extract_call_args(str_slice(masked, p_mf, str_len(masked)), "mem_free_aligned("))
+            _vt_add(mut vt, fp, _VT_RAW_FREED())
+            fp_pos = p_mf + 17
+        }
+        fp_pos = 0
+        while true {
+            p_ff := str_find(masked, "ffi_free(", fp_pos)
+            if p_ff < 0 { break }
+            fp := str_trim(_sast_extract_call_args(str_slice(masked, p_ff, str_len(masked)), "ffi_free("))
+            _vt_add(mut vt, fp, _VT_RAW_FREED())
+            fp_pos = p_ff + 9
+        }
     }
 
-    // 3. Track `if` guards: null checks (`v == 0`, `v != 0`), upper bounds (`v > ...`, `v >= ...`, `v < ...`), non-zero (`v <= 0`, `v == 0`), CRLF & safe-path checks
+    // 3. Track `if` guards: separate non-zero (`v > 0`/`v != 0`/`v <= 0`) from upper-bound guards (`v < C`/`v <= C`/`v > C`)!
     if str_starts_with(masked, "if ") or str_contains(masked, " else if ") {
         ids := _sast_extract_idents(masked)
         in_len := svec_len(ids)
@@ -346,10 +365,13 @@ fn _sast_update_guards(masked: str, raw_code: str, mut vt: StrMap) {
         while k < in_len {
             id := svec_get(ids, k)
             if not _sast_is_keyword(id) {
-                if str_contains(masked, id + " == 0") or str_contains(masked, id + " != 0") or str_contains(masked, id + " <= 0") {
+                if str_contains(masked, id + " == 0") or str_contains(masked, id + " != 0")
+                    or str_contains(masked, id + " <= 0") or str_contains(masked, id + " > 0") or str_contains(masked, id + " >= 1") {
                     _vt_add(mut vt, id, _VT_NULL_OK() | _VT_NONZERO())
                 }
-                if str_contains(masked, id + " > ") or str_contains(masked, id + " >= ") or str_contains(masked, id + " < ") or str_contains(masked, id + " <= ") {
+                only_lower := str_contains(masked, id + " > 0") or str_contains(masked, id + " >= 0") or str_contains(masked, id + " >= 1")
+                if str_contains(masked, id + " < ") or str_contains(masked, id + " <= ")
+                    or ((not only_lower) and (str_contains(masked, id + " > ") or str_contains(masked, id + " >= "))) {
                     _vt_add(mut vt, id, _VT_BOUNDED())
                 }
                 if str_contains(masked, "http_is_safe_header_val(" + id) or (str_contains(masked, "str_find_byte(" + id + ", 13") and str_contains(masked, "str_find_byte(" + id + ", 10")) {
@@ -446,7 +468,7 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
         }
 
         // Update intra-procedural variable guards BEFORE checking sinks on this line
-        _sast_update_guards(masked, code, mut vt)
+        _sast_update_guards(masked, code, mut vt, fn_brace_depth)
 
         // Record newly allocated raw pointer for leak tracking (AX-SAST-015)
         if str_contains(masked, "mem_alloc_aligned(") or str_contains(masked, "ffi_alloc(") {
@@ -520,8 +542,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
             }
         }
 
-        // --- AX-SAST-004 (CWE-476): `mem_alloc_aligned` written via `ptr_write_*`/`mem_set` without null guard ---
-        if str_contains(masked, "mem_alloc_aligned(") {
+        // --- AX-SAST-004 (CWE-476): `mem_alloc_aligned`/`ffi_alloc` written via `ptr_write_*`/`ffi_write_*`/`mem_set` without null guard ---
+        if str_contains(masked, "mem_alloc_aligned(") or str_contains(masked, "ffi_alloc(") {
             pvar := _sast_extract_assign_var(masked)
             if str_len(pvar) > 0 {
                 mut j := i + 1
@@ -535,6 +557,7 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
                         break
                     }
                     if (str_contains(m2, "ptr_write_") and str_contains(m2, "(" + pvar + ","))
+                        or (str_contains(m2, "ffi_write_") and str_contains(m2, "(" + pvar + ","))
                         or str_contains(m2, "mem_set(" + pvar + ",") {
                         used_raw = true
                         break
@@ -544,9 +567,9 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
                 if used_raw and not checked_null {
                     _sast_push(
                         mut sr, 3, SAST_CONF_HIGH(), "AX-SAST-004", "CWE-476", file_path, lno,
-                        f"Raw pointer `{pvar}` from `mem_alloc_aligned` dereferenced before null check",
+                        f"Raw pointer `{pvar}` from `mem_alloc_aligned`/`ffi_alloc` dereferenced before null check",
                         code,
-                        f"Add `if {pvar} == 0 {{ return ... }}` immediately after `mem_alloc_aligned` before calling `ptr_write_*` or `mem_set`."
+                        f"Add `if {pvar} == 0 {{ return ... }}` immediately after allocation before calling `ptr_write_*`, `ffi_write_*`, or `mem_set`."
                     )
                 }
             }

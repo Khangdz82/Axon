@@ -211,7 +211,8 @@ fn _fz_apply_single_mutator(r: Rng, move cur_in: ByteBuf, op: i64, dict: StrVec,
         mut del_len := 1 + _fz_u64_mod(r, if n < 32 { n - 1 } else { 32 })
         if del_len >= n { del_len = n - 1 }
         pos := _fz_u64_mod(r, n - del_len + 1)
-        nb := buf_new(limit + 64)
+        nb_cap := (if n > limit { n } else { limit }) + 64
+        nb := buf_new(nb_cap)
         if pos > 0 { buf_push_str(nb, buf_slice_str(cur, 0, pos)) }
         if pos + del_len < n { buf_push_str(nb, buf_slice_str(cur, pos + del_len, n)) }
         buf_free(move cur)
@@ -223,7 +224,8 @@ fn _fz_apply_single_mutator(r: Rng, move cur_in: ByteBuf, op: i64, dict: StrVec,
         reps := 1 + _fz_u64_mod(r, 4)
         dst_pos := _fz_u64_mod(r, n + 1)
         blk := buf_slice_str(cur, src_pos, src_pos + blk_len)
-        nb := buf_new(limit + 64)
+        nb_cap := (if n > limit { n } else { limit }) + 64
+        nb := buf_new(nb_cap)
         if dst_pos > 0 { buf_push_str(nb, buf_slice_str(cur, 0, dst_pos)) }
         mut ri := 0
         while ri < reps and buf_len(nb) + blk_len <= limit {
@@ -243,7 +245,8 @@ fn _fz_apply_single_mutator(r: Rng, move cur_in: ByteBuf, op: i64, dict: StrVec,
         // Insert random bytes (1..16 bytes)
         ins_len := 1 + _fz_u64_mod(r, 16)
         pos := if n > 0 { _fz_u64_mod(r, n + 1) } else { 0 }
-        nb := buf_new(limit + 64)
+        nb_cap := (if n > limit { n } else { limit }) + 64
+        nb := buf_new(nb_cap)
         if pos > 0 { buf_push_str(nb, buf_slice_str(cur, 0, pos)) }
         mut j := 0
         while j < ins_len and buf_len(nb) < limit {
@@ -281,7 +284,8 @@ fn _fz_apply_single_mutator(r: Rng, move cur_in: ByteBuf, op: i64, dict: StrVec,
                 }
             } else if n + tlen <= limit {
                 pos := if n > 0 { _fz_u64_mod(r, n + 1) } else { 0 }
-                nb := buf_new(limit + 64)
+                nb_cap := (if n + tlen > limit { n + tlen } else { limit }) + 64
+                nb := buf_new(nb_cap)
                 if pos > 0 { buf_push_str(nb, buf_slice_str(cur, 0, pos)) }
                 buf_push_str(nb, tok)
                 if pos < n { buf_push_str(nb, buf_slice_str(cur, pos, n)) }
@@ -359,6 +363,8 @@ struct SecFuzzer {
     max_len: i64
     max_corpus: i64
     det_idx: i64
+    det_limit: i64
+    i2s_streak: i64
     unique_bits: i64
     last_op: i64
     i2s_queued_total: i64
@@ -412,6 +418,8 @@ fn fuzz_new(seed: i64 = 1337, max_iters: i64 = 4096, max_len: i64 = 1024) -> Sec
         max_len = ml,
         max_corpus = 512,
         det_idx = 0,
+        det_limit = -1,
+        i2s_streak = 0,
         unique_bits = 0,
         last_op = -1,
         i2s_queued_total = 0,
@@ -441,10 +449,11 @@ fn fuzz_free(move fz: SecFuzzer) {
 
 fn _fz_add_corpus_dedup(mut fz: SecFuzzer, s: str, init_energy: i64) -> bool {
     if svec_len(fz.corpus) >= fz.max_corpus { return false }
-    h := fnv1a_64(s) ^ (str_len(s) *% 0x9E3779B97F4A7C15)
+    eff_s := if str_len(s) > fz.max_len { str_slice(s, 0, fz.max_len) } else { s }
+    h := fnv1a_64(eff_s) ^ (str_len(eff_s) *% 0x9E3779B97F4A7C15)
     if dmap_contains(fz.corpus_hashes, h) { return false }
     dmap_put(mut fz.corpus_hashes, h, 1)
-    svec_push(mut fz.corpus, s)
+    svec_push(mut fz.corpus, eff_s)
     dvec_push(mut fz.energy, init_energy)
     return true
 }
@@ -710,14 +719,29 @@ fn fuzz_next(mut fz: SecFuzzer) -> bool {
         return false
     }
 
-    // Priority 2: Drain REDQUEEN I2S replacement queue immediately!
-    if fz.i2s_head < svec_len(fz.i2s_queue) {
-        s := svec_get(fz.i2s_queue, fz.i2s_head)
+    if svec_len(fz.corpus) == 0 {
+        fuzz_add_seed(mut fz, "")
+        fuzz_add_seed(mut fz, "a")
+    }
+    if fz.det_limit < 0 {
+        fz.det_limit = svec_len(fz.corpus)
+    }
+
+    // Priority 2: Drain REDQUEEN I2S replacement queue (bounded streak prevents starving normal havoc!)
+    if fz.i2s_head < svec_len(fz.i2s_queue) and fz.i2s_streak < 8 {
+        s := "" + svec_get(fz.i2s_queue, fz.i2s_head)
         fz.i2s_head = fz.i2s_head + 1
-        // Compact queue periodically when fully drained
-        if fz.i2s_head >= svec_len(fz.i2s_queue) and fz.i2s_head >= 128 {
+        // Compact queue whenever head >= 128 regardless of emptiness (prevents unbounded growth!)
+        qlen := svec_len(fz.i2s_queue)
+        if fz.i2s_head >= 128 {
+            mut nq := svec_new(64, 4096)
+            mut qi := fz.i2s_head
+            while qi < qlen {
+                svec_push(mut nq, svec_get(fz.i2s_queue, qi))
+                qi += 1
+            }
             svec_free(move fz.i2s_queue)
-            fz.i2s_queue = svec_new(64, 4096)
+            fz.i2s_queue = nq
             fz.i2s_head = 0
         }
         nb := _fz_str_to_buf(s, 64)
@@ -725,17 +749,14 @@ fn fuzz_next(mut fz: SecFuzzer) -> bool {
         fz.cur_input = nb
         fz.last_op = -1
         fz.i2s_applied = fz.i2s_applied + 1
+        fz.i2s_streak = fz.i2s_streak + 1
         fz.iter = fz.iter + 1
         return true
     }
+    fz.i2s_streak = 0
 
-    if svec_len(fz.corpus) == 0 {
-        fuzz_add_seed(mut fz, "")
-        fuzz_add_seed(mut fz, "a")
-    }
-
-    // Priority 3: Deterministic replay of initial seeds
-    if fz.det_idx < svec_len(fz.corpus) and fz.iter == fz.det_idx {
+    // Priority 3: Deterministic replay of all initial seeds (never cut short by seed-0 I2S hits!)
+    if fz.det_idx < fz.det_limit and fz.det_idx < svec_len(fz.corpus) {
         s := svec_get(fz.corpus, fz.det_idx)
         nb := _fz_str_to_buf(s, 64)
         buf_free(move fz.cur_input)
@@ -831,7 +852,17 @@ fn gen_i64_range(g: SecGen, lo: i64, hi_incl: i64) -> i64 {
     if pick == 1 { return hi_incl }
     if pick == 2 and lo <= 0 and hi_incl >= 0 { return 0 }
     span := hi_incl -% lo
-    if span <= 0 or span >= 9223372036854775806 { return lo }
+    if span < 0 or span >= 9223372036854775806 {
+        // Full-range span > INT64_MAX: sample uniformly across [lo, 0] or [0, hi_incl]
+        if _fz_u64_mod(g.rng, 2) == 0 and lo < 0 {
+            hspan := 0 -% lo
+            if hspan > 0 and hspan < 9223372036854775806 { return lo +% _fz_u64_mod(g.rng, hspan + 1) }
+        }
+        if hi_incl > 0 and hi_incl < 9223372036854775806 { return _fz_u64_mod(g.rng, hi_incl + 1) }
+        r := rng_next_u64(g.rng)
+        if r >= lo and r <= hi_incl { return r }
+        return lo
+    }
     return lo +% _fz_u64_mod(g.rng, span + 1)
 }
 
@@ -1210,7 +1241,7 @@ fn shrink_seq_result_len(sh: ShrinkSeq) -> i64 { return ibuf_len(sh.best) / 3 }
 
 fn seq_format_repro(ops: IntBuf) -> str {
     n_ops := ibuf_len(ops) / 3
-    b := buf_new(n_ops * 32 + 32)
+    b := buf_new(n_ops * 72 + 32)
     buf_push_str(b, "[")
     mut i := 0
     while i < n_ops {
