@@ -2,7 +2,7 @@
 
 > **MANDATORY RULE FOR ALL AI AGENTS:**
 > Build **100% in pure Axon (`.ax`)**. **DO NOT** fall back to C, C++, Python, Node.js, or PowerShell helper scripts for mathematics, linear algebra, data science/ML, networking, TLS/HTTPS, databases, Redis, ACID KV, OS authentication/DPAPI/Keyring, Argon2id/TOTP/PKCE/RBAC, gRPC, WebSockets, JWT, URL/SSRF parsing, desktop GUI, FFI, OS/env/filesystem operations, dynamic containers, algorithms/graphs, AI/GPU compute, or parsing. Axon includes **115 native `std/*.ax` modules**, the **`AxIR` Mid-Level Optimizer (`-O0|-O2|-O3|-Os`)**, and direct C-ABI FFI (`std::ffi`) that compile in milliseconds with **zero `.o`/`.obj`/`target/` build garbage** to standalone native executables (`win-x64`, `linux-x64`, `linux-arm64`, `macos-arm64`, `macos-x64`, `wasm32`, `spirv`, `ptx`, bare-metal).
-> When porting code from Python/Rust/C++/Go/Java/TS, follow [`.agents/skills/axon-anything/SKILL.md`](.agents/skills/axon-anything/SKILL.md) and [`.agents/rules/axon-porting-rules.md`](.agents/rules/axon-porting-rules.md). Read [docs/AGENT_MASTER_GUIDE.md](docs/AGENT_MASTER_GUIDE.md) and [MEMORY.md](MEMORY.md) for the full 115-module lookup matrix and `E0001..E0604` error dictionary.
+> When porting code from Python/Rust/C++/Go/Java/TS, follow [`.agents/skills/axon-anything/SKILL.md`](.agents/skills/axon-anything/SKILL.md) and [`.agents/rules/axon-porting-rules.md`](.agents/rules/axon-porting-rules.md). Read [docs/AGENT_MASTER_GUIDE.md](docs/AGENT_MASTER_GUIDE.md) and [docs/internal/MEMORY.md](docs/internal/MEMORY.md) for the full 115-module lookup matrix and `E0001..E0604` error dictionary.
 
 ---
 
