@@ -157,6 +157,7 @@ fn tls_ctx_set_verify_peer(ctx: TlsCtx, ca_file: str) -> bool {
 fn tls_ctx_set_alpn_h2(ctx: TlsCtx) -> bool {
     if ctx.handle == 0 or ctx.api.fn_ctx_set_alpn == 0 { return false }
     p := ffi_alloc(8)
+    if p == 0 { return false }
     ffi_write_u8(p, 0, 2)   // length 2
     ffi_write_u8(p, 1, 104) // 'h'
     ffi_write_u8(p, 2, 50)  // '2'
@@ -287,27 +288,42 @@ fn tls_is_safe_http_token(s: str) -> bool {
     return n > 0
 }
 
-// Allows single or CRLF-separated `Name: Value` headers while blocking bare CR/LF, empty-line `\r\n\r\n` smuggling, and NUL (CWE-113)
+// Allows single or CRLF-separated RFC 9110 `Name: Value` headers while blocking bare CR/LF, `\r\n\r\n` smuggling, malformed lines without `:`, and NUL (CWE-113)
 fn tls_is_safe_http_headers(h: str) -> bool {
     n := str_len(h)
     if n == 0 { return true }
     if str_byte(h, 0) == 13 or str_byte(h, 0) == 10 { return false }
     if str_byte(h, n - 1) == 13 or str_byte(h, n - 1) == 10 { return false }
     mut i := 0
+    mut seen_colon := false
+    mut name_len := 0
     while i < n {
         b := str_byte(h, i)
         if b == 13 {
-            // Only allow `\r\n` followed by a non-CRLF header char (blocks `\r\n\r\n` body injection)
+            // Every header line before `\r\n` must have a non-empty `Field-Name:` (CWE-113)
+            if not seen_colon or name_len <= 0 { return false }
+            // Only allow `\r\n` followed by a non-CRLF non-whitespace header name char
             if i + 2 >= n or str_byte(h, i + 1) != 10 { return false }
             nxt := str_byte(h, i + 2)
             if nxt == 13 or nxt == 10 or nxt <= 32 { return false }
+            seen_colon = false
+            name_len = 0
             i += 2
             continue
         }
         if b == 0 or b == 10 or (b < 32 and b != 9) or b == 127 { return false }
+        if not seen_colon {
+            if b == 58 {
+                if name_len <= 0 { return false }
+                seen_colon = true
+            } else {
+                if b <= 32 or b >= 127 { return false }
+                name_len += 1
+            }
+        }
         i += 1
     }
-    return true
+    return seen_colon and name_len > 0
 }
 
 fn https_request(method: str, host: str, port: i64, path: str, headers: str = "", body: str = "") -> HttpsResponse ! i64 {
@@ -372,15 +388,19 @@ fn https_request(method: str, host: str, port: i64, path: str, headers: str = ""
         if ok_r {
             st_box := ffi_alloc(8)
             sz_box := ffi_alloc(8)
-            ffi_write_u32_le(sz_box, 0, 4)
-            // WINHTTP_QUERY_STATUS_CODE (19) | WINHTTP_QUERY_FLAG_NUMBER (0x20000000)
-            _ := ffi_call6(f_qhdr, h_rq, 0x20000013, 0, st_box, sz_box, 0)
-            status_code = ffi_read_u32_le(st_box, 0)
-            ffi_free(st_box); ffi_free(sz_box)
+            if st_box != 0 and sz_box != 0 {
+                ffi_write_u32_le(sz_box, 0, 4)
+                // WINHTTP_QUERY_STATUS_CODE (19) | WINHTTP_QUERY_FLAG_NUMBER (0x20000000)
+                _ := ffi_call6(f_qhdr, h_rq, 0x20000013, 0, st_box, sz_box, 0)
+                status_code = ffi_read_u32_le(st_box, 0)
+            }
+            if st_box != 0 { ffi_free(st_box) }
+            if sz_box != 0 { ffi_free(sz_box) }
 
             avl_box := ffi_alloc(8)
             rd_box := ffi_alloc(8)
             chunk := ffi_alloc(8192)
+            if avl_box != 0 and rd_box != 0 and chunk != 0 {
             while true {
                 ffi_write_u32_le(avl_box, 0, 0)
                 if (ffi_call2(f_qavl, h_rq, avl_box) & 0xFFFFFFFF) == 0 { break }
@@ -407,7 +427,10 @@ fn https_request(method: str, host: str, port: i64, path: str, headers: str = ""
                 mut i := 0
                 while i < got { buf_push(out_buf, ffi_read_u8(chunk, i)); i += 1 }
             }
-            ffi_free(chunk); ffi_free(rd_box); ffi_free(avl_box)
+            }
+            if chunk != 0 { ffi_free(chunk) }
+            if rd_box != 0 { ffi_free(rd_box) }
+            if avl_box != 0 { ffi_free(avl_box) }
         }
         if h_rq != 0 { _ := ffi_call1(f_cls, h_rq) }
         if h_con != 0 { _ := ffi_call1(f_cls, h_con) }

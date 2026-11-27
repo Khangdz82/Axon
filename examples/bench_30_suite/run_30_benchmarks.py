@@ -74,6 +74,24 @@ def find_vcvars():
     return os.path.join(vc, "VC", "Auxiliary", "Build", "vcvars64.bat") if vc else None
 
 
+def capture_vcvars_env(vcvars):
+    if not vcvars or not os.path.isfile(vcvars) or '"' in vcvars:
+        return None
+    p = subprocess.run(
+        ["cmd.exe", "/d", "/q", "/c", f'call "{vcvars}" >nul && set'],
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        return None
+    env = os.environ.copy()
+    for line in p.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            env[k] = v
+    return env
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="axon_bench30_") as tmp:
         exe = os.path.join(tmp, "axon_bench_30.exe" if os.name == "nt" else "axon_bench_30")
@@ -100,12 +118,18 @@ def main() -> int:
         c_runs = []
         c_compile_ms = 0.0
         vcvars = find_vcvars()
-        if vcvars and os.path.exists(SRC_C):
+        msvc_env = capture_vcvars_env(vcvars)
+        if msvc_env and os.path.exists(SRC_C):
             c_exe = os.path.join(tmp, "bench_30_c.exe")
             c_obj = os.path.join(tmp, "bench_30_c.obj")
             tc0 = time.perf_counter()
-            cmd = f'"{vcvars}" >nul && cl /nologo /O2 /arch:AVX2 /Fo"{c_obj}" /Fe:"{c_exe}" "{SRC_C}" >nul'
-            c_proc = subprocess.run(cmd, cwd=DIR, shell=True, capture_output=True, text=True)
+            c_proc = subprocess.run(
+                ["cl", "/nologo", "/O2", "/arch:AVX2", f"/Fo{c_obj}", f"/Fe{c_exe}", SRC_C],
+                cwd=DIR,
+                env=msvc_env,
+                capture_output=True,
+                text=True,
+            )
             c_compile_ms = (time.perf_counter() - tc0) * 1000.0
             if c_proc.returncode == 0 and os.path.exists(c_exe):
                 for _ in range(3):

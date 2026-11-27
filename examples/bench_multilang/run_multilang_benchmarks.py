@@ -3,12 +3,25 @@ import json
 import os
 import sys
 
-def run_command(cmd, shell=False):
-    res = subprocess.run(cmd, shell=shell, capture_output=True, text=True)
+def run_command(cmd, env=None):
+    res = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if res.returncode != 0:
         print(f"Error running {cmd}: {res.stderr}")
         return None
     return res.stdout.strip()
+
+def capture_vcvars_env(vcvars):
+    if not os.path.isfile(vcvars) or '"' in vcvars:
+        return None
+    p = subprocess.run(["cmd.exe", "/d", "/q", "/c", f'call "{vcvars}" >nul && set'], capture_output=True, text=True)
+    if p.returncode != 0:
+        return None
+    env = os.environ.copy()
+    for line in p.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            env[k] = v
+    return env
 
 def extract_json(stdout):
     for line in stdout.splitlines():
@@ -31,8 +44,11 @@ def main():
     # 1. C (MSVC)
     print("[1/9] Compiling and running C (MSVC /O2 /arch:AVX2)...")
     vcvars = r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
-    cmd_c = f'call "{vcvars}" && cl /O2 /arch:AVX2 /nologo examples\\bench_multilang\\c_bench.c /Fe:examples\\bench_multilang\\c_bench.exe && examples\\bench_multilang\\c_bench.exe'
-    out_c = run_command(cmd_c, shell=True)
+    msvc_env = capture_vcvars_env(vcvars)
+    out_c = None
+    if msvc_env:
+        if run_command(["cl", "/O2", "/arch:AVX2", "/nologo", "examples\\bench_multilang\\c_bench.c", "/Fe:examples\\bench_multilang\\c_bench.exe"], env=msvc_env) is not None:
+            out_c = run_command(["examples\\bench_multilang\\c_bench.exe"])
     data_c = extract_json(out_c) if out_c else None
     if data_c: results.append(data_c)
 

@@ -4,8 +4,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DIR = os.path.dirname(os.path.abspath(__file__))
 AXC = os.path.join(ROOT, "bin", "axc.exe")
 
-def run_json(cmd, cwd=DIR):
-    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, shell=isinstance(cmd, str))
+def run_json(cmd, cwd=DIR, env=None):
+    p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
     if p.returncode != 0:
         raise RuntimeError(f"Failed ({cmd}): {p.stderr or p.stdout}")
     for line in reversed(p.stdout.strip().splitlines()):
@@ -13,6 +13,19 @@ def run_json(cmd, cwd=DIR):
         if line.startswith("{"):
             return json.loads(line)
     raise RuntimeError(f"No JSON output from {cmd}: {p.stdout}")
+
+def capture_vcvars_env(vcvars):
+    if not vcvars or not os.path.isfile(vcvars) or '"' in vcvars:
+        return None
+    p = subprocess.run(["cmd.exe", "/d", "/q", "/c", f'call "{vcvars}" >nul && set'], capture_output=True, text=True)
+    if p.returncode != 0:
+        return None
+    env = os.environ.copy()
+    for line in p.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            env[k] = v
+    return env
 
 def find_vcvars():
     vswhere = os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe")
@@ -25,12 +38,12 @@ def main():
     tmp = tempfile.mkdtemp(prefix="axon_hard_")
     results = []
     try:
-        vcvars = find_vcvars()
-        if vcvars:
+        msvc_env = capture_vcvars_env(find_vcvars())
+        if msvc_env:
             print("[1/7] C (MSVC /O2 /arch:AVX2)...")
             c_exe = os.path.join(tmp, "c_hard.exe")
             c_obj = os.path.join(tmp, "c_hard.obj")
-            run_json(f'"{vcvars}" >nul && cl /O2 /arch:AVX2 /Fo"{c_obj}" /Fe:"{c_exe}" "{os.path.join(DIR, "c_hard.c")}" >nul && "{c_exe}"')
+            subprocess.run(["cl", "/nologo", "/O2", "/arch:AVX2", f"/Fo{c_obj}", f"/Fe{c_exe}", os.path.join(DIR, "c_hard.c")], cwd=DIR, env=msvc_env, check=True)
             results.append(run_json([c_exe]))
         if shutil.which("rustc"):
             print("[2/7] Rust (rustc -O3)...")
