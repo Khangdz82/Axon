@@ -13,9 +13,9 @@
    .\axc_s1.exe build compiler_ax/main.ax -o axc_s2.exe
    .\axc_s2.exe build compiler_ax/main.ax -o axc_s3.exe
    ```
-   - Verified `SHA256(axc_s2.exe) == SHA256(axc_s3.exe) == 15DCB961512AB0FA4B3B9F2A0FC763C7D41CD02BC11A6B3B2000B6466209F874` (`2,760,704` bytes `win-x64`, `2,711,432` bytes `linux-x64`, `1,556,544` bytes `macos-arm64`).
-   - Cross-compiled outputs: `bin/axc-linux-x64` (`2,610,728` bytes), `bin/axc-macos-arm64` (`1,491,008` bytes).
-3. **Full Regression Gate:** **`85/85`** [`tests/pass/*.ax`](tests/pass/) + **`42/42`** [`tests/fail_compile/*.ax`](tests/fail_compile/) + `--shield` / `--simd=scalar` / `-O3` / `-Os` / `wasm32` WASI suites must pass before promoting changes.
+   - Verified `SHA256(axc_s2.exe) == SHA256(axc_s3.exe) == 8DA48F4B6BAA79BBF23D0BC67B77C23D56B4A1E76B6A2198B9D641EFD748C201` (`2,915,328` bytes `win-x64`, `2,866,264` bytes `linux-x64`, `1,572,928` bytes `macos-arm64`).
+   - Cross-compiled outputs: `bin/axc-linux-x64` (`2,866,264` bytes), `bin/axc-macos-arm64` (`1,572,928` bytes).
+3. **Full Regression Gate:** **`85/85`** [`tests/pass/*.ax`](tests/pass/) (`83` native + `2` WASM32) + **`42/42`** [`tests/fail_compile/*.ax`](tests/fail_compile/) + `--shield` / `--simd=scalar` / `-O3` / `-Os` / `wasm32` WASI + `safe-anything . --fail-on low --include-tests` (`0` findings) must pass before promoting changes.
 
 ---
 
@@ -79,7 +79,7 @@
 - **Promoted Local GPRs (`pr = 1..10`):** `RBX`, `R12`, `R13`, `R14`, `R15`, `RSI`, `RDI`, `R10`, `R11`, `R8`.
   - **`RAX`, `RCX`, `RDX`, `R9` are NEVER assigned to promoted locals.**
 - **Promoted Local `f64` XMMs (`fr = 1..8`):** Assigned to callee-saved `XMM6..XMM13` (Win64). `XMM0..XMM5` (`YMM0..YMM5`) are caller-saved volatile on both Win64 and SysV. Any kernel touching `YMM6..YMM15` MUST save/restore them around the loop and emit `VZEROUPPER` (`C5 F8 77`).
-- **Active Vectorizers & Fastpaths:** `try_emit_fast_rec_fn_ax` (`n <= 7`), `try_emit_avx2_u8_sum_while_ax` (`64 B/iter` `VPSADBW`), `try_emit_avx2_for_range_ax` (`8×i64`), `try_emit_avx2_f64_dot_sum_while_ax` (`8×f64` `VFMADD231PD` / `VADDPD`), `try_emit_avx2_mandel_while_ax` (`4×f64`), `h_ai_gemm_f32` (`4×16` AVX2+FMA3), `h_str_eq` (`VPCMPEQB`), plus ARM64 NEON (`2×i64`) and WASM SIMD128 (`i64x2.add`).
+- **Active Vectorizers & Fastpaths:** `try_emit_fast_rec_fn_ax` (`n <= 7`), `try_emit_avx2_u8_sum_while_ax` (`64 B/iter` `VPSADBW`), `try_emit_avx2_for_range_ax` (`8×i64`), `try_emit_avx2_f64_dot_sum_while_ax` (`8×f64` `VFMADD231PD` / `VADDPD`), `try_emit_avx2_f64_axpy_while_ax` (unwraps `nk_unsafe_block`), `try_emit_avx2_mandel_while_ax` (`4×f64`), `h_ai_gemm_f32` (`4×16` AVX2+FMA3), `h_sha256_blocks` (`10000056`, register-resident Horner+ILP multi-block SHA-256 via `sha256_compress_blocks_ptr`), `ai_pool_dispatch` (persistent 12-thread OS pool for 3-arg `fn_addr` workers), `h_str_eq` (`VPCMPEQB`), plus ARM64 NEON (`2×i64`) and WASM SIMD128 (`i64x2.add`, `128 KB`/fn + `512 KB` code buffers). Note: `emit_expr_ax` (`nk_ident`) applies deferred `cg.state[24]` (`defer_iv`) offset inside 4× unrolled loops.
 
 ---
 
@@ -90,8 +90,10 @@ Because `load_and_merge_program_v7` merges imported modules into a single flat n
 Key `v1.2.0` additions:
 - **Math:** `linalg.ax`, `numeric.ax` (Reverse-Communication `BrentSolver`/`Rk4State`/`LbfgsState` + `Simplex`), `prob.ax`, `bigint.ax` (base-$10^9$ limbs).
 - **Data Science:** `dataframe.ax` (CSV/JSONL/`AXDF` IPC), `stats.ax` (Welford/Quickselect/`OLS`/`Holt-Winters`), `ml.ax` (Flat-Arena `CartTree`/`RandomForest`/`GBDT`/`PCA`/`Lasso`/`KMeans++`/`DBSCAN`).
-- **OS Auth & Security:** `os_auth.ax` (`std::ffi` Win32 `bcrypt`/`advapi32`/`crypt32` + Unix `libc` with graceful static fallback), `auth.ax` (RFC 9106 `Argon2id` `v=19`, `BLAKE2b`, `PBKDF2`, `HKDF`, `TOTP`, `PKCE`, `RBAC`).
+- **OS Auth & Security:** `os_auth.ax` (`std::ffi` Win32 `bcrypt`/`advapi32`/`crypt32` + Unix `libc` with graceful static fallback), `auth.ax` (RFC 9106 `Argon2id` `v=19`, `BLAKE2b`, `PBKDF2`, `HKDF`, `TOTP`, `PKCE`, `RBAC`), and **SecTest v4.0** (`sec_sast.ax` + `sec_test.ax`: 26 rule families `AX-SAST-001..026` covering Axon + polyglot XSS/CORS/TLS/secrets/AI-agent/MCP/Trojan-Source/prompt-injection/Docker/GHA, inline `ax-sec:ignore` / `safe-anything:ignore` suppressions, automatic secret redaction, and recursive `sast_scan_repo` / `sec_hunt_sast_repo`).
 - **Databases:** `redis.ax`, `kv_acid.ax`, `db_pool.ax`, plus `postgres.ax` (`SCRAM-SHA-256`) and `sqlite.ax` (`f64`/`blob`/`null`/`col_type`).
+- **Extreme Performance Stdlib Wave:** `algo.ax` (3-phase 12T parallel MSB-8 + L1D-resident LSD radix sort), `linalg.ax` (12T AVX2 FMA3 `MatF64` GEMM), `crypto.ax` (`sha256_compress_blocks_ptr` multi-block native kernel), `ds.ax` (1-branch `DynMap` sentinel + Fibonacci hash), `ringbuf.ax` (2-chunk contiguous `mem_copy` batching).
+- **30-Benchmark Light-to-Impossible vs Rust (`examples/bench_vs_rust_30/`):** Axon `-O3` vs `rustc -C opt-level=3 -C target-cpu=native` (`results_vs_rust_30.json`, 5-run median): **`266.45 ms`** vs **`973.46 ms`** (**`3.65x`** total wall speedup, **`2.33x`** geomean, **`24/30`** wins, **`30/30`** checksum parity, **`20.0x`** faster compile `147.95 ms` vs `2961.59 ms`).
 
 ---
 
@@ -123,7 +125,8 @@ Key `v1.2.0` additions:
 .\bin\axc.exe run .agents/skills/axon-anything/scripts/axon_anything.ax -- analyze std/ml.ax
 .\bin\axc.exe run .agents/skills/axon-anything/scripts/axon_anything.ax -- gate tests/pass/54_v1_2_ds_math_auth_db_ir.ax
 
-# 4. Full regression sweep (77 pass + 37 fail_compile)
+# 4. Full regression sweep (85 pass + 42 fail_compile) + safe-anything
 Get-ChildItem tests\pass\*.ax | ForEach-Object { .\bin\axc.exe run $_.FullName }
 Get-ChildItem tests\fail_compile\*.ax | ForEach-Object { .\bin\axc.exe check $_.FullName }
+safe-anything . --fail-on low --include-tests
 ```

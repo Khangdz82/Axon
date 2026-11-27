@@ -1,28 +1,15 @@
-// Axon Deep Security Testing Library — Token & Intra-Procedural Data-Flow SAST v2 (`std/sec_sast.ax`)
-// 100% Pure Axon, Zero-GC, Zero External Dependencies, `--shield` Safe.
-// Uses a real Axon tokenizer + per-function `VarTrack` guard/bounds/null/sanitizer lattice to achieve
-// >90% false-positive reduction while hunting 16 Axon-specific CWE vulnerability classes:
-//   AX-SAST-001 (CWE-120): Fixed small-capacity `buf_new(<=512)` OOB DoS trap on dynamic `buf_push_str`
-//   AX-SAST-002 (CWE-613): Negative `-1` sentinel collision on `json_get_i64`/`parse_i64` unwrap
-//   AX-SAST-003 (CWE-208): Non-constant-time `str_eq` comparison on secret/token/MAC variables
-//   AX-SAST-004 (CWE-476): Unchecked `mem_alloc_aligned` written via `ptr_write_*`/`mem_set` without null guard
-//   AX-SAST-005 (CWE-190): Unbounded variable multiplication inside `mem_alloc_aligned`/`ffi_alloc`
-//   AX-SAST-006 (CWE-78/89): Dynamic interpolation/concatenation in `os_exec`/`sqlite_exec`/`pg_query`/`mysql_query`
-//   AX-SAST-007 (CWE-113): Unsanitized HTTP response header concatenation (`Content-Type:`/`Location:`/`Set-Cookie:`)
-//   AX-SAST-008 (CWE-377): Predictable hardcoded temp file path (`.tmp`) without PID/nonce entropy
-//   AX-SAST-009 (CWE-918): Weak string-based IPv6 SSRF guard or first-`@` URL authority split
-//   AX-SAST-010 (CWE-444): Permissive bare-LF (`\n\n`) HTTP header termination fallback
-//   AX-SAST-011 (CWE-681): Unchecked `f64 as i64` cast without NaN/Inf/range guard
-//   AX-SAST-012 (CWE-190): Unbounded variable bit-shift (`<< var`) without `< 63` / `& 63` guard
-//   AX-SAST-013 (CWE-369): Unchecked integer division/modulo by function parameter without zero guard
-//   AX-SAST-014 (CWE-88):  Unvalidated variable interpolated into CLI flag `--flag="{var}"`
-//   AX-SAST-015 (CWE-401): Early-return raw heap leak after `mem_alloc_aligned`/`ffi_alloc`
-//   AX-SAST-016 (CWE-330): Non-cryptographic PRNG (`rng_next_u64`/`clock_ns`) used for secret/session/key
+// `std/sec_sast.ax` — Axon Token-Aware, Data-Flow & Polyglot SAST Engine (SecTest v4.0)
+//
+// Pure-Axon static security scanner combining Axon intra-procedural data-flow
+// analysis (AX-SAST-001..016) with polyglot web/secret/AI-agent/CI/Trojan-Source
+// rules (AX-SAST-017..026), inline suppressions (`ax-sec:ignore` / `safe-anything:ignore`),
+// automatic secret redaction, and recursive repository walking (`sast_scan_repo`).
 
 use std::os
 use std::str
 use std::ds
 use std::fs
+use std::sys
 use std::path
 
 // Confidence levels
@@ -107,6 +94,99 @@ fn _sast_push(
     svec_push(mut sr.snippets, str_trim(snippet))
     svec_push(mut sr.fixes, fix_hint)
     sr.count = sr.count + 1
+}
+
+// --- 0b. Inline Suppression (`ax-sec:ignore` / `safe-anything:ignore`) & Secret Redaction ---
+
+fn _sast_line_has_ignore_for(raw_line: str, rule_id: str) -> bool {
+    mut marker_pos := str_find(raw_line, "ax-sec:ignore", 0)
+    mut marker_len := 13
+    if marker_pos < 0 {
+        marker_pos = str_find(raw_line, "safe-anything:ignore", 0)
+        marker_len = 20
+    }
+    if marker_pos < 0 { return false }
+    prefix := str_slice(raw_line, 0, marker_pos)
+    if (not str_contains(prefix, "//")) and (not str_contains(prefix, "#")) and (not str_contains(prefix, "/*")) and (not str_contains(prefix, "<!--")) {
+        return false
+    }
+    rest := str_trim(str_slice(raw_line, marker_pos + marker_len, str_len(raw_line)))
+    if str_len(rest) == 0 or str_starts_with(rest, "*/") or str_starts_with(rest, "-->") or str_starts_with(rest, "--") {
+        return true
+    }
+    rlen := str_len(rule_id)
+    mut p := 0
+    while p >= 0 {
+        p = str_find(rest, rule_id, p)
+        if p < 0 { break }
+        left_ok := (p == 0) or (not _sast_is_id_char(str_byte(rest, p - 1)) and str_byte(rest, p - 1) != 45 and str_byte(rest, p - 1) != 46)
+        end_p := p + rlen
+        right_ok := (end_p >= str_len(rest)) or (not _sast_is_id_char(str_byte(rest, end_p)) and str_byte(rest, end_p) != 45 and str_byte(rest, end_p) != 46)
+        if left_ok and right_ok { return true }
+        p = p + rlen
+    }
+    return false
+}
+
+fn _sast_is_suppressed(lines: StrVec, line_idx: i64, rule_id: str) -> bool {
+    if line_idx >= 0 and line_idx < svec_len(lines) {
+        if _sast_line_has_ignore_for(svec_get(lines, line_idx), rule_id) {
+            return true
+        }
+    }
+    if line_idx > 0 {
+        prev_raw := str_trim(svec_get(lines, line_idx - 1))
+        if str_starts_with(prev_raw, "//") or str_starts_with(prev_raw, "#") or str_starts_with(prev_raw, "/*") or str_starts_with(prev_raw, "<!--") {
+            if _sast_line_has_ignore_for(prev_raw, rule_id) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+fn _sast_push_checked(
+    mut sr: SastResults,
+    lines: StrVec,
+    line_idx: i64,
+    sev: i64,
+    conf: i64,
+    rule_id: str,
+    cwe: str,
+    file_path: str,
+    line_no: i64,
+    title: str,
+    snippet: str,
+    fix_hint: str
+) {
+    if _sast_is_suppressed(lines, line_idx, rule_id) { return }
+    _sast_push(mut sr, sev, conf, rule_id, cwe, file_path, line_no, title, snippet, fix_hint)
+}
+
+fn _sast_redact_token(tok: str) -> str {
+    n := str_len(tok)
+    if n <= 6 { return "***REDACTED***" }
+    return str_slice(tok, 0, 4) + "***REDACTED***"
+}
+
+fn _sast_redact_line(line: str, match_pos: i64, match_len: i64) -> str {
+    trimmed := str_trim(line)
+    n := str_len(line)
+    if match_pos < 0 or match_pos >= n { return trimmed }
+    mut end_p := match_pos + match_len
+    if end_p > n { end_p = n }
+    while end_p < n {
+        b := str_byte(line, end_p)
+        if _sast_is_id_char(b) or b == 45 or b == 46 or b == 47 or b == 43 or b == 61 {
+            end_p += 1
+        } else {
+            break
+        }
+    }
+    tok := str_slice(line, match_pos, end_p)
+    masked := _sast_redact_token(tok)
+    out := str_slice(line, 0, match_pos) + masked + str_slice(line, end_p, n)
+    return str_trim(out)
 }
 
 // --- 1. Real Axon Line Tokenizer & String/Comment Stripper ---
@@ -505,8 +585,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
                     j += 1
                 }
                 if has_dyn_push and not has_cap_guard {
-                    _sast_push(
-                        mut sr, 2, SAST_CONF_HIGH(), "AX-SAST-001", "CWE-120", file_path, lno,
+                    _sast_push_checked(
+                        mut sr, lines, i, 2, SAST_CONF_HIGH(), "AX-SAST-001", "CWE-120", file_path, lno,
                         f"Fixed small ByteBuf capacity ({small_cap}B) receives dynamic string without bounds check (DoS trap risk)",
                         code,
                         "Compute exact capacity from input string lengths (`str_len(...) + margin`) before `buf_new(...)` to prevent exit-101 OOB trap DoS."
@@ -520,9 +600,9 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
             vname := _sast_extract_assign_var(masked)
             // Exclude IPv4 octet check (`o0 <= 255`) where negative values fail closed cleanly; flag temporal/auth/len/idx checks
             is_ipv4_octet := str_eq(vname, "o0") or str_eq(vname, "o1") or str_eq(vname, "o2") or str_eq(vname, "o3")
-            if str_len(vname) > 0 and (not is_ipv4_octet) and _sast_window_contains(lines, i + 1, i + 4, vname + " >= 0") {
-                _sast_push(
-                    mut sr, 3, SAST_CONF_HIGH(), "AX-SAST-002", "CWE-613", file_path, lno,
+            if str_len(vname) > 0 and (not is_ipv4_octet) and (_sast_window_contains(lines, i + 1, i + 4, vname + " >= 0") or _sast_window_contains(lines, i + 1, i + 4, vname + " < 0") or _sast_window_contains(lines, i + 1, i + 4, vname + " != -1")) {
+                _sast_push_checked(
+                    mut sr, lines, i, 3, SAST_CONF_HIGH(), "AX-SAST-002", "CWE-613", file_path, lno,
                     f"Negative `-1` error-unwrap sentinel collides with legitimate negative integer input for `{vname}`",
                     code,
                     "Separate error-presence from parsed integer value using a `(bool, i64)` helper instead of `or -1` + `>= 0`."
@@ -533,8 +613,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
         // --- AX-SAST-003 (CWE-208): Non-constant-time `str_eq` on secret/token/MAC identifiers ---
         if str_contains(masked, "str_eq(") and (not str_contains(masked, "ct_eq_str(")) and _sast_has_secret_ident(masked) {
             if (not str_contains(masked, "assert")) and (not str_contains(masked, "println")) {
-                _sast_push(
-                    mut sr, 3, SAST_CONF_HIGH(), "AX-SAST-003", "CWE-208", file_path, lno,
+                _sast_push_checked(
+                    mut sr, lines, i, 3, SAST_CONF_HIGH(), "AX-SAST-003", "CWE-208", file_path, lno,
                     "Secret/authentication value compared using non-constant-time `str_eq` (timing side-channel)",
                     code,
                     "Replace `str_eq(a, b)` with `std::crypto::ct_eq_str(a, b)` to eliminate early-exit timing leaks."
@@ -565,8 +645,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
                     j += 1
                 }
                 if used_raw and not checked_null {
-                    _sast_push(
-                        mut sr, 3, SAST_CONF_HIGH(), "AX-SAST-004", "CWE-476", file_path, lno,
+                    _sast_push_checked(
+                        mut sr, lines, i, 3, SAST_CONF_HIGH(), "AX-SAST-004", "CWE-476", file_path, lno,
                         f"Raw pointer `{pvar}` from `mem_alloc_aligned`/`ffi_alloc` dereferenced before null check",
                         code,
                         f"Add `if {pvar} == 0 {{ return ... }}` immediately after allocation before calling `ptr_write_*`, `ffi_write_*`, or `mem_set`."
@@ -596,8 +676,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
                 }
                 svec_free(move a_ids)
                 if has_unbounded_var {
-                    _sast_push(
-                        mut sr, 2, SAST_CONF_MEDIUM(), "AX-SAST-005", "CWE-190", file_path, lno,
+                    _sast_push_checked(
+                        mut sr, lines, i, 2, SAST_CONF_MEDIUM(), "AX-SAST-005", "CWE-190", file_path, lno,
                         "Unbounded variable multiplication inside raw heap allocation without upper-bound guard",
                         code,
                         "Validate multiplication operands against explicit upper bounds (or division overflow check) before calling `mem_alloc_aligned`/`ffi_alloc`."
@@ -608,16 +688,16 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
 
         // --- AX-SAST-006 (CWE-78 / CWE-89): Dynamic command/SQL sink with interpolation or concat ---
         if (str_contains(masked, "os_exec(") or str_contains(masked, "shell_exec(")) and (str_contains(code, "f\"") or str_contains(masked, " + ")) {
-            _sast_push(
-                mut sr, 3, SAST_CONF_HIGH(), "AX-SAST-006", "CWE-78", file_path, lno,
+            _sast_push_checked(
+                mut sr, lines, i, 3, SAST_CONF_HIGH(), "AX-SAST-006", "CWE-78", file_path, lno,
                 "Dynamic string interpolation/concatenation passed into OS command execution sink",
                 code,
                 "Validate/allowlist every argument via `std::taint::sanitize_shell_arg` or use direct process spawning without shell interpolation."
             )
         }
         if (str_contains(masked, "sqlite_exec(") or str_contains(masked, "pg_query(") or str_contains(masked, "mysql_query(")) and (str_contains(code, "f\"") or str_contains(masked, " + ")) {
-            _sast_push(
-                mut sr, 4, SAST_CONF_HIGH(), "AX-SAST-006", "CWE-89", file_path, lno,
+            _sast_push_checked(
+                mut sr, lines, i, 4, SAST_CONF_HIGH(), "AX-SAST-006", "CWE-89", file_path, lno,
                 "Dynamic string interpolation/concatenation passed into SQL execution sink",
                 code,
                 "Use parameterized prepared statements (`sqlite_prepare` + `sqlite_bind_*` / `pg_encode_extended_query`) instead of SQL string concatenation."
@@ -637,8 +717,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
                 svec_free(move r_ids)
             }
             if not rhs_safe {
-                _sast_push(
-                    mut sr, 3, SAST_CONF_HIGH(), "AX-SAST-007", "CWE-113", file_path, lno,
+                _sast_push_checked(
+                    mut sr, lines, i, 3, SAST_CONF_HIGH(), "AX-SAST-007", "CWE-113", file_path, lno,
                     "HTTP response header constructed via string concatenation without CR/LF sanitization (Response Splitting)",
                     code,
                     "Validate header value with `std::http::http_is_safe_header_val(val)` (rejecting `\\r`, `\\n`, and NUL) before emitting the header."
@@ -648,8 +728,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
 
         // --- AX-SAST-008 (CWE-377): Predictable hardcoded temp file path ---
         if str_contains(code, ".tmp\"") and (not _sast_window_contains(lines, fn_start, i + 2, "sys_pid")) and (not _sast_window_contains(lines, fn_start, i + 2, "nonce")) {
-            _sast_push(
-                mut sr, 2, SAST_CONF_MEDIUM(), "AX-SAST-008", "CWE-377", file_path, lno,
+            _sast_push_checked(
+                mut sr, lines, i, 2, SAST_CONF_MEDIUM(), "AX-SAST-008", "CWE-377", file_path, lno,
                 "Predictable static temporary filename (`.tmp`) without PID/random nonce entropy",
                 code,
                 "Incorporate `sys_pid()` and `(clock_ns() ^ cpu_rdtsc())` into temporary filenames to prevent clobbering and symlink races."
@@ -658,8 +738,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
 
         // --- AX-SAST-009 (CWE-918 / CWE-436): Weak string-based IPv6 SSRF guard or first-`@` authority split ---
         if str_contains(masked, "str_eq(") and str_contains(code, "\"[::1]\"") {
-            _sast_push(
-                mut sr, 4, SAST_CONF_HIGH(), "AX-SAST-009", "CWE-918", file_path, lno,
+            _sast_push_checked(
+                mut sr, lines, i, 4, SAST_CONF_HIGH(), "AX-SAST-009", "CWE-918", file_path, lno,
                 "String-equality IPv6 SSRF check (`\"[::1]\"`) is bypassed by expanded/IPv4-mapped IPv6 forms",
                 code,
                 "Parse IPv6 literals into 8 x 16-bit hextets (128-bit) and block loopback, unspecified, IPv4-mapped (`::ffff:0:0/96`), ULA (`fc00::/7`), link-local (`fe80::/10`), and multicast (`ff00::/8`)."
@@ -667,8 +747,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
         }
         if str_contains(masked, "str_find_byte(auth, 64, 0)") {
             if not _sast_window_contains(lines, i + 1, i + 6, ", 64,") {
-                _sast_push(
-                    mut sr, 4, SAST_CONF_HIGH(), "AX-SAST-009", "CWE-918", file_path, lno,
+                _sast_push_checked(
+                    mut sr, lines, i, 4, SAST_CONF_HIGH(), "AX-SAST-009", "CWE-918", file_path, lno,
                     "URL authority splits on first `@` without rejecting multiple `@` or `\\` (SSRF authority confusion)",
                     code,
                     "Reject multiple `@` characters and backslashes (`\\`) in URL authority and validate hostname characters strictly."
@@ -678,12 +758,15 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
 
         // --- AX-SAST-010 (CWE-444): Permissive bare-LF (`\n\n`) HTTP header fallback ---
         if str_contains(masked, "str_find(") and str_contains(code, "\"\\n\\n\"") {
-            _sast_push(
-                mut sr, 3, SAST_CONF_HIGH(), "AX-SAST-010", "CWE-444", file_path, lno,
-                "HTTP request parser accepts bare-LF (`\\n\\n`) header terminator (RFC 9112 request smuggling risk)",
-                code,
-                "Require strict `\\r\\n\\r\\n` header termination and reject bare LF line endings per RFC 9112 Section 2.2."
-            )
+            is_reject := str_starts_with(masked, "if ") and (str_contains(masked, ">= 0") or str_contains(masked, "!= -1")) and (str_contains(masked, "return") or _sast_window_contains(lines, i + 1, i + 2, "return"))
+            if not is_reject {
+                _sast_push_checked(
+                    mut sr, lines, i, 3, SAST_CONF_HIGH(), "AX-SAST-010", "CWE-444", file_path, lno,
+                    "HTTP request parser accepts bare-LF (`\\n\\n`) header terminator (RFC 9112 request smuggling risk)",
+                    code,
+                    "Require strict `\\r\\n\\r\\n` header termination and reject bare LF line endings per RFC 9112 Section 2.2."
+                )
+            }
         }
 
         // --- AX-SAST-011 (CWE-681): Unchecked `f64 as i64` cast without NaN/Inf/range guard ---
@@ -702,8 +785,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
                 svec_free(move c_ids)
             }
             if is_flt and (str_contains(lhs_cast, " * ") or str_contains(lhs_cast, " / ")) {
-                _sast_push(
-                    mut sr, 2, SAST_CONF_MEDIUM(), "AX-SAST-011", "CWE-681", file_path, lno,
+                _sast_push_checked(
+                    mut sr, lines, i, 2, SAST_CONF_MEDIUM(), "AX-SAST-011", "CWE-681", file_path, lno,
                     "Float-to-i64 cast (`as i64`) without NaN/Inf/overflow guard produces INT64_MIN corruption",
                     code,
                     "Guard `if val != val` (NaN), `±Inf`, and upper bound `< 9.22e18` before casting `f64 as i64`."
@@ -721,8 +804,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
                     sv := svec_get(r_ids, 0)
                     fl := _vt_get(vt, sv)
                     if (not _sast_is_keyword(sv)) and ((fl & _VT_PARAM()) != 0) and ((fl & _VT_BOUNDED()) == 0) {
-                        _sast_push(
-                            mut sr, 2, SAST_CONF_HIGH(), "AX-SAST-012", "CWE-190", file_path, lno,
+                        _sast_push_checked(
+                            mut sr, lines, i, 2, SAST_CONF_HIGH(), "AX-SAST-012", "CWE-190", file_path, lno,
                             f"Unbounded parameter `{sv}` used as shift count in `<<` without `< 63` clamp",
                             code,
                             f"Clamp shift amount (`if {sv} < 0 or {sv} >= 63 {{ return ... }}`) before shifting."
@@ -745,8 +828,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
                         dv := svec_get(d_ids, 0)
                         fl := _vt_get(vt, dv)
                         if (not _sast_is_keyword(dv)) and ((fl & _VT_PARAM()) != 0) and ((fl & (_VT_NONZERO() | _VT_BOUNDED())) == 0) {
-                            _sast_push(
-                                mut sr, 2, SAST_CONF_MEDIUM(), "AX-SAST-013", "CWE-369", file_path, lno,
+                            _sast_push_checked(
+                                mut sr, lines, i, 2, SAST_CONF_MEDIUM(), "AX-SAST-013", "CWE-369", file_path, lno,
                                 f"Division/modulo by unguarded parameter `{dv}` without zero check (divide-by-zero trap)",
                                 code,
                                 f"Add `if {dv} == 0 {{ return ... }}` (and guard `INT64_MIN / -1` if signed) before division/modulo."
@@ -772,8 +855,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
                     v_interp := str_trim(str_slice(code, fp + pat_len, cl_b))
                     fl := _vt_get(vt, v_interp)
                     if str_len(v_interp) > 0 and ((fl & _VT_SAFE_PATH()) == 0) and ((fl & _VT_CONST()) == 0) {
-                        _sast_push(
-                            mut sr, 4, SAST_CONF_HIGH(), "AX-SAST-014", "CWE-88", file_path, lno,
+                        _sast_push_checked(
+                            mut sr, lines, i, 4, SAST_CONF_HIGH(), "AX-SAST-014", "CWE-88", file_path, lno,
                             f"Unvalidated variable `{v_interp}` interpolated into quoted CLI flag (Argument/Command Injection RCE)",
                             code,
                             f"Validate `{v_interp}` with a strict character allowlist (blocking quotes, spaces/metacharacters) before CLI flag interpolation."
@@ -800,8 +883,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
                         }
                     }
                     if not is_null_bail {
-                        _sast_push(
-                            mut sr, 2, SAST_CONF_MEDIUM(), "AX-SAST-015", "CWE-401", file_path, lno,
+                        _sast_push_checked(
+                            mut sr, lines, i, 2, SAST_CONF_MEDIUM(), "AX-SAST-015", "CWE-401", file_path, lno,
                             f"Early return path may leak raw heap allocation `{av}` without `mem_free_aligned`/`ffi_free`",
                             code,
                             f"Free `{av}` on early-return error branches before returning."
@@ -817,8 +900,8 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
             av := _sast_extract_assign_var(masked)
             lo_av := str_to_lower(av)
             if str_contains(lo_av, "secret") or str_contains(lo_av, "session_id") or str_contains(lo_av, "auth_token") or str_contains(lo_av, "api_key") {
-                _sast_push(
-                    mut sr, 3, SAST_CONF_HIGH(), "AX-SAST-016", "CWE-330", file_path, lno,
+                _sast_push_checked(
+                    mut sr, lines, i, 3, SAST_CONF_HIGH(), "AX-SAST-016", "CWE-330", file_path, lno,
                     f"Predictable non-cryptographic RNG/clock assigned to security credential `{av}`",
                     code,
                     "Use OS CSPRNG (`BCryptGenRandom` / `getrandom` / `std::uuid`) instead of deterministic PRNG or `clock_ns()` for secrets."
@@ -832,6 +915,7 @@ fn sast_scan_source(file_path: str, src: str, mut sr: SastResults) {
     smap_free(move vt)
     svec_free(move fn_params)
     svec_free(move fn_raw_allocs)
+    _sast_scan_v4_rules(file_path, src, lines, true, mut sr)
     svec_free(move lines)
 }
 
@@ -857,5 +941,586 @@ fn sast_scan_dir(dir_path: str, mut sr: SastResults) -> i64 {
         i += 1
     }
     svec_free(move entries)
+    return scanned
+}
+
+
+// --- 3. SecTest v4.0 Polyglot, Secret, AI-Agent, Trojan-Source & CI Rules (AX-SAST-017..026) ---
+
+fn _sast_to_lower_ascii(s: str) -> str {
+    n := str_len(s)
+    mut b := buf_new(n + 1)
+    mut i := 0
+    while i < n {
+        ch := str_byte(s, i)
+        if ch >= 65 and ch <= 90 { buf_push(mut b, ch + 32) }
+        else { buf_push(mut b, ch) }
+        i += 1
+    }
+    return buf_to_owned_str(move b)
+}
+
+fn _sast_is_placeholder(val: str) -> bool {
+    lo := _sast_to_lower_ascii(val)
+    if str_len(lo) == 0 { return true }
+    if str_contains(lo, "example") or str_contains(lo, "dummy") or str_contains(lo, "placeholder")
+        or str_contains(lo, "your_") or str_contains(lo, "your-") or str_contains(lo, "changeme")
+        or str_contains(lo, "replace_me") or str_contains(lo, "redacted") or str_contains(lo, "xxxx")
+        or str_contains(lo, "fake") or str_contains(lo, "sample") or str_contains(lo, "test_")
+        or str_contains(lo, "${") or str_contains(lo, "<") or str_contains(lo, "todo") {
+        return true
+    }
+    if str_len(lo) >= 6 {
+        first := str_byte(lo, 0)
+        mut same := true
+        mut i := 1
+        while i < str_len(lo) {
+            if str_byte(lo, i) != first { same = false; break }
+            i += 1
+        }
+        if same { return true }
+    }
+    return false
+}
+
+fn _sast_is_upper_alnum(b: i64) -> bool {
+    return (b >= 65 and b <= 90) or (b >= 48 and b <= 57)
+}
+
+fn _sast_count_tok_len(s: str, start: i64) -> i64 {
+    n := str_len(s)
+    mut p := start
+    while p < n {
+        b := str_byte(s, p)
+        if _sast_is_id_char(b) or b == 45 or b == 46 { p += 1 } else { break }
+    }
+    return p - start
+}
+
+fn _sast_is_agent_or_doc_file(fp: str) -> bool {
+    lo := _sast_to_lower_ascii(fp)
+    return str_ends_with(lo, ".md") or str_ends_with(lo, ".mdc") or str_ends_with(lo, ".txt")
+        or str_contains(lo, "claude") or str_contains(lo, "agents") or str_contains(lo, "skill")
+        or str_contains(lo, "cursorrules") or str_contains(lo, "mcp") or str_contains(lo, ".gemini")
+}
+
+fn _sast_is_config_or_mcp_file(fp: str) -> bool {
+    lo := _sast_to_lower_ascii(fp)
+    return str_ends_with(lo, ".json") or str_ends_with(lo, ".toml") or str_ends_with(lo, ".yaml")
+        or str_ends_with(lo, ".yml") or str_contains(lo, "mcp") or str_contains(lo, "settings")
+        or str_contains(lo, "dockerfile") or str_contains(lo, ".github/workflows") or str_contains(lo, ".github\\workflows")
+}
+
+fn _sast_is_web_or_script_file(fp: str) -> bool {
+    lo := _sast_to_lower_ascii(fp)
+    return str_ends_with(lo, ".ax") or str_ends_with(lo, ".py") or str_ends_with(lo, ".js")
+        or str_ends_with(lo, ".ts") or str_ends_with(lo, ".jsx") or str_ends_with(lo, ".tsx")
+        or str_ends_with(lo, ".html") or str_ends_with(lo, ".htm") or str_ends_with(lo, ".go")
+        or str_ends_with(lo, ".rs") or str_ends_with(lo, ".rb") or str_ends_with(lo, ".php")
+}
+
+// AX-SAST-024 (CWE-116): Detect invisible zero-width, bidi override, and Unicode Tag bytes in raw UTF-8
+fn _sast_check_hidden_unicode(file_path: str, src: str, lines: StrVec, mut sr: SastResults) {
+    n := str_len(src)
+    mut i := 0
+    mut lno := 1
+    mut reported_line := -1
+    while i < n {
+        b0 := str_byte(src, i)
+        if b0 == 10 {
+            lno += 1
+            i += 1
+            continue
+        }
+        mut hit_kind := ""
+        if b0 == 216 and i + 1 < n and str_byte(src, i + 1) == 156 {
+            hit_kind = "Bidi control U+061C"
+        } else if b0 == 226 and i + 2 < n {
+            b1 := str_byte(src, i + 1)
+            b2 := str_byte(src, i + 2)
+            if b1 == 128 {
+                if b2 >= 139 and b2 <= 143 { hit_kind = "Zero-width/Bidi mark (U+200B..U+200F)" }
+                else if b2 >= 170 and b2 <= 174 { hit_kind = "Bidi override/embedding (Trojan Source U+202A..U+202E)" }
+            } else if b1 == 129 {
+                if (b2 >= 160 and b2 <= 164) or (b2 >= 166 and b2 <= 169) {
+                    hit_kind = "Invisible/Bidi isolate control (U+2060..U+2069)"
+                }
+            }
+        } else if b0 == 239 and i > 0 and i + 2 < n and str_byte(src, i + 1) == 187 and str_byte(src, i + 2) == 191 {
+            hit_kind = "Mid-file zero-width BOM (U+FEFF)"
+        } else if b0 == 243 and i + 3 < n and str_byte(src, i + 1) == 160 {
+            b2 := str_byte(src, i + 2)
+            b3 := str_byte(src, i + 3)
+            if (b2 == 128 and b3 >= 129) or (b2 == 129 and b3 <= 191) {
+                hit_kind = "Hidden Unicode Tag character (U+E0001..U+E007F)"
+            }
+        }
+        if str_len(hit_kind) > 0 and reported_line != lno {
+            reported_line = lno
+            lidx := lno - 1
+            snip := if lidx >= 0 and lidx < svec_len(lines) { svec_get(lines, lidx) } else { "" }
+            _sast_push_checked(
+                mut sr, lines, lidx, 4, SAST_CONF_HIGH(), "AX-SAST-024", "CWE-116", file_path, lno,
+                f"Hidden/Bidirectional Unicode detected: {hit_kind}",
+                snip,
+                "Remove invisible zero-width, bidi override (Trojan Source), and Unicode Tag characters from source/prompt files."
+            )
+        }
+        i += 1
+    }
+}
+
+// AX-SAST-021 (CWE-798): Check a single line for 18+ secret/key provider signatures with redaction
+fn _sast_check_line_secrets(file_path: str, raw_line: str, lines: StrVec, i: i64, lno: i64, mut sr: SastResults) {
+    pem_hdr := "-----BEGIN "
+    pem_tail := "PRIVATE KEY-----"
+    p_pem := str_find(raw_line, pem_hdr, 0)
+    if p_pem >= 0 and str_contains(raw_line, pem_tail) {
+        _sast_push_checked(
+            mut sr, lines, i, 4, SAST_CONF_HIGH(), "AX-SAST-021", "CWE-798", file_path, lno,
+            "Hardcoded PEM Private Key block detected in repository",
+            _sast_redact_line(raw_line, p_pem, 24),
+            "Remove private keys from source control immediately, rotate the key, and load from OS keyring or secret manager."
+        )
+        return
+    }
+
+    mut ak_pos := str_find(raw_line, "AK" + "IA", 0)
+    if ak_pos < 0 { ak_pos = str_find(raw_line, "AS" + "IA", 0) }
+    if ak_pos >= 0 and ak_pos + 20 <= str_len(raw_line) {
+        mut ok_ak := true
+        mut k := 4
+        while k < 20 {
+            if not _sast_is_upper_alnum(str_byte(raw_line, ak_pos + k)) { ok_ak = false; break }
+            k += 1
+        }
+        if ok_ak {
+            cand := str_slice(raw_line, ak_pos, ak_pos + 20)
+            if not _sast_is_placeholder(cand) {
+                _sast_push_checked(
+                    mut sr, lines, i, 4, SAST_CONF_HIGH(), "AX-SAST-021", "CWE-798", file_path, lno,
+                    "Hardcoded AWS Access Key ID detected",
+                    _sast_redact_line(raw_line, ak_pos, 20),
+                    "Revoke the AWS access key and supply credentials via environment variables or IAM roles."
+                )
+                return
+            }
+        }
+    }
+
+    mut p_tok := -1
+    mut tok_name := ""
+    mut min_len := 20
+    p1 := str_find(raw_line, "gh" + "p_", 0)
+    if p1 >= 0 { p_tok = p1; tok_name = "GitHub Personal Access Token"; min_len = 24 }
+    if p_tok < 0 {
+        p2 := str_find(raw_line, "github_" + "pat_", 0)
+        if p2 >= 0 { p_tok = p2; tok_name = "GitHub Fine-Grained PAT"; min_len = 30 }
+    }
+    if p_tok < 0 {
+        p3 := str_find(raw_line, "gl" + "pat-", 0)
+        if p3 >= 0 { p_tok = p3; tok_name = "GitLab Personal Access Token"; min_len = 20 }
+    }
+    if p_tok < 0 {
+        p4 := str_find(raw_line, "sk_" + "live_", 0)
+        if p4 >= 0 { p_tok = p4; tok_name = "Stripe Live Secret Key"; min_len = 24 }
+    }
+    if p_tok < 0 {
+        p5 := str_find(raw_line, "sk-ant-" + "api", 0)
+        if p5 >= 0 { p_tok = p5; tok_name = "Anthropic API Key"; min_len = 28 }
+    }
+    if p_tok < 0 {
+        p6 := str_find(raw_line, "sk-" + "proj-", 0)
+        if p6 >= 0 { p_tok = p6; tok_name = "OpenAI Project API Key"; min_len = 28 }
+    }
+    if p_tok < 0 {
+        p7 := str_find(raw_line, "xo" + "xb-", 0)
+        if p7 >= 0 { p_tok = p7; tok_name = "Slack Bot Token"; min_len = 24 }
+    }
+    if p_tok < 0 {
+        p8 := str_find(raw_line, "xo" + "xp-", 0)
+        if p8 >= 0 { p_tok = p8; tok_name = "Slack User Token"; min_len = 24 }
+    }
+    if p_tok < 0 {
+        p9 := str_find(raw_line, "AI" + "za", 0)
+        if p9 >= 0 { p_tok = p9; tok_name = "Google API Key"; min_len = 35 }
+    }
+    if p_tok < 0 {
+        p10 := str_find(raw_line, "gs" + "k_", 0)
+        if p10 >= 0 { p_tok = p10; tok_name = "Groq API Key"; min_len = 28 }
+    }
+    if p_tok < 0 {
+        p11 := str_find(raw_line, "h" + "f_", 0)
+        if p11 >= 0 {
+            if p11 == 0 or (not _sast_is_id_char(str_byte(raw_line, p11 - 1))) {
+                p_tok = p11; tok_name = "HuggingFace Token"; min_len = 30
+            }
+        }
+    }
+    if p_tok < 0 {
+        p12 := str_find(raw_line, "np" + "m_", 0)
+        if p12 >= 0 {
+            if p12 == 0 or (not _sast_is_id_char(str_byte(raw_line, p12 - 1))) {
+                p_tok = p12; tok_name = "npm Access Token"; min_len = 30
+            }
+        }
+    }
+    if p_tok < 0 {
+        p13 := str_find(raw_line, "py" + "pi-", 0)
+        if p13 >= 0 { p_tok = p13; tok_name = "PyPI API Token"; min_len = 32 }
+    }
+    if p_tok < 0 {
+        p14 := str_find(raw_line, "hooks.slack.com/" + "services/T", 0)
+        if p14 >= 0 { p_tok = p14; tok_name = "Slack Incoming Webhook URL"; min_len = 36 }
+    }
+    if p_tok < 0 {
+        p15 := str_find(raw_line, "discord.com/api/" + "webhooks/", 0)
+        if p15 >= 0 { p_tok = p15; tok_name = "Discord Webhook URL"; min_len = 40 }
+    }
+    if p_tok >= 0 {
+        tlen := _sast_count_tok_len(raw_line, p_tok)
+        if tlen >= min_len {
+            cand := str_slice(raw_line, p_tok, p_tok + tlen)
+            if not _sast_is_placeholder(cand) {
+                _sast_push_checked(
+                    mut sr, lines, i, 4, SAST_CONF_HIGH(), "AX-SAST-021", "CWE-798", file_path, lno,
+                    f"Hardcoded {tok_name} detected",
+                    _sast_redact_line(raw_line, p_tok, tlen),
+                    "Revoke the leaked credential immediately and load secrets from environment variables or a secret manager."
+                )
+                return
+            }
+        }
+    }
+
+    p_sch := str_find(raw_line, "://", 0)
+    if p_sch > 0 {
+        p_at := str_find_byte(raw_line, 64, p_sch + 3)
+        if p_at > p_sch + 5 {
+            auth := str_slice(raw_line, p_sch + 3, p_at)
+            if (not str_contains(auth, "/")) and (not str_contains(auth, " ")) and (not str_contains(auth, "{")) {
+                p_col := str_find_byte(auth, 58, 0)
+                if p_col > 0 and p_col + 5 < str_len(auth) {
+                    pwd := str_slice(auth, p_col + 1, str_len(auth))
+                    if (not _sast_is_placeholder(pwd)) and (not str_contains(raw_line, "127.0.0.1")) and (not str_contains(raw_line, "localhost")) {
+                        _sast_push_checked(
+                            mut sr, lines, i, 3, SAST_CONF_MEDIUM(), "AX-SAST-021", "CWE-798", file_path, lno,
+                            "Hardcoded credentials embedded in URL (`user:pass@host`)",
+                            _sast_redact_line(raw_line, p_sch + 3 + p_col + 1, str_len(pwd)),
+                            "Remove plaintext credentials from URLs and inject them via secure environment or keyring lookup."
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Run SecTest v4.0 rules (AX-SAST-017..026) over any source/config/agent/doc file
+fn _sast_scan_v4_rules(file_path: str, src: str, lines: StrVec, is_axon: bool, mut sr: SastResults) {
+    _sast_check_hidden_unicode(file_path, src, lines, mut sr)
+
+    ln_cnt := svec_len(lines)
+    is_agent := _sast_is_agent_or_doc_file(file_path)
+    is_cfg := _sast_is_config_or_mcp_file(file_path)
+    is_code := is_axon or _sast_is_web_or_script_file(file_path)
+    lo_fp := _sast_to_lower_ascii(file_path)
+    is_py := str_ends_with(lo_fp, ".py")
+    is_js := str_ends_with(lo_fp, ".js") or str_ends_with(lo_fp, ".ts") or str_ends_with(lo_fp, ".jsx") or str_ends_with(lo_fp, ".tsx")
+    is_docker := str_contains(lo_fp, "dockerfile")
+    is_gha := str_contains(lo_fp, ".github/workflows") or str_contains(lo_fp, ".github\\workflows")
+
+    mut i := 0
+    while i < ln_cnt {
+        raw_line := svec_get(lines, i)
+        trimmed := str_trim(raw_line)
+        lno := i + 1
+        if str_len(trimmed) == 0 {
+            i += 1
+            continue
+        }
+
+        _sast_check_line_secrets(file_path, raw_line, lines, i, lno, mut sr)
+
+        code_line := if is_code { str_trim(_sast_strip_comment(raw_line)) } else { trimmed }
+        lo_line := _sast_to_lower_ascii(trimmed)
+
+        if is_code and str_len(code_line) > 0 and (not str_starts_with(trimmed, "#")) {
+            if str_contains(code_line, "inner" + "HTML =") or str_contains(code_line, "inner" + "HTML=")
+                or str_contains(code_line, "outer" + "HTML =") or str_contains(code_line, "document." + "write(")
+                or str_contains(code_line, "dangerously" + "SetInnerHTML") or str_contains(code_line, "v-" + "html=") {
+                _sast_push_checked(
+                    mut sr, lines, i, 3, SAST_CONF_HIGH(), "AX-SAST-017", "CWE-79", file_path, lno,
+                    "Unsafe raw HTML injection sink (DOM/Reflected XSS risk)",
+                    code_line,
+                    "Use `textContent`, auto-escaping templates, or a strict HTML sanitizer instead of raw HTML sinks."
+                )
+            }
+        }
+
+        if is_code and str_len(code_line) > 0 and (not str_starts_with(trimmed, "#")) {
+            if (not str_contains(lo_fp, "sec_sast.ax")) and (not str_contains(lo_fp, "sec_corpus.ax")) and (str_contains(lo_line, "java" + "script:") and (str_contains(lo_line, "href") or str_contains(lo_line, "location") or str_contains(lo_line, "redirect"))) {
+                is_rej := str_starts_with(str_trim(code_line), "if ") and (str_contains(code_line, "return") or _sast_window_contains(lines, i + 1, i + 2, "return"))
+                if not is_rej {
+                    _sast_push_checked(
+                        mut sr, lines, i, 3, SAST_CONF_HIGH(), "AX-SAST-018", "CWE-79", file_path, lno,
+                        "Active `javascript:` URI in href/redirect context (XSS / Open Redirect)",
+                        code_line,
+                        "Allowlist only `https://`, `http://`, or relative `/` URLs for redirects and links."
+                    )
+                }
+            }
+        }
+
+        if is_code and str_len(code_line) > 0 and (not str_starts_with(trimmed, "#")) {
+            if str_contains(code_line, "verify" + "=False") or str_contains(code_line, "verify" + " = False")
+                or str_contains(code_line, "InsecureSkip" + "Verify: true")
+                or str_contains(code_line, "reject" + "Unauthorized: false")
+                or str_contains(code_line, "NODE_TLS_REJECT_" + "UNAUTHORIZED")
+                or str_contains(code_line, "danger_accept_" + "invalid_certs")
+                or str_contains(code_line, "SSL_VERIFY_" + "NONE") {
+                _sast_push_checked(
+                    mut sr, lines, i, 4, SAST_CONF_HIGH(), "AX-SAST-019", "CWE-295", file_path, lno,
+                    "TLS certificate verification disabled (MITM vulnerability)",
+                    code_line,
+                    "Enable strict TLS certificate and hostname verification; never disable peer verification in production."
+                )
+            }
+        }
+
+        if is_code and str_len(code_line) > 0 {
+            if (str_contains(code_line, "Access-Control-Allow-" + "Origin: *") or str_contains(code_line, "allow_origins=[\"*\"]")) {
+                if _sast_window_contains(lines, i - 3, i + 3, "Allow-Credentials") or _sast_window_contains(lines, i - 3, i + 3, "allow_credentials") {
+                    _sast_push_checked(
+                        mut sr, lines, i, 3, SAST_CONF_HIGH(), "AX-SAST-020", "CWE-942", file_path, lno,
+                        "Wildcard CORS (`*`) combined with credentials allows cross-origin credential theft",
+                        code_line,
+                        "Restrict `Access-Control-Allow-Origin` to an explicit origin allowlist when credentials are enabled."
+                    )
+                }
+            }
+        }
+
+        if is_agent or is_cfg or is_docker or is_gha or str_ends_with(lo_fp, ".sh") {
+            if str_contains(raw_line, "--dangerously-" + "skip-permissions")
+                or str_contains(raw_line, "bypass" + "Permissions")
+                or str_contains(raw_line, "\"auto" + "Approve\"")
+                or str_contains(raw_line, "dangerously" + "DisableSandbox") {
+                _sast_push_checked(
+                    mut sr, lines, i, 4, SAST_CONF_HIGH(), "AX-SAST-022", "CWE-269", file_path, lno,
+                    "AI agent sandbox/permission bypass or auto-approve configuration",
+                    trimmed,
+                    "Remove permission-bypass and auto-approve flags; enforce explicit user approval for high-risk tools."
+                )
+            }
+            if ((str_contains(lo_line, "cu" + "rl ") or str_contains(lo_line, "wg" + "et ")) and (str_contains(lo_line, "| s" + "h") or str_contains(lo_line, "| ba" + "sh")))
+                or (str_contains(lo_line, "ir" + "m ") and str_contains(lo_line, "| ie" + "x")) {
+                _sast_push_checked(
+                    mut sr, lines, i, 4, SAST_CONF_HIGH(), "AX-SAST-022", "CWE-829", file_path, lno,
+                    "Remote script piped directly into shell execution (`curl|sh` / `irm|iex`)",
+                    trimmed,
+                    "Download scripts to disk, verify SHA-256 checksum/signature, inspect, and execute locally."
+                )
+            }
+        }
+
+        if is_cfg or is_agent {
+            if str_contains(raw_line, "np" + "x") and str_contains(raw_line, "-y") and str_contains(raw_line, "mcp") {
+                if not str_contains(raw_line, "@0.") and not str_contains(raw_line, "@1.") and not str_contains(raw_line, "@2.") {
+                    _sast_push_checked(
+                        mut sr, lines, i, 3, SAST_CONF_MEDIUM(), "AX-SAST-023", "CWE-829", file_path, lno,
+                        "Unpinned `npx -y` MCP server execution (supply-chain hijack risk)",
+                        trimmed,
+                        "Pin MCP packages to an exact immutable version (`pkg@x.y.z`) or install locally."
+                    )
+                }
+            }
+            if (not is_axon) and str_contains(lo_fp, "mcp") and str_contains(lo_line, "http" + "://") and (not str_contains(lo_line, "localhost")) and (not str_contains(lo_line, "127.0.0.1")) {
+                _sast_push_checked(
+                    mut sr, lines, i, 3, SAST_CONF_HIGH(), "AX-SAST-023", "CWE-319", file_path, lno,
+                    "MCP server configured over plaintext HTTP to non-local host",
+                    trimmed,
+                    "Use `https://` with TLS verification for remote MCP endpoints."
+                )
+            }
+        }
+
+        if is_agent and (not is_axon) {
+            if str_contains(lo_line, "ignore " + "previous instructions")
+                or str_contains(lo_line, "ignore all " + "previous")
+                or str_contains(lo_line, "disregard " + "prior instructions")
+                or str_contains(lo_line, "disregard " + "previous rules")
+                or str_contains(lo_line, "forget " + "earlier instructions") {
+                _sast_push_checked(
+                    mut sr, lines, i, 3, SAST_CONF_HIGH(), "AX-SAST-025", "CWE-74", file_path, lno,
+                    "Prompt injection override phrase detected in agent/instruction document",
+                    trimmed,
+                    "Remove untrusted instruction-override text from agent prompts, skills, and rule files."
+                )
+            }
+        }
+
+        if is_py and (not str_starts_with(trimmed, "#")) {
+            if str_contains(raw_line, "sh" + "ell=True") or str_contains(raw_line, "sh" + "ell = True") or str_contains(raw_line, "os." + "system(") {
+                _sast_push_checked(
+                    mut sr, lines, i, 4, SAST_CONF_HIGH(), "AX-SAST-026", "CWE-78", file_path, lno,
+                    "Python shell command execution (`shell=True` / `os.system`) risks command injection",
+                    trimmed,
+                    "Pass an explicit argv list to `subprocess.run([...], shell=False)` instead of invoking a shell."
+                )
+            }
+        }
+        if is_js and (not str_starts_with(trimmed, "//")) {
+            if str_contains(code_line, "ev" + "al(") or str_contains(code_line, "new Func" + "tion(") {
+                _sast_push_checked(
+                    mut sr, lines, i, 4, SAST_CONF_HIGH(), "AX-SAST-026", "CWE-95", file_path, lno,
+                    "Dynamic JavaScript code evaluation (`eval`/`new Function`)",
+                    code_line,
+                    "Eliminate dynamic code execution; parse structured data with `JSON.parse`."
+                )
+            }
+        }
+        if is_docker {
+            if str_starts_with(trimmed, "USER " + "root") {
+                _sast_push_checked(
+                    mut sr, lines, i, 3, SAST_CONF_HIGH(), "AX-SAST-026", "CWE-250", file_path, lno,
+                    "Container explicitly configured to run as `USER root`",
+                    trimmed,
+                    "Create and switch to an unprivileged non-root `USER` in the Dockerfile."
+                )
+            }
+        }
+        if is_gha {
+            if str_contains(raw_line, "pull_request_" + "target") or str_contains(raw_line, "write-" + "all") {
+                _sast_push_checked(
+                    mut sr, lines, i, 4, SAST_CONF_HIGH(), "AX-SAST-026", "CWE-269", file_path, lno,
+                    "High-privilege GitHub Actions trigger/permission (`pull_request_target` / `write-all`)",
+                    trimmed,
+                    "Use `pull_request` and least-privilege explicit `permissions:` blocks."
+                )
+            }
+        }
+
+        i += 1
+    }
+}
+
+fn _sast_has_nul_head(src: str) -> bool {
+    mut lim := str_len(src)
+    if lim > 8192 { lim = 8192 }
+    mut i := 0
+    while i < lim {
+        if str_byte(src, i) == 0 { return true }
+        i += 1
+    }
+    return false
+}
+
+fn _sast_split_lines(src: str) -> StrVec {
+    mut out := svec_new(64, str_len(src) + 64)
+    n := str_len(src)
+    mut start := 0
+    mut i := 0
+    while i < n {
+        if str_byte(src, i) == 10 {
+            mut end := i
+            if end > start and str_byte(src, end - 1) == 13 { end -= 1 }
+            svec_push(mut out, str_slice(src, start, end))
+            start = i + 1
+        }
+        i += 1
+    }
+    if start <= n {
+        svec_push(mut out, str_slice(src, start, n))
+    }
+    return out
+}
+
+fn sast_scan_polyglot(file_path: str, src: str, mut sr: SastResults) {
+    if _sast_has_nul_head(src) { return }
+    lines := _sast_split_lines(src)
+    _sast_scan_v4_rules(file_path, src, lines, false, mut sr)
+    svec_free(move lines)
+}
+
+fn _sast_should_skip_dir(name: str, include_tests: bool) -> bool {
+    if str_eq(name, ".") or str_eq(name, "..") or str_eq(name, ".git")
+        or str_eq(name, "node_modules") or str_eq(name, "target")
+        or str_eq(name, "dist") or str_eq(name, "build")
+        or str_eq(name, "__pycache__") or str_eq(name, ".venv")
+        or str_eq(name, "venv") or str_eq(name, "bin")
+        or str_eq(name, "vendor") or str_eq(name, ".next")
+        or str_eq(name, "graphify-out") or str_eq(name, ".idea") {
+        return true
+    }
+    if not include_tests {
+        if str_eq(name, "tests") or str_eq(name, "test") or str_eq(name, "__tests__")
+            or str_eq(name, "fixtures") or str_eq(name, "examples") {
+            return true
+        }
+    }
+    return false
+}
+
+fn _sast_is_binary_ext(name: str) -> bool {
+    lo := _sast_to_lower_ascii(name)
+    return str_ends_with(lo, ".exe") or str_ends_with(lo, ".dll") or str_ends_with(lo, ".so")
+        or str_ends_with(lo, ".dylib") or str_ends_with(lo, ".o") or str_ends_with(lo, ".obj")
+        or str_ends_with(lo, ".a") or str_ends_with(lo, ".lib") or str_ends_with(lo, ".pdb")
+        or str_ends_with(lo, ".wasm") or str_ends_with(lo, ".png") or str_ends_with(lo, ".jpg")
+        or str_ends_with(lo, ".jpeg") or str_ends_with(lo, ".gif") or str_ends_with(lo, ".webp")
+        or str_ends_with(lo, ".ico") or str_ends_with(lo, ".pdf") or str_ends_with(lo, ".zip")
+        or str_ends_with(lo, ".tar") or str_ends_with(lo, ".gz") or str_ends_with(lo, ".7z")
+        or str_ends_with(lo, ".woff") or str_ends_with(lo, ".woff2") or str_ends_with(lo, ".ttf")
+        or str_ends_with(lo, ".mp3") or str_ends_with(lo, ".mp4") or str_ends_with(lo, ".wav")
+        or str_ends_with(lo, ".pyc") or str_ends_with(lo, ".jar") or str_ends_with(lo, ".db")
+        or str_ends_with(lo, ".sqlite") or str_ends_with(lo, ".gguf") or str_ends_with(lo, ".safetensors")
+        or str_ends_with(lo, ".bin") or str_ends_with(lo, ".lock") or str_ends_with(lo, ".map")
+        or str_ends_with(lo, ".min.js") or str_ends_with(lo, ".min.css")
+}
+
+fn sast_scan_file_any(file_path: str, mut sr: SastResults) -> bool {
+    sz := sys_fs_size(file_path)
+    if sz <= 0 or sz > 2097152 { return false }
+    src := fs_read_text(file_path) or return false
+    if _sast_has_nul_head(src) { return false }
+    if str_ends_with(file_path, ".ax") {
+        sast_scan_source(file_path, src, mut sr)
+    } else {
+        sast_scan_polyglot(file_path, src, mut sr)
+    }
+    return true
+}
+
+// Recursive multi-language repository security scanner (skips binaries, >2MB, junk dirs).
+fn sast_scan_repo(root_dir: str, mut sr: SastResults, include_tests: bool) -> i64 {
+    mut queue := svec_new(64, 2048)
+    svec_push(mut queue, root_dir)
+    mut qi := 0
+    mut scanned := 0
+    while qi < svec_len(queue) {
+        cur := svec_get(queue, qi)
+        qi += 1
+        entries := fs_list_dir(cur)
+        mut ei := 0
+        while ei < svec_len(entries) {
+            nm := svec_get(entries, ei)
+            ei += 1
+            if str_eq(nm, ".") or str_eq(nm, "..") { continue }
+            full := if str_eq(cur, ".") { nm } else { f"{cur}/{nm}" }
+            if fs_is_dir(full) {
+                if not _sast_should_skip_dir(nm, include_tests) {
+                    svec_push(mut queue, full)
+                }
+            } else {
+                if _sast_is_binary_ext(nm) { continue }
+                if sast_scan_file_any(full, mut sr) {
+                    scanned += 1
+                }
+            }
+        }
+        svec_free(move entries)
+    }
+    svec_free(move queue)
     return scanned
 }

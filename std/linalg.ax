@@ -231,6 +231,40 @@ fn mat_dot_vec(a: MatF64, x: MatF64) -> MatF64 {
 }
 
 // Cache-friendly `ikj` Matrix Multiply (`C = A * B`): inner loop triggers 8-wide AVX2+FMA3 `try_emit_avx2_f64_axpy_while_ax`!
+fn _mat_mul_f64_worker(tid: i64, nthreads: i64, pool: i64) {
+    unsafe {
+        pa := ptr_read_i64(pool, 4)
+        pb := ptr_read_i64(pool, 5)
+        pc := ptr_read_i64(pool, 6)
+        m := ptr_read_i64(pool, 7)
+        k_dim := ptr_read_i64(pool, 8)
+        n := ptr_read_i64(pool, 9)
+        r0 := (tid * m) / nthreads
+        r1 := ((tid + 1) * m) / nthreads
+        mut i := r0
+        while i < r1 {
+            o1 := i * n
+            ia := i * k_dim
+            mut k := 0
+            while k < k_dim {
+                aik := ptr_read_f64(pa, ia + k)
+                if aik != 0.0 {
+                    o2 := k * n
+                    mut j := 0
+                    while j < n {
+                        cv := ptr_read_f64(pc, o1 + j)
+                        bv := ptr_read_f64(pb, o2 + j)
+                        ptr_write_f64(pc, o1 + j, cv + aik * bv)
+                        j += 1
+                    }
+                }
+                k += 1
+            }
+            i += 1
+        }
+    }
+}
+
 fn mat_mul(a: MatF64, b: MatF64) -> MatF64 {
     if a.ptr == 0 or b.ptr == 0 or a.cols != b.rows {
         return MatF64(0, 0, 0)
@@ -239,26 +273,46 @@ fn mat_mul(a: MatF64, b: MatF64) -> MatF64 {
     out := mat_zeros(m, n)
     if out.ptr == 0 { return out }
     pa := a.ptr; pb := b.ptr; pc := out.ptr
-    mut i := 0
-    while i < m {
-        o1 := i * n
-        ia := i * k_dim
-        mut k := 0
-        while k < k_dim {
-            aik := unsafe { ptr_read_f64(pa, ia + k) }
-            if aik != 0.0 {
-                o2 := k * n
-                mut j := 0
-                while j < n {
-                    cv := unsafe { ptr_read_f64(pc, o1 + j) }
-                    bv := unsafe { ptr_read_f64(pb, o2 + j) }
-                    unsafe { ptr_write_f64(pc, o1 + j, cv + aik * bv) }
-                    j += 1
-                }
+    if m >= 32 and m * k_dim * n >= 65536 {
+        unsafe {
+            args := mem_alloc_aligned(64)
+            if args != 0 {
+                ptr_write_i64(args, 0, pa)
+                ptr_write_i64(args, 1, pb)
+                ptr_write_i64(args, 2, pc)
+                ptr_write_i64(args, 3, m)
+                ptr_write_i64(args, 4, k_dim)
+                ptr_write_i64(args, 5, n)
+                _ := ai_pool_dispatch(fn_addr(_mat_mul_f64_worker), args)
+                mem_free_aligned(args)
+                return out
             }
-            k += 1
         }
-        i += 1
+    }
+    if true {
+        unsafe {
+            mut i := 0
+            while i < m {
+                o1 := i * n
+                ia := i * k_dim
+                mut k := 0
+                while k < k_dim {
+                    aik := ptr_read_f64(pa, ia + k)
+                    if aik != 0.0 {
+                        o2 := k * n
+                        mut j := 0
+                        while j < n {
+                            cv := ptr_read_f64(pc, o1 + j)
+                            bv := ptr_read_f64(pb, o2 + j)
+                            ptr_write_f64(pc, o1 + j, cv + aik * bv)
+                            j += 1
+                        }
+                    }
+                    k += 1
+                }
+                i += 1
+            }
+        }
     }
     return out
 }
@@ -980,6 +1034,7 @@ fn csr_from_dense(a: MatF64, drop_tol: f64 = 0.0) -> CsrMat {
     row_ptr := ibuf_new(rows + 4)
     col_idx := ibuf_new(nnz + 8)
     vp := unsafe { mem_alloc_aligned((nnz + 4) * 8 + 64) }
+    if vp == 0 { return CsrMat(0, 0, 0, row_ptr, col_idx, 0) }
     mut cur := 0
     mut r := 0
     while r < rows {
