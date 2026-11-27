@@ -90,14 +90,184 @@ fn graph_bfs(g: Graph, src: i64) -> IntBuf {
     return dist
 }
 
+// Call-free 10-GPR Dial's circular-bucket Dijkstra core (`B = 512`, `0 <= w < 512`, O(V + E) linear time).
+// Returns `0` on success, `1` if pool capacity exceeded, `2` if any edge has `w >= 512` (fallback to 4-ary heap).
+fn _dijkstra_dial_core(src: i64, dp: i64, hp: i64, ep: i64, bhead: i64, pool: i64) -> i64 {
+    unsafe {
+        hcap := ptr_read_i64(pool, 0)
+        ptr_write_i64(pool, 1, src << 32)
+        ptr_write_i64(bhead, 0, 1)
+        mut cur := 0
+        mut cnt := 1
+        mut slot := 2
+        while cnt > 0 {
+            while ptr_read_i64(bhead, cur & 511) == 0 { cur += 1 }
+            hd := ptr_read_i64(bhead, cur & 511)
+            packed := ptr_read_i64(pool, hd)
+            ptr_write_i64(bhead, cur & 511, packed & 0xFFFFFFFF)
+            cnt -= 1
+            u := ushr64(packed, 32)
+            if cur <= ptr_read_i64(dp, u) {
+                mut e := ptr_read_i64(hp, u)
+                while e >= 0 {
+                    b := e + (e << 1)
+                    v := ptr_read_i64(ep, b)
+                    w := ptr_read_i64(ep, b + 1)
+                    if w >= 512 { return 2 }
+                    if w >= 0 {
+                        nd := cur + w
+                        if nd < ptr_read_i64(dp, v) {
+                            ptr_write_i64(dp, v, nd)
+                            if slot >= hcap { return 1 }
+                            nb := nd & 511
+                            ptr_write_i64(pool, slot, (v << 32) | ptr_read_i64(bhead, nb))
+                            ptr_write_i64(bhead, nb, slot)
+                            slot += 1
+                            cnt += 1
+                        }
+                    }
+                    e = ptr_read_i64(ep, b + 2)
+                }
+            }
+        }
+        return 0
+    }
+}
+
+// Call-free 4-ary cache-line Dijkstra core (promotes all 10 GPRs with zero stack spills!)
+// Returns `0` on success, `1` if heap capacity exceeded (caller grows heap), or `-1` on dist overflow.
+fn _dijkstra_4ary_core(nv: i64, src: i64, dp: i64, hp: i64, ep: i64, heap: i64, hcap: i64) -> i64 {
+    unsafe {
+        mut hsz := 1
+        ptr_write_i64(heap, 0, src)
+        while hsz > 0 {
+            top := ptr_read_i64(heap, 0)
+            hsz -= 1
+            if hsz > 0 {
+                last := ptr_read_i64(heap, hsz)
+                mut idx := 0
+                while true {
+                    c0 := (idx << 2) + 1
+                    if c0 >= hsz { break }
+                    mut best_c := c0
+                    mut best_v := ptr_read_i64(heap, c0)
+                    if c0 + 3 < hsz {
+                        v1 := ptr_read_i64(heap, c0 + 1)
+                        mut v2 := ptr_read_i64(heap, c0 + 2)
+                        v3 := ptr_read_i64(heap, c0 + 3)
+                        if v1 < best_v { best_v = v1; best_c = c0 + 1 }
+                        mut b23 := c0 + 2
+                        if v3 < v2 { v2 = v3; b23 = c0 + 3 }
+                        if v2 < best_v { best_v = v2; best_c = b23 }
+                    } else {
+                        c1 := c0 + 1
+                        if c1 < hsz {
+                            v1 := ptr_read_i64(heap, c1)
+                            if v1 < best_v { best_v = v1; best_c = c1 }
+                            c2 := c0 + 2
+                            if c2 < hsz {
+                                v2 := ptr_read_i64(heap, c2)
+                                if v2 < best_v { best_v = v2; best_c = c2 }
+                            }
+                        }
+                    }
+                    if last <= best_v { break }
+                    ptr_write_i64(heap, idx, best_v)
+                    idx = best_c
+                }
+                ptr_write_i64(heap, idx, last)
+            }
+            d := ushr64(top, 20)
+            u := top & 0xFFFFF
+            if d <= ptr_read_i64(dp, u) {
+                mut e := ptr_read_i64(hp, u)
+                while e >= 0 {
+                    b := e + (e << 1)
+                    v := ptr_read_i64(ep, b)
+                    w := ptr_read_i64(ep, b + 1)
+                    if w >= 0 {
+                        nd := d + w
+                        if nd < ptr_read_i64(dp, v) {
+                            if nd >= 0x40000000000 { return -1 }
+                            ptr_write_i64(dp, v, nd)
+                            if hsz >= hcap { return 1 }
+                            entry := (nd << 20) | v
+                            mut pi := hsz
+                            hsz += 1
+                            while pi > 0 {
+                                par := ushr64(pi - 1, 2)
+                                pv := ptr_read_i64(heap, par)
+                                if pv <= entry { break }
+                                ptr_write_i64(heap, pi, pv)
+                                pi = par
+                            }
+                            ptr_write_i64(heap, pi, entry)
+                        }
+                    }
+                    e = ptr_read_i64(ep, b + 2)
+                }
+            }
+        }
+        return 0
+    }
+}
+
 // Non-negative weighted Dijkstra shortest distances from `src` (`0x3FFFFFFFFFFFFFFF` if unreachable).
+// Fastpath 1: Dial's O(V + E) circular 512-bucket queue for bounded integer weights `0 <= w < 512`.
+// Fastpath 2: Call-free 10-GPR 4-ary cache-line heap with packed `(dist << 20) | node` entries for `n_verts <= 1048576`.
 fn graph_dijkstra(g: Graph, src: i64) -> IntBuf {
     inf := 0x3FFFFFFFFFFFFFFF
-    dist := ibuf_new(g.n_verts + 4)
+    nv := g.n_verts
+    dist := ibuf_new(nv + 4)
+    if nv <= 0 or src < 0 or src >= nv {
+        mut i := 0
+        while i < nv { ibuf_push(dist, inf); i += 1 }
+        return dist
+    }
+    if nv <= 1048576 {
+        unsafe {
+            dp := (dist as i64) + 16
+            ptr_write_i64(dist as i64, 0, nv)
+            hp := (g.head as i64) + 16
+            ep := (g.edges as i64) + 16
+            mut hcap := g.n_edges * 2 + nv + 64
+            if hcap < 128 { hcap = 128 }
+            mut try_dial := true
+            mut attempt := 0
+            while attempt < 3 {
+                mem_set(dp, 0x3F, nv * 8)
+                ptr_write_i64(dp, src, 0)
+                if try_dial {
+                    buf := mem_alloc_aligned(4096 + hcap * 8 + 64)
+                    if buf == 0 { break }
+                    mem_set(buf, 0, 4096)
+                    pool := buf + 4096
+                    ptr_write_i64(pool, 0, hcap)
+                    rc := _dijkstra_dial_core(src, dp, hp, ep, buf, pool)
+                    mem_free_aligned(buf)
+                    if rc == 0 { return dist }
+                    if rc == 2 {
+                        try_dial = false
+                    } else {
+                        hcap = hcap * 4
+                        attempt += 1
+                    }
+                } else {
+                    heap := mem_alloc_aligned(hcap * 8 + 64)
+                    if heap == 0 { break }
+                    rc := _dijkstra_4ary_core(nv, src, dp, hp, ep, heap, hcap)
+                    mem_free_aligned(heap)
+                    if rc == 0 { return dist }
+                    if rc < 0 { break }
+                    hcap = hcap * 4
+                    attempt += 1
+                }
+            }
+            ibuf_truncate(dist, 0)
+        }
+    }
     mut i := 0
-    while i < g.n_verts { ibuf_push(dist, inf); i += 1 }
-    if src < 0 or src >= g.n_verts { return dist }
-
+    while i < nv { ibuf_push(dist, inf); i += 1 }
     pq := heap_kv_new(g.n_edges + 16)
     ibuf_set(dist, src, 0)
     heap_push_kv_min(pq, 0, src)

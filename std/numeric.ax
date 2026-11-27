@@ -315,83 +315,348 @@ fn cplx_exp(z: Complex) -> Complex {
 // 3. In-Place Radix-2 Cooley-Tukey FFT / IFFT & Spectral Windowing
 // ============================================================================
 
+// Parallel Cache-Blocked Precomputed-Twiddle Radix-2 FFT Helpers
+fn _fft_local_worker(tid: i64, nthreads: i64, pool: i64) {
+    unsafe {
+        pre := ptr_read_i64(pool, 4)
+        pim := ptr_read_i64(pool, 5)
+        twr := ptr_read_i64(pool, 6)
+        twi := ptr_read_i64(pool, 7)
+        n := ptr_read_i64(pool, 8)
+        packed := ptr_read_i64(pool, 9) // (max_local_len << 2) | (inv_flag)
+        max_len := ushr64(packed, 2)
+        sign := if (packed & 1) != 0 { 1.0 } else { -1.0 }
+        nblk := n / max_len
+        b0 := (tid * nblk) / nthreads
+        b1 := ((tid + 1) * nblk) / nthreads
+        half_n := n >> 1
+        mut bi := b0
+        while bi < b1 {
+            seg := bi * max_len
+            seg_end := seg + max_len
+            // Stage 1: len=2 (0 multiplications!)
+            mut p := seg
+            while p < seg_end {
+                ur := ptr_read_f64(pre, p); ui := ptr_read_f64(pim, p)
+                vr := ptr_read_f64(pre, p + 1); vi := ptr_read_f64(pim, p + 1)
+                ptr_write_f64(pre, p, ur + vr);     ptr_write_f64(pim, p, ui + vi)
+                ptr_write_f64(pre, p + 1, ur - vr); ptr_write_f64(pim, p + 1, ui - vi)
+                p += 2
+            }
+            // Stage 2: len=4 (0 multiplications: w_1 = (0, sign)!)
+            if max_len >= 4 {
+                p = seg
+                while p < seg_end {
+                    u0r := ptr_read_f64(pre, p);     u0i := ptr_read_f64(pim, p)
+                    v0r := ptr_read_f64(pre, p + 2); v0i := ptr_read_f64(pim, p + 2)
+                    ptr_write_f64(pre, p, u0r + v0r);     ptr_write_f64(pim, p, u0i + v0i)
+                    ptr_write_f64(pre, p + 2, u0r - v0r); ptr_write_f64(pim, p + 2, u0i - v0i)
+                    u1r := ptr_read_f64(pre, p + 1); u1i := ptr_read_f64(pim, p + 1)
+                    v1r := ptr_read_f64(pre, p + 3); v1i := ptr_read_f64(pim, p + 3)
+                    t1r := (0.0 - sign) * v1i
+                    t1i := sign * v1r
+                    ptr_write_f64(pre, p + 1, u1r + t1r); ptr_write_f64(pim, p + 1, u1i + t1i)
+                    ptr_write_f64(pre, p + 3, u1r - t1r); ptr_write_f64(pim, p + 3, u1i - t1i)
+                    p += 4
+                }
+            }
+            // Stages len = 8 .. max_len using L1-resident twiddle LUT
+            mut len_b := 8
+            while len_b <= max_len {
+                half := len_b >> 1
+                step := half_n / half
+                mut base := seg
+                while base < seg_end {
+                    mut k := 0
+                    mut ti := 0
+                    while k < half {
+                        u_idx := base + k
+                        v_idx := u_idx + half
+                        wr := ptr_read_f64(twr, ti)
+                        wi := ptr_read_f64(twi, ti)
+                        ur := ptr_read_f64(pre, u_idx); ui := ptr_read_f64(pim, u_idx)
+                        vr := ptr_read_f64(pre, v_idx); vi := ptr_read_f64(pim, v_idx)
+                        tr := vr * wr - vi * wi
+                        tim := vr * wi + vi * wr
+                        ptr_write_f64(pre, u_idx, ur + tr);  ptr_write_f64(pim, u_idx, ui + tim)
+                        ptr_write_f64(pre, v_idx, ur - tr);  ptr_write_f64(pim, v_idx, ui - tim)
+                        k += 1
+                        ti += step
+                    }
+                    base += len_b
+                }
+                len_b = len_b << 1
+            }
+            bi += 1
+        }
+    }
+}
+
+// Parallel Bit-Reversal + Twiddle-Build + Cache-Blocked Radix-2 FFT Helpers (Zero IDIV!)
+fn _fft_bitrev_tw_worker(tid: i64, nthreads: i64, pool: i64) {
+    unsafe {
+        pre := ptr_read_i64(pool, 4)
+        pim := ptr_read_i64(pool, 5)
+        tmp_r := ptr_read_i64(pool, 6)
+        tmp_i := ptr_read_i64(pool, 7)
+        meta := ptr_read_i64(pool, 8) // [0]=twr, [1]=twi, [2]=rev8, [3]=n, [4]=log2n, [5]=inv_b
+        twr := ptr_read_i64(meta, 0)
+        twi := ptr_read_i64(meta, 1)
+        rev8 := ptr_read_i64(meta, 2)
+        n := ptr_read_i64(meta, 3)
+        logn := ptr_read_i64(meta, 4)
+        inv_b := ptr_read_i64(meta, 5)
+        // 1. Parallel bit-reversal scatter-free gather into tmp_r/tmp_i via 8-bit LUT
+        i0 := (tid * n) / nthreads
+        i1 := ((tid + 1) * n) / nthreads
+        mut i := i0
+        if logn <= 16 {
+            sh := 16 - logn
+            while i < i1 {
+                r := ushr64((ptr_read_u8(rev8, i & 255) << 8) | ptr_read_u8(rev8, ushr64(i, 8)), sh)
+                ptr_write_f64(tmp_r, i, ptr_read_f64(pre, r))
+                ptr_write_f64(tmp_i, i, ptr_read_f64(pim, r))
+                i += 1
+            }
+        } else {
+            sh := 24 - logn
+            while i < i1 {
+                r := ushr64((ptr_read_u8(rev8, i & 255) << 16) | (ptr_read_u8(rev8, ushr64(i, 8) & 255) << 8) | ptr_read_u8(rev8, ushr64(i, 16) & 255), sh)
+                ptr_write_f64(tmp_r, i, ptr_read_f64(pre, r))
+                ptr_write_f64(tmp_i, i, ptr_read_f64(pim, r))
+                i += 1
+            }
+        }
+        // 2. Parallel twiddle LUT generation for half_n = n/2
+        half_n := n >> 1
+        k0 := (tid * half_n) / nthreads
+        k1 := ((tid + 1) * half_n) / nthreads
+        if k0 < k1 {
+            sign := if inv_b != 0 { 1.0 } else { -1.0 }
+            ang0 := sign * num_two_pi() / (n as f64)
+            dr := num_cos(ang0)
+            di := num_sin(ang0)
+            mut k := k0
+            while k < k1 {
+                ak := ang0 * (k as f64)
+                mut wr := num_cos(ak)
+                mut wi := num_sin(ak)
+                mut end_k := k + 256
+                if end_k > k1 { end_k = k1 }
+                while k < end_k {
+                    ptr_write_f64(twr, k, wr)
+                    ptr_write_f64(twi, k, wi)
+                    nwr := wr * dr - wi * di
+                    wi = wr * di + wi * dr
+                    wr = nwr
+                    k += 1
+                }
+            }
+        }
+    }
+}
+
+fn _fft_stage_worker(tid: i64, nthreads: i64, pool: i64) {
+    unsafe {
+        pre := ptr_read_i64(pool, 4)
+        pim := ptr_read_i64(pool, 5)
+        twr := ptr_read_i64(pool, 6)
+        twi := ptr_read_i64(pool, 7)
+        n := ptr_read_i64(pool, 8)
+        hsh := ptr_read_i64(pool, 9) // log2(half): half = 1 << hsh, len_b = 1 << (hsh + 1)
+        half := 1 << hsh
+        hmask := half - 1
+        step := ushr64(n >> 1, hsh)
+        total_bf := n >> 1
+        bf0 := (tid * total_bf) / nthreads
+        bf1 := ((tid + 1) * total_bf) / nthreads
+        mut bf := bf0
+        while bf < bf1 {
+            blk := ushr64(bf, hsh)
+            k := bf & hmask
+            u_idx := (blk << (hsh + 1)) + k
+            v_idx := u_idx + half
+            ti := k * step
+            wr := ptr_read_f64(twr, ti)
+            wi := ptr_read_f64(twi, ti)
+            ur := ptr_read_f64(pre, u_idx); ui := ptr_read_f64(pim, u_idx)
+            vr := ptr_read_f64(pre, v_idx); vi := ptr_read_f64(pim, v_idx)
+            tr := vr * wr - vi * wi
+            tim := vr * wi + vi * wr
+            ptr_write_f64(pre, u_idx, ur + tr);  ptr_write_f64(pim, u_idx, ui + tim)
+            ptr_write_f64(pre, v_idx, ur - tr);  ptr_write_f64(pim, v_idx, ui - tim)
+            bf += 1
+        }
+    }
+}
+
+fn _fft_final_stage_worker(tid: i64, nthreads: i64, pool: i64) {
+    unsafe {
+        src_r := ptr_read_i64(pool, 4)
+        src_i := ptr_read_i64(pool, 5)
+        dst_r := ptr_read_i64(pool, 6)
+        dst_i := ptr_read_i64(pool, 7)
+        meta := ptr_read_i64(pool, 8) // [0]=twr, [1]=twi, [3]=n
+        twr := ptr_read_i64(meta, 0)
+        twi := ptr_read_i64(meta, 1)
+        half := ptr_read_i64(meta, 3) >> 1
+        k0 := (tid * half) / nthreads
+        k1 := ((tid + 1) * half) / nthreads
+        sv_r := src_r + half * 8; sv_i := src_i + half * 8
+        dv_r := dst_r + half * 8; dv_i := dst_i + half * 8
+        mut k := k0
+        while k < k1 {
+            wr := ptr_read_f64(twr, k); wi := ptr_read_f64(twi, k)
+            ur := ptr_read_f64(src_r, k); ui := ptr_read_f64(src_i, k)
+            vr := ptr_read_f64(sv_r, k); vi := ptr_read_f64(sv_i, k)
+            tr := vr * wr - vi * wi
+            tim := vr * wi + vi * wr
+            ptr_write_f64(dst_r, k, ur + tr); ptr_write_f64(dst_i, k, ui + tim)
+            ptr_write_f64(dv_r, k, ur - tr);  ptr_write_f64(dv_i, k, ui - tim)
+            k += 1
+        }
+    }
+}
+
 // Performs in-place Radix-2 FFT (`inverse == false`) or IFFT (`inverse == true`) on length-`n` `MatF64` buffers.
 // `n` must be a positive power of two (`(n & (n - 1)) == 0`).
 fn fft_radix2_inplace(re: MatF64, im: MatF64, inverse: bool) -> bool {
     n := re.rows * re.cols
     if re.ptr == 0 or im.ptr == 0 or n <= 0 or im.rows * im.cols != n { return false }
     if (n & (n - 1)) != 0 { return false }
+    if n == 1 { return true }
     pre := re.ptr
     pim := im.ptr
-    // Bit-reversal permutation
-    mut j := 0
-    mut i := 1
-    while i < n {
-        mut bit := n >> 1
-        while (j & bit) != 0 {
-            j = j ^ bit
-            bit = bit >> 1
-        }
-        j = j ^ bit
-        if i < j {
-            tre := unsafe { ptr_read_f64(pre, i) }
-            tim := unsafe { ptr_read_f64(pim, i) }
-            unsafe {
-                ptr_write_f64(pre, i, ptr_read_f64(pre, j))
-                ptr_write_f64(pim, i, ptr_read_f64(pim, j))
-                ptr_write_f64(pre, j, tre)
-                ptr_write_f64(pim, j, tim)
+    sign := if inverse { 1.0 } else { -1.0 }
+    // Parallel bit-reversal + twiddle LUT + L1/L2-blocked path for 2048 <= n <= 16777216
+    if n >= 2048 and n <= 16777216 {
+        half_n := n >> 1
+        mut logn := 0
+        mut tn := n
+        while tn > 1 { tn = tn >> 1; logn += 1 }
+        unsafe {
+            arena := mem_alloc_aligned(n * 24 + 1024)
+            if arena != 0 {
+                tmp_r := arena
+                tmp_i := arena + n * 8 + 64
+                twr := tmp_i + n * 8 + 64
+                twi := twr + half_n * 8 + 64
+                rev8 := twi + half_n * 8 + 64
+                meta := rev8 + 256
+                args := meta + 64
+                mut bi := 0
+                while bi < 256 {
+                    mut rv := 0; mut bb := 0; mut x := bi
+                    while bb < 8 { rv = (rv << 1) | (x & 1); x = x >> 1; bb += 1 }
+                    ptr_write_u8(rev8, bi, rv)
+                    bi += 1
+                }
+                inv_b := if inverse { 1 } else { 0 }
+                ptr_write_i64(meta, 0, twr); ptr_write_i64(meta, 1, twi); ptr_write_i64(meta, 2, rev8)
+                ptr_write_i64(meta, 3, n);   ptr_write_i64(meta, 4, logn); ptr_write_i64(meta, 5, inv_b)
+                ptr_write_i64(args, 0, pre); ptr_write_i64(args, 1, pim)
+                ptr_write_i64(args, 2, tmp_r); ptr_write_i64(args, 3, tmp_i)
+                ptr_write_i64(args, 4, meta);  ptr_write_i64(args, 5, 0)
+                _ := ai_pool_dispatch(fn_addr(_fft_bitrev_tw_worker), args)
+
+                mut max_local := n >> 2
+                if max_local > 4096 { max_local = 4096 }
+                if max_local < 128 { max_local = 128 }
+                // Run local stages directly on tmp_r/tmp_i (zero copy before FFT!)
+                ptr_write_i64(args, 0, tmp_r); ptr_write_i64(args, 1, tmp_i)
+                ptr_write_i64(args, 2, twr);   ptr_write_i64(args, 3, twi)
+                ptr_write_i64(args, 4, n);     ptr_write_i64(args, 5, (max_local << 2) | inv_b)
+                _ := ai_pool_dispatch(fn_addr(_fft_local_worker), args)
+
+                mut hsh := 0
+                mut tm := max_local
+                while tm > 1 { tm = tm >> 1; hsh += 1 }
+                // Intermediate global stages in tmp_r/tmp_i, then fuse final stage directly into pre/pim (zero final memcpy!)
+                while (1 << (hsh + 1)) < n {
+                    ptr_write_i64(args, 5, hsh)
+                    _ := ai_pool_dispatch(fn_addr(_fft_stage_worker), args)
+                    hsh += 1
+                }
+                if (1 << hsh) < n {
+                    ptr_write_i64(args, 0, tmp_r); ptr_write_i64(args, 1, tmp_i)
+                    ptr_write_i64(args, 2, pre);   ptr_write_i64(args, 3, pim)
+                    ptr_write_i64(args, 4, meta);  ptr_write_i64(args, 5, 0)
+                    _ := ai_pool_dispatch(fn_addr(_fft_final_stage_worker), args)
+                } else {
+                    _ := mem_copy(pre, tmp_r, n * 8)
+                    _ := mem_copy(pim, tmp_i, n * 8)
+                }
+                mem_free_aligned(arena)
+                if inverse {
+                    inv_n := 1.0 / (n as f64)
+                    mut idx := 0
+                    while idx < n {
+                        ptr_write_f64(pre, idx, ptr_read_f64(pre, idx) * inv_n)
+                        ptr_write_f64(pim, idx, ptr_read_f64(pim, idx) * inv_n)
+                        idx += 1
+                    }
+                }
+                return true
             }
         }
-        i += 1
     }
-    // Cooley-Tukey butterflies
-    sign := if inverse { 1.0 } else { -1.0 }
-    mut len_b := 2
-    while len_b <= n {
-        half := len_b >> 1
-        ang := sign * num_two_pi() / (len_b as f64)
-        wlen_re := num_cos(ang)
-        wlen_im := num_sin(ang)
-        mut base := 0
-        while base < n {
-            mut w_re := 1.0
-            mut w_im := 0.0
-            mut k := 0
-            while k < half {
-                u_idx := base + k
-                v_idx := u_idx + half
-                u_re := unsafe { ptr_read_f64(pre, u_idx) }
-                u_im := unsafe { ptr_read_f64(pim, u_idx) }
-                vr := unsafe { ptr_read_f64(pre, v_idx) }
-                vi := unsafe { ptr_read_f64(pim, v_idx) }
-                t_re := vr * w_re - vi * w_im
-                t_im := vr * w_im + vi * w_re
-                unsafe {
+    // Small-N scalar bit-reversal + Cooley-Tukey butterflies
+    unsafe {
+        mut j := 0
+        mut i := 1
+        while i < n {
+            mut bit := n >> 1
+            while (j & bit) != 0 { j = j ^ bit; bit = bit >> 1 }
+            j = j ^ bit
+            if i < j {
+                tre := ptr_read_f64(pre, i); tim := ptr_read_f64(pim, i)
+                ptr_write_f64(pre, i, ptr_read_f64(pre, j)); ptr_write_f64(pim, i, ptr_read_f64(pim, j))
+                ptr_write_f64(pre, j, tre); ptr_write_f64(pim, j, tim)
+            }
+            i += 1
+        }
+        mut len_b := 2
+        while len_b <= n {
+            half := len_b >> 1
+            ang := sign * num_two_pi() / (len_b as f64)
+            wlen_re := num_cos(ang)
+            wlen_im := num_sin(ang)
+            mut base := 0
+            while base < n {
+                mut w_re := 1.0
+                mut w_im := 0.0
+                mut k := 0
+                while k < half {
+                    u_idx := base + k
+                    v_idx := u_idx + half
+                    u_re := ptr_read_f64(pre, u_idx)
+                    u_im := ptr_read_f64(pim, u_idx)
+                    vr := ptr_read_f64(pre, v_idx)
+                    vi := ptr_read_f64(pim, v_idx)
+                    t_re := vr * w_re - vi * w_im
+                    t_im := vr * w_im + vi * w_re
                     ptr_write_f64(pre, u_idx, u_re + t_re)
                     ptr_write_f64(pim, u_idx, u_im + t_im)
                     ptr_write_f64(pre, v_idx, u_re - t_re)
                     ptr_write_f64(pim, v_idx, u_im - t_im)
+                    nw_re := w_re * wlen_re - w_im * wlen_im
+                    nw_im := w_re * wlen_im + w_im * wlen_re
+                    w_re = nw_re
+                    w_im = nw_im
+                    k += 1
                 }
-                nw_re := w_re * wlen_re - w_im * wlen_im
-                nw_im := w_re * wlen_im + w_im * wlen_re
-                w_re = nw_re
-                w_im = nw_im
-                k += 1
+                base += len_b
             }
-            base += len_b
+            len_b = len_b << 1
         }
-        len_b = len_b << 1
-    }
-    if inverse {
-        inv_n := 1.0 / (n as f64)
-        mut idx := 0
-        while idx < n {
-            unsafe {
+        if inverse {
+            inv_n := 1.0 / (n as f64)
+            mut idx := 0
+            while idx < n {
                 ptr_write_f64(pre, idx, ptr_read_f64(pre, idx) * inv_n)
                 ptr_write_f64(pim, idx, ptr_read_f64(pim, idx) * inv_n)
+                idx += 1
             }
-            idx += 1
         }
     }
     return true

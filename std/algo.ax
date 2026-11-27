@@ -205,19 +205,25 @@ fn _radix_par_bucket_worker(tid: i64, nthreads: i64, pool: i64) {
         sub_passes := ptr_read_i64(pool, 8)
         lhist_all := ptr_read_i64(pool, 9)
         lhist := lhist_all + (tid << 14) // pre-allocated 16 KB/thread (zero malloc in worker!)
-        b_lo := (tid * 256) / nthreads
-        b_hi := ((tid + 1) * 256) / nthreads
-        mut bi := b_lo
-        while bi < b_hi {
+        // Round-robin bucket striping ensures 100% load balance even when keys are all-positive (buckets 0..127 empty)!
+        mut bi := tid
+        while bi < 256 {
             st := ptr_read_i64(offs, bi)
             en := ptr_read_i64(ends, bi)
             bn := en - st
             if bn == 1 {
                 ptr_write_i64(arr, st, ptr_read_i64(tmp, st))
+            } else if bn <= 512 or lhist_all == 0 {
+                mem_copy(arr + st * 8, tmp + st * 8, bn * 8)
+                if bn <= 48 {
+                    isort_raw_i64(arr + st * 8, 0, bn - 1)
+                } else {
+                    qsort_raw_i64(arr + st * 8, 0, bn - 1)
+                }
             } else if bn > 1 {
                 _radix_lsd_sub_i64(tmp + st * 8, arr + st * 8, tmp + st * 8, lhist, bn, sub_passes)
             }
-            bi += 1
+            bi += nthreads
         }
     }
 }
@@ -257,7 +263,76 @@ unsafe fn radix_sort_raw_i64(arr: i64, n: i64) {
         return
     }
 
-    if n >= 65536 {
+    // Medium-size hybrid MSB-8 (256 L1D buckets, 2 KB histogram!) + 1-dispatch parallel L1D bucket sort:
+    // Single <512KB heap arena (no VirtualAlloc syscall!), 0 TLB thrash, ONLY ONE pool dispatch!
+    if n >= 8192 and n < 131072 {
+        arena := mem_alloc_aligned(n * 8 + 8192)
+        if arena != 0 {
+            cnt := arena
+            offs := arena + 2048
+            ends := arena + 4096
+            args := arena + 6144
+            tmp := arena + 6400
+            mem_set(cnt, 0, 2048)
+            mut i := 0
+            lim2 := n - 1
+            while i < lim2 {
+                bk0 := ushr64(ptr_read_i64(arr, i), 56) ^ 128
+                bk1 := ushr64(ptr_read_i64(arr, i + 1), 56) ^ 128
+                ptr_write_i64(cnt, bk0, ptr_read_i64(cnt, bk0) + 1)
+                ptr_write_i64(cnt, bk1, ptr_read_i64(cnt, bk1) + 1)
+                i += 2
+            }
+            while i < n {
+                bk := ushr64(ptr_read_i64(arr, i), 56) ^ 128
+                ptr_write_i64(cnt, bk, ptr_read_i64(cnt, bk) + 1)
+                i += 1
+            }
+            mut sum := 0
+            mut non_empty := 0
+            mut b := 0
+            while b < 256 {
+                c_b := ptr_read_i64(cnt, b)
+                if c_b > 0 { non_empty += 1 }
+                ptr_write_i64(offs, b, sum)
+                ptr_write_i64(cnt, b, sum)
+                sum += c_b
+                ptr_write_i64(ends, b, sum)
+                b += 1
+            }
+            if non_empty >= 16 {
+                i = 0
+                while i < lim2 {
+                    v0 := ptr_read_i64(arr, i); v1 := ptr_read_i64(arr, i + 1)
+                    bk0 := ushr64(v0, 56) ^ 128
+                    p0 := ptr_read_i64(cnt, bk0); ptr_write_i64(tmp, p0, v0); ptr_write_i64(cnt, bk0, p0 + 1)
+                    bk1 := ushr64(v1, 56) ^ 128
+                    p1 := ptr_read_i64(cnt, bk1); ptr_write_i64(tmp, p1, v1); ptr_write_i64(cnt, bk1, p1 + 1)
+                    i += 2
+                }
+                while i < n {
+                    v := ptr_read_i64(arr, i)
+                    bk := ushr64(v, 56) ^ 128
+                    pos := ptr_read_i64(cnt, bk)
+                    ptr_write_i64(tmp, pos, v)
+                    ptr_write_i64(cnt, bk, pos + 1)
+                    i += 1
+                }
+                ptr_write_i64(args, 0, arr)
+                ptr_write_i64(args, 1, tmp)
+                ptr_write_i64(args, 2, offs)
+                ptr_write_i64(args, 3, ends)
+                ptr_write_i64(args, 4, 7)
+                ptr_write_i64(args, 5, 0)
+                _ := ai_pool_dispatch(fn_addr(_radix_par_bucket_worker), args)
+                mem_free_aligned(arena)
+                return
+            }
+            mem_free_aligned(arena)
+        }
+    }
+
+    if n >= 131072 {
         // Sample 512 elements to pick the highest varying byte
         mut diff_bits := 0
         v0 := ptr_read_i64(arr, 0)
