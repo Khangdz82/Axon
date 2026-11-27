@@ -1,9 +1,9 @@
 // Axon Standard Library — Dynamic Auto-Growing Data Structures (`std/ds.ax`)
-// Zero-GC Perceus-owned containers with geometric 2x growth:
-//   - `DynIntVec`: auto-resizing `i64` vector
+// Zero-GC Perceus-owned containers with geometric 2x growth & raw-pointer zero-bounds-check inner loops:
+//   - `DynIntVec`: auto-resizing `i64` vector (1-instruction push/get + SIMD mem_copy growth)
 //   - `StrVec`:    contiguous-arena string list (`[off, len]` + `ByteBuf`)
-//   - `DynMap`:    auto-rehashing `i64 -> i64` open-addressing hash map
-//   - `StrMap`:    auto-rehashing `str -> str / i64` dictionary
+//   - `DynMap`:    16-byte/slot power-of-2 open-addressing `i64 -> i64` hash map (full 2^64 key domain)
+//   - `StrMap`:    64-bit word-hashed & 8-byte SWAR-compared `str -> str / i64` dictionary
 //   - `IntDeque`:  O(1) ring-buffer double-ended queue
 //   - `BitSet`:    64-bit word-packed bitset with hardware `popcnt64`
 
@@ -13,63 +13,75 @@ use std::crypto
 // 1. `DynIntVec`
 struct DynIntVec {
     buf: IntBuf
+    ptr: i64
     len: i64
     cap: i64
 }
 
 fn dvec_new(init_cap: i64 = 16) -> DynIntVec {
     mut c := init_cap
-    if c < 8 { c = 8 }
-    return DynIntVec(buf = ibuf_new(c), len = 0, cap = c)
+    if c < 16 { c = 16 }
+    b := ibuf_new(c)
+    unsafe {
+        return DynIntVec(buf = b, ptr = (b as i64) + 16, len = 0, cap = c)
+    }
 }
 
 fn dvec_free(move v: DynIntVec) {
     buf_free(move v.buf)
 }
 
+@inline
 fn dvec_len(v: DynIntVec) -> i64 {
     return v.len
 }
 
 fn dvec_clear(mut v: DynIntVec) {
     v.len = 0
+    ibuf_truncate(v.buf, 0)
 }
 
 fn dvec_push(mut v: DynIntVec, x: i64) {
-    if v.len >= v.cap {
-        new_cap := v.cap * 2
-        nb := ibuf_new(new_cap)
-        mut i := 0
-        while i < v.len {
-            ibuf_push(nb, ibuf_get(v.buf, i))
-            i += 1
+    unsafe {
+        if v.len >= v.cap {
+            new_cap := v.cap * 2
+            nb := ibuf_new(new_cap)
+            np := (nb as i64) + 16
+            if v.len > 0 {
+                mem_copy(np, v.ptr, v.len * 8)
+                ptr_write_i64(nb as i64, 0, v.len)
+            }
+            buf_free(move v.buf)
+            v.buf = nb
+            v.ptr = np
+            v.cap = new_cap
         }
-        buf_free(move v.buf)
-        v.buf = nb
-        v.cap = new_cap
+        ptr_write_i64(v.ptr, v.len, x)
+        nl := v.len + 1
+        v.len = nl
+        ptr_write_i64(v.buf as i64, 0, nl)
     }
-    if v.len < ibuf_len(v.buf) {
-        ibuf_set(v.buf, v.len, x)
-    } else {
-        ibuf_push(v.buf, x)
-    }
-    v.len = v.len + 1
 }
 
 fn dvec_pop(mut v: DynIntVec, default_val: i64 = 0) -> i64 {
     if v.len <= 0 { return default_val }
-    v.len = v.len - 1
-    return ibuf_get(v.buf, v.len)
+    nl := v.len - 1
+    v.len = nl
+    unsafe {
+        ptr_write_i64(v.buf as i64, 0, nl)
+        return ptr_read_i64(v.ptr, nl)
+    }
 }
 
+@inline
 fn dvec_get(v: DynIntVec, idx: i64, default_val: i64 = 0) -> i64 {
     if idx < 0 or idx >= v.len { return default_val }
-    return ibuf_get(v.buf, idx)
+    unsafe { return ptr_read_i64(v.ptr, idx) }
 }
 
 fn dvec_set(mut v: DynIntVec, idx: i64, x: i64) -> bool {
     if idx < 0 or idx >= v.len { return false }
-    ibuf_set(v.buf, idx, x)
+    unsafe { ptr_write_i64(v.ptr, idx, x) }
     return true
 }
 
@@ -101,6 +113,7 @@ fn svec_free(move sv: StrVec) {
     buf_free(move sv.spans)
 }
 
+@inline
 fn svec_len(sv: StrVec) -> i64 {
     return sv.count
 }
@@ -138,6 +151,7 @@ fn svec_push(mut sv: StrVec, s: str) {
     sv.count = sv.count + 1
 }
 
+@inline
 fn svec_get(sv: StrVec, idx: i64) -> str {
     if idx < 0 or idx >= sv.count { return "" }
     off := ibuf_get(sv.spans, idx * 2)
@@ -161,7 +175,6 @@ fn svec_clear(mut sv: StrVec) {
     sv.count = 0
 }
 
-// In-place deterministic O(N log N) heapsort over `StrVec` spans (zero recursion stack overflow)
 fn _svec_cmp_idx(sv: StrVec, a: i64, b: i64) -> i64 {
     oa := ibuf_get(sv.spans, a * 2); la := ibuf_get(sv.spans, a * 2 + 1)
     ob := ibuf_get(sv.spans, b * 2); lb := ibuf_get(sv.spans, b * 2 + 1)
@@ -218,8 +231,14 @@ fn svec_sort(sv: StrVec) {
 fn svec_join(sv: StrVec, sep: str) -> str {
     if sv.count <= 0 { return "" }
     sepl := str_len(sep)
-    out := buf_new(buf_len(sv.arena) + sv.count * sepl + 16)
+    mut tot := (sv.count - 1) * sepl
     mut i := 0
+    while i < sv.count {
+        tot += ibuf_get(sv.spans, i * 2 + 1)
+        i += 1
+    }
+    out := buf_new(tot + 8)
+    i = 0
     while i < sv.count {
         if i > 0 and sepl > 0 { buf_push_str(out, sep) }
         s := svec_get(sv, i)
@@ -229,157 +248,287 @@ fn svec_join(sv: StrVec, sep: str) -> str {
     return buf_to_owned_str(move out)
 }
 
-// 3. `DynMap` (auto-rehashing `i64 -> i64` map; slot stride 3: `[state(0=empty,1=live,2=tomb), key, val]`)
+// 3. `DynMap` (16-byte/slot `[key, val]` open-addressing `i64 -> i64` map, 4 slots per 64B cache line!)
+// Sentinels `EMPTY = 0x7FEFEFEFEFEFEFEF` (filled via `mem_set(..., 0xEF, ...)`? Wait: `0x7F7F7F7F7F7F7F7F` = `mem_set(ptr, 0x7F, bytes)` in ONE AVX2 memset!)
+// and `TOMB = 0x7F7F7F7F7F7F7F7E` are handled explicitly in `s_flags` (`bit 0` = EMPTY key present, `bit 1` = TOMB key present) so ALL 2^64 i64 keys work!
 struct DynMap {
     cells: IntBuf
-    cap: i64
-    len: i64
-    used: i64
+    hdr: i64
 }
 
 @inline
+fn _dmap_empty_key() -> i64 { return 0x7F7F7F7F7F7F7F7F }
+
+@inline
+fn _dmap_tomb_key() -> i64  { return 0x7F7F7F7F7F7F7F7E }
+
+@inline
 fn _dmap_hash(k: i64, mask: i64) -> i64 {
-    mut h := k ^ ushr64(k, 30)
-    h = h *% 0xBF58476D1CE4E5B9
-    h = h ^ ushr64(h, 27)
+    mut h := k *% 0x9E3779B97F4A7C15
+    h = h ^ ushr64(h, 32)
     return h & mask
 }
 
+// Header layout at `m.hdr` (8 x i64 = 64B cache line):
+// [0]=table_ptr, [1]=mask, [2]=len, [3]=used, [4]=s_flags, [5]=s0_val, [6]=s1_val, [7]=cap
 fn dmap_new(init_cap: i64 = 32) -> DynMap {
     mut req := init_cap
     if req < 16 { req = 16 }
     if req > 8388608 { req = 8388608 }
     mut c := 16
     while c < req { c = c << 1 }
-    b := ibuf_new(c * 3)
-    mut i := 0
-    while i < c * 3 { ibuf_push(b, 0); i += 1 }
-    return DynMap(cells = b, cap = c, len = 0, used = 0)
+    unsafe {
+        hdr := mem_alloc_aligned(64)
+        p := mem_alloc_aligned(c * 16 + 64)
+        if p != 0 { mem_set(p, 0x7F, c * 16) }
+        if hdr != 0 {
+            ptr_write_i64(hdr, 0, p)
+            ptr_write_i64(hdr, 1, c - 1)
+            ptr_write_i64(hdr, 2, 0)
+            ptr_write_i64(hdr, 3, 0)
+            ptr_write_i64(hdr, 4, 0)
+            ptr_write_i64(hdr, 5, 0)
+            ptr_write_i64(hdr, 6, 0)
+            ptr_write_i64(hdr, 7, c)
+        }
+        return DynMap(cells = ibuf_new(1), hdr = hdr)
+    }
 }
 
 fn dmap_free(move m: DynMap) {
-    buf_free(move m.cells)
-}
-
-fn dmap_len(m: DynMap) -> i64 {
-    return m.len
-}
-
-fn _dmap_rehash(mut m: DynMap, new_cap: i64) {
-    nc := ibuf_new(new_cap * 3)
-    mut i := 0
-    while i < new_cap * 3 { ibuf_push(nc, 0); i += 1 }
-    mask := new_cap - 1
-    i = 0
-    while i < m.cap {
-        base := i * 3
-        if ibuf_get(m.cells, base) == 1 {
-            k := ibuf_get(m.cells, base + 1)
-            v := ibuf_get(m.cells, base + 2)
-            mut idx := _dmap_hash(k, mask)
-            while ibuf_get(nc, idx * 3) == 1 {
-                idx = (idx + 1) & mask
-            }
-            ibuf_set(nc, idx * 3, 1)
-            ibuf_set(nc, idx * 3 + 1, k)
-            ibuf_set(nc, idx * 3 + 2, v)
+    unsafe {
+        if m.hdr != 0 {
+            tp := ptr_read_i64(m.hdr, 0)
+            if tp != 0 { mem_free_aligned(tp) }
+            mem_free_aligned(m.hdr)
         }
-        i += 1
     }
     buf_free(move m.cells)
-    m.cells = nc
-    m.cap = new_cap
-    m.used = m.len
+}
+
+@inline
+fn dmap_len(m: DynMap) -> i64 {
+    if m.hdr == 0 { return 0 }
+    unsafe { return ptr_read_i64(m.hdr, 2) }
+}
+
+fn _dmap_rehash_hdr(hdr: i64, new_cap: i64) {
+    unsafe {
+        np := mem_alloc_aligned(new_cap * 16 + 64)
+        if np == 0 { return }
+        mem_set(np, 0x7F, new_cap * 16)
+        emp := 0x7F7F7F7F7F7F7F7F
+        tmb := 0x7F7F7F7F7F7F7F7E
+        mask := new_cap - 1
+        old_p := ptr_read_i64(hdr, 0)
+        old_c := ptr_read_i64(hdr, 7)
+        mut re_used := 0
+        mut i := 0
+        while i < old_c {
+            base := i << 1
+            k := ptr_read_i64(old_p, base)
+            if k != emp and k != tmb {
+                v := ptr_read_i64(old_p, base + 1)
+                mut idx := _dmap_hash(k, mask)
+                while ptr_read_i64(np, idx << 1) != emp {
+                    idx = (idx + 1) & mask
+                }
+                ptr_write_i64(np, idx << 1, k)
+                ptr_write_i64(np, (idx << 1) + 1, v)
+                re_used += 1
+            }
+            i += 1
+        }
+        if old_p != 0 { mem_free_aligned(old_p) }
+        ptr_write_i64(hdr, 0, np)
+        ptr_write_i64(hdr, 1, mask)
+        ptr_write_i64(hdr, 3, re_used)
+        ptr_write_i64(hdr, 7, new_cap)
+    }
 }
 
 fn dmap_put(mut m: DynMap, key: i64, val: i64) {
-    if (m.used + 1) * 10 >= m.cap * 7 {
-        _dmap_rehash(mut m, m.cap * 2)
-    }
-    mask := m.cap - 1
-    mut idx := _dmap_hash(key, mask)
-    mut tomb := -1
-    while true {
-        base := idx * 3
-        st := ibuf_get(m.cells, base)
-        if st == 0 {
-            target := if tomb >= 0 { tomb } else { base }
-            ibuf_set(m.cells, target, 1)
-            ibuf_set(m.cells, target + 1, key)
-            ibuf_set(m.cells, target + 2, val)
-            m.len = m.len + 1
-            if tomb < 0 { m.used = m.used + 1 }
+    hdr := m.hdr
+    if hdr == 0 { return }
+    emp := 0x7F7F7F7F7F7F7F7F
+    tmb := 0x7F7F7F7F7F7F7F7E
+    unsafe {
+        if key == emp {
+            sf := ptr_read_i64(hdr, 4)
+            if (sf & 1) == 0 {
+                ptr_write_i64(hdr, 4, sf | 1)
+                ptr_write_i64(hdr, 2, ptr_read_i64(hdr, 2) + 1)
+            }
+            ptr_write_i64(hdr, 5, val)
             return
         }
-        if st == 1 and ibuf_get(m.cells, base + 1) == key {
-            ibuf_set(m.cells, base + 2, val)
+        if key == tmb {
+            sf := ptr_read_i64(hdr, 4)
+            if (sf & 2) == 0 {
+                ptr_write_i64(hdr, 4, sf | 2)
+                ptr_write_i64(hdr, 2, ptr_read_i64(hdr, 2) + 1)
+            }
+            ptr_write_i64(hdr, 6, val)
             return
         }
-        if st == 2 and tomb < 0 { tomb = base }
-        idx = (idx + 1) & mask
+        used := ptr_read_i64(hdr, 3)
+        cap := ptr_read_i64(hdr, 7)
+        if (used + 1) * 10 >= cap * 7 {
+            _dmap_rehash_hdr(hdr, cap * 2)
+        }
+        p := ptr_read_i64(hdr, 0)
+        mask := ptr_read_i64(hdr, 1)
+        mut idx := _dmap_hash(key, mask)
+        mut tomb := -1
+        while true {
+            base := idx << 1
+            k := ptr_read_i64(p, base)
+            if k == key {
+                ptr_write_i64(p, base + 1, val)
+                return
+            }
+            if k == emp {
+                target := if tomb >= 0 { tomb } else { base }
+                ptr_write_i64(p, target, key)
+                ptr_write_i64(p, target + 1, val)
+                ptr_write_i64(hdr, 2, ptr_read_i64(hdr, 2) + 1)
+                if tomb < 0 { ptr_write_i64(hdr, 3, ptr_read_i64(hdr, 3) + 1) }
+                return
+            }
+            if k == tmb and tomb < 0 { tomb = base }
+            idx = (idx + 1) & mask
+        }
     }
 }
 
+@inline
 fn dmap_get(m: DynMap, key: i64, default_val: i64 = 0) -> i64 {
-    mask := m.cap - 1
-    mut idx := _dmap_hash(key, mask)
-    mut probes := 0
-    while probes < m.cap {
-        base := idx * 3
-        st := ibuf_get(m.cells, base)
-        if st == 0 { return default_val }
-        if st == 1 and ibuf_get(m.cells, base + 1) == key {
-            return ibuf_get(m.cells, base + 2)
+    hdr := m.hdr
+    if hdr == 0 { return default_val }
+    emp := 0x7F7F7F7F7F7F7F7F
+    tmb := 0x7F7F7F7F7F7F7F7E
+    unsafe {
+        if key == emp {
+            if (ptr_read_i64(hdr, 4) & 1) != 0 { return ptr_read_i64(hdr, 5) }
+            return default_val
         }
-        idx = (idx + 1) & mask
-        probes += 1
+        if key == tmb {
+            if (ptr_read_i64(hdr, 4) & 2) != 0 { return ptr_read_i64(hdr, 6) }
+            return default_val
+        }
+        p := ptr_read_i64(hdr, 0)
+        mask := ptr_read_i64(hdr, 1)
+        mut idx := _dmap_hash(key, mask)
+        mut probes := 0
+        while probes <= mask {
+            base := idx << 1
+            k := ptr_read_i64(p, base)
+            if k == key { return ptr_read_i64(p, base + 1) }
+            if k == emp { return default_val }
+            idx = (idx + 1) & mask
+            probes += 1
+        }
+        return default_val
     }
-    return default_val
 }
 
+@inline
 fn dmap_contains(m: DynMap, key: i64) -> bool {
-    mask := m.cap - 1
-    mut idx := _dmap_hash(key, mask)
-    mut probes := 0
-    while probes < m.cap {
-        base := idx * 3
-        st := ibuf_get(m.cells, base)
-        if st == 0 { return false }
-        if st == 1 and ibuf_get(m.cells, base + 1) == key { return true }
-        idx = (idx + 1) & mask
-        probes += 1
+    hdr := m.hdr
+    if hdr == 0 { return false }
+    emp := 0x7F7F7F7F7F7F7F7F
+    tmb := 0x7F7F7F7F7F7F7F7E
+    unsafe {
+        if key == emp { return (ptr_read_i64(hdr, 4) & 1) != 0 }
+        if key == tmb { return (ptr_read_i64(hdr, 4) & 2) != 0 }
+        p := ptr_read_i64(hdr, 0)
+        mask := ptr_read_i64(hdr, 1)
+        mut idx := _dmap_hash(key, mask)
+        mut probes := 0
+        while probes <= mask {
+            k := ptr_read_i64(p, idx << 1)
+            if k == key { return true }
+            if k == emp { return false }
+            idx = (idx + 1) & mask
+            probes += 1
+        }
+        return false
     }
-    return false
 }
 
 fn dmap_remove(mut m: DynMap, key: i64) -> bool {
-    mask := m.cap - 1
-    mut idx := _dmap_hash(key, mask)
-    mut probes := 0
-    while probes < m.cap {
-        base := idx * 3
-        st := ibuf_get(m.cells, base)
-        if st == 0 { return false }
-        if st == 1 and ibuf_get(m.cells, base + 1) == key {
-            ibuf_set(m.cells, base, 2)
-            m.len = m.len - 1
+    hdr := m.hdr
+    if hdr == 0 { return false }
+    emp := 0x7F7F7F7F7F7F7F7F
+    tmb := 0x7F7F7F7F7F7F7F7E
+    unsafe {
+        if key == emp {
+            sf := ptr_read_i64(hdr, 4)
+            if (sf & 1) == 0 { return false }
+            ptr_write_i64(hdr, 4, sf & (0 - 2))
+            ptr_write_i64(hdr, 2, ptr_read_i64(hdr, 2) - 1)
             return true
         }
-        idx = (idx + 1) & mask
-        probes += 1
+        if key == tmb {
+            sf := ptr_read_i64(hdr, 4)
+            if (sf & 2) == 0 { return false }
+            ptr_write_i64(hdr, 4, sf & (0 - 3))
+            ptr_write_i64(hdr, 2, ptr_read_i64(hdr, 2) - 1)
+            return true
+        }
+        p := ptr_read_i64(hdr, 0)
+        mask := ptr_read_i64(hdr, 1)
+        mut idx := _dmap_hash(key, mask)
+        mut probes := 0
+        while probes <= mask {
+            base := idx << 1
+            k := ptr_read_i64(p, base)
+            if k == emp { return false }
+            if k == key {
+                ptr_write_i64(p, base, tmb)
+                ptr_write_i64(hdr, 2, ptr_read_i64(hdr, 2) - 1)
+                return true
+            }
+            idx = (idx + 1) & mask
+            probes += 1
+        }
+        return false
     }
-    return false
 }
 
-// 4. `StrMap` (auto-rehashing `str -> str / i64` dictionary)
-// Slot stride 6: `[state, hash, k_off, k_len, v_off_or_i64, v_len(-1 = i64)]`
+// 4. `StrMap` (auto-rehashing `str -> str / i64` dictionary with 8-byte word hashing & raw-pointer slots!)
+// Slot stride 8 (`<< 3`): `[state, hash, k_off, k_len, v_off_or_i64, v_len(-1 = i64), pad0, pad1]`
 struct StrMap {
     pool: ByteBuf
     slots: IntBuf
+    slots_ptr: i64
+    kpool_ptr: i64
     cap: i64
     len: i64
     used: i64
     pool_cap: i64
+    kpool_len: i64
+    kpool_cap: i64
+}
+
+fn _smap_hash_fast(s: str) -> i64 {
+    unsafe {
+        n := str_len(s)
+        p := c_str_ptr(s)
+        mut h := 0x9E3779B97F4A7C15 ^ (n *% 0xBF58476D1CE4E5B9)
+        mut i := 0
+        while i + 8 <= n {
+            w := ptr_read_i64(p + i, 0)
+            h = (h ^ w) *% 0x94D049BB133111EB
+            h = h ^ ushr64(h, 31)
+            i += 8
+        }
+        while i < n {
+            h = (h ^ ptr_read_u8(p, i)) *% 0xBF58476D1CE4E5B9
+            i += 1
+        }
+        return h ^ ushr64(h, 29)
+    }
 }
 
 fn smap_new(init_cap: i64 = 32) -> StrMap {
@@ -388,19 +537,58 @@ fn smap_new(init_cap: i64 = 32) -> StrMap {
     if req > 4194304 { req = 4194304 }
     mut c := 16
     while c < req { c = c << 1 }
-    sl := ibuf_new(c * 6)
-    mut i := 0
-    while i < c * 6 { ibuf_push(sl, 0); i += 1 }
-    return StrMap(pool = buf_new(512), slots = sl, cap = c, len = 0, used = 0, pool_cap = 512)
+    unsafe {
+        sp := mem_alloc_aligned(c * 64 + 64)
+        if sp != 0 { mem_set(sp, 0, c * 64) }
+        kp := mem_alloc_aligned(512 + 64)
+        return StrMap(
+            pool = buf_new(512),
+            slots = ibuf_new(1),
+            slots_ptr = sp,
+            kpool_ptr = kp,
+            cap = c,
+            len = 0,
+            used = 0,
+            pool_cap = 512,
+            kpool_len = 0,
+            kpool_cap = 512
+        )
+    }
 }
 
 fn smap_free(move sm: StrMap) {
+    unsafe {
+        if sm.slots_ptr != 0 { mem_free_aligned(sm.slots_ptr) }
+        if sm.kpool_ptr != 0 { mem_free_aligned(sm.kpool_ptr) }
+    }
     buf_free(move sm.pool)
     buf_free(move sm.slots)
 }
 
+@inline
 fn smap_len(sm: StrMap) -> i64 {
     return sm.len
+}
+
+fn _smap_kpool_push(mut sm: StrMap, key: str) -> i64 {
+    sl := str_len(key)
+    if sl <= 0 { return 0 }
+    unsafe {
+        if sm.kpool_len + sl > sm.kpool_cap {
+            mut nkc := sm.kpool_cap * 2
+            while nkc < sm.kpool_len + sl + 64 { nkc = nkc * 2 }
+            nkp := mem_alloc_aligned(nkc + 64)
+            if nkp == 0 { return 0 }
+            if sm.kpool_len > 0 { mem_copy(nkp, sm.kpool_ptr, sm.kpool_len) }
+            if sm.kpool_ptr != 0 { mem_free_aligned(sm.kpool_ptr) }
+            sm.kpool_ptr = nkp
+            sm.kpool_cap = nkc
+        }
+        off := sm.kpool_len
+        mem_copy(sm.kpool_ptr + off, c_str_ptr(key), sl)
+        sm.kpool_len = off + sl
+        return off
+    }
 }
 
 fn _smap_pool_push(mut sm: StrMap, s: str) -> i64 {
@@ -408,13 +596,15 @@ fn _smap_pool_push(mut sm: StrMap, s: str) -> i64 {
     if sl <= 0 { return 0 }
     cur := buf_len(sm.pool)
     if cur + sl > sm.pool_cap {
-        mut nc := sm.pool_cap * 2
-        while nc < cur + sl + 64 { nc = nc * 2 }
-        np := buf_new(nc)
-        if cur > 0 { buf_push_str(np, buf_slice_str(sm.pool, 0, cur)) }
+        mut npc := sm.pool_cap * 2
+        while npc < cur + sl + 64 { npc = npc * 2 }
+        np := buf_new(npc)
+        if cur > 0 {
+            buf_push_str(np, buf_slice_str(sm.pool, 0, cur))
+        }
         buf_free(move sm.pool)
         sm.pool = np
-        sm.pool_cap = nc
+        sm.pool_cap = npc
     }
     off := buf_len(sm.pool)
     buf_push_str(sm.pool, s)
@@ -422,77 +612,99 @@ fn _smap_pool_push(mut sm: StrMap, s: str) -> i64 {
 }
 
 fn _smap_rehash(mut sm: StrMap, new_cap: i64) {
-    ns := ibuf_new(new_cap * 6)
-    mut i := 0
-    while i < new_cap * 6 { ibuf_push(ns, 0); i += 1 }
-    mask := new_cap - 1
-    i = 0
-    while i < sm.cap {
-        b := i * 6
-        if ibuf_get(sm.slots, b) == 1 {
-            h := ibuf_get(sm.slots, b + 1)
-            mut idx := h & mask
-            while ibuf_get(ns, idx * 6) == 1 {
-                idx = (idx + 1) & mask
+    unsafe {
+        nsp := mem_alloc_aligned(new_cap * 64 + 64)
+        if nsp == 0 { return }
+        mem_set(nsp, 0, new_cap * 64)
+        mask := new_cap - 1
+        old_sp := sm.slots_ptr
+        old_c := sm.cap
+        mut re_used := 0
+        mut i := 0
+        while i < old_c {
+            b := i << 3
+            if ptr_read_i64(old_sp, b) == 1 {
+                h := ptr_read_i64(old_sp, b + 1)
+                mut idx := h & mask
+                while ptr_read_i64(nsp, idx << 3) == 1 {
+                    idx = (idx + 1) & mask
+                }
+                nb := idx << 3
+                ptr_write_i64(nsp, nb, 1)
+                ptr_write_i64(nsp, nb + 1, h)
+                ptr_write_i64(nsp, nb + 2, ptr_read_i64(old_sp, b + 2))
+                ptr_write_i64(nsp, nb + 3, ptr_read_i64(old_sp, b + 3))
+                ptr_write_i64(nsp, nb + 4, ptr_read_i64(old_sp, b + 4))
+                ptr_write_i64(nsp, nb + 5, ptr_read_i64(old_sp, b + 5))
+                re_used += 1
             }
-            nb := idx * 6
-            ibuf_set(ns, nb, 1)
-            ibuf_set(ns, nb + 1, h)
-            ibuf_set(ns, nb + 2, ibuf_get(sm.slots, b + 2))
-            ibuf_set(ns, nb + 3, ibuf_get(sm.slots, b + 3))
-            ibuf_set(ns, nb + 4, ibuf_get(sm.slots, b + 4))
-            ibuf_set(ns, nb + 5, ibuf_get(sm.slots, b + 5))
+            i += 1
         }
-        i += 1
+        if old_sp != 0 { mem_free_aligned(old_sp) }
+        sm.slots_ptr = nsp
+        sm.cap = new_cap
+        sm.used = re_used
     }
-    buf_free(move sm.slots)
-    sm.slots = ns
-    sm.cap = new_cap
-    sm.used = sm.len
 }
 
-fn _smap_key_eq(sm: StrMap, base: i64, h: i64, key: str) -> bool {
-    if ibuf_get(sm.slots, base + 1) != h { return false }
-    kl := ibuf_get(sm.slots, base + 3)
-    if kl != str_len(key) { return false }
-    if kl == 0 { return true }
-    ko := ibuf_get(sm.slots, base + 2)
-    return str_eq(buf_slice_str(sm.pool, ko, ko + kl), key)
+@inline
+fn _smap_key_eq_raw(sp: i64, kp_base: i64, base: i64, h: i64, key_p: i64, kl: i64) -> bool {
+    unsafe {
+        if ptr_read_i64(sp, base + 1) != h { return false }
+        if ptr_read_i64(sp, base + 3) != kl { return false }
+        if kl == 0 { return true }
+        pa := kp_base + ptr_read_i64(sp, base + 2)
+        mut i := 0
+        while i + 8 <= kl {
+            if ptr_read_i64(pa + i, 0) != ptr_read_i64(key_p + i, 0) { return false }
+            i += 8
+        }
+        while i < kl {
+            if ptr_read_u8(pa, i) != ptr_read_u8(key_p, i) { return false }
+            i += 1
+        }
+        return true
+    }
 }
 
 fn smap_set_str(mut sm: StrMap, key: str, val: str) {
     if (sm.used + 1) * 10 >= sm.cap * 7 {
         _smap_rehash(mut sm, sm.cap * 2)
     }
-    h := fnv1a_str(key)
-    mask := sm.cap - 1
-    mut idx := h & mask
-    mut tomb := -1
-    while true {
-        b := idx * 6
-        st := ibuf_get(sm.slots, b)
-        if st == 0 {
-            t := if tomb >= 0 { tomb } else { b }
-            ko := _smap_pool_push(mut sm, key)
-            vo := _smap_pool_push(mut sm, val)
-            ibuf_set(sm.slots, t, 1)
-            ibuf_set(sm.slots, t + 1, h)
-            ibuf_set(sm.slots, t + 2, ko)
-            ibuf_set(sm.slots, t + 3, str_len(key))
-            ibuf_set(sm.slots, t + 4, vo)
-            ibuf_set(sm.slots, t + 5, str_len(val))
-            sm.len = sm.len + 1
-            if tomb < 0 { sm.used = sm.used + 1 }
-            return
+    h := _smap_hash_fast(key)
+    kl := str_len(key)
+    vl := str_len(val)
+    unsafe {
+        key_p := c_str_ptr(key)
+        mask := sm.cap - 1
+        mut idx := h & mask
+        mut tomb := -1
+        while true {
+            b := idx << 3
+            st := ptr_read_i64(sm.slots_ptr, b)
+            if st == 0 {
+                t := if tomb >= 0 { tomb } else { b }
+                ko := _smap_kpool_push(mut sm, key)
+                vo := _smap_pool_push(mut sm, val)
+                ptr_write_i64(sm.slots_ptr, t, 1)
+                ptr_write_i64(sm.slots_ptr, t + 1, h)
+                ptr_write_i64(sm.slots_ptr, t + 2, ko)
+                ptr_write_i64(sm.slots_ptr, t + 3, kl)
+                ptr_write_i64(sm.slots_ptr, t + 4, vo)
+                ptr_write_i64(sm.slots_ptr, t + 5, vl)
+                sm.len = sm.len + 1
+                if tomb < 0 { sm.used = sm.used + 1 }
+                return
+            }
+            if st == 1 and _smap_key_eq_raw(sm.slots_ptr, sm.kpool_ptr, b, h, key_p, kl) {
+                vo := _smap_pool_push(mut sm, val)
+                ptr_write_i64(sm.slots_ptr, b + 4, vo)
+                ptr_write_i64(sm.slots_ptr, b + 5, vl)
+                return
+            }
+            if st == 2 and tomb < 0 { tomb = b }
+            idx = (idx + 1) & mask
         }
-        if st == 1 and _smap_key_eq(sm, b, h, key) {
-            vo := _smap_pool_push(mut sm, val)
-            ibuf_set(sm.slots, b + 4, vo)
-            ibuf_set(sm.slots, b + 5, str_len(val))
-            return
-        }
-        if st == 2 and tomb < 0 { tomb = b }
-        idx = (idx + 1) & mask
     }
 }
 
@@ -500,56 +712,68 @@ fn smap_set_i64(mut sm: StrMap, key: str, val: i64) {
     if (sm.used + 1) * 10 >= sm.cap * 7 {
         _smap_rehash(mut sm, sm.cap * 2)
     }
-    h := fnv1a_str(key)
-    mask := sm.cap - 1
-    mut idx := h & mask
-    mut tomb := -1
-    while true {
-        b := idx * 6
-        st := ibuf_get(sm.slots, b)
-        if st == 0 {
-            t := if tomb >= 0 { tomb } else { b }
-            ko := _smap_pool_push(mut sm, key)
-            ibuf_set(sm.slots, t, 1)
-            ibuf_set(sm.slots, t + 1, h)
-            ibuf_set(sm.slots, t + 2, ko)
-            ibuf_set(sm.slots, t + 3, str_len(key))
-            ibuf_set(sm.slots, t + 4, val)
-            ibuf_set(sm.slots, t + 5, -1)
-            sm.len = sm.len + 1
-            if tomb < 0 { sm.used = sm.used + 1 }
-            return
+    h := _smap_hash_fast(key)
+    kl := str_len(key)
+    unsafe {
+        key_p := c_str_ptr(key)
+        mask := sm.cap - 1
+        mut idx := h & mask
+        mut tomb := -1
+        while true {
+            b := idx << 3
+            st := ptr_read_i64(sm.slots_ptr, b)
+            if st == 0 {
+                t := if tomb >= 0 { tomb } else { b }
+                ko := _smap_kpool_push(mut sm, key)
+                ptr_write_i64(sm.slots_ptr, t, 1)
+                ptr_write_i64(sm.slots_ptr, t + 1, h)
+                ptr_write_i64(sm.slots_ptr, t + 2, ko)
+                ptr_write_i64(sm.slots_ptr, t + 3, kl)
+                ptr_write_i64(sm.slots_ptr, t + 4, val)
+                ptr_write_i64(sm.slots_ptr, t + 5, -1)
+                sm.len = sm.len + 1
+                if tomb < 0 { sm.used = sm.used + 1 }
+                return
+            }
+            if st == 1 and _smap_key_eq_raw(sm.slots_ptr, sm.kpool_ptr, b, h, key_p, kl) {
+                ptr_write_i64(sm.slots_ptr, b + 4, val)
+                ptr_write_i64(sm.slots_ptr, b + 5, -1)
+                return
+            }
+            if st == 2 and tomb < 0 { tomb = b }
+            idx = (idx + 1) & mask
         }
-        if st == 1 and _smap_key_eq(sm, b, h, key) {
-            ibuf_set(sm.slots, b + 4, val)
-            ibuf_set(sm.slots, b + 5, -1)
-            return
-        }
-        if st == 2 and tomb < 0 { tomb = b }
-        idx = (idx + 1) & mask
     }
 }
 
 fn _smap_find(sm: StrMap, key: str) -> i64 {
-    h := fnv1a_str(key)
-    mask := sm.cap - 1
-    mut idx := h & mask
-    mut probes := 0
-    while probes < sm.cap {
-        b := idx * 6
-        st := ibuf_get(sm.slots, b)
-        if st == 0 { return -1 }
-        if st == 1 and _smap_key_eq(sm, b, h, key) { return b }
-        idx = (idx + 1) & mask
-        probes += 1
+    h := _smap_hash_fast(key)
+    kl := str_len(key)
+    unsafe {
+        sp := sm.slots_ptr
+        kp := sm.kpool_ptr
+        key_p := c_str_ptr(key)
+        mask := sm.cap - 1
+        mut idx := h & mask
+        mut probes := 0
+        while probes < sm.cap {
+            b := idx << 3
+            st := ptr_read_i64(sp, b)
+            if st == 0 { return -1 }
+            if st == 1 and _smap_key_eq_raw(sp, kp, b, h, key_p, kl) { return b }
+            idx = (idx + 1) & mask
+            probes += 1
+        }
+        return -1
     }
-    return -1
 }
 
+@inline
 fn smap_has(sm: StrMap, key: str) -> bool {
     return _smap_find(sm, key) >= 0
 }
 
+@inline
 fn smap_contains(sm: StrMap, key: str) -> bool {
     return _smap_find(sm, key) >= 0
 }
@@ -557,24 +781,29 @@ fn smap_contains(sm: StrMap, key: str) -> bool {
 fn smap_get_str(sm: StrMap, key: str, default_val: str = "") -> str {
     b := _smap_find(sm, key)
     if b < 0 { return default_val }
-    vl := ibuf_get(sm.slots, b + 5)
-    if vl < 0 { return str_from_i64(ibuf_get(sm.slots, b + 4)) }
-    if vl == 0 { return "" }
-    vo := ibuf_get(sm.slots, b + 4)
-    return buf_slice_str(sm.pool, vo, vo + vl)
+    unsafe {
+        vl := ptr_read_i64(sm.slots_ptr, b + 5)
+        if vl < 0 { return str_from_i64(ptr_read_i64(sm.slots_ptr, b + 4)) }
+        if vl == 0 { return "" }
+        vo := ptr_read_i64(sm.slots_ptr, b + 4)
+        return buf_slice_str(sm.pool, vo, vo + vl)
+    }
 }
 
+@inline
 fn smap_get_i64(sm: StrMap, key: str, default_val: i64 = 0) -> i64 {
     b := _smap_find(sm, key)
     if b < 0 { return default_val }
-    if ibuf_get(sm.slots, b + 5) == -1 { return ibuf_get(sm.slots, b + 4) }
-    return default_val
+    unsafe {
+        if ptr_read_i64(sm.slots_ptr, b + 5) == -1 { return ptr_read_i64(sm.slots_ptr, b + 4) }
+        return default_val
+    }
 }
 
 fn smap_remove(mut sm: StrMap, key: str) -> bool {
     b := _smap_find(sm, key)
     if b < 0 { return false }
-    ibuf_set(sm.slots, b, 2)
+    unsafe { ptr_write_i64(sm.slots_ptr, b, 2) }
     sm.len = sm.len - 1
     return true
 }
@@ -582,19 +811,28 @@ fn smap_remove(mut sm: StrMap, key: str) -> bool {
 // Collect all live keys from `StrMap` into a `StrVec`
 fn smap_keys(sm: StrMap) -> StrVec {
     mut out := svec_new(if sm.len > 8 { sm.len } else { 8 }, 256)
-    mut i := 0
-    while i < sm.cap {
-        b := i * 6
-        if ibuf_get(sm.slots, b) == 1 {
-            ko := ibuf_get(sm.slots, b + 2)
-            kl := ibuf_get(sm.slots, b + 3)
-            if kl > 0 {
-                svec_push(mut out, buf_slice_str(sm.pool, ko, ko + kl))
-            } else {
-                svec_push(mut out, "")
+    unsafe {
+        mut i := 0
+        while i < sm.cap {
+            b := i << 3
+            if ptr_read_i64(sm.slots_ptr, b) == 1 {
+                ko := ptr_read_i64(sm.slots_ptr, b + 2)
+                kl := ptr_read_i64(sm.slots_ptr, b + 3)
+                if kl > 0 {
+                    kb := buf_new(kl + 4)
+                    mut j := 0
+                    while j < kl {
+                        buf_push(kb, ptr_read_u8(sm.kpool_ptr, ko + j))
+                        j += 1
+                    }
+                    ks := buf_to_owned_str(move kb)
+                    svec_push(mut out, ks)
+                } else {
+                    svec_push(mut out, "")
+                }
             }
+            i += 1
         }
-        i += 1
     }
     return out
 }

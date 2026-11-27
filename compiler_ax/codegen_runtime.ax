@@ -78,6 +78,7 @@ fn h_chkstk() -> i64          { return 10000051 }
 fn h_ai_bnn_popcnt() -> i64   { return 10000052 }
 fn h_alloc_mem_raw() -> i64   { return 10000053 }
 fn h_thread_trampoline() -> i64 { return 10000054 }
+fn h_crc32_slice8() -> i64      { return 10000055 }
 
 // Fixup Kinds
 fn fx_iat() -> i64    { return 1 }
@@ -2327,6 +2328,189 @@ fn emit_used_runtime_helpers(cg: CodegenCtx) {
         mc_b2(c, 0x0F, 0x0B) // UD2 fallback if ExitProcess is hooked!
         mc_b1(c, 0xCC)
         cg_reg_helper(cg, h_shield_trap(), s_t2, buf_len(c))
+    }
+
+
+    // GF(2)-Verified Slicing-by-16 Byte-Table Loop Accelerator (`h_crc32_slice8(RCX=crc, RDX=buf_ptr, R8=count, R9=tbl_ptr) -> RAX=new_crc or -1`)
+    if cg_is_helper_used(cg, h_crc32_slice8()) {
+        mc_align16(c)
+        s_cs8 := buf_len(c)
+        mc_b4(c, 0xF3, 0x0F, 0x1E, 0xFA) // ENDBR64
+        mc_b4(c, 0x55, 0x48, 0x89, 0xE5) // PUSH RBP; MOV RBP, RSP
+        mc_b1(c, 0x53); mc_b1(c, 0x56); mc_b1(c, 0x57) // PUSH RBX; PUSH RSI; PUSH RDI
+        mc_b2(c, 0x41, 0x54); mc_b2(c, 0x41, 0x55)     // PUSH R12; PUSH R13
+        mc_b4(c, 0x48, 0x83, 0xEC, 0x08)               // align RSP 16B
+
+        // Guards: count >= 256, (crc >> 32) == 0, tbl != 0, tbl[0] == 0
+        mc_b3(c, 0x49, 0x81, 0xF8); mc_u32(c, 256)
+        jl_fb := mc_jcc32(c, 0x8C)
+        mc_b3(c, 0x48, 0x85, 0xD2)
+        jz_fb0 := mc_jcc32(c, 0x84)
+        mc_b3(c, 0x4D, 0x85, 0xC9)
+        jz_fb1 := mc_jcc32(c, 0x84)
+        mc_b3(c, 0x48, 0x89, 0xC8)
+        mc_b4(c, 0x48, 0xC1, 0xE8, 0x20)
+        jnz_fb2 := mc_jcc32(c, 0x85)
+        mc_b4(c, 0x49, 0x83, 0x39, 0x00)
+        jne_fb3 := mc_jcc32(c, 0x85)
+
+        // Verify GF(2)-linearity & 32-bit range of tbl[1..255]: tbl[i] == tbl[i & (i-1)] ^ tbl[i & -i]
+        mc_b1(c, 0xBE); mc_u32(c, 1)
+        lp_vf := buf_len(c)
+        mc_b4(c, 0x49, 0x8B, 0x04, 0xF1)
+        mc_b3(c, 0x48, 0x89, 0xC3)
+        mc_b4(c, 0x48, 0xC1, 0xEB, 0x20)
+        jnz_fb4 := mc_jcc32(c, 0x85)
+        mc_b4(c, 0x48, 0x8D, 0x7E, 0xFF)
+        mc_b3(c, 0x48, 0x21, 0xF7)
+        jz_pow2 := mc_jcc8(c, 0x74)
+        mc_b3(c, 0x49, 0x89, 0xF2)
+        mc_b3(c, 0x49, 0x31, 0xFA)
+        mc_b4(c, 0x4D, 0x8B, 0x1C, 0xF9)
+        mc_b4(c, 0x4F, 0x33, 0x1C, 0xD1)
+        mc_b3(c, 0x4C, 0x39, 0xD8)
+        jne_fb5 := mc_jcc32(c, 0x85)
+        mc_patch_jcc8(c, jz_pow2, buf_len(c))
+        mc_b2(c, 0xFF, 0xC6)
+        mc_b2(c, 0x81, 0xFE); mc_u32(c, 256)
+        jl_vf := mc_jcc8(c, 0x7C)
+        mc_patch_jcc8(c, jl_vf, lp_vf)
+
+        // Probe & allocate 16 KB (`u32 T[16][256]`) on stack across Win64 4 KB guard pages
+        mut pg := 0
+        while pg < 4 {
+            mc_b3(c, 0x48, 0x81, 0xEC); mc_u32(c, 0x1000)
+            mc_b4(c, 0x48, 0xC7, 0x04, 0x24); mc_u32(c, 0)
+            pg += 1
+        }
+
+        mc_b3(c, 0x41, 0x89, 0xCD) // MOV R13D, ECX (crc)
+        mc_b3(c, 0x4C, 0x89, 0xC3) // MOV RBX, R8   (rem)
+
+        // Copy T0[0..255] as u32
+        mc_b2(c, 0x31, 0xF6)
+        lp_t0 := buf_len(c)
+        mc_b4(c, 0x41, 0x8B, 0x04, 0xF1)
+        mc_b3(c, 0x89, 0x04, 0xB4)
+        mc_b2(c, 0xFF, 0xC6)
+        mc_b2(c, 0x81, 0xFE); mc_u32(c, 256)
+        jl_t0 := mc_jcc8(c, 0x7C)
+        mc_patch_jcc8(c, jl_t0, lp_t0)
+
+        // Build T1..T15 in one flat loop: RSI = 0..3839 (15 * 256)
+        mc_b2(c, 0x31, 0xF6)
+        lp_tk := buf_len(c)
+        mc_b3(c, 0x8B, 0x04, 0xB4)
+        mc_b3(c, 0x0F, 0xB6, 0xF8)
+        mc_b3(c, 0xC1, 0xE8, 0x08)
+        mc_b3(c, 0x33, 0x04, 0xBC)
+        mc_b3(c, 0x89, 0x84, 0xB4); mc_u32(c, 0x400)
+        mc_b2(c, 0xFF, 0xC6)
+        mc_b2(c, 0x81, 0xFE); mc_u32(c, 3840)
+        jl_tk := mc_jcc8(c, 0x7C)
+        mc_patch_jcc8(c, jl_tk, lp_tk)
+
+        // EAX = crc, RDX = buf_ptr, RBX = rem
+        mc_b3(c, 0x44, 0x89, 0xE8) // MOV EAX, R13D
+        mc_b4(c, 0x48, 0x83, 0xFB, 0x10)
+        jb_tail16 := mc_jcc32(c, 0x82)
+
+        mc_align16_nop(c)
+        lp_s16 := buf_len(c)
+        // Compute crc-INDEPENDENT words W1=[RDX+4], W2=[RDX+8], W3=[RDX+12] into R10D & R11D FIRST so OoO CPU runs next iter ahead!
+        // Word 3 (bytes 12..15 -> T3..T0) -> R10D
+        mc_b3(c, 0x8B, 0x4A, 0x0C)             // MOV ECX, [RDX + 12]
+        mc_b3(c, 0x0F, 0xB6, 0xF1)             // MOVZX ESI, CL
+        mc_b2(c, 0x89, 0xCF); mc_b3(c, 0xC1, 0xEF, 0x08); mc_b4(c, 0x40, 0x0F, 0xB6, 0xFF) // EDI = byte1
+        mc_b3(c, 0x41, 0x89, 0xC8); mc_b4(c, 0x41, 0xC1, 0xE8, 0x10); mc_b4(c, 0x45, 0x0F, 0xB6, 0xC0) // R8D = byte2
+        mc_b3(c, 0xC1, 0xE9, 0x18)             // ECX = byte3
+        mc_b4(c, 0x44, 0x8B, 0x94, 0xB4); mc_u32(c, 0x0C00) // R10D = T3[b12]
+        mc_b4(c, 0x44, 0x8B, 0x9C, 0xBC); mc_u32(c, 0x0800) // R11D = T2[b13]
+        mc_b4(c, 0x46, 0x33, 0x94, 0x84); mc_u32(c, 0x0400) // R10D ^= T1[b14]
+        mc_b4(c, 0x44, 0x33, 0x1C, 0x8C)                    // R11D ^= T0[b15]
+        mc_b3(c, 0x45, 0x31, 0xDA)                          // R10D ^= R11D
+
+        // Word 2 (bytes 8..11 -> T7..T4) -> R11D, fold into R10D
+        mc_b3(c, 0x8B, 0x4A, 0x08)             // MOV ECX, [RDX + 8]
+        mc_b3(c, 0x0F, 0xB6, 0xF1)
+        mc_b2(c, 0x89, 0xCF); mc_b3(c, 0xC1, 0xEF, 0x08); mc_b4(c, 0x40, 0x0F, 0xB6, 0xFF)
+        mc_b3(c, 0x41, 0x89, 0xC8); mc_b4(c, 0x41, 0xC1, 0xE8, 0x10); mc_b4(c, 0x45, 0x0F, 0xB6, 0xC0)
+        mc_b3(c, 0xC1, 0xE9, 0x18)
+        mc_b4(c, 0x44, 0x8B, 0x9C, 0xB4); mc_u32(c, 0x1C00) // R11D = T7[b8]
+        mc_b4(c, 0x44, 0x8B, 0xA4, 0xBC); mc_u32(c, 0x1800) // R12D = T6[b9]
+        mc_b4(c, 0x46, 0x33, 0x9C, 0x84); mc_u32(c, 0x1400) // R11D ^= T5[b10]
+        mc_b4(c, 0x44, 0x33, 0xA4, 0x8C); mc_u32(c, 0x1000) // R12D ^= T4[b11]
+        mc_b3(c, 0x45, 0x31, 0xE3)                          // R11D ^= R12D
+        mc_b3(c, 0x45, 0x31, 0xDA)                          // R10D ^= R11D
+
+        // Word 1 (bytes 4..7 -> T11..T8) -> R11D, fold into R10D
+        mc_b3(c, 0x8B, 0x4A, 0x04)             // MOV ECX, [RDX + 4]
+        mc_b3(c, 0x0F, 0xB6, 0xF1)
+        mc_b2(c, 0x89, 0xCF); mc_b3(c, 0xC1, 0xEF, 0x08); mc_b4(c, 0x40, 0x0F, 0xB6, 0xFF)
+        mc_b3(c, 0x41, 0x89, 0xC8); mc_b4(c, 0x41, 0xC1, 0xE8, 0x10); mc_b4(c, 0x45, 0x0F, 0xB6, 0xC0)
+        mc_b3(c, 0xC1, 0xE9, 0x18)
+        mc_b4(c, 0x44, 0x8B, 0x9C, 0xB4); mc_u32(c, 0x2C00) // R11D = T11[b4]
+        mc_b4(c, 0x44, 0x8B, 0xA4, 0xBC); mc_u32(c, 0x2800) // R12D = T10[b5]
+        mc_b4(c, 0x46, 0x33, 0x9C, 0x84); mc_u32(c, 0x2400) // R11D ^= T9[b6]
+        mc_b4(c, 0x44, 0x33, 0xA4, 0x8C); mc_u32(c, 0x2000) // R12D ^= T8[b7]
+        mc_b3(c, 0x45, 0x31, 0xE3)
+        mc_b3(c, 0x45, 0x31, 0xDA)
+
+        // Word 0 (crc ^ [RDX + 0] -> T15..T12) -> short critical path!
+        mc_b2(c, 0x33, 0x02)                   // XOR EAX, [RDX]
+        mc_b4(c, 0x48, 0x83, 0xC2, 0x10)       // ADD RDX, 16
+        mc_b3(c, 0x0F, 0xB6, 0xF0)             // ESI = L0
+        mc_b2(c, 0x89, 0xC7); mc_b3(c, 0xC1, 0xEF, 0x08); mc_b4(c, 0x40, 0x0F, 0xB6, 0xFF) // EDI = L1
+        mc_b3(c, 0x41, 0x89, 0xC0); mc_b4(c, 0x41, 0xC1, 0xE8, 0x10); mc_b4(c, 0x45, 0x0F, 0xB6, 0xC0) // R8D = L2
+        mc_b3(c, 0xC1, 0xE8, 0x18)             // EAX = L3
+        mc_b3(c, 0x8B, 0x8C, 0xB4); mc_u32(c, 0x3C00)       // ECX  = T15[L0]
+        mc_b4(c, 0x44, 0x8B, 0x9C, 0xBC); mc_u32(c, 0x3800) // R11D = T14[L1]
+        mc_b4(c, 0x42, 0x33, 0x8C, 0x84); mc_u32(c, 0x3400) // ECX  ^= T13[L2]
+        mc_b4(c, 0x44, 0x33, 0x9C, 0x84); mc_u32(c, 0x3000) // R11D ^= T12[L3]
+        mc_b3(c, 0x44, 0x31, 0xD9)             // XOR ECX, R11D
+        mc_b3(c, 0x44, 0x89, 0xD0)             // MOV EAX, R10D
+        mc_b2(c, 0x31, 0xC8)                   // XOR EAX, ECX
+
+        mc_b4(c, 0x48, 0x83, 0xEB, 0x10)       // SUB RBX, 16
+        mc_b4(c, 0x48, 0x83, 0xFB, 0x10)       // CMP RBX, 16
+        jae_s16 := mc_jcc32(c, 0x83)
+        mc_patch_rel32(c, jae_s16, lp_s16)
+
+        mc_patch_rel32(c, jb_tail16, buf_len(c))
+        // Scalar tail (0..15 bytes)
+        mc_b3(c, 0x48, 0x85, 0xDB)
+        jz_done := mc_jcc8(c, 0x74)
+        lp_tail := buf_len(c)
+        mc_b3(c, 0x0F, 0xB6, 0x0A)
+        mc_b3(c, 0x48, 0xFF, 0xC2)
+        mc_b2(c, 0x31, 0xC1)
+        mc_b3(c, 0x0F, 0xB6, 0xC9)
+        mc_b3(c, 0xC1, 0xE8, 0x08)
+        mc_b3(c, 0x33, 0x04, 0x8C)
+        mc_b3(c, 0x48, 0xFF, 0xCB)
+        jnz_tl := mc_jcc8(c, 0x75)
+        mc_patch_jcc8(c, jnz_tl, lp_tail)
+        mc_patch_jcc8(c, jz_done, buf_len(c))
+
+        mc_b3(c, 0x48, 0x81, 0xC4); mc_u32(c, 0x4008) // ADD RSP, 0x4008 (16 KB + 8B align)
+        mc_b2(c, 0x41, 0x5D); mc_b2(c, 0x41, 0x5C)
+        mc_b1(c, 0x5F); mc_b1(c, 0x5E); mc_b1(c, 0x5B)
+        mc_b1(c, 0x5D); mc_b1(c, 0xC3)
+
+        fb_lbl := buf_len(c)
+        mc_patch_rel32(c, jl_fb, fb_lbl)
+        mc_patch_rel32(c, jz_fb0, fb_lbl)
+        mc_patch_rel32(c, jz_fb1, fb_lbl)
+        mc_patch_rel32(c, jnz_fb2, fb_lbl)
+        mc_patch_rel32(c, jne_fb3, fb_lbl)
+        mc_patch_rel32(c, jnz_fb4, fb_lbl)
+        mc_patch_rel32(c, jne_fb5, fb_lbl)
+        mc_b4(c, 0x48, 0x83, 0xC4, 0x08)
+        mc_b3(c, 0x48, 0xC7, 0xC0); mc_u32(c, 0xFFFFFFFF)
+        mc_b2(c, 0x41, 0x5D); mc_b2(c, 0x41, 0x5C)
+        mc_b1(c, 0x5F); mc_b1(c, 0x5E); mc_b1(c, 0x5B)
+        mc_b1(c, 0x5D); mc_b1(c, 0xC3)
+        cg_reg_helper(cg, h_crc32_slice8(), s_cs8, buf_len(c))
     }
 
     emit_io_helpers_used(cg)

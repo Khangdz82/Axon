@@ -65,14 +65,12 @@ fn safetensors_parse_buffer(raw: ByteBuf) -> SafetensorsFile ! i64 {
     payload_start := 8 + header_len
     payload_len := buf_len(raw) - payload_start
     
-    // Allocate contiguous buffer for tensor payload
+    // Allocate contiguous buffer for tensor payload & bulk-copy via SIMD mem_copy
     payload_mem := mem_alloc_aligned(payload_len + 64)
     if payload_mem == 0 { return err(500) }
-    mut i := 0
-    while i < payload_len {
-        b := buf_get(raw, payload_start + i)
-        ptr_write_u8(payload_mem, i, b)
-        i += 1
+    if payload_len > 0 {
+        payload_slice := buf_slice_str(raw, payload_start, payload_start + payload_len)
+        mem_copy(payload_mem, c_str_ptr(payload_slice), payload_len)
     }
 
     return ok(SafetensorsFile(
@@ -186,7 +184,11 @@ fn safetensors_get_tensor(st: SafetensorsFile, name: str, rows: i64, cols: i64 =
         return err(422) // Size mismatch or offset out of bounds
     }
 
-    arr := np_zeros(rows, cols)
+    arr := _np_alloc_raw(rows, cols)
+    if arr.data_ptr == 0 {
+        buf_free(move offsets)
+        return err(500)
+    }
     src_ptr := st.data_buffer_ptr + begin_off
     mem_copy(arr.data_ptr, src_ptr, num_floats * 4)
 
@@ -247,20 +249,18 @@ fn safetensors_serialize(name: str, arr: NdArray) -> ByteBuf {
         i += 1
     }
 
-    // 4. Write contiguous raw float32 bytes
-    i = 0
-    scratch := mem_alloc_aligned(64)
-    while i < arr.size {
-        val := ptr_read_f32(arr.data_ptr, i)
-        ptr_write_f32(scratch, 0, val)
-        bits := ptr_read_i64(scratch, 0) & 0xFFFFFFFF
-        buf_push(out, bits & 0xFF)
-        buf_push(out, (bits >> 8) & 0xFF)
-        buf_push(out, (bits >> 16) & 0xFF)
-        buf_push(out, (bits >> 24) & 0xFF)
-        i += 1
+    // 4. Bulk-append contiguous raw float32 bytes 8 bytes (2 floats) at a time
+    n_qwords := data_bytes >> 3
+    mut qi := 0
+    while qi < n_qwords {
+        buf_push_u64(out, ptr_read_i64(arr.data_ptr, qi))
+        qi += 1
     }
-    mem_free_aligned(scratch)
+    mut bi := n_qwords << 3
+    while bi < data_bytes {
+        buf_push(out, ptr_read_u8(arr.data_ptr, bi))
+        bi += 1
+    }
 
     return out
     }

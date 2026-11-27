@@ -466,7 +466,7 @@ fn ir_pass_auto_inline(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf,
     if opt_level <= 0 { return }
     f_base := ibuf_get(sym, 7)
     f_cnt := ibuf_get(sym, 8)
-    disallowed := fnflag_inline() | fnflag_extern() | fnflag_export() | fnflag_async() | fnflag_shield() | fnflag_whitebox() | fnflag_nan_guard() | fnflag_frame_arena() | fnflag_comptime() | fnflag_unsafe() | fnflag_test() | fnflag_gpu() | fnflag_shader()
+    disallowed := fnflag_inline() | fnflag_extern() | fnflag_export() | fnflag_async() | fnflag_shield() | fnflag_whitebox() | fnflag_nan_guard() | fnflag_frame_arena() | fnflag_comptime() | fnflag_test() | fnflag_gpu() | fnflag_shader()
 
     mut max_multi_cost := 14
     mut max_single_cost := 26
@@ -1581,9 +1581,21 @@ fn ir_fold_gvn_stmt(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, snid: i64, is_s
         // Dead-branch elimination (`if true` / `if false`)
         if ce > 0 and ast_kind(nodes, ce) == nk_bool() {
             if ast_get(nodes, ce, 1) != 0 {
-                if tb > 0 { ir_copy_node_in_place(nodes, snid, tb) }
+                if tb > 0 {
+                    if ast_kind(nodes, tb) == nk_block() and ast_get(nodes, tb, 2) == 1 and ast_get(nodes, tb, 3) == 0 {
+                        ir_copy_node_in_place(nodes, snid, ibuf_get(extra, ast_get(nodes, tb, 1)))
+                    } else {
+                        ir_copy_node_in_place(nodes, snid, tb)
+                    }
+                }
             } else {
-                if eb > 0 { ir_copy_node_in_place(nodes, snid, eb) }
+                if eb > 0 {
+                    if ast_kind(nodes, eb) == nk_block() and ast_get(nodes, eb, 2) == 1 and ast_get(nodes, eb, 3) == 0 {
+                        ir_copy_node_in_place(nodes, snid, ibuf_get(extra, ast_get(nodes, eb, 1)))
+                    } else {
+                        ir_copy_node_in_place(nodes, snid, eb)
+                    }
+                }
                 else {
                     ast_set(nodes, snid, 0, nk_block())
                     ast_set(nodes, snid, 1, 0)
@@ -1804,6 +1816,564 @@ fn ir_pass_licm_block(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, bnid: i64, is
 }
 
 // ============================================================================
+
+// ============================================================================
+// Pass 1b: AST-Level Pure Scalar & Branchless Ternary Expression Inliner
+// ============================================================================
+// Substitutes small pure scalar helpers (`min_val`, `max_val`, `clamp_val`, bit/math helpers)
+// directly into `nk_if_expr` / expression ASTs BEFORE SRoA, ConstProp/GVN, LICM, GPR promotion,
+// 4x loop unrolling, and 8x AVX2 vectorization!
+
+fn ir_ast_find_param(pool: ByteBuf, sym: IntBuf, p_base: i64, p_cnt: i64, soff: i64, slen: i64) -> i64 {
+    mut i := 0
+    while i < p_cnt {
+        po := p_base + i * 6
+        if ibuf_get(sym, po + 1) == slen and pool_str_eq2(pool, ibuf_get(sym, po), slen, soff) {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn ir_ast_tpl_ok(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, enid: i64, p_base: i64, p_cnt: i64, force_shield: bool, stats: IntBuf) -> bool {
+    if enid <= 0 { return false }
+    cost := ibuf_get(stats, 0) + 1
+    ibuf_set(stats, 0, cost)
+    if cost > 20 { return false }
+    k := ast_kind(nodes, enid)
+    if k == nk_int() or k == nk_float() or k == nk_bool() {
+        return true
+    }
+    if k == nk_ident() {
+        pi := ir_ast_find_param(pool, sym, p_base, p_cnt, ast_get(nodes, enid, 1), ast_get(nodes, enid, 2))
+        if pi < 0 { return false }
+        ibuf_set(stats, 1 + pi, ibuf_get(stats, 1 + pi) + 1)
+        return true
+    }
+    if k == nk_unary() {
+        return ir_ast_tpl_ok(pool, nodes, extra, sym, ast_get(nodes, enid, 2), p_base, p_cnt, force_shield, stats)
+    }
+    if k == nk_binary() {
+        op := ast_get(nodes, enid, 1)
+        if op == op_div() or op == op_mod() or op == op_pow() or op == op_and() or op == op_or() {
+            return false
+        }
+        if force_shield and (op == op_add() or op == op_sub() or op == op_mul()) {
+            return false
+        }
+        return ir_ast_tpl_ok(pool, nodes, extra, sym, ast_get(nodes, enid, 2), p_base, p_cnt, force_shield, stats) and ir_ast_tpl_ok(pool, nodes, extra, sym, ast_get(nodes, enid, 3), p_base, p_cnt, force_shield, stats)
+    }
+    if k == nk_if_expr() {
+        if not ir_ast_tpl_ok(pool, nodes, extra, sym, ast_get(nodes, enid, 1), p_base, p_cnt, force_shield, stats) { return false }
+        tb := ast_get(nodes, enid, 2)
+        eb := ast_get(nodes, enid, 3)
+        if tb <= 0 or eb <= 0 or ast_kind(nodes, tb) != nk_block() or ast_get(nodes, tb, 2) != 0 or ast_get(nodes, tb, 3) <= 0 {
+            return false
+        }
+        if not ir_ast_tpl_ok(pool, nodes, extra, sym, ast_get(nodes, tb, 3), p_base, p_cnt, force_shield, stats) { return false }
+        if ast_kind(nodes, eb) == nk_if_expr() {
+            return ir_ast_tpl_ok(pool, nodes, extra, sym, eb, p_base, p_cnt, force_shield, stats)
+        }
+        if ast_kind(nodes, eb) == nk_block() and ast_get(nodes, eb, 2) == 0 and ast_get(nodes, eb, 3) > 0 {
+            return ir_ast_tpl_ok(pool, nodes, extra, sym, ast_get(nodes, eb, 3), p_base, p_cnt, force_shield, stats)
+        }
+        return false
+    }
+    if k == nk_call() {
+        if ast_get(nodes, enid, 6) != 0 { return false }
+        cs := ast_get(nodes, enid, 1); cl := ast_get(nodes, enid, 2)
+        aoff := ast_get(nodes, enid, 3); acnt := ast_get(nodes, enid, 4)
+        if pool_str_eq_lit(pool, cs, cl, "ushr64") and acnt == 2 {
+            c0 := ibuf_get(extra, aoff); c1 := ibuf_get(extra, aoff + 1)
+            if ast_get(nodes, c0, 2) >= 0 or ast_get(nodes, c1, 2) >= 0 { return false }
+            e1 := ast_get(nodes, c1, 4)
+            if e1 <= 0 or ast_kind(nodes, e1) != nk_int() { return false }
+            sh := ast_get(nodes, e1, 1)
+            if sh < 0 or sh > 63 { return false }
+            return ir_ast_tpl_ok(pool, nodes, extra, sym, ast_get(nodes, c0, 4), p_base, p_cnt, force_shield, stats)
+        }
+        if (pool_str_eq_lit(pool, cs, cl, "popcnt64") or pool_str_eq_lit(pool, cs, cl, "sqrt_f64") or pool_str_eq_lit(pool, cs, cl, "abs_f64")) and acnt == 1 {
+            c0 := ibuf_get(extra, aoff)
+            if ast_get(nodes, c0, 2) >= 0 { return false }
+            return ir_ast_tpl_ok(pool, nodes, extra, sym, ast_get(nodes, c0, 4), p_base, p_cnt, force_shield, stats)
+        }
+        return false
+    }
+    return false
+}
+
+fn ir_make_expr_block(nodes: IntBuf, enid: i64, sp: i64) -> i64 {
+    bn := ast_alloc(nodes, nk_block(), sp)
+    ast_set(nodes, bn, 1, 0)
+    ast_set(nodes, bn, 2, 0)
+    ast_set(nodes, bn, 3, enid)
+    return bn
+}
+
+fn ir_extract_single_ret_expr(nodes: IntBuf, extra: IntBuf, bnid: i64) -> i64 {
+    if bnid <= 0 or ast_kind(nodes, bnid) != nk_block() { return 0 }
+    cnt := ast_get(nodes, bnid, 2)
+    if cnt == 0 { return ast_get(nodes, bnid, 3) }
+    if cnt == 1 and ast_get(nodes, bnid, 3) == 0 {
+        st0 := ibuf_get(extra, ast_get(nodes, bnid, 1))
+        if st0 > 0 and ast_kind(nodes, st0) == nk_return() {
+            return ast_get(nodes, st0, 1)
+        }
+    }
+    return 0
+}
+
+fn ir_build_fn_ast_tpl(nodes: IntBuf, extra: IntBuf, body_nid: i64) -> i64 {
+    if body_nid <= 0 or ast_kind(nodes, body_nid) != nk_block() { return 0 }
+    e_direct := ir_extract_single_ret_expr(nodes, extra, body_nid)
+    if e_direct > 0 { return e_direct }
+    off := ast_get(nodes, body_nid, 1)
+    cnt := ast_get(nodes, body_nid, 2)
+    if ast_get(nodes, body_nid, 3) > 0 { return 0 }
+    if cnt == 1 {
+        st0 := ibuf_get(extra, off)
+        if st0 > 0 and ast_kind(nodes, st0) == nk_if() and ast_get(nodes, st0, 3) > 0 {
+            te := ir_extract_single_ret_expr(nodes, extra, ast_get(nodes, st0, 2))
+            fe := ir_extract_single_ret_expr(nodes, extra, ast_get(nodes, st0, 3))
+            if te > 0 and fe > 0 {
+                sp := ast_span(nodes, st0)
+                ie := ast_alloc(nodes, nk_if_expr(), sp)
+                ast_set(nodes, ie, 1, ast_get(nodes, st0, 1))
+                ast_set(nodes, ie, 2, ir_make_expr_block(nodes, te, sp))
+                ast_set(nodes, ie, 3, ir_make_expr_block(nodes, fe, sp))
+                return ie
+            }
+        }
+        return 0
+    }
+    if cnt >= 2 and cnt <= 4 {
+        st_end := ibuf_get(extra, off + cnt - 1)
+        if st_end <= 0 or ast_kind(nodes, st_end) != nk_return() or ast_get(nodes, st_end, 1) <= 0 {
+            return 0
+        }
+        mut cur_else_expr := ast_get(nodes, st_end, 1)
+        mut cur_is_if_expr := false
+        mut idx := cnt - 2
+        while idx >= 0 {
+            sti := ibuf_get(extra, off + idx)
+            if sti <= 0 or ast_kind(nodes, sti) != nk_if() or ast_get(nodes, sti, 3) != 0 {
+                return 0
+            }
+            te := ir_extract_single_ret_expr(nodes, extra, ast_get(nodes, sti, 2))
+            if te <= 0 { return 0 }
+            sp := ast_span(nodes, sti)
+            ie := ast_alloc(nodes, nk_if_expr(), sp)
+            ast_set(nodes, ie, 1, ast_get(nodes, sti, 1))
+            ast_set(nodes, ie, 2, ir_make_expr_block(nodes, te, sp))
+            ast_set(nodes, ie, 3, ir_make_expr_block(nodes, cur_else_expr, sp))
+            cur_else_expr = ie
+            cur_is_if_expr = true
+            idx -= 1
+        }
+        return cur_else_expr
+    }
+    return 0
+}
+
+fn ir_is_safe_subst_leaf(nodes: IntBuf, enid: i64) -> bool {
+    if enid <= 0 { return false }
+    k := ast_kind(nodes, enid)
+    return k == nk_int() or k == nk_float() or k == nk_bool() or k == nk_ident()
+}
+
+fn ir_is_safe_subst_arg(nodes: IntBuf, enid: i64, use_cnt: i64, is_shield: bool) -> bool {
+    if enid <= 0 { return false }
+    if ir_is_safe_subst_leaf(nodes, enid) { return true }
+    if use_cnt > 3 { return false }
+    k := ast_kind(nodes, enid)
+    if k == nk_unary() {
+        if is_shield and ast_get(nodes, enid, 1) == uop_neg() { return false }
+        return ir_is_safe_subst_leaf(nodes, ast_get(nodes, enid, 2))
+    }
+    if k == nk_binary() {
+        op := ast_get(nodes, enid, 1)
+        if op == op_div() or op == op_mod() or op == op_pow() or op == op_and() or op == op_or() {
+            return false
+        }
+        if is_shield and (op == op_add() or op == op_sub() or op == op_mul()) {
+            return false
+        }
+        return ir_is_safe_subst_leaf(nodes, ast_get(nodes, enid, 2)) and ir_is_safe_subst_leaf(nodes, ast_get(nodes, enid, 3))
+    }
+    return false
+}
+
+fn ir_clone_subst_expr(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, enid: i64, p_base: i64, p_cnt: i64, args_nid: IntBuf, call_sp: i64) -> i64 {
+    if enid <= 0 { return 0 }
+    k := ast_kind(nodes, enid)
+    if k == nk_int() or k == nk_float() or k == nk_bool() {
+        nn := ast_alloc(nodes, k, call_sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, enid, 1))
+        ast_set(nodes, nn, 2, ast_get(nodes, enid, 2))
+        return nn
+    }
+    if k == nk_ident() {
+        if p_cnt > 0 {
+            pi := ir_ast_find_param(pool, sym, p_base, p_cnt, ast_get(nodes, enid, 1), ast_get(nodes, enid, 2))
+            if pi >= 0 {
+                return ir_clone_subst_expr(pool, nodes, extra, sym, ibuf_get(args_nid, pi), 0, 0, args_nid, call_sp)
+            }
+        }
+        nn := ast_alloc(nodes, k, call_sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, enid, 1))
+        ast_set(nodes, nn, 2, ast_get(nodes, enid, 2))
+        return nn
+    }
+    if k == nk_unary() {
+        c2 := ir_clone_subst_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 2), p_base, p_cnt, args_nid, call_sp)
+        nn := ast_alloc(nodes, k, call_sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, enid, 1))
+        ast_set(nodes, nn, 2, c2)
+        return nn
+    }
+    if k == nk_binary() {
+        cl := ir_clone_subst_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 2), p_base, p_cnt, args_nid, call_sp)
+        cr := ir_clone_subst_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 3), p_base, p_cnt, args_nid, call_sp)
+        nn := ast_alloc(nodes, k, call_sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, enid, 1))
+        ast_set(nodes, nn, 2, cl)
+        ast_set(nodes, nn, 3, cr)
+        return nn
+    }
+    if k == nk_block() {
+        ce := ir_clone_subst_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 3), p_base, p_cnt, args_nid, call_sp)
+        return ir_make_expr_block(nodes, ce, call_sp)
+    }
+    if k == nk_if_expr() {
+        cc := ir_clone_subst_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 1), p_base, p_cnt, args_nid, call_sp)
+        ct := ir_clone_subst_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 2), p_base, p_cnt, args_nid, call_sp)
+        ce := ir_clone_subst_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 3), p_base, p_cnt, args_nid, call_sp)
+        nn := ast_alloc(nodes, k, call_sp)
+        ast_set(nodes, nn, 1, cc)
+        ast_set(nodes, nn, 2, ct)
+        ast_set(nodes, nn, 3, ce)
+        return nn
+    }
+    if k == nk_call() {
+        aoff := ast_get(nodes, enid, 3)
+        acnt := ast_get(nodes, enid, 4)
+        new_arg_ids := ibuf_new(acnt + 1)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            cae := ir_clone_subst_expr(pool, nodes, extra, sym, ast_get(nodes, ca, 4), p_base, p_cnt, args_nid, call_sp)
+            nca := ast_alloc(nodes, nk_call_arg(), call_sp)
+            ast_set(nodes, nca, 1, ast_get(nodes, ca, 1))
+            ast_set(nodes, nca, 2, ast_get(nodes, ca, 2))
+            ast_set(nodes, nca, 3, ast_get(nodes, ca, 3))
+            ast_set(nodes, nca, 4, cae)
+            ast_set(nodes, nca, 5, ast_get(nodes, ca, 5))
+            ibuf_push(new_arg_ids, nca)
+            i += 1
+        }
+        naoff := ibuf_len(extra)
+        i = 0
+        while i < acnt {
+            ibuf_push(extra, ibuf_get(new_arg_ids, i))
+            i += 1
+        }
+        buf_free(move new_arg_ids)
+        nn := ast_alloc(nodes, nk_call(), call_sp)
+        ast_set(nodes, nn, 1, ast_get(nodes, enid, 1))
+        ast_set(nodes, nn, 2, ast_get(nodes, enid, 2))
+        ast_set(nodes, nn, 3, naoff)
+        ast_set(nodes, nn, 4, acnt)
+        return nn
+    }
+    return enid
+}
+
+fn ir_ast_inline_expr(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, enid: i64, cur_fi: i64, is_shd: bool, decls: IntBuf, d_cnt: i64, tpl_map: IntBuf, args_tmp: IntBuf, depth: i64) -> bool {
+    if enid <= 0 or depth > 6 { return false }
+    mut changed := false
+    k := ast_kind(nodes, enid)
+    if k == nk_unary() {
+        return ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 2), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+    }
+    if k == nk_cast() or k == nk_field() or k == nk_tuple_idx() {
+        return ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 1), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+    }
+    if k == nk_binary() {
+        c1 := ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 2), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        c2 := ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 3), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        return c1 or c2
+    }
+    if k == nk_index() or k == nk_or_return() {
+        c1 := ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 1), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        c2 := ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 2), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        return c1 or c2
+    }
+    if k == nk_if_expr() {
+        c1 := ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 1), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        c2 := ir_ast_inline_block(pool, nodes, extra, sym, ast_get(nodes, enid, 2), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        eb := ast_get(nodes, enid, 3)
+        mut c3 := false
+        if eb > 0 {
+            if ast_kind(nodes, eb) == nk_if_expr() {
+                c3 = ir_ast_inline_expr(pool, nodes, extra, sym, eb, cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+            } else {
+                c3 = ir_ast_inline_block(pool, nodes, extra, sym, eb, cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+            }
+        }
+        return c1 or c2 or c3
+    }
+    if k == nk_unsafe_block() {
+        return ir_ast_inline_block(pool, nodes, extra, sym, ast_get(nodes, enid, 1), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+    }
+    if k == nk_tuple() or k == nk_fstr() {
+        off := ast_get(nodes, enid, 1); cnt := ast_get(nodes, enid, 2)
+        mut i := 0
+        while i < cnt {
+            if ir_ast_inline_expr(pool, nodes, extra, sym, ibuf_get(extra, off + i), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth) { changed = true }
+            i += 1
+        }
+        return changed
+    }
+    if k == nk_method_call() {
+        if ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, enid, 1), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth) { changed = true }
+        aoff := ast_get(nodes, enid, 4); acnt := ast_get(nodes, enid, 5)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            if ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, ca, 4), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth) { changed = true }
+            i += 1
+        }
+        return changed
+    }
+    if k == nk_call() {
+        aoff := ast_get(nodes, enid, 3); acnt := ast_get(nodes, enid, 4)
+        mut i := 0
+        while i < acnt {
+            ca := ibuf_get(extra, aoff + i)
+            if ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, ca, 4), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth) { changed = true }
+            i += 1
+        }
+        if ast_get(nodes, enid, 6) == 0 and acnt >= 1 and acnt <= 6 {
+            cs := ast_get(nodes, enid, 1); cl := ast_get(nodes, enid, 2)
+            if not ir_namelist_has(pool, decls, 0, d_cnt, cs, cl) {
+                tfi := sym_find_fn_idx(pool, sym, cs, cl)
+                if tfi >= 0 and tfi != cur_fi {
+                    tbase := tfi * 8
+                    tpl_nid := ibuf_get(tpl_map, tbase)
+                    if tpl_nid > 0 {
+                        fo := ibuf_get(sym, 7) + tfi * 10
+                        p_base := ibuf_get(sym, fo + 3)
+                        p_cnt := ibuf_get(sym, fo + 4)
+                        if acnt == p_cnt {
+                            mut ok_args := true
+                            i = 0
+                            while ok_args and i < acnt {
+                                ca := ibuf_get(extra, aoff + i)
+                                if ast_get(nodes, ca, 2) >= 0 or ast_get(nodes, ca, 1) != pmode_val() {
+                                    ok_args = false
+                                } else {
+                                    ucnt := ibuf_get(tpl_map, tbase + 1 + i)
+                                    if not ir_is_safe_subst_arg(nodes, ast_get(nodes, ca, 4), ucnt, is_shd) {
+                                        ok_args = false
+                                    }
+                                }
+                                i += 1
+                            }
+                            if ok_args {
+                                ibuf_truncate(args_tmp, 0)
+                                i = 0
+                                while i < acnt {
+                                    ibuf_push(args_tmp, ast_get(nodes, ibuf_get(extra, aoff + i), 4))
+                                    i += 1
+                                }
+                                cloned := ir_clone_subst_expr(pool, nodes, extra, sym, tpl_nid, p_base, p_cnt, args_tmp, ast_span(nodes, enid))
+                                ir_copy_node_in_place(nodes, enid, cloned)
+                                _ := ir_ast_inline_expr(pool, nodes, extra, sym, enid, cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth + 1)
+                                return true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return changed
+    }
+    return false
+}
+
+fn ir_ast_inline_stmt(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, snid: i64, cur_fi: i64, is_shd: bool, decls: IntBuf, d_cnt: i64, tpl_map: IntBuf, args_tmp: IntBuf, depth: i64) -> bool {
+    if snid <= 0 { return false }
+    k := ast_kind(nodes, snid)
+    if k == nk_var_decl() {
+        return ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, snid, 5), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+    }
+    if k == nk_tuple_destruct() {
+        return ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, snid, 3), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+    }
+    if k == nk_assign() {
+        c1 := ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, snid, 2), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        c2 := ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, snid, 3), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        return c1 or c2
+    }
+    if k == nk_return() or k == nk_expr_stmt() {
+        return ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, snid, 1), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+    }
+    if k == nk_if() {
+        c1 := ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, snid, 1), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        c2 := ir_ast_inline_block(pool, nodes, extra, sym, ast_get(nodes, snid, 2), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        eb := ast_get(nodes, snid, 3)
+        mut c3 := false
+        if eb > 0 {
+            if ast_kind(nodes, eb) == nk_if() {
+                c3 = ir_ast_inline_stmt(pool, nodes, extra, sym, eb, cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+            } else {
+                c3 = ir_ast_inline_block(pool, nodes, extra, sym, eb, cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+            }
+        }
+        return c1 or c2 or c3
+    }
+    if k == nk_while() {
+        c1 := ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, snid, 1), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        c2 := ir_ast_inline_block(pool, nodes, extra, sym, ast_get(nodes, snid, 2), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        return c1 or c2
+    }
+    if k == nk_for_range() or k == nk_par_for_range() {
+        c1 := ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, snid, 3), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        c2 := ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, snid, 4), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        c3 := ir_ast_inline_block(pool, nodes, extra, sym, ast_get(nodes, snid, 5), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        return c1 or c2 or c3
+    }
+    if k == nk_for_each() or k == nk_par_for_each() {
+        c1 := ir_ast_inline_expr(pool, nodes, extra, sym, ast_get(nodes, snid, 3), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        c2 := ir_ast_inline_block(pool, nodes, extra, sym, ast_get(nodes, snid, 4), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+        return c1 or c2
+    }
+    if k == nk_unsafe_block() {
+        return ir_ast_inline_block(pool, nodes, extra, sym, ast_get(nodes, snid, 1), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+    }
+    if k == nk_block() {
+        return ir_ast_inline_block(pool, nodes, extra, sym, snid, cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth)
+    }
+    return false
+}
+
+fn ir_ast_inline_block(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, bnid: i64, cur_fi: i64, is_shd: bool, decls: IntBuf, d_cnt: i64, tpl_map: IntBuf, args_tmp: IntBuf, depth: i64) -> bool {
+    if bnid <= 0 or ast_kind(nodes, bnid) != nk_block() { return false }
+    mut changed := false
+    off := ast_get(nodes, bnid, 1)
+    cnt := ast_get(nodes, bnid, 2)
+    mut i := 0
+    while i < cnt {
+        if ir_ast_inline_stmt(pool, nodes, extra, sym, ibuf_get(extra, off + i), cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth) {
+            changed = true
+        }
+        i += 1
+    }
+    te := ast_get(nodes, bnid, 3)
+    if te > 0 and ir_ast_inline_expr(pool, nodes, extra, sym, te, cur_fi, is_shd, decls, d_cnt, tpl_map, args_tmp, depth) {
+        changed = true
+    }
+    return changed
+}
+
+fn ir_pass_ast_inline(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, opt_level: i64, force_shield: bool, live: IntBuf, decls: IntBuf, muts: IntBuf) -> bool {
+    if opt_level < 2 or opt_level > 3 { return false }
+    f_base := ibuf_get(sym, 7)
+    f_cnt := ibuf_get(sym, 8)
+    disallowed := fnflag_extern() | fnflag_export() | fnflag_async() | fnflag_shield() | fnflag_whitebox() | fnflag_nan_guard() | fnflag_frame_arena() | fnflag_comptime() | fnflag_test() | fnflag_gpu() | fnflag_shader()
+    tpl_map := ibuf_new(f_cnt * 8 + 8)
+    mut zi := 0
+    while zi < f_cnt * 8 { ibuf_push(tpl_map, 0); zi += 1 }
+    stats := ibuf_new(8)
+    mut has_any_tpl := false
+
+    mut fi := 0
+    while fi < f_cnt {
+        if ibuf_get(live, fi) == 1 {
+            fo := f_base + fi * 10
+            flags := ibuf_get(sym, fo + 9)
+            rty := ibuf_get(sym, fo + 5)
+            p_base := ibuf_get(sym, fo + 3)
+            p_cnt := ibuf_get(sym, fo + 4)
+            if (flags & disallowed) == 0 and p_cnt >= 1 and p_cnt <= 6 and (rty == ty_int() or rty == ty_bool() or rty == ty_float()) {
+                fn_soff := ibuf_get(sym, fo); fn_slen := ibuf_get(sym, fo + 1)
+                if not pool_str_eq_lit(pool, fn_soff, fn_slen, "main") {
+                    fnid := ibuf_get(sym, fo + 2)
+                    moff := ushr64(ast_get(nodes, fnid, 4), 16)
+                    mut p_ok := (moff == 0 or ibuf_get(extra, moff + 8) == 0)
+                    mut pi := 0
+                    while p_ok and pi < p_cnt {
+                        po := p_base + pi * 6
+                        pty := ibuf_get(sym, po + 3)
+                        if ibuf_get(sym, po + 2) != pmode_val() or (pty != ty_int() and pty != ty_bool() and pty != ty_float()) {
+                            p_ok = false
+                        }
+                        pi += 1
+                    }
+                    if p_ok {
+                        body_nid := ast_get(nodes, fnid, 6) & 0xFFFFFFFF
+                        cand_tpl := ir_build_fn_ast_tpl(nodes, extra, body_nid)
+                        if cand_tpl > 0 {
+                            ibuf_truncate(stats, 0)
+                            mut si := 0
+                            while si < 8 { ibuf_push(stats, 0); si += 1 }
+                            if ir_ast_tpl_ok(pool, nodes, extra, sym, cand_tpl, p_base, p_cnt, force_shield, stats) {
+                                tbase := fi * 8
+                                ibuf_set(tpl_map, tbase, cand_tpl)
+                                pi = 0
+                                while pi < p_cnt {
+                                    ibuf_set(tpl_map, tbase + 1 + pi, ibuf_get(stats, 1 + pi))
+                                    pi += 1
+                                }
+                                has_any_tpl = true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fi += 1
+    }
+
+    mut did_any := false
+    if has_any_tpl {
+        args_tmp := ibuf_new(8)
+        fi = 0
+        while fi < f_cnt {
+            if ibuf_get(live, fi) == 1 {
+                fo := f_base + fi * 10
+                flags := ibuf_get(sym, fo + 9)
+                fnid := ibuf_get(sym, fo + 2)
+                body_nid := ast_get(nodes, fnid, 6) & 0xFFFFFFFF
+                if body_nid > 0 and (flags & (fnflag_extern() | fnflag_comptime() | fnflag_shield() | fnflag_whitebox() | fnflag_nan_guard())) == 0 {
+                    ibuf_truncate(decls, 0)
+                    ibuf_truncate(muts, 0)
+                    p_base := ibuf_get(sym, fo + 3)
+                    p_cnt := ibuf_get(sym, fo + 4)
+                    mut pi := 0
+                    while pi < p_cnt {
+                        po := p_base + pi * 6
+                        ir_record_decl_name(pool, decls, 0, muts, 0, ibuf_get(sym, po), ibuf_get(sym, po + 1), false)
+                        pi += 1
+                    }
+                    ir_collect_muts_block(pool, nodes, extra, body_nid, decls, 0, muts, 0)
+                    d_cnt := ibuf_len(decls) / 2
+                    if ir_ast_inline_block(pool, nodes, extra, sym, body_nid, fi, force_shield, decls, d_cnt, tpl_map, args_tmp, 0) {
+                        did_any = true
+                    }
+                }
+            }
+            fi += 1
+        }
+        buf_free(move args_tmp)
+    }
+
+    buf_free(move stats)
+    buf_free(move tpl_map)
+    return did_any
+}
+
 // Top-Level Streaming `AxIR` Module Driver
 // ============================================================================
 
@@ -1820,17 +2390,24 @@ fn ir_opt_module(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: IntBuf, opt_l
     m_tgt := ibuf_new(f_cnt + 8)
     arena := ibuf_new(524288) // Single streaming arena reused O(1) across all functions!
 
-    // Pass 1: Whole-program call-graph reachability + call-site frequency
-    ir_build_callgraph(pool, nodes, extra, sym, is_dll, test_mode, live, call_cnt, m_tgt)
-
-    // Pass 2: Bottom-up cost-model auto-inliner (`-Os`, `-O2`, `-O3`, single-caller inline)
-    ir_pass_auto_inline(pool, nodes, extra, sym, opt_level, live, call_cnt, m_tgt, arena)
-
-    // Passes 3..5: Streaming per-function SRoA -> Fold/Strength-Reduce/DeadBranch/GVN -> LICM
     uid_box := ibuf_new(4)
     ibuf_push(uid_box, 0)
     decls := ibuf_new(32768)
     muts := ibuf_new(32768)
+
+    // Pass 1: Whole-program call-graph reachability + call-site frequency
+    ir_build_callgraph(pool, nodes, extra, sym, is_dll, test_mode, live, call_cnt, m_tgt)
+
+    // Pass 1b: AST-level pure scalar & branchless ternary expression inliner + DCE refresh!
+    if ir_pass_ast_inline(pool, nodes, extra, sym, opt_level, force_shield, live, decls, muts) {
+        ibuf_truncate(live, 0)
+        ibuf_truncate(call_cnt, 0)
+        ibuf_truncate(m_tgt, 0)
+        ir_build_callgraph(pool, nodes, extra, sym, is_dll, test_mode, live, call_cnt, m_tgt)
+    }
+
+    // Pass 2: Bottom-up cost-model auto-inliner (`-Os`, `-O2`, `-O3`, single-caller inline)
+    ir_pass_auto_inline(pool, nodes, extra, sym, opt_level, live, call_cnt, m_tgt, arena)
     cmap := ibuf_new(8192)
     gvn := ibuf_new(1024)
 
