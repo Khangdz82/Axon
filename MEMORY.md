@@ -13,7 +13,7 @@
    .\axc_s1.exe build compiler_ax/main.ax -o axc_s2.exe
    .\axc_s2.exe build compiler_ax/main.ax -o axc_s3.exe
    ```
-   - Verified `SHA256(axc_s2.exe) == SHA256(axc_s3.exe) == 1CD085975B2676E62C9691C84D960A31D3281F21B8214C18BC7B6A6C06911A63` (`2,760,192` bytes `win-x64`, `2,711,336` bytes `linux-x64`, `1,556,544` bytes `macos-arm64`).
+   - Verified `SHA256(axc_s2.exe) == SHA256(axc_s3.exe) == 15DCB961512AB0FA4B3B9F2A0FC763C7D41CD02BC11A6B3B2000B6466209F874` (`2,760,704` bytes `win-x64`, `2,711,432` bytes `linux-x64`, `1,556,544` bytes `macos-arm64`).
    - Cross-compiled outputs: `bin/axc-linux-x64` (`2,610,728` bytes), `bin/axc-macos-arm64` (`1,491,008` bytes).
 3. **Full Regression Gate:** **`85/85`** [`tests/pass/*.ax`](tests/pass/) + **`42/42`** [`tests/fail_compile/*.ax`](tests/fail_compile/) + `--shield` / `--simd=scalar` / `-O3` / `-Os` / `wasm32` WASI suites must pass before promoting changes.
 
