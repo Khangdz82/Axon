@@ -107,7 +107,7 @@ fn arm_intern_slice(ac: ArmCg, soff: i64, slen: i64) -> i64 {
     return roff
 }
 
-// Fixup kinds in `ac.fixups` (`[code_off, kind, target]`): `1 = BL fn_id`, `2 = ADRP+ADD rdata_off`
+// Fixup kinds in `ac.fixups` (`[code_off, kind, target]`): `1 = BL fn_id`, `2 = ADRP+ADD rdata_off`, `3 = ADRP+ADD data_off`
 fn arm_call_fn(ac: ArmCg, fn_id: i64) {
     pos := buf_len(ac.code)
     arm_emit(ac.code, 0x94000000)
@@ -123,6 +123,15 @@ fn arm_adr_rdata_x0(ac: ArmCg, roff: i64) {
     ibuf_push(ac.fixups, pos)
     ibuf_push(ac.fixups, 2)
     ibuf_push(ac.fixups, roff)
+}
+
+fn arm_adr_data_x0(ac: ArmCg, doff: i64) {
+    pos := buf_len(ac.code)
+    arm_emit(ac.code, 0x90000000) // ADRP X0, page
+    arm_emit(ac.code, 0x91000000) // ADD  X0, X0, #lo12
+    ibuf_push(ac.fixups, pos)
+    ibuf_push(ac.fixups, 3)
+    ibuf_push(ac.fixups, doff)
 }
 
 fn arm_emit_svc(c: ByteBuf, is_macos: bool, linux_nr: i64, macos_nr: i64) {
@@ -345,6 +354,19 @@ fn arm_emit_expr(ac: ArmCg, vars: IntBuf, enid: i64) -> i64 {
         arm_ldr_slot(c, 0, arm_slot(lr), 0)
         arm_ldr_slot(c, 1, arm_slot(rr), 0)
         lty := arm_ty(lr)
+        if lty == ty_str() and (op == op_eq() or op == op_neq()) {
+            arm_ldr_slot(c, 0, arm_slot(lr), 0)
+            arm_ldr_slot(c, 1, arm_slot(lr), 1)
+            arm_ldr_slot(c, 2, arm_slot(rr), 0)
+            arm_ldr_slot(c, 3, arm_slot(rr), 1)
+            arm_call_fn(ac, 10000005)
+            if op == op_neq() {
+                arm_emit(c, 0xD2800021) // MOVZ X1, #1
+                arm_emit(c, 0xCA010000) // EOR X0, X0, X1
+            }
+            arm_str_slot(c, 0, s, 0)
+            return arm_pack(s, ty_bool())
+        }
         if lty == ty_float() {
             // FMOV D0, X0 (`0x9E670000`); FMOV D1, X1 (`0x9E670021`)
             arm_emit(c, 0x9E670000)
@@ -469,6 +491,22 @@ fn arm_emit_expr(ac: ArmCg, vars: IntBuf, enid: i64) -> i64 {
             }
             zs := arm_alloc_slots(ac, 1)
             return arm_pack(zs, ty_unit())
+        }
+        if pool_str_eq_lit(ac.pool, csoff, cslen, "args_count") and acnt == 0 {
+            arm_adr_data_x0(ac, 0)
+            arm_emit(c, 0xF9400000) // LDR X0, [X0, #0]
+            s := arm_alloc_slots(ac, 1)
+            arm_str_slot(c, 0, s, 0)
+            return arm_pack(s, ty_int())
+        }
+        if pool_str_eq_lit(ac.pool, csoff, cslen, "args_get") and acnt == 1 {
+            ir := arm_emit_expr(ac, vars, ast_get(ac.nodes, ibuf_get(ac.extra, aoff), 4))
+            arm_ldr_slot(c, 0, arm_slot(ir), 0)
+            arm_call_fn(ac, 10000004)
+            dst := arm_alloc_slots(ac, 2)
+            arm_str_slot(c, 0, dst, 0)
+            arm_str_slot(c, 1, dst, 1)
+            return arm_pack(dst, ty_str())
         }
         if pool_str_eq_lit(ac.pool, csoff, cslen, "len") and acnt == 1 {
             ar := arm_emit_expr(ac, vars, ast_get(ac.nodes, ibuf_get(ac.extra, aoff), 4))
@@ -691,6 +729,10 @@ fn arm_emit_stmt(ac: ArmCg, vars: IntBuf, snid: i64) {
                 arm_ldr_slot(c, 1, arm_slot(rr), 0)
                 if aop == aop_eq() {
                     arm_str_slot(c, 1, tslot, 0)
+                    if ty_tag(arm_ty(rr)) == 5 {
+                        arm_ldr_slot(c, 2, arm_slot(rr), 1)
+                        arm_str_slot(c, 2, tslot, 1)
+                    }
                 } else {
                     arm_ldr_slot(c, 0, tslot, 0)
                     if aop == aop_add() { arm_emit(c, 0x8B010000) }
@@ -847,9 +889,21 @@ fn compile_module_to_arm64(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: Int
         fi += 1
     }
 
-    // `_start` at `.text + 0`: `STP X29, X30, [SP, #-16]!`; `MOV X29, SP`; `BL main`; `exit(X0)`
-    arm_emit(code, 0xA9BF7BFD)
-    arm_emit(code, 0x910003FD)
+    // `_start` at `.text + 0`: capture `argc`/`argv` into `__DATA + 0` / `__DATA + 8`, then `BL main`; `exit(X0)`
+    if is_macos {
+        // macOS `LC_MAIN` passes `X0 = argc`, `X1 = argv`
+        arm_emit(code, 0xAA0003E9) // MOV X9, X0
+        arm_emit(code, 0xAA0103EA) // MOV X10, X1
+    } else {
+        // Linux ELF64 `_start` has `[SP, #0] = argc`, `SP + 8 = argv`
+        arm_emit(code, 0xF94003E9) // LDR X9, [SP, #0]
+        arm_emit(code, 0x910023EA) // ADD X10, SP, #8
+    }
+    arm_adr_data_x0(ac, 0)
+    arm_emit(code, 0xF9000009) // STR X9, [X0, #0]
+    arm_emit(code, 0xF900040A) // STR X10, [X0, #8]
+    arm_emit(code, 0xA9BF7BFD) // STP X29, X30, [SP, #-16]!
+    arm_emit(code, 0x910003FD) // MOV X29, SP
     if main_idx >= 0 {
         arm_call_fn(ac, main_idx)
     } else {
@@ -936,6 +990,8 @@ fn compile_module_to_arm64(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: Int
     mut need_h1 := false
     mut need_h2 := false
     mut need_h3 := false
+    mut need_h4 := false
+    mut need_h5 := false
     mut fxi := 0
     while fxi < ibuf_len(fixups) / 3 {
         if ibuf_get(fixups, fxi * 3 + 1) == 1 {
@@ -943,6 +999,8 @@ fn compile_module_to_arm64(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: Int
             if ft_h == 10000001 { need_h1 = true }
             else if ft_h == 10000002 { need_h2 = true; need_h1 = true }
             else if ft_h == 10000003 { need_h3 = true }
+            else if ft_h == 10000004 { need_h4 = true }
+            else if ft_h == 10000005 { need_h5 = true }
         }
         fxi += 1
     }
@@ -1009,6 +1067,72 @@ fn compile_module_to_arm64(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: Int
         arm_emit(code, 0xD65F03C0)
     }
 
+    // Helper `10000004`: `h_arm64_args_get` (`X0 = idx` -> `X0 = ptr, X1 = len`)
+    if need_h4 {
+        ibuf_set(state, 20, buf_len(code))
+        arm_emit(code, 0xAA0003E9) // MOV X9, X0 (idx)
+        arm_adr_data_x0(ac, 0)
+        arm_emit(code, 0xF940000A) // LDR X10, [X0, #0] (argc)
+        arm_emit(code, 0xF940040B) // LDR X11, [X0, #8] (argv)
+        arm_emit(code, 0xF100013F) // CMP X9, #0
+        blt_oob := buf_len(code)
+        arm_emit(code, 0x5400000B) // B.LT oob
+        arm_emit(code, 0xEB0A013F) // CMP X9, X10
+        bge_oob := buf_len(code)
+        arm_emit(code, 0x5400000A) // B.GE oob
+        cbz_argv := buf_len(code)
+        arm_emit(code, 0xB400000B) // CBZ X11, oob
+        arm_emit(code, 0xF8697960) // LDR X0, [X11, X9, LSL #3]
+        cbz_str := buf_len(code)
+        arm_emit(code, 0xB4000000) // CBZ X0, oob
+        arm_emit(code, 0xD2800001) // MOVZ X1, #0 (len = 0)
+        sloop := buf_len(code)
+        arm_emit(code, 0x3861680C) // LDRB W12, [X0, X1]
+        arm_emit(code, 0xB400006C) // CBZ X12, +3 (done)
+        arm_emit(code, 0x91000421) // ADD X1, X1, #1
+        sbw := (sloop - buf_len(code)) >> 2
+        arm_emit(code, 0x14000000 | (sbw & 0x3FFFFFF))
+        arm_emit(code, 0xD65F03C0) // RET
+        oob_pos := buf_len(code)
+        buf_put_u32(code, blt_oob,  0x5400000B | ((((oob_pos - blt_oob) >> 2) & 0x7FFFF) << 5))
+        buf_put_u32(code, bge_oob,  0x5400000A | ((((oob_pos - bge_oob) >> 2) & 0x7FFFF) << 5))
+        buf_put_u32(code, cbz_argv, 0xB400000B | ((((oob_pos - cbz_argv) >> 2) & 0x7FFFF) << 5))
+        buf_put_u32(code, cbz_str,  0xB4000000 | ((((oob_pos - cbz_str) >> 2) & 0x7FFFF) << 5))
+        arm_emit(code, 0xD2800000) // MOVZ X0, #0
+        arm_emit(code, 0xD2800001) // MOVZ X1, #0
+        arm_emit(code, 0xD65F03C0) // RET
+    }
+
+    // Helper `10000005`: `h_arm64_str_eq` (`X0=p1, X1=l1, X2=p2, X3=l2` -> `X0 = 1/0`)
+    if need_h5 {
+        ibuf_set(state, 21, buf_len(code))
+        arm_emit(code, 0xEB03003F) // CMP X1, X3
+        bne_len := buf_len(code)
+        arm_emit(code, 0x54000001) // B.NE neq
+        arm_emit(code, 0xD2800009) // MOVZ X9, #0
+        eloop := buf_len(code)
+        arm_emit(code, 0xEB01013F) // CMP X9, X1
+        bge_eq := buf_len(code)
+        arm_emit(code, 0x5400000A) // B.GE eq
+        arm_emit(code, 0x3869680A) // LDRB W10, [X0, X9]
+        arm_emit(code, 0x3869684B) // LDRB W11, [X2, X9]
+        arm_emit(code, 0xEB0B015F) // CMP X10, X11
+        bne_ch := buf_len(code)
+        arm_emit(code, 0x54000001) // B.NE neq
+        arm_emit(code, 0x91000529) // ADD X9, X9, #1
+        ebw := (eloop - buf_len(code)) >> 2
+        arm_emit(code, 0x14000000 | (ebw & 0x3FFFFFF))
+        eq_pos := buf_len(code)
+        buf_put_u32(code, bge_eq, 0x5400000A | ((((eq_pos - bge_eq) >> 2) & 0x7FFFF) << 5))
+        arm_emit(code, 0xD2800020) // MOVZ X0, #1
+        arm_emit(code, 0xD65F03C0) // RET
+        neq_pos := buf_len(code)
+        buf_put_u32(code, bne_len, 0x54000001 | ((((neq_pos - bne_len) >> 2) & 0x7FFFF) << 5))
+        buf_put_u32(code, bne_ch,  0x54000001 | ((((neq_pos - bne_ch) >> 2) & 0x7FFFF) << 5))
+        arm_emit(code, 0xD2800000) // MOVZ X0, #0
+        arm_emit(code, 0xD65F03C0) // RET
+    }
+
     // Compute exact layout virtual addresses & patch all `BL` and `ADRP+ADD` fixups!
     lay := ibuf_new(8)
     if is_macos {
@@ -1018,6 +1142,7 @@ fn compile_module_to_arm64(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: Int
     }
     text_va := ibuf_get(lay, 0)
     rdata_va := ibuf_get(lay, 1)
+    data_va := ibuf_get(lay, 2)
     buf_free(move lay)
 
     fxcnt := ibuf_len(fixups) / 3
@@ -1036,9 +1161,9 @@ fn compile_module_to_arm64(pool: ByteBuf, nodes: IntBuf, extra: IntBuf, sym: Int
             }
             rel_w := (tgt_off - cpos) >> 2
             buf_put_u32(code, cpos, 0x94000000 | (rel_w & 0x3FFFFFF))
-        } else if fk == 2 {
+        } else if fk == 2 or fk == 3 {
             pc_page := (text_va + cpos) & (0 - 4096)
-            sym_va := rdata_va + ft
+            sym_va := (if fk == 2 { rdata_va } else { data_va }) + ft
             sym_page := sym_va & (0 - 4096)
             pdiff := (sym_page - pc_page) >> 12
             immlo := pdiff & 3
