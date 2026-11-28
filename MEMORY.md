@@ -6,15 +6,15 @@
 
 ## 1. Golden Project Invariants
 
-1. **100% Pure Axon Self-Hosting:** Every compiler pass ([`compiler_ax/`](compiler_ax/) — **`19` files, `43,219` LOC**) and standard library module ([`std/`](std/) — **`143` files, `81,151` LOC**) is written in pure `.ax` with zero C/C++/Rust/LLVM/Python runtime or build dependencies and **zero build/run temp garbage** (`0` `.o`/`.obj`/`target/` or leaked `.axon_run_*` files).
+1. **100% Pure Axon Self-Hosting:** Every compiler pass ([`compiler_ax/`](compiler_ax/) — **`19` files, `65,748` LOC**) and standard library module ([`std/`](std/) — **`143` files, `83,745` LOC**) is written in pure `.ax` with zero C/C++/Rust/LLVM/Python runtime or build dependencies and **zero build/run temp garbage** (`0` `.o`/`.obj`/`target/` or leaked `.axon_run_*` files).
 2. **Deterministic 3-Stage Bootstrap Gate:** Any edit to `compiler_ax/*.ax` MUST pass:
    ```powershell
    .\bin\axc.exe build compiler_ax/main.ax -o axc_s1.exe
    .\axc_s1.exe build compiler_ax/main.ax -o axc_s2.exe
    .\axc_s2.exe build compiler_ax/main.ax -o axc_s3.exe
    ```
-   - Verified `SHA256(axc_s2.exe) == SHA256(axc_s3.exe) == 36E5BDC4C3E8E15EF67F48193F30A1D7E86A264019863D9D08FBBBF336030C5E` (`3,139,072` bytes `win-x64`, `785` units; `3,089,768` bytes `linux-x64`; `1,704,000` bytes `macos-arm64`).
-   - Cross-compiled outputs: `bin/axc-linux-x64` (`3,089,768` bytes, ELF64 `7F 45 4C 46`), `bin/axc-macos-arm64` (`1,704,000` bytes, Mach-O 64 `CF FA ED FE`).
+   - Verified `SHA256(axc_s2.exe) == SHA256(axc_s3.exe) == 9C50BA40A40C3374F259E0E7975DC45AD764BFF1C2FE137D58FF24BF356FB62D` (`4,920,320` bytes `win-x64`, `818` units; `4,906,776` bytes `linux-x64`; `3,735,616` bytes `macos-arm64`).
+   - Cross-compiled outputs: `bin/axc-linux-x64` (`4,906,776` bytes, ELF64 `7F 45 4C 46`), `bin/axc-macos-arm64` (`3,735,616` bytes, Mach-O 64 `CF FA ED FE`).
 3. **Full Regression Gate:** **`85/85`** [`tests/pass/*.ax`](tests/pass/) (`83` native + `2` WASM32) + **`42/42`** [`tests/fail_compile/*.ax`](tests/fail_compile/) + `--shield` / `--simd=scalar` / `-O3` / `-Os` / `wasm32` WASI + `safe-anything . --fail-on low --include-tests` (`0` findings) must pass before promoting changes.
 
 ---
@@ -93,8 +93,8 @@ Key `v1.2.0` additions:
 - **OS Auth & Security:** `os_auth.ax` (`std::ffi` Win32 `bcrypt`/`advapi32`/`crypt32` + Unix `libc` with graceful static fallback), `auth.ax` (RFC 9106 `Argon2id` `v=19`, `BLAKE2b`, `PBKDF2`, `HKDF`, `TOTP`, `PKCE`, `RBAC`), and **SecTest v4.0** (`sec_sast.ax` + `sec_test.ax`: 26 rule families `AX-SAST-001..026` covering Axon + polyglot XSS/CORS/TLS/secrets/AI-agent/MCP/Trojan-Source/prompt-injection/Docker/GHA, inline `ax-sec:ignore` / `safe-anything:ignore` suppressions, automatic secret redaction, and recursive `sast_scan_repo` / `sec_hunt_sast_repo`).
 - **Databases:** `redis.ax`, `kv_acid.ax`, `db_pool.ax`, plus `postgres.ax` (`SCRAM-SHA-256`) and `sqlite.ax` (`f64`/`blob`/`null`/`col_type`).
 - **Extreme Performance Stdlib Wave:** `algo.ax` (round-robin striped parallel MSB-8 + hybrid medium-N 1-dispatch L1D bucket sort with `bn <= 512` QuickSort cutoff), `graph.ax` (linear-time `O(V+E)` 512-bucket circular Dial Dijkstra `_dijkstra_dial_core` with automatic 4-ary heap fallback), `numeric.ax` (single-arena L1/L2-blocked parallel FFT with zero-copy direct-write final stage & 2-lookup `logn<=16` bit-reversal), `linalg.ax` (`avx_gemm_f64`), `crypto.ax` (`sha256_compress_blocks_ptr` multi-block native kernel), `ds.ax` (1-branch `DynMap` sentinel + cached 75% `grow_limit` + Fibonacci hash), `ringbuf.ax` (2-chunk contiguous `mem_copy` batching).
-- **Preserved 30-Benchmark Light-to-Impossible vs Rust (`examples/bench_vs_rust_30/`):** Axon `-O3` vs `rustc -C opt-level=3 -C target-cpu=native` (`results_vs_rust_30.json`, 5-run median): **`123.70 ms`** vs **`887.00 ms`** (**`7.17x`** total wall speedup, **`4.79x`** geomean, **`30/30` FULL WIN**, **`30/30`** checksum parity, **`19.6x`** faster compile `122.4 ms` vs `2,395.3 ms`).
-- **Strict 100-Benchmark Extreme Suite vs Rust (`examples/bench_vs_rust_100/`):** 10 domains × 10 benchmarks (`B001..B100`, Light -> Medium -> Hard -> Extreme -> Impossible, anti-DCE `black_box`, 5-run median, `results_vs_rust_100.json`): **`48.05 ms`** (`< 100 ms` hard cap PASS, **`< 50 ms` strict target PASS!**) vs **`255.87 ms`** (**`5.32x`** total wall speedup, **`3.20x`** geomean, **`100/100` FULL WIN across all 10 domains `10/10`**, **`100/100`** checksum parity, **`37.5x`** faster compile `235.9 ms` vs `8,852.8 ms`).
+- **Preserved 30-Benchmark Light-to-Impossible vs Rust (`examples/bench_vs_rust_30/`):** Axon `-O3` vs `rustc -C opt-level=3 -C target-cpu=native` (`results_vs_rust_30.json`, 5-run median): **`121.87 ms`** vs **`944.48 ms`** (**`7.75x`** total wall speedup, **`5.92x`** geomean, **`30/30` FULL WIN**, **`30/30`** exact checksum parity, **`23.4x`** faster compile `95.6 ms` vs `2239.8 ms`).
+- **Strict 100-Benchmark Extreme Suite vs Rust (`examples/bench_vs_rust_100/`):** 10 domains × 10 benchmarks (`B001..B100`, Light -> Medium -> Hard -> Extreme -> Impossible, anti-DCE `black_box`, 5-run median, `results_vs_rust_100.json`): **`14.62 ms`** (`< 100 ms` PASS, `< 50 ms` PASS, **`< 15 ms` EXTREME TARGET PASS!**) vs **`249.39 ms`** (**`17.06x`** total wall speedup, **`11.37x`** geomean, **`100/100` FULL WIN across all 10 domains `10/10`**, **`100/100` EXACT (`0` drift) on BOTH AVX2 & `--simd=scalar`**, **`40.8x`** faster compile `190.8 ms` vs `7793.6 ms`).
 
 ---
 

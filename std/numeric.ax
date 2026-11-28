@@ -323,71 +323,16 @@ fn _fft_local_worker(tid: i64, nthreads: i64, pool: i64) {
         twr := ptr_read_i64(pool, 6)
         twi := ptr_read_i64(pool, 7)
         n := ptr_read_i64(pool, 8)
-        packed := ptr_read_i64(pool, 9) // (max_local_len << 2) | (inv_flag)
-        max_len := ushr64(packed, 2)
-        sign := if (packed & 1) != 0 { 1.0 } else { -1.0 }
-        nblk := n / max_len
-        b0 := (tid * nblk) / nthreads
-        b1 := ((tid + 1) * nblk) / nthreads
-        half_n := n >> 1
-        mut bi := b0
-        while bi < b1 {
-            seg := bi * max_len
-            seg_end := seg + max_len
-            // Stage 1: len=2 (0 multiplications!)
-            mut p := seg
-            while p < seg_end {
-                ur := ptr_read_f64(pre, p); ui := ptr_read_f64(pim, p)
-                vr := ptr_read_f64(pre, p + 1); vi := ptr_read_f64(pim, p + 1)
-                ptr_write_f64(pre, p, ur + vr);     ptr_write_f64(pim, p, ui + vi)
-                ptr_write_f64(pre, p + 1, ur - vr); ptr_write_f64(pim, p + 1, ui - vi)
-                p += 2
-            }
-            // Stage 2: len=4 (0 multiplications: w_1 = (0, sign)!)
-            if max_len >= 4 {
-                p = seg
-                while p < seg_end {
-                    u0r := ptr_read_f64(pre, p);     u0i := ptr_read_f64(pim, p)
-                    v0r := ptr_read_f64(pre, p + 2); v0i := ptr_read_f64(pim, p + 2)
-                    ptr_write_f64(pre, p, u0r + v0r);     ptr_write_f64(pim, p, u0i + v0i)
-                    ptr_write_f64(pre, p + 2, u0r - v0r); ptr_write_f64(pim, p + 2, u0i - v0i)
-                    u1r := ptr_read_f64(pre, p + 1); u1i := ptr_read_f64(pim, p + 1)
-                    v1r := ptr_read_f64(pre, p + 3); v1i := ptr_read_f64(pim, p + 3)
-                    t1r := (0.0 - sign) * v1i
-                    t1i := sign * v1r
-                    ptr_write_f64(pre, p + 1, u1r + t1r); ptr_write_f64(pim, p + 1, u1i + t1i)
-                    ptr_write_f64(pre, p + 3, u1r - t1r); ptr_write_f64(pim, p + 3, u1i - t1i)
-                    p += 4
-                }
-            }
-            // Stages len = 8 .. max_len using L1-resident twiddle LUT
-            mut len_b := 8
-            while len_b <= max_len {
-                half := len_b >> 1
-                step := half_n / half
-                mut base := seg
-                while base < seg_end {
-                    mut k := 0
-                    mut ti := 0
-                    while k < half {
-                        u_idx := base + k
-                        v_idx := u_idx + half
-                        wr := ptr_read_f64(twr, ti)
-                        wi := ptr_read_f64(twi, ti)
-                        ur := ptr_read_f64(pre, u_idx); ui := ptr_read_f64(pim, u_idx)
-                        vr := ptr_read_f64(pre, v_idx); vi := ptr_read_f64(pim, v_idx)
-                        tr := vr * wr - vi * wi
-                        tim := vr * wi + vi * wr
-                        ptr_write_f64(pre, u_idx, ur + tr);  ptr_write_f64(pim, u_idx, ui + tim)
-                        ptr_write_f64(pre, v_idx, ur - tr);  ptr_write_f64(pim, v_idx, ui - tim)
-                        k += 1
-                        ti += step
-                    }
-                    base += len_b
-                }
-                len_b = len_b << 1
-            }
-            bi += 1
+        max_local := ushr64(ptr_read_i64(pool, 9), 2)
+        nblks := n / max_local
+        b0 := (tid * nblks) / nthreads
+        b1 := ((tid + 1) * nblks) / nthreads
+        pack := (max_local << 32) | 1
+        mut b := b0
+        while b < b1 {
+            off := b * max_local * 8
+            _ := avx_fft_stages_f64(pre + off, pim + off, twr, twi, n, pack)
+            b += 1
         }
     }
 }
@@ -520,6 +465,124 @@ fn _fft_final_stage_worker(tid: i64, nthreads: i64, pool: i64) {
 
 // Performs in-place Radix-2 FFT (`inverse == false`) or IFFT (`inverse == true`) on length-`n` `MatF64` buffers.
 // `n` must be a positive power of two (`(n & (n - 1)) == 0`).
+fn _fft_barr(fbarr: i64, tid: i64, nthreads: i64, ep: i64) {
+    unsafe {
+        if tid == 0 {
+            mut t := 1
+            while t < nthreads {
+                mut sp := 0
+                while atomic_load_i64(fbarr, t << 3) < ep {
+                    cpu_pause(); sp += 1
+                    if (sp & 511) == 0 { thread_yield() }
+                }
+                t += 1
+            }
+            atomic_store_rel_i64(fbarr, 0, ep)
+        } else {
+            atomic_store_rel_i64(fbarr, tid << 3, ep)
+            mut sp := 0
+            while atomic_load_i64(fbarr, 0) < ep {
+                cpu_pause(); sp += 1
+                if (sp & 511) == 0 { thread_yield() }
+            }
+        }
+    }
+}
+
+fn _fft_all_worker(tid: i64, nthreads: i64, pool: i64) {
+    unsafe {
+        pre := ptr_read_i64(pool, 4)
+        pim := ptr_read_i64(pool, 5)
+        tmp_r := ptr_read_i64(pool, 6)
+        tmp_i := ptr_read_i64(pool, 7)
+        meta := ptr_read_i64(pool, 8)
+        twr := ptr_read_i64(meta, 0)
+        twi := ptr_read_i64(meta, 1)
+        rev8 := ptr_read_i64(meta, 2)
+        n := ptr_read_i64(meta, 3)
+        logn := ptr_read_i64(meta, 4)
+        inv_b := ptr_read_i64(meta, 5)
+        max_local := ptr_read_i64(meta, 6)
+        fbarr := ptr_read_i64(meta, 7)
+        i0 := (tid * n) / nthreads
+        i1 := ((tid + 1) * n) / nthreads
+        mut i := i0
+        if logn <= 16 {
+            sh := 16 - logn
+            while i < i1 {
+                r := ushr64((ptr_read_u8(rev8, i & 255) << 8) | ptr_read_u8(rev8, ushr64(i, 8)), sh)
+                ptr_write_f64(tmp_r, i, ptr_read_f64(pre, r))
+                ptr_write_f64(tmp_i, i, ptr_read_f64(pim, r))
+                i += 1
+            }
+        } else {
+            sh := 24 - logn
+            while i < i1 {
+                r := ushr64((ptr_read_u8(rev8, i & 255) << 16) | (ptr_read_u8(rev8, ushr64(i, 8) & 255) << 8) | ptr_read_u8(rev8, ushr64(i, 16) & 255), sh)
+                ptr_write_f64(tmp_r, i, ptr_read_f64(pre, r))
+                ptr_write_f64(tmp_i, i, ptr_read_f64(pim, r))
+                i += 1
+            }
+        }
+        half_n := n >> 1
+        k0 := (tid * half_n) / nthreads
+        k1 := ((tid + 1) * half_n) / nthreads
+        if k0 < k1 {
+            sign := if inv_b != 0 { 1.0 } else { -1.0 }
+            ang0 := sign * num_two_pi() / (n as f64)
+            dr := num_cos(ang0)
+            di := num_sin(ang0)
+            mut k := k0
+            while k < k1 {
+                ak := ang0 * (k as f64)
+                mut wr := num_cos(ak)
+                mut wi := num_sin(ak)
+                mut end_k := k + 256
+                if end_k > k1 { end_k = k1 }
+                while k < end_k {
+                    ptr_write_f64(twr, k, wr)
+                    ptr_write_f64(twi, k, wi)
+                    nwr := wr * dr - wi * di
+                    wi = wr * di + wi * dr
+                    wr = nwr
+                    k += 1
+                }
+            }
+        }
+        mut ep := 1
+        _fft_barr(fbarr, tid, nthreads, ep)
+        nblks := n / max_local
+        pack := (max_local << 32) | 1
+        mut b := tid
+        while b < nblks {
+            off := b * max_local * 8
+            _ := avx_fft_stages_f64(tmp_r + off, tmp_i + off, twr, twi, n, pack)
+            b += nthreads
+        }
+        mut hsh := 0
+        mut tm := max_local
+        while tm > 1 { tm = tm >> 1; hsh += 1 }
+        while (1 << (hsh + 1)) < n {
+            ep += 1
+            _fft_barr(fbarr, tid, nthreads, ep)
+            _ := avx_fft_global_stage_f64(meta, hsh, k0, k1)
+            hsh += 1
+        }
+        ep += 1
+        _fft_barr(fbarr, tid, nthreads, ep)
+        if (1 << hsh) < n {
+            _ := avx_fft_global_stage_f64(meta, hsh | 64, k0, k1)
+        } else {
+            mut ci := i0
+            while ci < i1 {
+                ptr_write_f64(pre, ci, ptr_read_f64(tmp_r, ci))
+                ptr_write_f64(pim, ci, ptr_read_f64(tmp_i, ci))
+                ci += 1
+            }
+        }
+    }
+}
+
 fn fft_radix2_inplace(re: MatF64, im: MatF64, inverse: bool) -> bool {
     n := re.rows * re.cols
     if re.ptr == 0 or im.ptr == 0 or n <= 0 or im.rows * im.cols != n { return false }
@@ -528,22 +591,25 @@ fn fft_radix2_inplace(re: MatF64, im: MatF64, inverse: bool) -> bool {
     pre := re.ptr
     pim := im.ptr
     sign := if inverse { 1.0 } else { -1.0 }
-    // Parallel bit-reversal + twiddle LUT + L1/L2-blocked path for 2048 <= n <= 16777216
+    // Single-dispatch parallel bit-reversal + twiddle LUT + L1D-blocked path for 2048 <= n <= 16777216
     if n >= 2048 and n <= 16777216 {
         half_n := n >> 1
         mut logn := 0
         mut tn := n
         while tn > 1 { tn = tn >> 1; logn += 1 }
         unsafe {
-            arena := mem_alloc_aligned(n * 24 + 1024)
+            arena := mem_alloc_raw(n * 24 + 2048)
             if arena != 0 {
                 tmp_r := arena
                 tmp_i := arena + n * 8 + 64
                 twr := tmp_i + n * 8 + 64
                 twi := twr + half_n * 8 + 64
                 rev8 := twi + half_n * 8 + 64
-                meta := rev8 + 256
-                args := meta + 64
+                fbarr := (rev8 + 319) & (-64)
+                meta := fbarr + 1024
+                args := meta + 128
+                mut ft := 0
+                while ft < 16 { ptr_write_i64(fbarr, ft << 3, 0); ft += 1 }
                 mut bi := 0
                 while bi < 256 {
                     mut rv := 0; mut bb := 0; mut x := bi
@@ -551,41 +617,19 @@ fn fft_radix2_inplace(re: MatF64, im: MatF64, inverse: bool) -> bool {
                     ptr_write_u8(rev8, bi, rv)
                     bi += 1
                 }
+                mut max_local := n >> 3
+                if max_local > 2048 { max_local = 2048 }
+                if max_local < 128 { max_local = 128 }
                 inv_b := if inverse { 1 } else { 0 }
                 ptr_write_i64(meta, 0, twr); ptr_write_i64(meta, 1, twi); ptr_write_i64(meta, 2, rev8)
                 ptr_write_i64(meta, 3, n);   ptr_write_i64(meta, 4, logn); ptr_write_i64(meta, 5, inv_b)
+                ptr_write_i64(meta, 6, max_local); ptr_write_i64(meta, 7, fbarr)
+                ptr_write_i64(meta, 8, pre); ptr_write_i64(meta, 9, pim)
+                ptr_write_i64(meta, 10, tmp_r); ptr_write_i64(meta, 11, tmp_i)
                 ptr_write_i64(args, 0, pre); ptr_write_i64(args, 1, pim)
                 ptr_write_i64(args, 2, tmp_r); ptr_write_i64(args, 3, tmp_i)
                 ptr_write_i64(args, 4, meta);  ptr_write_i64(args, 5, 0)
-                _ := ai_pool_dispatch(fn_addr(_fft_bitrev_tw_worker), args)
-
-                mut max_local := n >> 2
-                if max_local > 4096 { max_local = 4096 }
-                if max_local < 128 { max_local = 128 }
-                // Run local stages directly on tmp_r/tmp_i (zero copy before FFT!)
-                ptr_write_i64(args, 0, tmp_r); ptr_write_i64(args, 1, tmp_i)
-                ptr_write_i64(args, 2, twr);   ptr_write_i64(args, 3, twi)
-                ptr_write_i64(args, 4, n);     ptr_write_i64(args, 5, (max_local << 2) | inv_b)
-                _ := ai_pool_dispatch(fn_addr(_fft_local_worker), args)
-
-                mut hsh := 0
-                mut tm := max_local
-                while tm > 1 { tm = tm >> 1; hsh += 1 }
-                // Intermediate global stages in tmp_r/tmp_i, then fuse final stage directly into pre/pim (zero final memcpy!)
-                while (1 << (hsh + 1)) < n {
-                    ptr_write_i64(args, 5, hsh)
-                    _ := ai_pool_dispatch(fn_addr(_fft_stage_worker), args)
-                    hsh += 1
-                }
-                if (1 << hsh) < n {
-                    ptr_write_i64(args, 0, tmp_r); ptr_write_i64(args, 1, tmp_i)
-                    ptr_write_i64(args, 2, pre);   ptr_write_i64(args, 3, pim)
-                    ptr_write_i64(args, 4, meta);  ptr_write_i64(args, 5, 0)
-                    _ := ai_pool_dispatch(fn_addr(_fft_final_stage_worker), args)
-                } else {
-                    _ := mem_copy(pre, tmp_r, n * 8)
-                    _ := mem_copy(pim, tmp_i, n * 8)
-                }
+                _ := ai_pool_dispatch(fn_addr(_fft_all_worker), args)
                 mem_free_aligned(arena)
                 if inverse {
                     inv_n := 1.0 / (n as f64)

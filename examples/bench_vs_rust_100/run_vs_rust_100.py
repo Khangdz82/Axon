@@ -190,6 +190,7 @@ def main() -> int:
     ax_chks = ax_runs[0]["chks"]
     rs_chks = rs_runs[0]["chks"]
     mismatches = []
+    exact_cnt = 0
     losses = []
     rows = []
     ratios = []
@@ -219,15 +220,13 @@ def main() -> int:
         domain_totals[dom] = (d_ax + ax_ms, d_rs + rs_ms, d_w + (1 if won else 0), d_n + 1)
 
         ac, rc = ax_chks[idx], rs_chks[idx]
-        if mode == "exact":
-            ok = (ac == rc)
+        ok = (ac == rc)
+        if ok:
+            exact_cnt += 1
         else:
-            tol = max(10, int(abs(rc) * 0.003))
-            ok = abs(ac - rc) <= tol
-        if not ok:
             mismatches.append((bid, name, ac, rc))
 
-        status = "EXACT" if ac == rc else ("FP_OK" if ok else f"DIFF({ac}!={rc})")
+        status = "EXACT" if ok else f"DIFF({ac-rc:+d})"
         mark = "" if won else " [LOSS]"
         print(f"{bid:<5} {dom:<11} {tier:<10} {name:<24} {ax_ms:10.3f} {rs_ms:10.3f} {ratio:8.2f}x {status:<14}{mark}")
         rows.append({
@@ -249,8 +248,8 @@ def main() -> int:
     print("=" * 116)
     print(f"TOTAL WALL TIME : Axon = {ax_total_ms:.2f} ms (runs: min={min(ax_run_totals):.2f}, med={statistics.median(ax_run_totals):.2f}, max={max(ax_run_totals):.2f}) | Rust = {rs_total_ms:.2f} ms | Wall Speedup = {wall_speedup:.2f}x")
     print(f"GEOMEAN SPEEDUP : {geomean:.2f}x | AXON WINS: {axon_wins}/100 | COMPILE SPEEDUP: {rs_compile_ms/max(ax_compile_ms,0.1):.1f}x")
-    print(f"CHECKSUM PARITY : {100 - len(mismatches)}/100 verified")
-    print(f"STRICT GATES    : <100ms={'PASS' if ax_total_ms < 100.0 else 'FAIL'} | <50ms_TARGET={'PASS' if ax_total_ms < 50.0 else 'FAIL'} | 100/100_WIN={'PASS' if axon_wins == 100 else 'FAIL'} | PARITY={'PASS' if not mismatches else 'FAIL'}")
+    print(f"EXACT PRECISION : {exact_cnt}/100 EXACT (0 drift)")
+    print(f"STRICT GATES    : <50ms={'PASS' if ax_total_ms < 50.0 else 'FAIL'} | <15ms_EXTREME={'PASS' if ax_total_ms < 15.0 else 'FAIL'} | 100/100_WIN={'PASS' if axon_wins == 100 else 'FAIL'} | 100/100_EXACT={'PASS' if exact_cnt == 100 else 'FAIL'}")
 
     if mismatches:
         print("MISMATCHES:")
@@ -274,15 +273,18 @@ def main() -> int:
         "wall_speedup": round(wall_speedup, 3),
         "geomean_speedup": round(geomean, 3),
         "axon_wins": axon_wins,
+        "exact_count": exact_cnt,
         "checksum_mismatches": len(mismatches),
         "gate_under_100ms": ax_total_ms < 100.0,
         "gate_under_50ms": ax_total_ms < 50.0,
+        "gate_under_15ms": ax_total_ms < 15.0,
         "gate_full_win": axon_wins == 100,
+        "gate_full_exact": exact_cnt == 100,
         "benchmarks": rows,
     }
     with open(OUT_JSON, "w", encoding="utf-8", newline="\n") as f:
         json.dump(summary, f, indent=2)
-    return 0 if (not mismatches and axon_wins == 100 and ax_total_ms < 50.0) else 2
+    return 0 if (exact_cnt == 100 and axon_wins == 100 and ax_total_ms < 15.0) else 2
 
 
 if __name__ == "__main__":

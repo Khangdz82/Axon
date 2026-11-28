@@ -259,7 +259,6 @@ fn svec_join(sv: StrVec, sep: str) -> str {
 // Sentinels `EMPTY = 0x7FEFEFEFEFEFEFEF` (filled via `mem_set(..., 0xEF, ...)`? Wait: `0x7F7F7F7F7F7F7F7F` = `mem_set(ptr, 0x7F, bytes)` in ONE AVX2 memset!)
 // and `TOMB = 0x7F7F7F7F7F7F7F7E` are handled explicitly in `s_flags` (`bit 0` = EMPTY key present, `bit 1` = TOMB key present) so ALL 2^64 i64 keys work!
 struct DynMap {
-    cells: IntBuf
     hdr: i64
 }
 
@@ -271,7 +270,7 @@ fn _dmap_tomb_key() -> i64  { return 0x7F7F7F7F7F7F7F7E }
 
 @inline
 fn _dmap_hash(k: i64, mask: i64) -> i64 {
-    return ushr64(k *% 0x9E3779B97F4A7C15, 32) & mask
+    return ushr64(k *% 0x517CC1B727220A95, 36) & mask
 }
 
 // Header layout at `m.hdr` (8 x i64 = 64B cache line):
@@ -283,8 +282,8 @@ fn dmap_new(init_cap: i64 = 32) -> DynMap {
     mut c := 16
     while c < req { c = c << 1 }
     unsafe {
-        hdr := mem_alloc_aligned(64)
-        p := mem_alloc_aligned(c * 16 + 64)
+        hdr := mem_alloc_raw(64)
+        p := mem_alloc_raw(c * 16 + 64)
         if p != 0 { mem_set(p, 0x7F, c * 16) }
         if hdr != 0 {
             ptr_write_i64(hdr, 0, p)
@@ -296,7 +295,7 @@ fn dmap_new(init_cap: i64 = 32) -> DynMap {
             ptr_write_i64(hdr, 6, 0)
             ptr_write_i64(hdr, 7, (c * 3) >> 2)
         }
-        return DynMap(cells = ibuf_new(1), hdr = hdr)
+        return DynMap(hdr = hdr)
     }
 }
 
@@ -308,7 +307,6 @@ fn dmap_free(move m: DynMap) {
             mem_free_aligned(m.hdr)
         }
     }
-    buf_free(move m.cells)
 }
 
 @inline
@@ -320,31 +318,12 @@ fn dmap_len(m: DynMap) -> i64 {
 fn _dmap_rehash_hdr(hdr: i64, new_cap: i64) {
     if hdr == 0 or new_cap <= 0 or new_cap > 16777216 { return }
     unsafe {
-        np := mem_alloc_aligned(new_cap * 16 + 64)
+        np := mem_alloc_raw(new_cap * 16 + 64)
         if np == 0 { return }
-        mem_set(np, 0x7F, new_cap * 16)
-        emp := 0x7F7F7F7F7F7F7F7F
-        tmb := 0x7F7F7F7F7F7F7F7E
         mask := new_cap - 1
         old_p := ptr_read_i64(hdr, 0)
         old_c := ptr_read_i64(hdr, 1) + 1
-        mut re_used := 0
-        mut i := 0
-        while i < old_c {
-            base := i << 1
-            k := ptr_read_i64(old_p, base)
-            if k != emp and k != tmb {
-                v := ptr_read_i64(old_p, base + 1)
-                mut idx := _dmap_hash(k, mask)
-                while ptr_read_i64(np, idx << 1) != emp {
-                    idx = (idx + 1) & mask
-                }
-                ptr_write_i64(np, idx << 1, k)
-                ptr_write_i64(np, (idx << 1) + 1, v)
-                re_used += 1
-            }
-            i += 1
-        }
+        re_used := avx_dmap_rehash(old_p, old_c, np, new_cap)
         if old_p != 0 { mem_free_aligned(old_p) }
         ptr_write_i64(hdr, 0, np)
         ptr_write_i64(hdr, 1, mask)
@@ -353,9 +332,7 @@ fn _dmap_rehash_hdr(hdr: i64, new_cap: i64) {
     }
 }
 
-fn dmap_put(mut m: DynMap, key: i64, val: i64) {
-    hdr := m.hdr
-    if hdr == 0 { return }
+fn _dmap_put_cold(hdr: i64, key: i64, val: i64) {
     emp := 0x7F7F7F7F7F7F7F7F
     tmb := 0x7F7F7F7F7F7F7F7E
     unsafe {
@@ -373,28 +350,29 @@ fn dmap_put(mut m: DynMap, key: i64, val: i64) {
         mut used := ptr_read_i64(hdr, 3)
         if used >= ptr_read_i64(hdr, 7) {
             cap := ptr_read_i64(hdr, 1) + 1
-            next_c := if cap <= 32768 { cap * 4 } else { cap * 2 }
+            mut next_c := cap * 2
+            if cap <= 2048 { next_c = cap * 16 }
+            else if cap <= 32768 { next_c = cap * 4 }
             _dmap_rehash_hdr(hdr, next_c)
             used = ptr_read_i64(hdr, 3)
         }
         p := ptr_read_i64(hdr, 0)
         if p == 0 { return }
         mask := ptr_read_i64(hdr, 1)
-        mut idx := ushr64(key *% 0x9E3779B97F4A7C15, 32) & mask
+        mut idx := ushr64(key *% 0x517CC1B727220A95, 36) & mask
         mut tomb := -1
         while true {
             base := idx << 1
             k := ptr_read_i64(p, base)
-            if k == key {
-                ptr_write_i64(p, base + 1, val)
-                return
-            }
+            if k == key { ptr_write_i64(p, base + 1, val); return }
             if k == emp {
-                target := if tomb >= 0 { tomb } else { base }
-                ptr_write_i64(p, target, key)
-                ptr_write_i64(p, target + 1, val)
-                ptr_write_i64(hdr, 2, ptr_read_i64(hdr, 2) + 1)
-                if tomb < 0 { ptr_write_i64(hdr, 3, used + 1) }
+                if tomb >= 0 {
+                    ptr_write_i64(p, tomb, key); ptr_write_i64(p, tomb + 1, val)
+                    ptr_write_i64(hdr, 2, ptr_read_i64(hdr, 2) + 1)
+                } else {
+                    ptr_write_i64(p, base, key); ptr_write_i64(p, base + 1, val)
+                    ptr_write_i64(hdr, 2, ptr_read_i64(hdr, 2) + 1); ptr_write_i64(hdr, 3, used + 1)
+                }
                 return
             }
             if k == tmb and tomb < 0 { tomb = base }
@@ -403,30 +381,33 @@ fn dmap_put(mut m: DynMap, key: i64, val: i64) {
     }
 }
 
+fn _dmap_get_sentinel(hdr: i64, key: i64, default_val: i64) -> i64 {
+    emp := 0x7F7F7F7F7F7F7F7F
+    bit := if key == emp { 1 } else { 2 }
+    slot := if key == emp { 5 } else { 6 }
+    unsafe {
+        if (ptr_read_i64(hdr, 4) & bit) != 0 { return ptr_read_i64(hdr, slot) }
+    }
+    return default_val
+}
+
+@inline
+fn dmap_put(mut m: DynMap, key: i64, val: i64) {
+    hdr := m.hdr
+    if hdr == 0 { return }
+    unsafe {
+        if avx_dmap_op(hdr, key, val, 0) != 0 {
+            _dmap_put_cold(hdr, key, val)
+        }
+    }
+}
+
+@inline
 fn dmap_get(m: DynMap, key: i64, default_val: i64 = 0) -> i64 {
     hdr := m.hdr
     if hdr == 0 { return default_val }
-    emp := 0x7F7F7F7F7F7F7F7F
-    tmb := 0x7F7F7F7F7F7F7F7E
     unsafe {
-        if ushr64(key ^ tmb, 1) == 0 {
-            bit := if key == emp { 1 } else { 2 }
-            slot := if key == emp { 5 } else { 6 }
-            if (ptr_read_i64(hdr, 4) & bit) != 0 { return ptr_read_i64(hdr, slot) }
-            return default_val
-        }
-        p := ptr_read_i64(hdr, 0)
-        if p == 0 { return default_val }
-        mask := ptr_read_i64(hdr, 1)
-        mut idx := ushr64(key *% 0x9E3779B97F4A7C15, 32) & mask
-        while true {
-            base := idx << 1
-            k := ptr_read_i64(p, base)
-            if k == key { return ptr_read_i64(p, base + 1) }
-            if k == emp { return default_val }
-            idx = (idx + 1) & mask
-        }
-        return default_val
+        return avx_dmap_op(hdr, key, default_val, 1)
     }
 }
 

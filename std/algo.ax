@@ -231,6 +231,83 @@ fn _radix_par_bucket_worker(tid: i64, nthreads: i64, pool: i64) {
 // Ultra-fast O(N) Full-Parallel Adaptive MSB-8 + L1D-Resident Constant-Shift Radix Sort!
 // For `n >= 65536`: 12-thread parallel MSB histogram -> 12-thread zero-lock scatter -> 12-thread L1D radix sort `tmp -> arr`!
 // Bit-exact across all signed 64-bit integers (`INT64_MIN .. INT64_MAX`).
+// Single-dispatch 6-thread MSB-8 (256 buckets) + 64B lock-free flag barrier + 64-sub-bucket local MSD + isort!
+fn _radix_med_all_worker(tid: i64, nthreads: i64, pool: i64) {
+    unsafe {
+        nt_use := if nthreads > 16 { 16 } else { nthreads }
+        if tid >= nt_use { return }
+        arr := ptr_read_i64(pool, 4)
+        tmp := ptr_read_i64(pool, 5)
+        n := ptr_read_i64(pool, 6)
+        meta := ptr_read_i64(pool, 7)
+        // 256-bucket L2-resident meta (~38KB): [0..1023]=fbarr, [1024..33791]=th_hist (16*2048B),
+        // [33792..35839]=offs (2048B), [35840..37887]=ends (2048B), [37888]=ok_box, [37896]=sh_box, [37904]=xor_box
+        fbarr := meta
+        th_hist := meta + 1024
+        offs := meta + 33792
+        ends := meta + 35840
+        ok_box := meta + 37888
+        sh := ptr_read_i64(meta + 37896, 0)
+        xor_m := ptr_read_i64(meta + 37904, 0)
+        lo := (tid * n) / nt_use
+        hi := ((tid + 1) * n) / nt_use
+        row := th_hist + (tid << 11) // 256 * 8 = 2048B per thread
+        mem_set(row, 0, 2048)
+        sh_xor := sh | (xor_m << 8)
+        _ := avx_radix_256_pass(0, arr, tmp, row, lo, hi, sh_xor)
+        if tid == 0 {
+            mut t := 1
+            while t < nt_use { mut sp := 0; while atomic_load_i64(fbarr, t << 3) < 1 { cpu_pause(); sp += 1; if (sp & 511) == 0 { thread_yield() } }; t += 1 }
+            mut sum := 0; mut non_empty := 0; mut b := 0
+            while b < 256 {
+                ptr_write_i64(offs, b, sum)
+                t = 0; mut b_tot := 0
+                while t < nt_use {
+                    c_tb := ptr_read_i64(th_hist, (t << 8) + b)
+                    ptr_write_i64(th_hist, (t << 8) + b, sum)
+                    sum += c_tb; b_tot += c_tb; t += 1
+                }
+                if b_tot > 0 { non_empty += 1 }
+                ptr_write_i64(ends, b, sum)
+                b += 1
+            }
+            ptr_write_i64(ok_box, 0, if non_empty >= 8 { 1 } else { 0 })
+            atomic_store_rel_i64(fbarr, 0, 1)
+        } else {
+            atomic_store_rel_i64(fbarr, tid << 3, 1)
+            mut sp := 0; while atomic_load_i64(fbarr, 0) < 1 { cpu_pause(); sp += 1; if (sp & 511) == 0 { thread_yield() } }
+        }
+        if ptr_read_i64(ok_box, 0) == 0 { return }
+        _ := avx_radix_256_pass(1, arr, tmp, row, lo, hi, sh_xor)
+        if tid == 0 {
+            mut t := 1
+            while t < nt_use { mut sp := 0; while atomic_load_i64(fbarr, t << 3) < 2 { cpu_pause(); sp += 1; if (sp & 511) == 0 { thread_yield() } }; t += 1 }
+            atomic_store_rel_i64(fbarr, 0, 2)
+        } else {
+            atomic_store_rel_i64(fbarr, tid << 3, 2)
+            mut sp2 := 0; while atomic_load_i64(fbarr, 0) < 2 { cpu_pause(); sp2 += 1; if (sp2 & 511) == 0 { thread_yield() } }
+        }
+        sh2 := sh - 6
+        mut bi := tid
+        while bi < 256 {
+            st := ptr_read_i64(offs, bi)
+            en := ptr_read_i64(ends, bi)
+            bn := en - st
+            if bn == 1 {
+                ptr_write_i64(arr, st, ptr_read_i64(tmp, st))
+            } else if bn > 1 {
+                if bn <= 4096 {
+                    _ := avx_radix_bsort_i64(tmp + st * 8, arr + st * 8, bn, sh2)
+                } else {
+                    mem_copy(arr + st * 8, tmp + st * 8, bn * 8)
+                    qsort_raw_i64(arr + st * 8, 0, bn - 1)
+                }
+            }
+            bi += nt_use
+        }
+    }
+}
+
 unsafe fn radix_sort_raw_i64(arr: i64, n: i64) {
     if n <= 1 { return }
     if n <= 48 {
@@ -263,9 +340,31 @@ unsafe fn radix_sort_raw_i64(arr: i64, n: i64) {
         return
     }
 
-    // Medium-size hybrid MSB-8 (256 L1D buckets, 2 KB histogram!) + 1-dispatch parallel L1D bucket sort:
-    // Single <512KB heap arena (no VirtualAlloc syscall!), 0 TLB thrash, ONLY ONE pool dispatch!
-    if n >= 8192 and n < 131072 {
+    // Medium-size SINGLE-DISPATCH 256-bucket MSB (sh=56, xor=128 -> 128 active buckets even on all-positive!) + L1D MSD+isort
+    if n >= 24576 and n < 131072 {
+        arena := mem_alloc_raw(38400 + n * 8)
+        if arena != 0 {
+            meta := arena
+            args := arena + 38016
+            tmp := arena + 38144
+            mut ft := 0
+            while ft < 16 { ptr_write_i64(meta, ft << 3, 0); ft += 1 }
+            ptr_write_i64(meta + 37888, 0, 0)
+            ptr_write_i64(meta + 37896, 0, 56)
+            ptr_write_i64(meta + 37904, 0, 128)
+            ptr_write_i64(args, 0, arr)
+            ptr_write_i64(args, 1, tmp)
+            ptr_write_i64(args, 2, n)
+            ptr_write_i64(args, 3, meta)
+            ptr_write_i64(args, 4, 0)
+            ptr_write_i64(args, 5, 0)
+            _ := ai_pool_dispatch(fn_addr(_radix_med_all_worker), args)
+            ok := ptr_read_i64(meta + 37888, 0)
+            mem_free_aligned(arena)
+            if ok != 0 { return }
+        }
+    }
+    if n >= 8192 and n < 24576 {
         arena := mem_alloc_aligned(n * 8 + 8192)
         if arena != 0 {
             cnt := arena
@@ -489,20 +588,7 @@ fn sort_i64_range(b: IntBuf, lo: i64, hi: i64) {
     }
     len := hi - lo + 1
     unsafe {
-        tmp := mem_alloc_aligned(len * 8 + 64)
-        if tmp == 0 { return }
-        mut k := 0
-        while k < len {
-            ptr_write_i64(tmp, k, ibuf_get(b, lo + k))
-            k += 1
-        }
-        radix_sort_raw_i64(tmp, len)
-        k = 0
-        while k < len {
-            ibuf_set(b, lo + k, ptr_read_i64(tmp, k))
-            k += 1
-        }
-        mem_free_aligned(tmp)
+        radix_sort_raw_i64((b as i64) + 16 + lo * 8, len)
     }
 }
 
